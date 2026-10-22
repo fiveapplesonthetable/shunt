@@ -1,0 +1,11 @@
+{
+  "session_id": "gemini-session-987123",
+  "cwd": "/workspace",
+  "hook_event_name": "BeforeTool",
+  "tool_call": {
+    "name": "run_shell_command",
+    "args": {
+      "command": "pytest tests/"
+    }
+  }
+}

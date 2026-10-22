@@ -1,0 +1,23 @@
+[package]
+name = "tacho-ring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[dependencies]
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+loom = "0.7"
+proptest = "1.12"
+criterion = "0.8"
+
+[[bench]]
+name = "ring_bench"
+harness = false

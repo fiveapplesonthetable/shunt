@@ -1,0 +1,16 @@
+{
+  "session_id": "7ab5f92a-5551-4941-a820-53a43c8ebeb9",
+  "transcript_path": "/Users/developer/.claude/transcripts/7ab5f92a.jsonl",
+  "cwd": "/Users/developer/project",
+  "hook_event_name": "PostToolUse",
+  "tool_use_id": "toolu_01A2B3C4D5E6F7G8H9I0",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cargo test --workspace"
+  },
+  "tool_response": {
+    "exit_code": 0,
+    "stdout": "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+    "stderr": ""
+  }
+}

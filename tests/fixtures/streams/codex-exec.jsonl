@@ -1,0 +1,5 @@
+{"type": "thread.started", "thread_id": "01931a2c-7b44-7000-8000-000000000001"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_01", "type": "agent_message", "text": "I am checking the project configuration."}}
+{"type": "item.completed", "item": {"id": "item_02", "type": "command_execution", "command": "cargo check", "exit_code": 0, "output": "Finished `dev` profile"}}
+{"type": "turn.completed", "usage": {"input_tokens": 1420, "cached_input_tokens": 1024, "output_tokens": 85, "reasoning_output_tokens": 0}}

@@ -1,0 +1,7 @@
+{
+  "session_id": "gemini-session-987123",
+  "cwd": "/workspace",
+  "hook_event_name": "AfterAgent",
+  "status": "success",
+  "turns": 3
+}

@@ -392,7 +392,8 @@ Spawns the command with inherited stdio except stdout, which is teed: bytes go
 to our stdout unchanged and, when the format is recognised
 (`claude --output-format stream-json`, `codex exec --json`,
 `gemini --output-format stream-json`), parsed into Inputs. Exit code is
-passed through. The run's pid is known, so cpu/rss counters are sampled over
+passed through. Recognition is by the output's first lines, never by the
+program's name: `codex` on some machines is an unrelated tool. The run's pid is known, so cpu/rss counters are sampled over
 its process tree. Unrecognised output is passed through and only Run, counters
 and RunEnded are recorded.
 

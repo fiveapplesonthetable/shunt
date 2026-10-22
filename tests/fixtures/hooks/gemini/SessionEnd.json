@@ -1,0 +1,6 @@
+{
+  "session_id": "gemini-session-987123",
+  "cwd": "/workspace",
+  "hook_event_name": "SessionEnd",
+  "reason": "exit"
+}

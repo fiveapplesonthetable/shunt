@@ -1,0 +1,6 @@
+{"type": "init", "session_id": "gemini-session-987123", "model": "gemini-1.5-pro", "timestamp": "2026-10-22T14:00:00Z"}
+{"type": "message", "session_id": "gemini-session-987123", "role": "user", "content": "Run tests and summarize findings."}
+{"type": "tool_use", "session_id": "gemini-session-987123", "tool_name": "run_shell_command", "args": {"command": "pytest"}}
+{"type": "tool_result", "session_id": "gemini-session-987123", "tool_name": "run_shell_command", "result": "=================== 25 passed in 1.42s ==================="}
+{"type": "message", "session_id": "gemini-session-987123", "role": "assistant", "content": "All 25 tests passed."}
+{"type": "result", "session_id": "gemini-session-987123", "status": "completed", "total_tokens": 2340, "input_tokens": 1820, "output_tokens": 520}
