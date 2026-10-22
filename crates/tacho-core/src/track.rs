@@ -66,6 +66,7 @@ pub fn compute_track_rank(key: &str, name: &str) -> i32 {
         }
     }
     match target_name {
+        "procs" => 40,
         "overflow" => 50,
         "waits" => 60,
         "tokens_in" => 100,
@@ -74,6 +75,7 @@ pub fn compute_track_rank(key: &str, name: &str) -> i32 {
         "cost" => 103,
         "cpu" => 110,
         "rss" => 111,
+        "proc_count" => 112,
         "daemon" => 1,
         "agents" => 2,
         "tasks" => 3,

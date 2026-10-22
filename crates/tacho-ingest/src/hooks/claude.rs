@@ -57,6 +57,7 @@ pub fn map_with_diagnostics(
                 model,
                 parent_session,
                 git_tree,
+                role: None,
             }]
         }
         Some("UserPromptSubmit") => {
@@ -168,15 +169,57 @@ pub fn map_with_diagnostics(
                 exit_code,
             }]
         }
-        Some("Stop") => {
+        Some("Stop") | Some("TurnEnd") | Some("AssistantMessage") => {
+            let input_tokens = obj
+                .get("input_tokens")
+                .or_else(|| obj.get("inputTokens"))
+                .and_then(|v| v.as_u64());
+            let output_tokens = obj
+                .get("output_tokens")
+                .or_else(|| obj.get("outputTokens"))
+                .and_then(|v| v.as_u64());
+            let cached_tokens = obj
+                .get("cached_tokens")
+                .or_else(|| obj.get("cachedTokens"))
+                .and_then(|v| v.as_u64());
+            let cost_micros = obj
+                .get("cost_micros")
+                .or_else(|| obj.get("costMicros"))
+                .and_then(|v| v.as_u64());
             vec![Input::TurnEnd {
                 source_ts_ns: Some(env.invoked_at_ns),
                 session: SessionKey::new("claude", session_id),
-                input_tokens: None,
-                output_tokens: None,
-                cached_tokens: None,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
                 text_bytes: None,
-                cost_micros: None,
+                cost_micros,
+            }]
+        }
+        Some("Wait") | Some("WaitBegin") => {
+            let on = match obj.get("on").and_then(|v| v.as_str()) {
+                Some("subagent") => Some(WaitOn::Subagent),
+                Some("input") => Some(WaitOn::Input),
+                Some("message") => Some(WaitOn::Message),
+                Some("rate_limit") => Some(WaitOn::RateLimit),
+                _ => Some(WaitOn::Other),
+            };
+            let target = obj.get("target").and_then(|v| v.as_str()).map(String::from);
+            vec![Input::Wait {
+                source_ts_ns: Some(env.invoked_at_ns),
+                session: SessionKey::new("claude", session_id),
+                target,
+                on,
+            }]
+        }
+        Some("WaitEnd") => {
+            vec![Input::WaitEnd {
+                source_ts_ns: Some(env.invoked_at_ns),
+                session: SessionKey::new("claude", session_id),
+                timed_out: obj
+                    .get("timed_out")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             }]
         }
         Some("SubagentStop") => {

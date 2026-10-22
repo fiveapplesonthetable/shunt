@@ -16,9 +16,8 @@ use tacho_core::{
 };
 
 fn run_trace_processor(trace_bytes: &[u8]) {
-    let tp_path = env::var("TACHO_TP").unwrap_or_else(|_| {
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-    });
+    let tp_path = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP");
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let trace_path = temp_dir.path().join("replay.pftrace");
@@ -99,6 +98,7 @@ fn test_replay_claude_parallel_tools() {
                         parent_session: None,
                         git_tree: None,
                         source_ts_ns: Some(now_ns),
+                        role: None,
                     },
                     now_ns,
                     &mut events,
@@ -137,6 +137,7 @@ fn test_replay_claude_parallel_tools() {
                         parent_session: parent_tool,
                         git_tree: None,
                         source_ts_ns: Some(now_ns),
+                        role: None,
                     },
                     now_ns,
                     &mut events,
@@ -346,6 +347,7 @@ fn test_replay_jetski_session() {
                         parent_session: None,
                         git_tree: None,
                         source_ts_ns: Some(now_ns),
+                        role: None,
                     },
                     now_ns,
                     &mut events,

@@ -199,9 +199,35 @@ impl DaemonClient {
         serde_json::from_str(&resp_line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    /// Sends a batch of `Input` events over a persistent `api.sock` connection.
+    pub fn send_inputs_batch(&self, inputs: &[tacho_core::Input]) -> io::Result<()> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let mut stream = self.connect_api()?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut resp_line = String::new();
+
+        for chunk in inputs.chunks(256) {
+            let req = serde_json::json!({ "inputs": chunk });
+            let line = serde_json::to_string(&req)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            stream.write_all(line.as_bytes())?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+
+            resp_line.clear();
+            reader.read_line(&mut resp_line)?;
+        }
+        Ok(())
+    }
+
     /// Fetches an in-memory trace snapshot from the daemon and streams bytes to `w`.
     ///
-    /// Connects to `trace.sock` first. If unavailable, falls back to `api.sock`.
+    /// Connects to `trace.sock` first (when unfiltered and not `from_log`).
+    /// Otherwise falls back to `api.sock`.
     pub fn fetch_trace(
         &self,
         since: Option<u64>,
@@ -210,18 +236,18 @@ impl DaemonClient {
     ) -> io::Result<u64> {
         let trace_sock = self.trace_sock();
 
-        // 1. Try dedicated trace.sock only if not requesting from_log rebuild
-        if !from_log {
+        // 1. Try dedicated trace.sock only if unfiltered and not requesting from_log rebuild
+        if !from_log && since.is_none() {
             if let Ok(mut stream) = UnixStream::connect(&trace_sock) {
                 let bytes_copied = io::copy(&mut stream, w)?;
                 return Ok(bytes_copied);
             }
         }
 
-        // 2. Fall back to api.sock
-        let mut stream = self.connect_api()?;
-        stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
-        stream.set_write_timeout(Some(Duration::from_millis(2000)))?;
+        // 2. Fall back to api.sock if daemon is running (do not spawn daemon for read-only trace)
+        let mut stream = self.try_connect_api_fast()?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let req = serde_json::json!({
             "cmd": "trace",
             "since": since,

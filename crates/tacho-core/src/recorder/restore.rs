@@ -2,12 +2,12 @@
 
 use crate::classify::CommandClass;
 use crate::event::Event;
-use crate::input::SessionKey;
+use crate::input::{AgentRole, SessionKey};
 use crate::kind::Kind;
 use crate::live::{AgentLiveState, RecentCommand};
 use crate::recorder::tool::OpenToolSlice;
 use crate::recorder::tracks::{command_class_name, from_proto_cmd_class};
-use crate::recorder::{Recorder, RunState, TaskMeta};
+use crate::recorder::{Recorder, RunState};
 use crate::track::TrackKind;
 use tacho_proto::tacho;
 
@@ -35,8 +35,14 @@ impl Recorder {
             } else if event.track_key.ends_with("/cpu") {
                 let segs: Vec<&str> = event.track_key.split('/').collect();
                 let agent_id = segs[0].strip_prefix("agent:").unwrap_or(segs[0]);
+                let cpu_us = match event.custom_name.as_deref() {
+                    Some("ms") => v.saturating_mul(1_000),
+                    Some("ns") => v / 1_000,
+                    Some("s") => v.saturating_mul(1_000_000),
+                    _ => v,
+                };
                 if let Some(det) = self.detectors.get_mut(agent_id) {
-                    det.touch_cpu_activity(event.ts_ns);
+                    det.record_cpu_sample(event.ts_ns, cpu_us);
                 }
             }
             if let Some(entry) = self.registry.get_by_key_mut(&event.track_key) {
@@ -58,9 +64,15 @@ impl Recorder {
             | Kind::Wait
             | Kind::WaitEnded
             | Kind::FileEdited => self.restore_slice_event(event),
-            Kind::AgentState | Kind::Custom | Kind::Stall | Kind::TaskQueued => {
-                self.restore_state_or_counter_event(event)
-            }
+            Kind::AgentState
+            | Kind::Custom
+            | Kind::CustomEnded
+            | Kind::Milestone
+            | Kind::Stall
+            | Kind::TaskQueued
+            | Kind::TaskState
+            | Kind::Message
+            | Kind::ClockStep => self.restore_state_or_counter_event(event),
             _ => {}
         }
     }
@@ -75,13 +87,13 @@ impl Recorder {
                     TrackKind::Slices
                 };
                 let chain = self.hierarchy_chain(key, default_kd, None);
-                for (k, parent_k, name, kind, unit) in chain {
+                for (k, parent_k, name, desc, kind, unit) in chain {
                     if &k == key {
                         self.registry.register(
                             &k,
                             parent_k.as_deref(),
                             tc.name.as_deref().unwrap_or(&name),
-                            None,
+                            desc.as_deref(),
                             kind,
                             unit.as_deref(),
                         );
@@ -134,17 +146,24 @@ impl Recorder {
                         .entry(agent_id.to_string())
                         .or_insert_with(|| AgentLiveState::new(agent_id, provider, session_id));
                     live_agent.run_n = run_n;
+                    live_agent.run_start_ts_ns = event.ts_ns;
                     live_agent.model = r.model.clone();
                     live_agent.cwd = r.cwd.clone();
                     live_agent.task = r.task.clone();
 
                     self.runs.insert((agent_id.to_string(), run_n), run_state);
                     let det = self.detectors.entry(agent_id.to_string()).or_default();
+                    det.role = AgentRole::infer(agent_id, r.task.as_deref());
                     det.touch_event(event.ts_ns);
 
+                    if let Some(ps) = r.parent_run_seq {
+                        self.subagent_flows.retain(|_, &mut v| v != ps);
+                    }
                     if let Some(ref slug) = r.task {
                         if let Some(tmeta) = self.task_meta.get_mut(slug) {
-                            det.set_declared_paths(tmeta.paths.clone());
+                            if !tmeta.paths.is_empty() {
+                                det.set_declared_paths(tmeta.paths.clone());
+                            }
                             det.task_token_budget = tmeta.token_budget;
                             det.task_cost_budget_micros = tmeta.cost_budget_micros;
                             tmeta.last_run_seq = Some(event.seq);
@@ -159,6 +178,8 @@ impl Recorder {
                     run.turn_begin_seq = None;
                     run.open_tools.clear();
                 }
+                let procs_track = format!("agent:{}/run:{}/procs", agent_id, run_n);
+                self.open_custom_slices.remove(&procs_track);
                 if let Some(agent) = self.live.agents.get_mut(agent_id) {
                     agent.state = "Exited".to_string();
                     agent.state_since_ns = event.ts_ns;
@@ -221,6 +242,11 @@ impl Recorder {
                         (f.tool_use_id.clone(), None, None, f.path.clone(), None)
                     }
                     Some(tacho::event::Body::ToolCall(t)) => {
+                        if event.custom_name.as_deref() == Some("Subagent") {
+                            if let Some(ref tid) = t.tool_use_id {
+                                self.subagent_flows.insert(tid.clone(), event.seq);
+                            }
+                        }
                         if let Some(ref dig) = t.input_digest {
                             let cfg = self.detector_cfg.clone();
                             det.on_tool_begin(&dig.to_string(), &cfg);
@@ -242,6 +268,7 @@ impl Recorder {
                             command_class: cmd_class,
                             file_path,
                             file_edit,
+                            triggered_stall: false,
                         },
                     );
                 }
@@ -267,7 +294,7 @@ impl Recorder {
                             let cfg = self.detector_cfg.clone();
                             det.on_command_ended(&argv, class, exit_code, event.ts_ns, &cfg);
                             if let Some(agent) = self.live.agents.get_mut(agent_id) {
-                                agent.recent_commands.push(RecentCommand {
+                                agent.push_recent_command(RecentCommand {
                                     argv,
                                     class: command_class_name(class).to_string(),
                                     exit_code,
@@ -328,6 +355,7 @@ impl Recorder {
                 if let Some(ref name) = event.custom_name {
                     if name != "Stalled" && name != "Exited" {
                         if let Some(det) = self.detectors.get_mut(agent_id) {
+                            det.active_stalls.clear();
                             det.is_stalled = false;
                         }
                     }
@@ -365,6 +393,18 @@ impl Recorder {
                             prov_entry.cumulative_cost_micros = val as u64;
                         }
                     }
+                } else if let Some(tacho::event::Body::Custom(c)) = &event.body.body {
+                    if c.id.is_some() || event.track_key.ends_with("/procs") {
+                        self.open_custom_slices
+                            .entry(event.track_key.clone())
+                            .or_default()
+                            .push(c.id.clone());
+                    }
+                }
+            }
+            Kind::CustomEnded => {
+                if let Some(stack) = self.open_custom_slices.get_mut(&event.track_key) {
+                    stack.pop();
                 }
             }
             Kind::TaskQueued => {
@@ -372,18 +412,86 @@ impl Recorder {
                     if let Some(ref slug) = tq.slug {
                         let paths = tq.paths.clone();
                         self.tasks.insert(slug.clone(), paths.clone());
-                        self.task_meta
-                            .entry(slug.clone())
-                            .or_insert_with(|| TaskMeta {
-                                paths: paths.clone(),
-                                agent: None,
-                                base_commit: None,
-                                token_budget: None,
-                                cost_budget_micros: None,
-                                last_run_seq: None,
-                            });
-                        for det in self.detectors.values_mut() {
-                            det.task_declared_paths = Some(paths.clone());
+                        let meta = self.task_meta.entry(slug.clone()).or_default();
+                        meta.paths = paths.clone();
+                        meta.agent = event.agent.clone();
+                        meta.last_state_seq = Some(event.seq);
+                        if let Some(ref aid) = event.agent {
+                            self.detectors
+                                .entry(aid.clone())
+                                .or_default()
+                                .set_declared_paths(paths.clone());
+                        }
+                        let bound_agents: Vec<String> = self
+                            .live
+                            .agents
+                            .iter()
+                            .filter(|(_, a)| a.task.as_deref() == Some(slug.as_str()))
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        for aid in bound_agents {
+                            self.detectors
+                                .entry(aid)
+                                .or_default()
+                                .set_declared_paths(paths.clone());
+                        }
+                    }
+                }
+            }
+            Kind::TaskState => {
+                if let Some(slug) = event
+                    .track_key
+                    .strip_prefix("task:")
+                    .and_then(|s| s.strip_suffix("/state"))
+                {
+                    self.task_meta
+                        .entry(slug.to_string())
+                        .or_default()
+                        .last_state_seq = Some(event.seq);
+                }
+            }
+            Kind::Message => {
+                if let Some(tacho::event::Body::Message(m)) = &event.body.body {
+                    if let Some(ref mid) = m.message_id {
+                        if m.direction == Some(tacho::MessageDirection::Sent as i32) {
+                            self.message_flows.insert(mid.clone(), event.seq);
+                        } else if m.direction == Some(tacho::MessageDirection::Delivered as i32) {
+                            self.message_flows.remove(mid);
+                        }
+                    }
+                }
+            }
+            Kind::ClockStep => {
+                if let Some(tacho::event::Body::ClockStep(cs)) = &event.body.body {
+                    self.last_clock_offset_ns = self
+                        .last_clock_offset_ns
+                        .saturating_add(cs.delta_ns.unwrap_or(0));
+                }
+            }
+            Kind::Milestone => {
+                if let Some(tacho::event::Body::Milestone(m)) = &event.body.body {
+                    if matches!(
+                        m.name.as_deref(),
+                        Some("WorktreeCommit" | "WorktreeFileChange")
+                    ) {
+                        let segs: Vec<&str> = event.track_key.split('/').collect();
+                        let agent_id = event
+                            .agent
+                            .as_deref()
+                            .unwrap_or_else(|| segs[0].strip_prefix("agent:").unwrap_or(segs[0]));
+                        let is_commit = m.name.as_deref() == Some("WorktreeCommit");
+                        if let Some(det) = self.detectors.get_mut(agent_id) {
+                            det.record_worktree_progress(event.ts_ns);
+                        }
+                        if let Some(agent) = self.live.agents.get_mut(agent_id) {
+                            if let Some(ref cname) = event.custom_name {
+                                agent.last_action = cname.clone();
+                            }
+                            if is_commit {
+                                agent.commits_succeeded += 1;
+                            } else {
+                                agent.last_edit_ts_ns = Some(event.ts_ns);
+                            }
                         }
                     }
                 }
@@ -397,6 +505,9 @@ impl Recorder {
                 let flag_str = match &event.body.body {
                     Some(tacho::event::Body::Stall(st)) => {
                         let k = st.kind.and_then(|k| tacho::StallKind::try_from(k).ok());
+                        if let Some(kind) = k {
+                            det.enter_stall(kind);
+                        }
                         match k {
                             Some(tacho::StallKind::Silent) => {
                                 det.silent_fired = true;

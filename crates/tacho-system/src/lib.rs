@@ -476,8 +476,8 @@ perfetto --query
 
 /// Resolves `$TACHO_RUNTIME`:
 /// 1. `$TACHO_RUNTIME`
-/// 2. `$XDG_RUNTIME_DIR/tacho`
-/// 3. `$TACHO_HOME/run`
+/// 2. `$TACHO_HOME/run` (when `$TACHO_HOME` is explicitly set; falls back to `/tmp/tacho-<hash>` if path > 100 bytes)
+/// 3. `$XDG_RUNTIME_DIR/tacho`
 /// 4. `$HOME/.local/state/tacho/run`
 fn resolve_runtime_dir() -> PathBuf {
     if let Ok(val) = env::var("TACHO_RUNTIME") {
@@ -485,14 +485,23 @@ fn resolve_runtime_dir() -> PathBuf {
             return PathBuf::from(val);
         }
     }
+    if let Ok(val) = env::var("TACHO_HOME") {
+        if !val.trim().is_empty() {
+            let candidate = PathBuf::from(val.trim()).join("run");
+            if candidate.join("trace.sock").as_os_str().len() <= 100 {
+                return candidate;
+            }
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in val.trim().as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            return PathBuf::from(format!("/tmp/tacho-{:016x}", h));
+        }
+    }
     if let Ok(val) = env::var("XDG_RUNTIME_DIR") {
         if !val.trim().is_empty() {
             return PathBuf::from(val).join("tacho");
-        }
-    }
-    if let Ok(val) = env::var("TACHO_HOME") {
-        if !val.trim().is_empty() {
-            return PathBuf::from(val).join("run");
         }
     }
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());

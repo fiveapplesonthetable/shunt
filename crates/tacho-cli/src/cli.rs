@@ -78,6 +78,11 @@ pub enum Commands {
     ///
     /// Example: tacho system start --profile default
     System(SystemArgs),
+
+    /// Tail on-disk agent JSONL transcripts into the flight recorder.
+    ///
+    /// Example: tacho tail ~/.claude/projects
+    Tail(TailArgs),
 }
 
 #[derive(Args, Debug)]
@@ -87,6 +92,12 @@ pub struct DaemonArgs {
     /// Example: --otlp 127.0.0.1:4318
     #[arg(long)]
     pub otlp: Option<String>,
+
+    /// Optional shell command to run when a stall detector fires.
+    ///
+    /// Example: --on-stall "notify-send \"Stall: $TACHO_AGENT ($TACHO_STALL_KIND)\""
+    #[arg(long)]
+    pub on_stall: Option<String>,
 
     /// Run daemon in foreground instead of background.
     #[arg(long)]
@@ -434,4 +445,24 @@ pub enum SystemSubcommands {
         #[arg(long)]
         sudo: bool,
     },
+}
+
+#[derive(Args, Debug, Default)]
+pub struct TailArgs {
+    /// Path to a transcript .jsonl file or projects directory. Defaults to ~/.claude/projects.
+    ///
+    /// Example: ~/.claude/projects
+    pub path: Option<PathBuf>,
+
+    /// Scan and ingest new transcript lines once, then exit.
+    ///
+    /// Example: --once
+    #[arg(long)]
+    pub once: bool,
+
+    /// Optional agent identifier to attribute transcript sessions to.
+    ///
+    /// Example: --agent worker-1
+    #[arg(long)]
+    pub agent: Option<String>,
 }

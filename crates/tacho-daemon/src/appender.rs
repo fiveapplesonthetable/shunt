@@ -21,6 +21,7 @@ pub struct AppenderHooks {
 }
 
 /// Commands accepted by the appender loop.
+#[allow(clippy::large_enum_variant)]
 pub enum AppenderCommand {
     /// Ingest a parsed flight recorder input with arrival timestamp.
     Input(Input, u64),
@@ -32,12 +33,14 @@ pub enum AppenderCommand {
     Shutdown,
 }
 
-/// Active running session metadata for per-run process-tree sampling.
+/// Active running session metadata for per-run process-tree and worktree sampling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRun {
     pub session: SessionKey,
+    pub agent_id: String,
     pub run_track: String,
     pub pid: u32,
+    pub cwd: Option<String>,
 }
 
 /// Handle to communicate with the running appender thread.
@@ -116,15 +119,47 @@ impl AppenderHandle {
 
 /// Spawns the dedicated appender thread and returns its handle.
 pub fn spawn_appender(
+    recorder: Recorder,
+    log: EventLog,
+    channel_capacity: usize,
+) -> (AppenderHandle, std::thread::JoinHandle<()>) {
+    let on_stall = std::env::var("TACHO_ON_STALL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    spawn_appender_with_hook(recorder, log, channel_capacity, on_stall)
+}
+
+/// Spawns the dedicated appender thread with an optional `on_stall` shell hook.
+pub fn spawn_appender_with_hook(
     mut recorder: Recorder,
     mut log: EventLog,
     channel_capacity: usize,
+    on_stall: Option<String>,
 ) -> (AppenderHandle, std::thread::JoinHandle<()>) {
     let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
 
     let initial_state = Arc::new(recorder.live_state().clone());
     let initial_reg = Arc::new(recorder.registry().clone());
-    let active_runs = Arc::new(ArcSwap::new(Arc::new(Vec::new())));
+
+    let mut initial_runs_map = HashMap::new();
+    for (agent_id, a) in &initial_state.agents {
+        if a.state != "Exited" && a.cwd.is_some() {
+            let sess = SessionKey::new(&a.provider, &a.session_id);
+            initial_runs_map.insert(
+                sess.clone(),
+                ActiveRun {
+                    session: sess,
+                    agent_id: agent_id.clone(),
+                    run_track: format!("agent:{}/run:{}", agent_id, a.run_n.max(1)),
+                    pid: 0,
+                    cwd: a.cwd.clone(),
+                },
+            );
+        }
+    }
+    let active_runs = Arc::new(ArcSwap::new(Arc::new(
+        initial_runs_map.values().cloned().collect(),
+    )));
 
     let live_state = Arc::new(ArcSwap::new(initial_state));
     let published_registry = Arc::new(ArcSwap::new(initial_reg));
@@ -150,8 +185,10 @@ pub fn spawn_appender(
                 live_state,
                 published_registry,
                 active_runs,
+                initial_runs_map,
                 hooks,
                 write_errors,
+                on_stall,
             );
         })
         .expect("failed to spawn appender thread");
@@ -168,12 +205,13 @@ fn run_appender_loop(
     live_state: Arc<ArcSwap<LiveState>>,
     published_registry: Arc<ArcSwap<TrackRegistry>>,
     active_runs: Arc<ArcSwap<Vec<ActiveRun>>>,
+    mut active_runs_map: HashMap<SessionKey, ActiveRun>,
     hooks: Arc<AppenderHooks>,
     write_errors: Arc<AtomicUsize>,
+    on_stall: Option<String>,
 ) {
     let mut batch_events = Vec::with_capacity(256);
     let mut flush_notifiers = Vec::new();
-    let mut active_runs_map: HashMap<SessionKey, ActiveRun> = HashMap::new();
     let mut last_live_publish = Instant::now();
     let mut last_published_reg_len = recorder.registry().len();
     let mut last_tick = Instant::now();
@@ -210,6 +248,7 @@ fn run_appender_loop(
                         &mut last_live_publish,
                         &mut last_published_reg_len,
                         &write_errors,
+                        on_stall.as_deref(),
                     );
                 }
                 continue;
@@ -252,6 +291,7 @@ fn run_appender_loop(
                             &mut last_live_publish,
                             &mut last_published_reg_len,
                             &write_errors,
+                            on_stall.as_deref(),
                         );
                     }
                 }
@@ -294,6 +334,7 @@ fn run_appender_loop(
                                 &mut last_live_publish,
                                 &mut last_published_reg_len,
                                 &write_errors,
+                                on_stall.as_deref(),
                             );
                         }
                     }
@@ -326,6 +367,7 @@ fn run_appender_loop(
                 &mut last_live_publish,
                 &mut last_published_reg_len,
                 &write_errors,
+                on_stall.as_deref(),
             );
         }
     }
@@ -371,11 +413,12 @@ fn run_appender_loop(
             &mut last_live_publish,
             &mut last_published_reg_len,
             &write_errors,
+            on_stall.as_deref(),
         );
     }
 }
 
-/// Helper to apply inputs and track active session runs for process-tree sampling.
+/// Helper to apply inputs and track active session runs for process-tree and worktree sampling.
 fn apply_input_with_tracking(
     input: Input,
     rx_ts: u64,
@@ -392,12 +435,13 @@ fn apply_input_with_tracking(
             provider,
             session_id,
             agent,
-            pid: Some(pid),
+            pid,
+            cwd,
             ..
-        } => {
+        } if pid.is_some() || cwd.is_some() => {
             let session_key = SessionKey::new(provider, session_id);
             let agent_id = agent.clone().unwrap_or_else(|| provider.clone());
-            run_start_info = Some((session_key, agent_id, *pid));
+            run_start_info = Some((session_key, agent_id, pid.unwrap_or(0), cwd.clone()));
         }
         Input::RunEnd { session, .. } => {
             run_ended_session = Some(session.clone());
@@ -408,7 +452,7 @@ fn apply_input_with_tracking(
     recorder.apply(input, rx_ts, batch_events);
 
     let mut changed = false;
-    if let Some((session_key, agent_id, pid)) = run_start_info {
+    if let Some((session_key, agent_id, pid, cwd)) = run_start_info {
         let run_n = recorder
             .live_state()
             .agents
@@ -420,8 +464,10 @@ fn apply_input_with_tracking(
             session_key.clone(),
             ActiveRun {
                 session: session_key,
+                agent_id,
                 run_track,
                 pid,
+                cwd,
             },
         );
         changed = true;
@@ -436,7 +482,7 @@ fn apply_input_with_tracking(
     }
 }
 
-/// Commits a batch of events: SQLite log row first, then publish state.
+/// Commits a batch of events: SQLite log row first, then publish state, then fire stall hooks.
 #[allow(clippy::too_many_arguments)]
 fn commit_batch(
     batch_events: &mut Vec<Event>,
@@ -448,6 +494,7 @@ fn commit_batch(
     last_live_publish: &mut Instant,
     last_published_reg_len: &mut usize,
     write_errors: &AtomicUsize,
+    on_stall: Option<&str>,
 ) {
     if !batch_events.is_empty() {
         // SQLite write: insert all events (sampled machine/run counters logged at sample interval)
@@ -457,6 +504,46 @@ fn commit_batch(
                 "[tacho-daemon] failed to insert batch into SQLite WAL (graceful degradation): {}",
                 e
             );
+        }
+
+        // Fire `on_stall` effect hook asynchronously for any newly committed Stall event
+        if let Some(cmd_str) = on_stall {
+            for ev in batch_events.iter() {
+                if ev.kind == tacho_core::Kind::Stall {
+                    if let Some(tacho_proto::tacho::event::Body::Stall(ref st)) = ev.body.body {
+                        let stall_kind = match st
+                            .kind
+                            .and_then(|k| tacho_proto::tacho::StallKind::try_from(k).ok())
+                        {
+                            Some(tacho_proto::tacho::StallKind::Silent) => "SILENT",
+                            Some(tacho_proto::tacho::StallKind::Loop) => "LOOP",
+                            Some(tacho_proto::tacho::StallKind::Spin) => "SPIN",
+                            Some(tacho_proto::tacho::StallKind::Burn) => "BURN",
+                            Some(tacho_proto::tacho::StallKind::Failing) => "FAILING",
+                            Some(tacho_proto::tacho::StallKind::OffBrief) => "OFF_BRIEF",
+                            Some(tacho_proto::tacho::StallKind::StallClaim) => "CLAIM",
+                            _ => "STALL",
+                        };
+                        let agent = ev.agent.clone().unwrap_or_default();
+                        let evidence = st.evidence.clone().unwrap_or_default();
+                        let seq_str = ev.seq.to_string();
+                        let cmd_owned = cmd_str.to_string();
+                        let _ = std::thread::Builder::new()
+                            .name("tacho-on-stall".to_string())
+                            .spawn(move || {
+                                let _ = std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(&cmd_owned)
+                                    .env("TACHO_AGENT", &agent)
+                                    .env("TACHO_STALL_KIND", stall_kind)
+                                    .env("TACHO_STALL_REASON", &evidence)
+                                    .env("TACHO_STALL_EVIDENCE", &evidence)
+                                    .env("TACHO_SEQ", &seq_str)
+                                    .status();
+                            });
+                    }
+                }
+            }
         }
 
         // Publish TrackRegistry immediately if new tracks were registered

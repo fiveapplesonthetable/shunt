@@ -8,11 +8,16 @@
 //! 5. Absent daemon: spawns daemon detached without waiting, drops the event,
 //!    and increments `$TACHO_HOME/hook-drops`.
 
-use std::fs;
-use std::io::{self, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tacho_core::{Input, ToolInput};
+use tacho_ingest::hooks::{claude, gemini, jetski, HookEnv};
 
 use crate::cli::Provider;
 use crate::client::DaemonClient;
@@ -50,8 +55,8 @@ pub fn execute_hook(provider: Provider) {
         }
     };
 
-    // 3. Map provider payload to NDJSON Input messages
-    let inputs = map_hook_payload(provider, &val);
+    // 3. Map provider payload to typed Input messages via tacho-ingest::hooks
+    let mut inputs = map_hook_payload(provider, &val);
     if inputs.is_empty() {
         return;
     }
@@ -74,6 +79,9 @@ pub fn execute_hook(provider: Provider) {
         }
     };
 
+    // Enrich git_tree only when daemon is present so absent-daemon drops stay <1ms
+    enrich_git_trees(&mut inputs, &val);
+
     // 5. Stream inputs with remaining wall budget as write timeout
     let remaining_ms = HARD_BUDGET_MS.saturating_sub(start_time.elapsed().as_millis() as u64);
     if remaining_ms <= 5 {
@@ -84,15 +92,32 @@ pub fn execute_hook(provider: Provider) {
     let _ = send_inputs_with_timeout(stream, &inputs, Duration::from_millis(remaining_ms));
 }
 
-/// Atomically increments the drop counter in `$TACHO_HOME/hook-drops`.
+/// Atomically increments the drop counter in `$TACHO_HOME/hook-drops` under `flock(LOCK_EX)`.
 pub fn record_hook_drop(home_dir: &Path) {
     let _ = crate::paths::ensure_dir_0700(home_dir);
     let drop_file = home_dir.join("hook-drops");
-    let count = fs::read_to_string(&drop_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let _ = fs::write(&drop_file, (count + 1).to_string());
+    if let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&drop_file)
+    {
+        unsafe {
+            let _ = libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+        }
+        let mut s = String::new();
+        let _ = file.read_to_string(&mut s);
+        let count = s.trim().parse::<u64>().unwrap_or(0);
+        if file.seek(SeekFrom::Start(0)).is_ok() && file.set_len(0).is_ok() {
+            let _ = file.write_all((count + 1).to_string().as_bytes());
+            let _ = file.flush();
+        }
+        unsafe {
+            let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 fn resolve_git_tree(cwd: Option<&Path>) -> Option<String> {
@@ -111,275 +136,82 @@ fn resolve_git_tree(cwd: Option<&Path>) -> Option<String> {
     None
 }
 
-/// Maps hook payloads from Claude, Gemini, or Jetski into generic Input JSON objects.
-fn map_hook_payload(provider: Provider, val: &serde_json::Value) -> Vec<serde_json::Value> {
+/// Maps hook payloads from Claude, Gemini, or Jetski into typed `Input` events via `tacho_ingest::hooks`.
+fn map_hook_payload(provider: Provider, val: &serde_json::Value) -> Vec<Input> {
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
 
-    let session_id = val
-        .get("session_id")
-        .or_else(|| val.get("sessionId"))
-        .or_else(|| val.get("conversationId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let agent = std::env::var("TACHO_AGENT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| val.get("agent").and_then(|v| v.as_str()).map(String::from));
+    let task = std::env::var("TACHO_TASK")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| val.get("task").and_then(|v| v.as_str()).map(String::from));
+    let ppid = val
+        .get("pid")
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u32)
+        .or_else(|| {
+            let p = unsafe { libc::getppid() };
+            if p > 0 {
+                Some(p as u32)
+            } else {
+                None
+            }
+        })
+        .filter(|&p| p > 0);
 
-    let provider_str = match provider {
-        Provider::Claude => "claude",
-        Provider::Gemini => "gemini",
-        Provider::Jetski => "jetski",
+    let env = HookEnv {
+        agent,
+        task,
+        invoked_at_ns: now_ns,
+        ppid,
     };
 
-    let session_key = serde_json::json!({
-        "provider": provider_str,
-        "session_id": session_id,
-    });
-
-    let hook_event = val
-        .get("hook_event_name")
-        .or_else(|| val.get("event"))
-        .or_else(|| val.get("type"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let mut result = Vec::new();
-
-    match hook_event {
-        "SessionStart" => {
-            let agent_id = std::env::var("TACHO_AGENT")
-                .ok()
-                .or_else(|| val.get("agent").and_then(|v| v.as_str()).map(String::from));
-            let cwd_str = val.get("cwd").and_then(|v| v.as_str());
-            let cwd_path = cwd_str.map(Path::new);
-            let git_tree = resolve_git_tree(cwd_path);
-            result.push(serde_json::json!({
-                "type": "run_start",
-                "source_ts_ns": now_ns,
-                "provider": provider_str,
-                "session_id": session_id,
-                "agent": agent_id,
-                "pid": val.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32),
-                "task": val.get("task").and_then(|v| v.as_str()),
-                "cwd": cwd_str,
-                "git_tree": git_tree,
-                "model": val.get("model").or_else(|| val.get("modelName")).and_then(|v| v.as_str()),
-            }));
-        }
-        "SessionEnd" | "Stop" => {
-            result.push(serde_json::json!({
-                "type": "run_end",
-                "source_ts_ns": now_ns,
-                "session": session_key,
-                "reason": val.get("reason").or_else(|| val.get("stop_reason")).and_then(|v| v.as_str()),
-            }));
-        }
-        "UserPromptSubmit" => {
-            let prompt = val.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-            result.push(serde_json::json!({
-                "type": "prompt",
-                "source_ts_ns": now_ns,
-                "session": session_key.clone(),
-                "text_len": prompt.len(),
-            }));
-            result.push(serde_json::json!({
-                "type": "turn_start",
-                "source_ts_ns": now_ns,
-                "session": session_key,
-            }));
-        }
-        "PreToolUse" | "BeforeTool" => {
-            let tool_name = val
-                .get("tool_name")
-                .or_else(|| val.get("toolCall").and_then(|tc| tc.get("name")))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let tool_id_owned;
-            let tool_id = if let Some(id) = val.get("tool_use_id").and_then(|v| v.as_str()) {
-                id
-            } else if let Some(step) = val.get("stepIdx") {
-                tool_id_owned = step.to_string();
-                &tool_id_owned
-            } else {
-                "0"
-            };
-
-            let tool_in = val.get("tool_input").or_else(|| val.get("input"));
-            let input = if let Some(cmd) = tool_in
-                .and_then(|ti| ti.get("command").or_else(|| ti.get("cmd")))
-                .and_then(|v| v.as_str())
-            {
-                let cwd_str = val.get("cwd").and_then(|v| v.as_str());
-                let cwd_path = cwd_str.map(Path::new);
-                let git_tree = resolve_git_tree(cwd_path);
-                serde_json::json!({
-                    "tool": "shell",
-                    "argv": cmd,
-                    "cwd": cwd_str,
-                    "git_tree": git_tree,
-                })
-            } else if tool_name == "Edit"
-                || tool_name == "StrReplace"
-                || tool_name == "Write"
-                || tool_name == "write_file"
-                || tool_name == "edit_file"
-            {
-                let path = tool_in
-                    .and_then(|ti| {
-                        ti.get("path")
-                            .or_else(|| ti.get("file_path"))
-                            .or_else(|| ti.get("filePath"))
-                    })
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                serde_json::json!({
-                    "tool": "file_edit",
-                    "path": path,
-                })
-            } else if tool_name == "View" || tool_name == "Read" || tool_name == "read_file" {
-                let path = tool_in
-                    .and_then(|ti| {
-                        ti.get("path")
-                            .or_else(|| ti.get("file_path"))
-                            .or_else(|| ti.get("filePath"))
-                    })
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                serde_json::json!({
-                    "tool": "file_read",
-                    "path": path,
-                })
-            } else {
-                serde_json::json!({
-                    "tool": "other",
-                    "input_bytes": tool_in.map(|ti| ti.to_string().len()).unwrap_or(0),
-                })
-            };
-
-            result.push(serde_json::json!({
-                "type": "tool_begin",
-                "source_ts_ns": now_ns,
-                "session": session_key,
-                "tool_use_id": tool_id,
-                "tool_name": tool_name,
-                "input": input,
-            }));
-        }
-        "PostToolUse" | "AfterTool" => {
-            let tool_id_owned;
-            let tool_id = if let Some(id) = val.get("tool_use_id").and_then(|v| v.as_str()) {
-                id
-            } else if let Some(step) = val.get("stepIdx") {
-                tool_id_owned = step.to_string();
-                &tool_id_owned
-            } else {
-                "0"
-            };
-            let tool_resp = val.get("tool_response").or_else(|| val.get("response"));
-            let mut exit_code = tool_resp
-                .and_then(|r| {
-                    r.get("exit_code")
-                        .or_else(|| r.get("exitCode"))
-                        .or_else(|| r.get("returncode"))
-                        .or_else(|| r.get("status"))
-                })
-                .and_then(|v| v.as_i64())
-                .map(|c| c as i32);
-            let mut error = exit_code.map(|c| c != 0).unwrap_or(false);
-            if let Some(err) = val
-                .get("error")
-                .or_else(|| tool_resp.and_then(|r| r.get("error")))
-                .or_else(|| tool_resp.and_then(|r| r.get("is_error")))
-            {
-                if !err.is_null()
-                    && (err.as_bool() == Some(true)
-                        || err.as_str().map(|s| !s.is_empty()).unwrap_or(false))
-                {
-                    error = true;
-                }
-            }
-            if error && exit_code.is_none() {
-                exit_code = Some(1);
-            }
-
-            result.push(serde_json::json!({
-                "type": "tool_end",
-                "source_ts_ns": now_ns,
-                "session": session_key,
-                "tool_use_id": tool_id,
-                "error": error,
-                "exit_code": exit_code,
-            }));
-        }
-        "TurnEnd" | "AssistantMessage" => {
-            let tin = val
-                .get("input_tokens")
-                .or_else(|| val.get("inputTokens"))
-                .and_then(|v| v.as_u64());
-            let tout = val
-                .get("output_tokens")
-                .or_else(|| val.get("outputTokens"))
-                .and_then(|v| v.as_u64());
-            let cost = val
-                .get("cost_micros")
-                .or_else(|| val.get("costMicros"))
-                .and_then(|v| v.as_u64());
-            result.push(serde_json::json!({
-                "type": "turn_end",
-                "source_ts_ns": now_ns,
-                "session": session_key,
-                "input_tokens": tin,
-                "output_tokens": tout,
-                "cost_micros": cost,
-            }));
-        }
-        "Wait" | "WaitBegin" => {
-            let on_str = val.get("on").and_then(|v| v.as_str());
-            let on_val = match on_str {
-                Some("subagent") => serde_json::json!("subagent"),
-                Some("input") => serde_json::json!("input"),
-                Some("message") => serde_json::json!("message"),
-                Some("rate_limit") => serde_json::json!("rate_limit"),
-                _ => serde_json::json!("other"),
-            };
-            result.push(serde_json::json!({
-                "type": "wait",
-                "source_ts_ns": now_ns,
-                "session": session_key,
-                "target": val.get("target").and_then(|v| v.as_str()),
-                "on": on_val,
-            }));
-        }
-        "WaitEnd" => {
-            result.push(serde_json::json!({
-                "type": "wait_end",
-                "source_ts_ns": now_ns,
-                "session": session_key,
-            }));
-        }
-        _ => {
-            // Generic hook event mapping
-            result.push(serde_json::json!({
-                "type": "custom",
-                "source_ts_ns": now_ns,
-                "track": format!("{}:{}", provider_str, session_id),
-                "op": "instant",
-                "name": if hook_event.is_empty() { "hook_event" } else { hook_event },
-            }));
-        }
+    match provider {
+        Provider::Claude => claude::map(val, &env),
+        Provider::Gemini => gemini::map(val, &env),
+        Provider::Jetski => jetski::map(val, &env),
     }
-
-    result
 }
 
-/// Sends mapped input lines to `api.sock` with a write timeout.
+fn enrich_git_trees(inputs: &mut [Input], val: &serde_json::Value) {
+    let top_cwd = val.get("cwd").and_then(|v| v.as_str());
+    for input in inputs {
+        match input {
+            Input::RunStart { cwd, git_tree, .. } => {
+                if git_tree.is_none() {
+                    *git_tree = resolve_git_tree(cwd.as_deref().or(top_cwd).map(Path::new));
+                }
+            }
+            Input::ToolBegin {
+                input: ToolInput::Shell { cwd, git_tree, .. },
+                ..
+            } => {
+                if cwd.is_none() {
+                    *cwd = top_cwd.map(String::from);
+                }
+                if git_tree.is_none() {
+                    *git_tree = resolve_git_tree(cwd.as_deref().map(Path::new));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Sends mapped input lines to `api.sock` with a write/read timeout and awaits the daemon queue ack.
 fn send_inputs_with_timeout(
     mut stream: UnixStream,
-    inputs: &[serde_json::Value],
+    inputs: &[Input],
     timeout: Duration,
 ) -> io::Result<()> {
     stream.set_write_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(timeout))?;
 
     for input in inputs {
         let msg = serde_json::json!({ "input": input });
@@ -388,5 +220,14 @@ fn send_inputs_with_timeout(
         stream.write_all(&line)?;
     }
     stream.flush()?;
+
+    let mut reader = io::BufReader::new(stream);
+    let mut ack = String::new();
+    for _ in inputs {
+        ack.clear();
+        if io::BufRead::read_line(&mut reader, &mut ack).unwrap_or(0) == 0 {
+            break;
+        }
+    }
     Ok(())
 }

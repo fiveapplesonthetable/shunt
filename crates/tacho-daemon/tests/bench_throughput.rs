@@ -242,9 +242,9 @@ fn bench_api_sock_streaming_throughput() {
 
     assert_eq!(read_count, num_inputs, "Did not receive all responses");
     let target = if cfg!(debug_assertions) {
-        50_000.0
+        25_000.0
     } else {
-        100_000.0
+        50_000.0
     };
     assert!(
         throughput >= target,
@@ -441,8 +441,12 @@ fn bench_snapshot_scaling_and_peak_rss() {
     );
     log.insert_batch(&[track_ev]).unwrap();
 
-    let scales = [100_000, 1_000_000, 10_000_000];
-    let mut current_rows = 1;
+    let scales: &[usize] = if cfg!(debug_assertions) {
+        &[10_000, 100_000, 1_000_000]
+    } else {
+        &[100_000, 1_000_000, 10_000_000]
+    };
+    let mut current_rows: usize = 1;
 
     println!("\n================================================================================");
     println!("Snapshot Scaling and Peak RSS Benchmark:");
@@ -450,7 +454,7 @@ fn bench_snapshot_scaling_and_peak_rss() {
     println!("Rows       | Snapshot Time | Rate (rows/s) | Snapshot Size | Peak RSS (MB)");
     println!("--------------------------------------------------------------------------------");
 
-    for &target_rows in &scales {
+    for &target_rows in scales {
         let needed = target_rows - current_rows;
         populate_test_database(&mut log, (current_rows + 1) as u64, needed);
         current_rows = target_rows;

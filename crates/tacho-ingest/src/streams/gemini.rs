@@ -90,6 +90,7 @@ impl StreamParser {
                     model: self.model.clone(),
                     parent_session: None,
                     git_tree: None,
+                    role: None,
                 });
             }
             Some("message") => {

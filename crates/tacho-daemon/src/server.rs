@@ -242,6 +242,31 @@ fn handle_api_connection(
             continue;
         }
 
+        // Fast path for batched streaming ingest inputs {"inputs": [...]}
+        if trimmed.starts_with("{\"inputs\"") {
+            if let Ok(batch) = serde_json::from_str::<IngestBatchFastPath>(trimmed) {
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                for inp in batch.inputs {
+                    input_batch.push((inp, now_ns));
+                }
+                if !input_batch.is_empty() {
+                    if let Err(e) = appender.send_input_batch(std::mem::take(&mut input_batch)) {
+                        eprintln!("[tacho-daemon] queue full: {}", e);
+                    }
+                }
+                if writer.write_all(b"{\"status\":\"ok\"}\n").is_err() {
+                    break;
+                }
+                if reader.buffer().is_empty() && writer.flush().is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
+
         // Fast path for streaming ingest inputs
         if trimmed.starts_with("{\"input\"") || trimmed.contains("\"input\"") {
             if let Ok(ingest) = serde_json::from_str::<IngestFastPath>(trimmed) {
@@ -250,15 +275,15 @@ fn handle_api_connection(
                     .unwrap_or_default()
                     .as_nanos() as u64;
                 input_batch.push((ingest.input, now_ns));
-                if writer.write_all(b"{\"status\":\"ok\"}\n").is_err() {
-                    break;
-                }
 
-                // If batch limit reached or socket buffer drained, dispatch to appender
+                // If batch limit reached or socket buffer drained, dispatch to appender BEFORE sending ack
                 if input_batch.len() >= 128 || reader.buffer().is_empty() {
                     if let Err(e) = appender.send_input_batch(std::mem::take(&mut input_batch)) {
                         eprintln!("[tacho-daemon] queue full: {}", e);
                     }
+                }
+                if writer.write_all(b"{\"status\":\"ok\"}\n").is_err() {
+                    break;
                 }
                 if reader.buffer().is_empty() && writer.flush().is_err() {
                     break;
@@ -295,6 +320,12 @@ fn handle_api_connection(
 #[derive(serde::Deserialize)]
 struct IngestFastPath {
     input: Input,
+}
+
+/// Helper struct for batched ingest inputs over a single request line.
+#[derive(serde::Deserialize)]
+struct IngestBatchFastPath {
+    inputs: Vec<Input>,
 }
 
 /// Handles a single line of NDJSON input.
@@ -446,8 +477,18 @@ fn process_ndjson_line(
             "trace" => {
                 let since = val.get("since").and_then(|v| v.as_u64());
                 let until = val.get("until").and_then(|v| v.as_u64());
-                let _ = write_snapshot(&paths.events_db(), since, until, stream);
+                let from_log = val
+                    .get("from_log")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if from_log {
+                    let _ =
+                        crate::snapshot::rebuild_from_log(&paths.events_db(), since, until, stream);
+                } else {
+                    let _ = write_snapshot(&paths.events_db(), since, until, stream);
+                }
                 let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 None
             }
 

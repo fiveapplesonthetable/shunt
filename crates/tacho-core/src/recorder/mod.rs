@@ -31,6 +31,21 @@ use crate::track::TrackRegistry;
 pub(crate) use counters::ProviderCounters;
 pub(crate) use tool::OpenToolSlice;
 
+/// Deterministic Perfetto flow ordinal constants (`flow_id = cause_seq * 256 + ordinal`).
+pub mod flow_ord {
+    pub const STALL: u64 = 1;
+    pub const SUBAGENT: u64 = 2;
+    pub const MESSAGE: u64 = 3;
+    pub const CUSTOM: u64 = 4;
+    pub const TASK_STATE: u64 = 5;
+    pub const TASK_RUN: u64 = 6;
+
+    #[inline]
+    pub const fn make(cause_seq: u64, ordinal: u64) -> u64 {
+        cause_seq.saturating_mul(256).saturating_add(ordinal)
+    }
+}
+
 /// Metadata and configuration for a tracked task.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskMeta {
@@ -40,6 +55,7 @@ pub(crate) struct TaskMeta {
     pub token_budget: Option<u64>,
     pub cost_budget_micros: Option<u64>,
     pub last_run_seq: Option<u64>,
+    pub last_state_seq: Option<u64>,
 }
 
 /// Internal flight recorder state for a single agent session run.
@@ -113,11 +129,14 @@ pub struct Recorder {
     pub(crate) tasks: HashMap<String, Vec<String>>,          // task_slug -> declared paths
     pub(crate) task_meta: HashMap<String, TaskMeta>,
     pub(crate) custom_flows: HashMap<String, u64>, // flow_name -> origin seq
-    pub(crate) message_flows: HashMap<String, u64>, // message_id -> origin seq
+    pub(crate) open_custom_slices: HashMap<String, Vec<Option<String>>>, // track_key -> stack of custom slice ids
+    pub(crate) message_flows: HashMap<String, u64>,                      // message_id -> origin seq
     pub(crate) subagent_flows: HashMap<String, u64>, // tool_use_id -> origin seq
     pub(crate) last_counter_value: HashMap<String, i64>, // track_key -> last emitted counter value
     pub(crate) active_builds: i64,
     pub(crate) active_tests: i64,
+    pub(crate) last_clock_offset_ns: i64,
+    pub(crate) last_ingest_now_ns: u64,
     pub(crate) live: LiveState,
 }
 
@@ -145,11 +164,14 @@ impl Recorder {
             tasks: HashMap::new(),
             task_meta: HashMap::new(),
             custom_flows: HashMap::new(),
+            open_custom_slices: HashMap::new(),
             message_flows: HashMap::new(),
             subagent_flows: HashMap::new(),
             last_counter_value: HashMap::new(),
             active_builds: 0,
             active_tests: 0,
+            last_clock_offset_ns: 0,
+            last_ingest_now_ns: 0,
             live: LiveState::new(),
         }
     }
@@ -176,15 +198,17 @@ impl Recorder {
 
     /// Applies an input event into the state machine, appending generated `Event` items to `out`.
     pub fn apply(&mut self, input: Input, now_ns: u64, out: &mut Vec<Event>) {
+        self.last_ingest_now_ns = now_ns;
         // 1. Time stamping & per-track clamp (design 8)
         let (ts, clock_stepped) = if let Some(source_ts) = input.source_ts_ns() {
-            const TEN_MIN_NS: u64 = 600 * 1_000_000_000;
-            let diff = source_ts.abs_diff(now_ns);
-            if diff > TEN_MIN_NS {
-                let delta = source_ts as i64 - now_ns as i64;
+            const TEN_MIN_NS: i64 = 600 * 1_000_000_000;
+            let offset = source_ts as i64 - now_ns as i64;
+            let step = offset.saturating_sub(self.last_clock_offset_ns);
+            if step < -TEN_MIN_NS || (offset > TEN_MIN_NS && step > TEN_MIN_NS) {
+                self.last_clock_offset_ns = self.last_clock_offset_ns.saturating_add(step);
                 (
-                    now_ns,
-                    Some((delta, "source timestamp out of bounds (±10m)".to_string())),
+                    source_ts,
+                    Some((step, "source timestamp out of bounds (±10m)".to_string())),
                 )
             } else {
                 (source_ts, None)
@@ -194,8 +218,8 @@ impl Recorder {
         };
 
         if let Some((delta, reason)) = clock_stepped {
-            self.ensure_track("daemon", now_ns, out);
-            let d_ts = self.clamp_ts("daemon", now_ns);
+            self.ensure_track("daemon", ts, out);
+            let d_ts = self.clamp_ts("daemon", ts);
             let seq = self.alloc_seq();
             out.push(Event {
                 seq,
@@ -218,6 +242,183 @@ impl Recorder {
         }
 
         self.dispatch_input(input, ts, out);
+    }
+
+    /// Updates an agent's event timestamp and marks historical replays so wall-clock ticks
+    /// do not overwrite replayed state ages with `now_ns`.
+    pub(crate) fn touch_agent_event(&mut self, agent_id: &str, ts_ns: u64) {
+        let silent_timeout = self.detector_cfg.silent_timeout_ns;
+        let now_ns = self.last_ingest_now_ns;
+        let det = self.detectors.entry(agent_id.to_string()).or_default();
+        det.touch_event(ts_ns);
+        if now_ns > 0 {
+            det.suppress_live_silent = now_ns.saturating_sub(ts_ns) >= silent_timeout;
+        }
+    }
+
+    /// Records any flow origin IDs referenced by `kind`, `cause_seq`, or `parent_run_seq`
+    /// into `origin_flows` so streaming encoders can attach `flow_ids` to the origin event.
+    pub fn record_flow_origin(
+        kind: Kind,
+        cause_seq: Option<u64>,
+        parent_run_seq: Option<u64>,
+        origin_flows: &mut HashMap<u64, Vec<u64>>,
+    ) {
+        match kind {
+            Kind::Stall => {
+                if let Some(cs) = cause_seq {
+                    origin_flows
+                        .entry(cs)
+                        .or_default()
+                        .push(flow_ord::make(cs, flow_ord::STALL));
+                }
+            }
+            Kind::Run => {
+                if let Some(ps) = parent_run_seq {
+                    origin_flows
+                        .entry(ps)
+                        .or_default()
+                        .push(flow_ord::make(ps, flow_ord::SUBAGENT));
+                }
+                if let Some(cs) = cause_seq {
+                    origin_flows
+                        .entry(cs)
+                        .or_default()
+                        .push(flow_ord::make(cs, flow_ord::TASK_RUN));
+                }
+            }
+            Kind::Message => {
+                if let Some(cs) = cause_seq {
+                    origin_flows
+                        .entry(cs)
+                        .or_default()
+                        .push(flow_ord::make(cs, flow_ord::MESSAGE));
+                }
+            }
+            Kind::Custom | Kind::CustomEnded => {
+                if let Some(cs) = cause_seq {
+                    origin_flows
+                        .entry(cs)
+                        .or_default()
+                        .push(flow_ord::make(cs, flow_ord::CUSTOM));
+                }
+            }
+            Kind::TaskState => {
+                if let Some(cs) = cause_seq {
+                    origin_flows
+                        .entry(cs)
+                        .or_default()
+                        .push(flow_ord::make(cs, flow_ord::TASK_STATE));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Populates `flow_ids` and `terminating_flow_ids` on a single `Event` using `cause_seq * 256 + ordinal`
+    /// and any downstream `origin_flows` referencing `ev.seq`.
+    pub fn populate_event_flows(ev: &mut Event, origin_flows: &HashMap<u64, Vec<u64>>) {
+        ev.flow_ids.clear();
+        ev.terminating_flow_ids.clear();
+
+        match ev.kind {
+            Kind::Stall => {
+                if let Some(cs) = ev.cause_seq {
+                    ev.terminating_flow_ids
+                        .push(flow_ord::make(cs, flow_ord::STALL));
+                }
+            }
+            Kind::Run => {
+                if let Some(tacho::event::Body::Run(r)) = &ev.body.body {
+                    if let Some(ps) = r.parent_run_seq {
+                        ev.terminating_flow_ids
+                            .push(flow_ord::make(ps, flow_ord::SUBAGENT));
+                    }
+                    if r.task.is_some() {
+                        ev.flow_ids.push(flow_ord::make(ev.seq, flow_ord::TASK_RUN));
+                    }
+                }
+                if let Some(cs) = ev.cause_seq {
+                    ev.terminating_flow_ids
+                        .push(flow_ord::make(cs, flow_ord::TASK_RUN));
+                }
+            }
+            Kind::ToolCall => {
+                if ev.custom_name.as_deref() == Some("Subagent") {
+                    ev.flow_ids.push(flow_ord::make(ev.seq, flow_ord::SUBAGENT));
+                }
+            }
+            Kind::Message => {
+                if let Some(tacho::event::Body::Message(m)) = &ev.body.body {
+                    if m.message_id.is_some()
+                        && m.direction == Some(tacho::MessageDirection::Sent as i32)
+                    {
+                        ev.flow_ids.push(flow_ord::make(ev.seq, flow_ord::MESSAGE));
+                    }
+                }
+                if let Some(cs) = ev.cause_seq {
+                    ev.terminating_flow_ids
+                        .push(flow_ord::make(cs, flow_ord::MESSAGE));
+                }
+            }
+            Kind::Custom | Kind::CustomEnded => {
+                if let Some(cs) = ev.cause_seq {
+                    ev.terminating_flow_ids
+                        .push(flow_ord::make(cs, flow_ord::CUSTOM));
+                }
+            }
+            Kind::TaskQueued => {
+                ev.flow_ids
+                    .push(flow_ord::make(ev.seq, flow_ord::TASK_STATE));
+            }
+            Kind::TaskState => {
+                if let Some(cs) = ev.cause_seq {
+                    ev.terminating_flow_ids
+                        .push(flow_ord::make(cs, flow_ord::TASK_STATE));
+                }
+                if let Some(tacho::event::Body::TaskState(ts)) = &ev.body.body {
+                    let is_terminal = matches!(
+                        ts.state.and_then(|s| tacho::TaskStatus::try_from(s).ok()),
+                        Some(
+                            tacho::TaskStatus::TaskDone
+                                | tacho::TaskStatus::TaskFailed
+                                | tacho::TaskStatus::TaskCancelled
+                        )
+                    );
+                    if !is_terminal {
+                        ev.flow_ids
+                            .push(flow_ord::make(ev.seq, flow_ord::TASK_STATE));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(fids) = origin_flows.get(&ev.seq) {
+            for &fid in fids {
+                if !ev.flow_ids.contains(&fid) {
+                    ev.flow_ids.push(fid);
+                }
+            }
+        }
+    }
+
+    /// Deterministically populates `flow_ids` and `terminating_flow_ids` (`cause_seq * 256 + ordinal`)
+    /// on a slice of events loaded from persistent storage.
+    pub fn populate_flows(events: &mut [Event]) {
+        let mut origin_flows: HashMap<u64, Vec<u64>> = HashMap::new();
+
+        for ev in events.iter() {
+            let parent_run_seq = match &ev.body.body {
+                Some(tacho::event::Body::Run(r)) => r.parent_run_seq,
+                _ => None,
+            };
+            Self::record_flow_origin(ev.kind, ev.cause_seq, parent_run_seq, &mut origin_flows);
+        }
+
+        for ev in events.iter_mut() {
+            Self::populate_event_flows(ev, &origin_flows);
+        }
     }
 
     /// Periodic tick for time-based detectors (e.g. SILENT detector).

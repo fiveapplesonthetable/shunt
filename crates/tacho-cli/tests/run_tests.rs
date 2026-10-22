@@ -2,33 +2,73 @@
 //!
 //! Verifies exit code pass-through, signal exit codes (128 + n), and stdout teeing.
 
-use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn find_tacho_bin() -> PathBuf {
-    if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
-        let p = PathBuf::from(dir).join("debug/tacho");
-        if p.is_file() {
-            return p;
+struct TestSandbox {
+    _temp: tempfile::TempDir,
+    home: PathBuf,
+    runtime: PathBuf,
+    tacho_bin: PathBuf,
+}
+
+impl TestSandbox {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let runtime = temp.path().join("run");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        Self {
+            _temp: temp,
+            home,
+            runtime,
+            tacho_bin: PathBuf::from(env!("CARGO_BIN_EXE_tacho")),
         }
     }
-    PathBuf::from("/tmp/tacho-target-ring/debug/tacho")
+
+    fn cmd(&self) -> Command {
+        let mut c = Command::new(&self.tacho_bin);
+        c.env("TACHO_HOME", &self.home)
+            .env("TACHO_RUNTIME", &self.runtime)
+            .env("TACHO_BIN", &self.tacho_bin);
+        c
+    }
+}
+
+impl Drop for TestSandbox {
+    fn drop(&mut self) {
+        let pid_file = self.runtime.join("daemon.pid");
+        if let Ok(s) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = s.trim().parse::<i32>() {
+                if pid > 0 {
+                    unsafe {
+                        let _ = libc::kill(pid, libc::SIGTERM);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        let _ = libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
 fn test_run_exit_code_passthrough() {
-    let tacho_bin = find_tacho_bin();
+    let sb = TestSandbox::new();
 
     // 1. Success exit code (0)
-    let status = Command::new(&tacho_bin)
+    let status = sb
+        .cmd()
         .args(["run", "--", "sh", "-c", "exit 0"])
         .status()
         .expect("failed to run tacho run");
     assert_eq!(status.code(), Some(0));
 
     // 2. Specific non-zero exit code (42)
-    let status42 = Command::new(&tacho_bin)
+    let status42 = sb
+        .cmd()
         .args(["run", "--", "sh", "-c", "exit 42"])
         .status()
         .expect("failed to run tacho run");
@@ -37,17 +77,19 @@ fn test_run_exit_code_passthrough() {
 
 #[test]
 fn test_run_signal_exit_code_128_plus_sig() {
-    let tacho_bin = find_tacho_bin();
+    let sb = TestSandbox::new();
 
     // SIGKILL (9) -> 128 + 9 = 137
-    let status_sigkill = Command::new(&tacho_bin)
+    let status_sigkill = sb
+        .cmd()
         .args(["run", "--", "sh", "-c", "kill -9 $$"])
         .status()
         .expect("failed to run tacho run");
     assert_eq!(status_sigkill.code(), Some(137));
 
     // SIGTERM (15) -> 128 + 15 = 143
-    let status_sigterm = Command::new(&tacho_bin)
+    let status_sigterm = sb
+        .cmd()
         .args(["run", "--", "sh", "-c", "kill -15 $$"])
         .status()
         .expect("failed to run tacho run");
@@ -56,9 +98,10 @@ fn test_run_signal_exit_code_128_plus_sig() {
 
 #[test]
 fn test_run_stdout_teeing() {
-    let tacho_bin = find_tacho_bin();
+    let sb = TestSandbox::new();
 
-    let output = Command::new(&tacho_bin)
+    let output = sb
+        .cmd()
         .args(["run", "--", "echo", "hello tachograph flight recorder"])
         .output()
         .expect("failed to run tacho run");
@@ -70,16 +113,17 @@ fn test_run_stdout_teeing() {
 
 #[test]
 fn test_run_binary_non_utf8_output() {
-    let tacho_bin = find_tacho_bin();
+    let sb = TestSandbox::new();
 
-    // 1. Pure binary non-UTF8 output
-    let output1 = Command::new(&tacho_bin)
+    // 1. Pure binary non-UTF8 output (POSIX octal escapes work under both dash and bash)
+    let output1 = sb
+        .cmd()
         .args([
             "run",
             "--",
             "sh",
             "-c",
-            "printf 'hello\\xff\\xfe\\x00world'",
+            "printf 'hello\\377\\376\\000world'",
         ])
         .output()
         .expect("failed to run tacho run");
@@ -87,13 +131,14 @@ fn test_run_binary_non_utf8_output() {
     assert_eq!(output1.stdout, b"hello\xff\xfe\x00world");
 
     // 2. Mixed lines: line1, binary bytes, line2
-    let output2 = Command::new(&tacho_bin)
+    let output2 = sb
+        .cmd()
         .args([
             "run",
             "--",
             "sh",
             "-c",
-            "echo 'line1'; printf '\\xff\\xfe\\x00'; echo 'line2'",
+            "echo 'line1'; printf '\\377\\376\\000'; echo 'line2'",
         ])
         .output()
         .expect("failed to run tacho run");

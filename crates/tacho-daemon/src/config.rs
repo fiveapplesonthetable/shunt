@@ -93,6 +93,9 @@ pub struct DetectorConfig {
     pub failing_count: usize,
     /// Check whether file edits fall outside task declared paths (default: true).
     pub off_brief: bool,
+    /// Optional shell command to execute when a stall detector enters (`sh -c <cmd>`).
+    /// Receives TACHO_AGENT, TACHO_STALL_KIND, TACHO_STALL_REASON, TACHO_STALL_EVIDENCE, TACHO_SEQ.
+    pub on_stall: Option<String>,
 }
 
 impl Default for DetectorConfig {
@@ -105,6 +108,7 @@ impl Default for DetectorConfig {
             burn_window_s: 600,
             failing_count: 3,
             off_brief: true,
+            on_stall: None,
         }
     }
 }

@@ -21,10 +21,14 @@ SELECT
   s.ts,
   s.dur,
   ag.string_value AS agent,
-  s.name AS slice_name
+  CASE
+    WHEN s.name LIKE 'Build%' THEN 'Build'
+    WHEN s.name LIKE 'Test%' THEN 'Test'
+    ELSE s.name
+  END AS slice_name
 FROM slice s
 JOIN args ag ON s.arg_set_id = ag.arg_set_id AND ag.key = 'agent'
-WHERE s.name IN ('Build', 'Test') AND s.dur > 0;
+WHERE (s.name IN ('Build', 'Test') OR s.name LIKE 'Build:%' OR s.name LIKE 'Test:%') AND s.dur > 0;
 
 CREATE PERFETTO TABLE agent_sched AS
 SELECT

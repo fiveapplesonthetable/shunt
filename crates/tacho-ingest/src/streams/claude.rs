@@ -1,14 +1,113 @@
 use std::collections::BTreeMap;
-use tacho_core::{Input, SessionKey};
+use tacho_core::{AgentRole, Input, SessionKey};
 
 use crate::hooks::{blake3_digest_8, classify_tool};
 
-/// Stateful parser for Claude Code `stream-json` streams.
+/// Parses an ISO-8601 timestamp string (e.g. `"2026-10-22T14:03:12.456Z"`) or numeric
+/// timestamp into nanoseconds since the UNIX epoch.
+pub fn parse_timestamp_ns(val: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = val.as_u64() {
+        return Some(if n < 10_000_000_000 {
+            n.saturating_mul(1_000_000_000)
+        } else if n < 10_000_000_000_000 {
+            n.saturating_mul(1_000_000)
+        } else if n < 10_000_000_000_000_000 {
+            n.saturating_mul(1_000)
+        } else {
+            n
+        });
+    }
+    if let Some(f) = val.as_f64() {
+        if f > 0.0 {
+            return Some(if f < 10_000_000_000.0 {
+                (f * 1_000_000_000.0) as u64
+            } else {
+                (f * 1_000_000.0) as u64
+            });
+        }
+    }
+    let s = val.as_str()?.trim();
+    if s.len() < 19 {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u64 = s.get(11..13)?.parse().ok()?;
+    let min: u64 = s.get(14..16)?.parse().ok()?;
+    let sec: u64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+
+    let mut rest = &s[19..];
+    let mut nanos: u64 = 0;
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let frac_len = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let digits = &after_dot[..frac_len.min(9)];
+        if let Ok(frac_val) = digits.parse::<u64>() {
+            nanos = frac_val * 10u64.pow((9 - digits.len()) as u32);
+        }
+        rest = &after_dot[frac_len..];
+    }
+
+    let mut tz_offset_secs: i64 = 0;
+    let rest = rest.trim();
+    if !rest.is_empty() && rest != "Z" && rest != "z" {
+        let sign: i64 = match rest.as_bytes().first()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let tz = &rest[1..];
+        let tz_h: i64 = tz.get(0..2)?.parse().ok()?;
+        let tz_m: i64 = if tz.len() >= 5 && tz.as_bytes().get(2) == Some(&b':') {
+            tz.get(3..5)?.parse().ok()?
+        } else if tz.len() >= 4 {
+            tz.get(2..4)?.parse().ok()?
+        } else {
+            0
+        };
+        tz_offset_secs = sign * (tz_h * 3600 + tz_m * 60);
+    }
+
+    // Howard Hinnant's civil-to-days algorithm
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u64;
+    let m_adj = if month > 2 {
+        (month - 3) as u64
+    } else {
+        (month + 9) as u64
+    };
+    let doy = (153 * m_adj + 2) / 5 + (day as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + (doe as i64) - 719468;
+
+    let epoch_secs =
+        days * 86_400 + (hour as i64) * 3_600 + (min as i64) * 60 + (sec as i64) - tz_offset_secs;
+    if epoch_secs < 0 {
+        return None;
+    }
+    Some(
+        (epoch_secs as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nanos),
+    )
+}
+
+/// Stateful parser for Claude Code `stream-json` streams and on-disk `.jsonl` transcripts.
 #[derive(Debug, Default)]
 pub struct StreamParser {
     pub session_id: Option<String>,
+    pub agent: Option<String>,
+    pub task: Option<String>,
+    pub pid: Option<u32>,
+    pub role: Option<AgentRole>,
     pub cwd: Option<String>,
     pub model: Option<String>,
+    pub run_started: bool,
+    pub emit_run_start: bool,
     pub in_turn: bool,
     pub accumulated_text_bytes: u64,
     pub open_tools: BTreeMap<String, String>,
@@ -22,6 +121,16 @@ impl StreamParser {
     /// Creates a new Claude stream parser.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a parser configured for tailing an on-disk Claude transcript file.
+    pub fn for_transcript(session_id: Option<String>, agent: Option<String>) -> Self {
+        Self {
+            session_id,
+            agent,
+            emit_run_start: true,
+            ..Self::default()
+        }
     }
 
     /// Feeds one chunk or line of NDJSON and returns zero or more parsed `Input` events.
@@ -60,10 +169,32 @@ impl StreamParser {
             return Vec::new();
         };
 
-        if let Some(sid) = obj.get("session_id").and_then(|v| v.as_str()) {
+        let ts_ns = obj
+            .get("timestamp")
+            .or_else(|| obj.get("ts"))
+            .and_then(parse_timestamp_ns)
+            .unwrap_or(now_ns);
+
+        if let Some(sid) = obj
+            .get("session_id")
+            .or_else(|| obj.get("sessionId"))
+            .and_then(|v| v.as_str())
+        {
             if self.session_id.is_none() {
                 self.session_id = Some(sid.to_string());
             }
+        }
+        if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str()) {
+            if self.cwd.is_none() {
+                self.cwd = Some(cwd.to_string());
+            }
+        }
+        if let Some(model) = obj
+            .get("model")
+            .or_else(|| obj.get("message").and_then(|m| m.get("model")))
+            .and_then(|v| v.as_str())
+        {
+            self.model = Some(model.to_string());
         }
 
         let msg_type = obj.get("type").and_then(|v| v.as_str());
@@ -75,25 +206,32 @@ impl StreamParser {
                 if subtype == Some("init") {
                     let sid = obj
                         .get("session_id")
+                        .or_else(|| obj.get("sessionId"))
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string();
                     self.session_id = Some(sid.clone());
 
-                    self.cwd = obj.get("cwd").and_then(|v| v.as_str()).map(String::from);
-                    self.model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
+                    if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str()) {
+                        self.cwd = Some(cwd.to_string());
+                    }
+                    if let Some(model) = obj.get("model").and_then(|v| v.as_str()) {
+                        self.model = Some(model.to_string());
+                    }
+                    self.run_started = true;
 
                     out.push(Input::RunStart {
-                        source_ts_ns: Some(now_ns),
+                        source_ts_ns: Some(ts_ns),
                         provider: "claude".to_string(),
                         session_id: sid,
-                        agent: None,
-                        task: None,
-                        pid: None,
+                        agent: self.agent.clone(),
+                        task: self.task.clone(),
+                        pid: self.pid,
                         cwd: self.cwd.clone(),
                         model: self.model.clone(),
                         parent_session: None,
                         git_tree: None,
+                        role: self.role,
                     });
                 }
             }
@@ -103,11 +241,28 @@ impl StreamParser {
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
 
+                if !self.run_started && (self.emit_run_start || obj.contains_key("sessionId")) {
+                    self.run_started = true;
+                    out.push(Input::RunStart {
+                        source_ts_ns: Some(ts_ns),
+                        provider: "claude".to_string(),
+                        session_id: session_id.clone(),
+                        agent: self.agent.clone(),
+                        task: self.task.clone(),
+                        pid: self.pid,
+                        cwd: self.cwd.clone(),
+                        model: self.model.clone(),
+                        parent_session: None,
+                        git_tree: None,
+                        role: self.role,
+                    });
+                }
+
                 if !self.in_turn {
                     self.in_turn = true;
                     self.accumulated_text_bytes = 0;
                     out.push(Input::TurnStart {
-                        source_ts_ns: Some(now_ns),
+                        source_ts_ns: Some(ts_ns),
                         session: SessionKey::new("claude", &session_id),
                         model: self.model.clone(),
                     });
@@ -163,7 +318,7 @@ impl StreamParser {
                                     self.open_tools.insert(id.clone(), name.clone());
 
                                     out.push(Input::ToolBegin {
-                                        source_ts_ns: Some(now_ns),
+                                        source_ts_ns: Some(ts_ns),
                                         session: SessionKey::new("claude", &session_id),
                                         tool_use_id: id,
                                         tool_name: name,
@@ -181,6 +336,23 @@ impl StreamParser {
                     .session_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
+
+                if !self.run_started && (self.emit_run_start || obj.contains_key("sessionId")) {
+                    self.run_started = true;
+                    out.push(Input::RunStart {
+                        source_ts_ns: Some(ts_ns),
+                        provider: "claude".to_string(),
+                        session_id: session_id.clone(),
+                        agent: self.agent.clone(),
+                        task: self.task.clone(),
+                        pid: self.pid,
+                        cwd: self.cwd.clone(),
+                        model: self.model.clone(),
+                        parent_session: None,
+                        git_tree: None,
+                        role: self.role,
+                    });
+                }
 
                 if let Some(msg) = obj.get("message").and_then(|m| m.as_object()) {
                     let mut text_prompts = Vec::new();
@@ -215,11 +387,21 @@ impl StreamParser {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
 
-                        let content_str = item.get("content").and_then(|v| v.as_str());
-                        let result_bytes = content_str.map(|s| s.len() as u64);
+                        let result_bytes = match item.get("content") {
+                            Some(serde_json::Value::String(s)) => Some(s.len() as u64),
+                            Some(serde_json::Value::Array(arr)) => {
+                                let sum: u64 = arr
+                                    .iter()
+                                    .filter_map(|blk| blk.get("text").and_then(|t| t.as_str()))
+                                    .map(|s| s.len() as u64)
+                                    .sum();
+                                Some(sum)
+                            }
+                            _ => None,
+                        };
 
                         out.push(Input::ToolEnd {
-                            source_ts_ns: Some(now_ns),
+                            source_ts_ns: Some(ts_ns),
                             session: SessionKey::new("claude", &session_id),
                             tool_use_id,
                             error: is_error,
@@ -231,7 +413,7 @@ impl StreamParser {
                     for text in text_prompts {
                         if self.in_turn {
                             out.push(Input::TurnEnd {
-                                source_ts_ns: Some(now_ns),
+                                source_ts_ns: Some(ts_ns),
                                 session: SessionKey::new("claude", &session_id),
                                 input_tokens: self.pending_input_tokens.take(),
                                 output_tokens: self.pending_output_tokens.take(),
@@ -246,7 +428,7 @@ impl StreamParser {
                         let digest = blake3_digest_8(&text);
 
                         out.push(Input::Prompt {
-                            source_ts_ns: Some(now_ns),
+                            source_ts_ns: Some(ts_ns),
                             session: SessionKey::new("claude", &session_id),
                             text_len,
                             digest: Some(digest),
@@ -255,7 +437,7 @@ impl StreamParser {
                         self.in_turn = true;
                         self.accumulated_text_bytes = 0;
                         out.push(Input::TurnStart {
-                            source_ts_ns: Some(now_ns),
+                            source_ts_ns: Some(ts_ns),
                             session: SessionKey::new("claude", &session_id),
                             model: self.model.clone(),
                         });
@@ -313,7 +495,7 @@ impl StreamParser {
                     self.in_turn = false;
 
                     out.push(Input::TurnEnd {
-                        source_ts_ns: Some(now_ns),
+                        source_ts_ns: Some(ts_ns),
                         session: SessionKey::new("claude", &session_id),
                         input_tokens,
                         output_tokens,
@@ -329,7 +511,7 @@ impl StreamParser {
                     .map(String::from);
 
                 out.push(Input::RunEnd {
-                    source_ts_ns: Some(now_ns),
+                    source_ts_ns: Some(ts_ns),
                     session: SessionKey::new("claude", &session_id),
                     exit_code: Some(0),
                     reason: subtype,
@@ -339,5 +521,53 @@ impl StreamParser {
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_iso_timestamp_and_ondisk_transcript() {
+        let mut parser = StreamParser::for_transcript(None, Some("worker-1".to_string()));
+        let l1 = r#"{"type":"user","sessionId":"abc-123","cwd":"/work/repo","timestamp":"2026-10-22T12:00:00.500Z","message":{"role":"user","content":"Fix the bug"}}"#;
+        let l2 = r#"{"type":"assistant","sessionId":"abc-123","timestamp":"2026-10-22T12:00:05.000Z","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}],"usage":{"input_tokens":100,"output_tokens":25}}}"#;
+        let l3 = r#"{"type":"user","sessionId":"abc-123","timestamp":"2026-10-22T12:00:10.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"test result: ok"}]}]}}"#;
+
+        let i1 = parser.feed_line(&format!("{}\n", l1), 999);
+        assert_eq!(i1.len(), 3); // RunStart + Prompt + TurnStart
+        assert!(matches!(
+            &i1[0],
+            Input::RunStart {
+                source_ts_ns: Some(1_792_670_400_500_000_000),
+                session_id,
+                agent: Some(agent),
+                cwd: Some(cwd),
+                ..
+            } if session_id == "abc-123" && agent == "worker-1" && cwd == "/work/repo"
+        ));
+
+        let i2 = parser.feed_line(&format!("{}\n", l2), 999);
+        assert_eq!(i2.len(), 1); // ToolBegin
+        assert!(matches!(
+            &i2[0],
+            Input::ToolBegin {
+                source_ts_ns: Some(1_792_670_405_000_000_000),
+                tool_use_id,
+                ..
+            } if tool_use_id == "toolu_1"
+        ));
+
+        let i3 = parser.feed_line(&format!("{}\n", l3), 999);
+        assert_eq!(i3.len(), 1); // ToolEnd with array content length 15
+        assert!(matches!(
+            &i3[0],
+            Input::ToolEnd {
+                source_ts_ns: Some(1_792_670_410_000_000_000),
+                result_bytes: Some(15),
+                ..
+            }
+        ));
     }
 }

@@ -46,6 +46,7 @@ fn test_claude_session_start() {
             model: None,
             parent_session: None,
             git_tree: None,
+            role: None,
         }]
     );
 }
@@ -240,6 +241,7 @@ fn test_gemini_session_start() {
             model: Some("gemini-1.5-pro".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
         }]
     );
 }
@@ -377,6 +379,7 @@ fn test_jetski_session_start() {
             model: Some("auto".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
         }]
     );
 }

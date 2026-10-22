@@ -18,6 +18,7 @@ impl Recorder {
                 model,
                 parent_session,
                 git_tree,
+                role,
                 ..
             } => {
                 self.handle_run_start(
@@ -30,6 +31,7 @@ impl Recorder {
                     model,
                     parent_session,
                     git_tree,
+                    role,
                     ts,
                     out,
                 );

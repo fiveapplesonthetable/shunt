@@ -207,6 +207,14 @@ edition = "2021"
         assert!(status.success());
     }
 
+    // Configure fast 200ms sampler interval so process tree slices, memory counters,
+    // and worktree progress milestones are captured at high resolution during the test.
+    fs::write(
+        env.home_dir.join("config.toml"),
+        "[sampler]\ninterval_ms = 200\n",
+    )
+    .unwrap();
+
     // Ensure daemon is running
     let _ = env.tacho_cmd().arg("status").output();
     assert!(env.wait_for_api_sock(Duration::from_secs(3)));
@@ -218,6 +226,8 @@ edition = "2021"
             "emit",
             "task",
             "auth-task",
+            "--agent",
+            "worker-auth",
             "--paths",
             "src/schema.rs,src/auth.rs",
         ])
@@ -231,7 +241,15 @@ edition = "2021"
 
     let out = env
         .tacho_cmd()
-        .args(["emit", "task", "db-task", "--paths", "src/schema.rs"])
+        .args([
+            "emit",
+            "task",
+            "db-task",
+            "--agent",
+            "worker-db",
+            "--paths",
+            "src/schema.rs",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -242,7 +260,15 @@ edition = "2021"
 
     let out = env
         .tacho_cmd()
-        .args(["emit", "task", "api-task", "--paths", "src/api.rs"])
+        .args([
+            "emit",
+            "task",
+            "api-task",
+            "--agent",
+            "worker-api",
+            "--paths",
+            "src/api.rs",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -253,7 +279,15 @@ edition = "2021"
 
     let out = env
         .tacho_cmd()
-        .args(["emit", "task", "rogue-task", "--paths", "src/main.rs"])
+        .args([
+            "emit",
+            "task",
+            "rogue-task",
+            "--agent",
+            "worker-rogue",
+            "--paths",
+            "src/main.rs",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -266,26 +300,59 @@ edition = "2021"
 
     // 4. Start sessions for 6 concurrent agents
     // (supervisor, worker-auth, worker-db, worker-api, worker-rogue, ci-train)
+    // Spawn real process trees for worker-auth and ci-train so /proc process tree slices
+    // (`procs`), `proc_count`, `cpu`, and `rss` tracks are populated in the example trace.
+    let mut auth_proc = Command::new("python3")
+        .args([
+            "-c",
+            "import subprocess, time; [(subprocess.run(['sleep', '0.35']), time.sleep(1.2)) for _ in range(10)]; time.sleep(60)",
+        ])
+        .spawn()
+        .expect("failed to spawn worker-auth process tree");
+    let mut ci_proc = Command::new("python3")
+        .args([
+            "-c",
+            "import subprocess, time; [(subprocess.run(['sleep', '0.35']), time.sleep(1.2)) for _ in range(10)]; time.sleep(60)",
+        ])
+        .spawn()
+        .expect("failed to spawn ci-train process tree");
+
     let agents = [
-        ("supervisor", "sess-supervisor"),
-        ("worker-auth", "sess-worker-auth"),
-        ("worker-db", "sess-worker-db"),
-        ("worker-api", "sess-worker-api"),
-        ("worker-rogue", "sess-worker-rogue"),
-        ("ci-train", "sess-ci-train"),
+        (
+            "supervisor",
+            "sess-supervisor",
+            Some("orchestrator"),
+            Some(0),
+        ),
+        (
+            "worker-auth",
+            "sess-worker-auth",
+            Some("worker"),
+            Some(auth_proc.id()),
+        ),
+        ("worker-db", "sess-worker-db", Some("worker"), Some(0)),
+        ("worker-api", "sess-worker-api", Some("worker"), Some(0)),
+        ("worker-rogue", "sess-worker-rogue", Some("worker"), Some(0)),
+        (
+            "ci-train",
+            "sess-ci-train",
+            Some("reviewer"),
+            Some(ci_proc.id()),
+        ),
     ];
-    for (agent, sess) in &agents {
-        send_claude_hook(
-            &env,
-            agent,
-            serde_json::json!({
-                "hook_event_name": "SessionStart",
-                "session_id": sess,
-                "agent": agent,
-                "cwd": repo_str,
-                "model": "claude-3-5-sonnet",
-            }),
-        );
+    for (agent, sess, role, pid_opt) in &agents {
+        let mut start_payload = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": sess,
+            "agent": agent,
+            "cwd": repo_str,
+            "model": "claude-3-5-sonnet",
+            "role": role,
+        });
+        if let Some(pid) = pid_opt {
+            start_payload["pid"] = serde_json::json!(pid);
+        }
+        send_claude_hook(&env, agent, start_payload);
         send_claude_hook(
             &env,
             agent,
@@ -296,6 +363,8 @@ edition = "2021"
             }),
         );
     }
+    // Allow initial sampler tick to record baseline process tree and worktree state
+    std::thread::sleep(Duration::from_millis(250));
 
     // 5. worker-auth edits src/schema.rs and builds cleanly
     send_claude_hook(
@@ -446,7 +515,20 @@ edition = "2021"
         .expect("tacho query failing-commands failed");
     assert!(fail_out.status.success());
 
-    // 9. Supervisor unblocks worker-db, which aborts rebase, edits schema, and tests
+    // 9. Supervisor messages worker-db to unblock it, which aborts rebase, edits schema, and tests
+    let _ = env
+        .tacho_cmd()
+        .args([
+            "emit",
+            "message",
+            "--from",
+            "supervisor",
+            "--to",
+            "worker-db",
+            "--summary",
+            "Abort conflicting rebase on src/schema.rs and re-apply migration cleanly",
+        ])
+        .output();
     send_claude_hook(
         &env,
         "worker-db",
@@ -860,6 +942,37 @@ edition = "2021"
             .unwrap();
         assert!(out.status.success());
 
+        // Complete a turn with token/cost metrics and start next turn after each PR batch
+        if pr_idx % 3 == 0 && pr_idx < 30 {
+            for (w_agent, w_sess, base_tok) in [
+                ("worker-auth", "sess-worker-auth", 4_200u64),
+                ("worker-api", "sess-worker-api", 3_800u64),
+                ("worker-db", "sess-worker-db", 4_500u64),
+            ] {
+                send_claude_hook(
+                    &env,
+                    w_agent,
+                    serde_json::json!({
+                        "hook_event_name": "TurnEnd",
+                        "session_id": w_sess,
+                        "input_tokens": base_tok + (pr_idx as u64) * 150,
+                        "output_tokens": 1_200 + (pr_idx as u64) * 80,
+                        "cached_tokens": 2_000 + (pr_idx as u64) * 100,
+                        "cost_micros": 18_000 + (pr_idx as u64) * 900,
+                    }),
+                );
+                send_claude_hook(
+                    &env,
+                    w_agent,
+                    serde_json::json!({
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": w_sess,
+                        "prompt": format!("Continue stacked PR batch after {pr_slug}"),
+                    }),
+                );
+            }
+        }
+
         // Milestones
         if pr_idx == 10 {
             let _ = env
@@ -916,9 +1029,9 @@ edition = "2021"
         .unwrap();
     assert!(out.status.success());
 
-    // Spawn a real child process that represents worker-flaky
-    let mut flaky_proc = Command::new("sleep")
-        .arg("60")
+    // Spawn a real child process tree that represents worker-flaky
+    let mut flaky_proc = Command::new("sh")
+        .args(["-c", "sleep 60; true"])
         .spawn()
         .expect("failed to spawn worker-flaky process");
     let flaky_pid = flaky_proc.id();
@@ -934,6 +1047,15 @@ edition = "2021"
             "task": flaky_slug,
             "cwd": repo_str,
             "model": "claude-3-5-sonnet",
+        }),
+    );
+    send_claude_hook(
+        &env,
+        "worker-flaky",
+        serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-worker-flaky",
+            "prompt": "Implement pr-31 and run test suite",
         }),
     );
 
@@ -957,6 +1079,9 @@ edition = "2021"
         }),
     );
 
+    // Let sampler record worker-flaky's live process tree before SIGKILL
+    std::thread::sleep(Duration::from_millis(250));
+
     // Kill the worker-flaky process with SIGKILL (simulating process crash / OOM killer)
     let _ = flaky_proc.kill();
     let _ = flaky_proc.wait();
@@ -975,9 +1100,19 @@ edition = "2021"
             "hook_event_name": "SessionStart",
             "session_id": "sess-worker-rescue",
             "agent": "worker-rescue",
+            "pid": 0,
             "task": flaky_slug,
             "cwd": repo_str,
             "model": "claude-3-5-sonnet",
+        }),
+    );
+    send_claude_hook(
+        &env,
+        "worker-rescue",
+        serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-worker-rescue",
+            "prompt": "Take over pr-31 from crashed worker-flaky and complete the PR",
         }),
     );
 
@@ -1171,6 +1306,92 @@ edition = "2021"
     let new_pid = env.daemon_pid().expect("new daemon PID should exist");
     assert_ne!(orig_pid, new_pid, "new daemon should have distinct PID");
 
+    // Complete final turns on active workers so Turn slices and token/cost counters are finalized
+    for (w_agent, w_sess, in_tok, out_tok, cached_tok, cost_us) in [
+        (
+            "worker-auth",
+            "sess-worker-auth",
+            6_400u64,
+            2_100u64,
+            3_500u64,
+            32_000u64,
+        ),
+        (
+            "worker-api",
+            "sess-worker-api",
+            5_900u64,
+            1_950u64,
+            3_100u64,
+            29_500u64,
+        ),
+        (
+            "worker-db",
+            "sess-worker-db",
+            6_800u64,
+            2_400u64,
+            3_200u64,
+            35_000u64,
+        ),
+        (
+            "worker-rescue",
+            "sess-worker-rescue",
+            4_100u64,
+            1_500u64,
+            1_800u64,
+            21_000u64,
+        ),
+        (
+            "ci-train",
+            "sess-ci-train",
+            3_200u64,
+            900u64,
+            1_500u64,
+            14_000u64,
+        ),
+        (
+            "supervisor",
+            "sess-supervisor",
+            2_500u64,
+            650u64,
+            1_200u64,
+            11_000u64,
+        ),
+    ] {
+        send_claude_hook(
+            &env,
+            w_agent,
+            serde_json::json!({
+                "hook_event_name": "TurnEnd",
+                "session_id": w_sess,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cached_tokens": cached_tok,
+                "cost_micros": cost_us,
+            }),
+        );
+    }
+
+    // Close completed worker runs so Run and procs slices span their full lifetime in Perfetto UI
+    for (w_agent, w_sess) in [
+        ("worker-auth", "sess-worker-auth"),
+        ("worker-api", "sess-worker-api"),
+        ("worker-db", "sess-worker-db"),
+        ("worker-rescue", "sess-worker-rescue"),
+        ("ci-train", "sess-ci-train"),
+        ("worker-rogue", "sess-worker-rogue"),
+        ("supervisor", "sess-supervisor"),
+    ] {
+        send_claude_hook(
+            &env,
+            w_agent,
+            serde_json::json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": w_sess,
+                "reason": "completed",
+            }),
+        );
+    }
+
     // 13. Final trace capture: write to /tmp/tacho-realistic-fleet.perfetto-trace
     let fleet_trace_path = PathBuf::from("/tmp/tacho-realistic-fleet.perfetto-trace");
     let mut final_trace_cmd = env.tacho_cmd();
@@ -1263,4 +1484,9 @@ edition = "2021"
             .env("PERFETTO_CONSUMER_SOCK_NAME", &consumer_sock);
         let _ = stop_cmd.status();
     }
+
+    let _ = auth_proc.kill();
+    let _ = auth_proc.wait();
+    let _ = ci_proc.kill();
+    let _ = ci_proc.wait();
 }

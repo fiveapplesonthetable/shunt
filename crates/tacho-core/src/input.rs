@@ -28,6 +28,49 @@ impl SessionKey {
     }
 }
 
+/// Agent role profile for stall detectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    #[default]
+    Worker,
+    Orchestrator,
+    Reviewer,
+    Watcher,
+}
+
+impl AgentRole {
+    /// Infers an agent role from its identifier or task name when not explicitly provided.
+    pub fn infer(agent_id: &str, task: Option<&str>) -> Self {
+        let lower = agent_id.to_ascii_lowercase();
+        if lower.contains("orchestrat")
+            || lower.contains("coordinat")
+            || lower.contains("supervisor")
+        {
+            return Self::Orchestrator;
+        }
+        if lower.contains("review") || lower.contains("verif") || lower.contains("audit") {
+            return Self::Reviewer;
+        }
+        if lower.contains("watch") || lower.contains("monitor") || lower.contains("observer") {
+            return Self::Watcher;
+        }
+        if let Some(t) = task {
+            let tl = t.to_ascii_lowercase();
+            if tl.starts_with("orchestrat") || tl.starts_with("coordinat") {
+                return Self::Orchestrator;
+            }
+            if tl.starts_with("review") || tl.starts_with("verif") {
+                return Self::Reviewer;
+            }
+            if tl.starts_with("watch") || tl.starts_with("monitor") {
+                return Self::Watcher;
+            }
+        }
+        Self::Worker
+    }
+}
+
 /// Operation type for custom spans, points, counters, or state tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,6 +247,8 @@ pub enum Input {
         parent_session: Option<String>,
         #[serde(default)]
         git_tree: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<AgentRole>,
     },
     RunEnd {
         #[serde(default)]
@@ -424,6 +469,7 @@ mod tests {
                 model: Some("claude-3-5".to_string()),
                 parent_session: None,
                 git_tree: None,
+                role: None,
             },
             Input::ToolBegin {
                 source_ts_ns: None,

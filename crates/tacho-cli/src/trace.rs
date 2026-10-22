@@ -13,7 +13,16 @@ pub fn execute_trace(args: TraceArgs) -> io::Result<()> {
     let client = DaemonClient::new();
     let home = crate::paths::resolve_home();
 
-    let since_ns = args.since.as_deref().and_then(parse_since_duration_ns);
+    let dur_ns = args
+        .since
+        .as_deref()
+        .or_else(|| args.from_log.as_ref().and_then(|opt| opt.as_deref()))
+        .and_then(parse_since_duration_ns);
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let since_ns = dur_ns.map(|d| now_ns.saturating_sub(d));
 
     let mut output_bytes = Vec::new();
 
@@ -44,6 +53,7 @@ pub fn execute_trace(args: TraceArgs) -> io::Result<()> {
     match client.fetch_trace(since_ns, from_log, &mut tacho_bytes) {
         Ok(_) => {}
         Err(e) => {
+            tacho_bytes.clear();
             eprintln!("opening events.sqlite read-only");
             let db_path = {
                 let sqlite = home.join("events.sqlite");
@@ -53,7 +63,12 @@ pub fn execute_trace(args: TraceArgs) -> io::Result<()> {
                     home.join("events.db")
                 }
             };
-            tacho_daemon::write_snapshot(&db_path, since_ns, None, &mut tacho_bytes).map_err(|snap_err| {
+            let res = if from_log {
+                tacho_daemon::rebuild_from_log(&db_path, since_ns, None, &mut tacho_bytes)
+            } else {
+                tacho_daemon::write_snapshot(&db_path, since_ns, None, &mut tacho_bytes)
+            };
+            res.map_err(|snap_err| {
                 io::Error::other(format!(
                     "failed to fetch trace from daemon ({e}) and fallback to events.sqlite failed ({snap_err})"
                 ))

@@ -39,19 +39,27 @@ fn get_paired_clocks() -> (u64, u64) {
 }
 
 fn locate_trace_processor() -> PathBuf {
-    if let Ok(path) = env::var("TACHO_TRACE_PROCESSOR").or_else(|_| env::var("TACHO_TP")) {
-        let p = PathBuf::from(path);
-        if p.is_file() {
-            return p;
-        }
+    tacho_core::find_trace_processor()
+        .expect("trace_processor_shell binary not found; run scripts/oracle.sh or set TACHO_TP")
+}
+
+fn supports_pipe_syntax(tp: &Path, trace: &Path) -> bool {
+    let mut child = match Command::new(tp)
+        .arg(trace)
+        .arg("-q")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"PERFETTO PRAGMA pipelines;\nSELECT 1;\n");
     }
-    let default_path = PathBuf::from(
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell",
-    );
-    if default_path.is_file() {
-        return default_path;
-    }
-    panic!("trace_processor_shell binary not found");
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 fn run_query(tp: &Path, trace: &Path, sql: &str) -> String {
@@ -149,6 +157,7 @@ fn test_scripted_fleet_queries() {
             model: Some("claude-3-5".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
         },
         base_ts,
         &mut events,
@@ -289,6 +298,7 @@ fn test_scripted_fleet_queries() {
             model: Some("gemini-2.5".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
         },
         base_ts,
         &mut events,
@@ -459,6 +469,7 @@ fn test_scripted_fleet_queries() {
             model: Some("jetski-1".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
         },
         base_ts,
         &mut events,
@@ -666,17 +677,21 @@ fn test_scripted_fleet_queries() {
         stats_rows
     );
 
+    let has_pipe = supports_pipe_syntax(&tp, &trace_path);
+
     // =========================================================================
     // 1. agents-now
     // =========================================================================
     let sql_std = get_embedded_query("agents-now.sql").unwrap();
     let sql_pipe = get_embedded_query("agents-now.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "agents-now standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "agents-now standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -700,11 +715,13 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("open-waits.sql").unwrap();
     let sql_pipe = get_embedded_query("open-waits.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "open-waits standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "open-waits standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![vec![
@@ -722,11 +739,13 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("failing-commands.sql").unwrap();
     let sql_pipe = get_embedded_query("failing-commands.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "failing-commands standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "failing-commands standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -760,11 +779,13 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("time-by-class.sql").unwrap();
     let sql_pipe = get_embedded_query("time-by-class.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "time-by-class standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "time-by-class standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -801,11 +822,13 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("edits-by-file.sql").unwrap();
     let sql_pipe = get_embedded_query("edits-by-file.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "edits-by-file standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "edits-by-file standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -832,11 +855,13 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("tokens-by-agent.sql").unwrap();
     let sql_pipe = get_embedded_query("tokens-by-agent.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "tokens-by-agent standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "tokens-by-agent standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -870,8 +895,10 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("stalls.sql").unwrap();
     let sql_pipe = get_embedded_query("stalls.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(rows_std, rows_pipe, "stalls standard and pipe must agree");
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(rows_std, rows_pipe, "stalls standard and pipe must agree");
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -896,11 +923,13 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("contention.sql").unwrap();
     let sql_pipe = get_embedded_query("contention.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "contention standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "contention standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -943,11 +972,13 @@ fn test_scripted_fleet_queries() {
     let sql_std = get_embedded_query("system-during-builds.sql").unwrap();
     let sql_pipe = get_embedded_query("system-during-builds.pipe.sql").unwrap();
     let (_, rows_std) = parse_tp_csv(&run_query(&tp, &trace_path, sql_std));
-    let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
-    assert_eq!(
-        rows_std, rows_pipe,
-        "system-during-builds standard and pipe must agree"
-    );
+    if has_pipe {
+        let (_, rows_pipe) = parse_tp_csv(&run_query(&tp, &trace_path, sql_pipe));
+        assert_eq!(
+            rows_std, rows_pipe,
+            "system-during-builds standard and pipe must agree"
+        );
+    }
     assert_eq!(
         rows_std,
         vec![
@@ -1129,6 +1160,7 @@ fn test_system_during_builds_with_real_traced() {
             model: Some("claude-3-5".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
         },
         start_wall_ns,
         &mut events,

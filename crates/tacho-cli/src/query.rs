@@ -1,6 +1,5 @@
 //! SQL query runner (`tacho query <name|file|-> [--trace FILE]`).
 
-use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -70,33 +69,9 @@ pub fn execute_query(args: QueryArgs) -> Result<(), String> {
 }
 
 fn locate_trace_processor() -> Result<PathBuf, String> {
-    if let Ok(path) = env::var("TACHO_TRACE_PROCESSOR").or_else(|_| env::var("TACHO_TP")) {
-        let p = PathBuf::from(path);
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
-
-    if let Ok(paths) = env::var("PATH") {
-        for dir in env::split_paths(&paths) {
-            let candidate = dir.join("trace_processor_shell");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    let default_path = PathBuf::from(
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell",
-    );
-    if default_path.is_file() {
-        return Ok(default_path);
-    }
-
-    Err(
-        "trace_processor_shell binary not found; set $TACHO_TRACE_PROCESSOR, $TACHO_TP, or install Perfetto"
-            .to_string(),
-    )
+    tacho_core::find_trace_processor().ok_or_else(|| {
+        "trace_processor_shell binary not found; run scripts/oracle.sh or set $TACHO_TP".to_string()
+    })
 }
 
 /// Returns the embedded PerfettoSQL query text for a named query if known.

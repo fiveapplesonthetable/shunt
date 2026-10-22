@@ -10,7 +10,7 @@ use crate::track::TrackKind;
 use tacho_proto::tacho;
 
 use super::slices::make_abandoned_body;
-use super::Recorder;
+use super::{flow_ord, Recorder};
 
 /// Cumulative provider counters for tokens and cost.
 #[derive(Debug, Clone, Default)]
@@ -39,8 +39,14 @@ impl Recorder {
                 .strip_prefix("agent:")
                 .and_then(|s| s.split('/').next())
             {
+                let cpu_us = match unit.as_deref() {
+                    Some("ms") => value.saturating_mul(1_000),
+                    Some("ns") => value / 1_000,
+                    Some("s") => value.saturating_mul(1_000_000),
+                    _ => value,
+                };
                 if let Some(det) = self.detectors.get_mut(agent_id) {
-                    det.touch_cpu_activity(ts);
+                    det.record_cpu_sample(ts, cpu_us);
                 }
             }
         }
@@ -185,6 +191,130 @@ impl Recorder {
         ts: u64,
         out: &mut Vec<Event>,
     ) {
+        if op == CustomOp::Instant
+            && track.starts_with("agent:")
+            && matches!(
+                name.as_deref(),
+                Some("WorktreeCommit" | "WorktreeFileChange")
+            )
+        {
+            let segs: Vec<&str> = track.split('/').collect();
+            let agent_id = segs[0]
+                .strip_prefix("agent:")
+                .unwrap_or(segs[0])
+                .to_string();
+            let run_n = self.agent_runs.get(&agent_id).copied().unwrap_or(1);
+            let target_track = if self.runs.contains_key(&(agent_id.clone(), run_n)) {
+                format!("agent:{}/run:{}/turns", agent_id, run_n)
+            } else {
+                format!("agent:{}", agent_id)
+            };
+            let is_commit = name.as_deref() == Some("WorktreeCommit");
+            let raw_sha = args.get("sha").map(|s| s.trim());
+            let short_sha = raw_sha.map(|s| {
+                if s.len() >= 7 && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    s[..s.len().min(8)].to_string()
+                } else {
+                    let scrubbed = self.scrubber.scrub(s);
+                    truncate_utf8(&scrubbed, 16)
+                }
+            });
+            let sha = raw_sha.map(|s| {
+                if s.len() >= 7 && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    s.to_string()
+                } else {
+                    truncate_utf8(&self.scrubber.scrub(s), 64)
+                }
+            });
+            let detail = args
+                .get("detail")
+                .or_else(|| args.get("path"))
+                .map(|s| truncate_utf8(&self.scrubber.scrub(s), 256));
+            let custom_label = if is_commit {
+                if let Some(ref s) = short_sha {
+                    format!("WorktreeCommit: {}", s)
+                } else {
+                    "WorktreeCommit".to_string()
+                }
+            } else if let Some(ref d) = detail {
+                format!("WorktreeFileChange: {}", truncate_utf8(d, 48))
+            } else {
+                "WorktreeFileChange".to_string()
+            };
+
+            let description = if is_commit { sha.or(detail) } else { detail };
+            let body = tacho::event::Body::Milestone(tacho::Milestone {
+                name: name.clone(),
+                description,
+            });
+            self.emit(
+                &target_track,
+                Kind::Milestone,
+                ts,
+                None,
+                None,
+                Some(agent_id.clone()),
+                Some(custom_label.clone()),
+                Some(body),
+                out,
+            );
+
+            let cleared_all = if let Some(det) = self.detectors.get_mut(&agent_id) {
+                det.record_worktree_progress(ts);
+                !det.is_stalled
+            } else {
+                false
+            };
+            let was_stalled = if let Some(agent) = self.live.agents.get_mut(&agent_id) {
+                agent.last_action = custom_label;
+                if is_commit {
+                    agent.commits_succeeded += 1;
+                } else {
+                    agent.last_edit_ts_ns = Some(ts);
+                }
+                agent.state == "Stalled"
+            } else {
+                false
+            };
+            if cleared_all && was_stalled {
+                self.transition_state(
+                    &agent_id,
+                    "Idle",
+                    tacho::AgentStateType::Idle,
+                    "worktree progress",
+                    ts,
+                    out,
+                );
+            }
+            return;
+        }
+
+        if op == CustomOp::Instant && track == "milestones" {
+            let ms_name = name
+                .as_deref()
+                .map(|n| truncate_utf8(&self.scrubber.scrub(n), 128));
+            let desc = args
+                .get("description")
+                .or_else(|| args.get("detail"))
+                .map(|d| truncate_utf8(&self.scrubber.scrub(d), 256));
+            let body = tacho::event::Body::Milestone(tacho::Milestone {
+                name: ms_name.clone(),
+                description: desc,
+            });
+            self.emit(
+                "milestones",
+                Kind::Milestone,
+                ts,
+                None,
+                None,
+                None,
+                ms_name,
+                Some(body),
+                out,
+            );
+            return;
+        }
+
         let custom_kind = match op {
             CustomOp::Counter => TrackKind::Counter,
             CustomOp::State => TrackKind::State,
@@ -196,14 +326,16 @@ impl Recorder {
 
         let mut flow_ids = Vec::new();
         let mut terminating_flows = Vec::new();
+        let mut cause_seq = None;
 
         if let Some(ref fo) = flow_out {
-            flow_ids.push(seq);
+            flow_ids.push(flow_ord::make(seq, flow_ord::CUSTOM));
             self.custom_flows.insert(fo.clone(), seq);
         }
         if let Some(ref fi) = flow_in {
             if let Some(orig) = self.custom_flows.remove(fi) {
-                terminating_flows.push(orig);
+                cause_seq = Some(orig);
+                terminating_flows.push(flow_ord::make(orig, flow_ord::CUSTOM));
             }
         }
 
@@ -213,6 +345,17 @@ impl Recorder {
             }
             CustomOp::End => Kind::CustomEnded,
         };
+
+        if op == CustomOp::Begin {
+            self.open_custom_slices
+                .entry(track.clone())
+                .or_default()
+                .push(id.clone());
+        } else if op == CustomOp::End {
+            if let Some(stack) = self.open_custom_slices.get_mut(&track) {
+                stack.pop();
+            }
+        }
 
         let proto_args: Vec<tacho::CustomArg> = args
             .into_iter()
@@ -240,7 +383,7 @@ impl Recorder {
             ts_ns: c_ts,
             kind,
             track_key: track,
-            cause_seq: None,
+            cause_seq,
             agent: None,
             custom_name: name,
             flow_ids,
@@ -268,6 +411,11 @@ impl Recorder {
         let c_ts = self.clamp_ts(&track, ts);
         let seq = self.alloc_seq();
 
+        let custom_label = match (tokens_before, tokens_after) {
+            (Some(b), Some(a)) => Some(format!("Compacted ({} -> {} tokens)", b, a)),
+            _ => Some("Compacted".to_string()),
+        };
+
         out.push(Event {
             seq,
             ts_ns: c_ts,
@@ -275,7 +423,7 @@ impl Recorder {
             track_key: track,
             cause_seq: None,
             agent: Some(agent_id),
-            custom_name: None,
+            custom_name: custom_label,
             flow_ids: Vec::new(),
             terminating_flow_ids: Vec::new(),
             counter_value: None,
@@ -304,6 +452,7 @@ impl Recorder {
             digest: digest.as_deref().map(|d| truncate_utf8(d, 64)),
             bytes: Some(text_len),
         });
+        let prompt_label = format!("Prompt ({}B)", text_len);
         self.emit(
             &track,
             Kind::Prompt,
@@ -311,7 +460,7 @@ impl Recorder {
             None,
             None,
             Some(agent_id.clone()),
-            None,
+            Some(prompt_label),
             Some(body),
             out,
         );
@@ -343,10 +492,21 @@ impl Recorder {
         };
         let s_model = model
             .as_deref()
-            .map(|m| truncate_utf8(&self.scrubber.scrub(m), 128));
+            .map(|m| truncate_utf8(&self.scrubber.scrub(m), 128))
+            .or_else(|| {
+                self.live
+                    .agents
+                    .get(&agent_id)
+                    .and_then(|a| a.model.clone())
+            });
+        let turn_label = if let Some(ref m) = s_model {
+            format!("Turn {} ({})", turn_n, truncate_utf8(m, 32))
+        } else {
+            format!("Turn {}", turn_n)
+        };
         let body = tacho::event::Body::Turn(tacho::Turn {
             turn_number: Some(turn_n),
-            model: s_model,
+            model: s_model.clone(),
         });
         self.emit(
             &track,
@@ -355,12 +515,15 @@ impl Recorder {
             Some(slice_id),
             None,
             Some(agent_id.clone()),
-            None,
+            Some(turn_label),
             Some(body),
             out,
         );
         if let Some(agent) = self.live.agents.get_mut(&agent_id) {
             agent.turn_n = turn_n;
+            if s_model.is_some() {
+                agent.model = s_model;
+            }
             agent.last_action = format!("Turn {}", turn_n);
         }
         self.transition_state(
@@ -371,9 +534,7 @@ impl Recorder {
             ts,
             out,
         );
-        if let Some(det) = self.detectors.get_mut(&agent_id) {
-            det.touch_event(ts);
-        }
+        self.touch_agent_event(&agent_id, ts);
     }
 
     /// Handles `Input::TurnEnd`.
@@ -464,20 +625,17 @@ impl Recorder {
                 agent.cost_micros += cost;
             }
         }
-        let is_stalled = self
-            .detectors
-            .get(&agent_id)
-            .map(|d| d.is_stalled)
-            .unwrap_or(false);
-        let (next_st, next_enum) = if is_stalled {
-            ("Stalled", tacho::AgentStateType::Stalled)
-        } else {
-            ("Idle", tacho::AgentStateType::Idle)
-        };
-        self.transition_state(&agent_id, next_st, next_enum, "turn end", ts, out);
+        self.transition_state(
+            &agent_id,
+            "Idle",
+            tacho::AgentStateType::Idle,
+            "turn end",
+            ts,
+            out,
+        );
+        self.touch_agent_event(&agent_id, ts);
         let cfg = self.detector_cfg.clone();
         let firings = if let Some(det) = self.detectors.get_mut(&agent_id) {
-            det.touch_event(ts);
             det.on_turn_end(ts, output_tokens, &cfg)
         } else {
             Vec::new()
@@ -485,7 +643,7 @@ impl Recorder {
         if !firings.is_empty() {
             if let Some(tseq) = turn_seq {
                 if let Some(ev) = out.iter_mut().rfind(|e| e.seq == tseq) {
-                    ev.flow_ids.push(tseq);
+                    ev.flow_ids.push(flow_ord::make(tseq, flow_ord::STALL));
                 }
             }
             self.handle_detector_firings(&agent_id, firings, turn_seq, ts, out);

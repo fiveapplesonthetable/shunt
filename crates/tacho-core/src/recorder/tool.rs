@@ -23,6 +23,7 @@ pub(crate) struct OpenToolSlice {
     pub(crate) command_class: Option<CommandClass>,
     pub(crate) file_path: Option<String>,
     pub(crate) file_edit: Option<(Option<FileEditKind>, Option<u32>, Option<u32>)>,
+    pub(crate) triggered_stall: bool,
 }
 
 pub(crate) struct ToolDetails {
@@ -140,61 +141,96 @@ impl Recorder {
             } => {
                 let s_argv = truncate_utf8(&self.scrubber.scrub(&argv), 512);
                 let eff_cwd = tool_cwd.as_deref().or(cwd);
-                let s_cwd = eff_cwd.map(|c| truncate_utf8(&relativize_cwd(c, None), 512));
+                let s_cwd = eff_cwd
+                    .map(|c| truncate_utf8(&self.scrubber.scrub(&relativize_cwd(c, None)), 512));
                 let words: Vec<&str> = argv.split_whitespace().collect();
                 let class = classify(&words);
                 let proto_class = to_proto_cmd_class(class);
+                let class_str = command_class_name(class);
+                let display_argv = match eff_cwd {
+                    Some(c) if !c.is_empty() && c != "." => {
+                        let s_c = self.scrubber.scrub(c);
+                        s_argv
+                            .replace(&format!(" -C {s_c} "), " ")
+                            .replace(&format!("{s_c}/"), "")
+                    }
+                    _ => s_argv.clone(),
+                };
+                let short_argv = truncate_utf8(&display_argv, 64);
+                let slice_label = if short_argv.is_empty() {
+                    class_str.to_string()
+                } else {
+                    format!("{}: {}", class_str, short_argv)
+                };
                 ToolDetails {
                     kind: Kind::Command,
-                    custom_name: Some(command_class_name(class).to_string()),
+                    custom_name: Some(slice_label),
                     body: tacho::event::Body::Command(tacho::Command {
-                        argv: Some(s_argv),
+                        argv: Some(s_argv.clone()),
                         cwd: s_cwd,
                         class: Some(proto_class as i32),
                         check_name: None,
                         via_wrap: Some(false),
-                        program: None,
+                        program: words.first().map(|w| truncate_utf8(w, 64)),
                         tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
                         git_tree: git_tree.as_deref().map(|g| truncate_utf8(g, 64)),
                     }),
-                    argv: Some(argv.clone()),
+                    argv: Some(s_argv),
                     command_class: Some(class),
                     digest: blake3_digest_8(&argv),
                     ..Default::default()
                 }
             }
-            ToolInput::FileRead { path } => ToolDetails {
-                kind: Kind::FileAccess,
-                custom_name: Some("Read".to_string()),
-                body: tacho::event::Body::FileAccess(tacho::FileAccess {
-                    path: Some(truncate_utf8(
-                        &relativize_path(&path, cwd.unwrap_or(".")),
-                        512,
-                    )),
-                    kind: Some(tacho::FileAccessKind::Read as i32),
-                    query: None,
-                    tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
-                }),
-                digest: blake3_digest_8(&path),
-                file_path: Some(path),
-                ..Default::default()
-            },
+            ToolInput::FileRead { path } => {
+                let s_path = truncate_utf8(
+                    &self
+                        .scrubber
+                        .scrub(&relativize_path(&path, cwd.unwrap_or("."))),
+                    512,
+                );
+                let slice_label = if s_path.is_empty() {
+                    "Read".to_string()
+                } else {
+                    format!("Read: {}", truncate_utf8(&s_path, 48))
+                };
+                ToolDetails {
+                    kind: Kind::FileAccess,
+                    custom_name: Some(slice_label),
+                    body: tacho::event::Body::FileAccess(tacho::FileAccess {
+                        path: Some(s_path.clone()),
+                        kind: Some(tacho::FileAccessKind::Read as i32),
+                        query: None,
+                        tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
+                    }),
+                    digest: blake3_digest_8(&path),
+                    file_path: Some(s_path),
+                    ..Default::default()
+                }
+            }
             ToolInput::FileSearch { pattern, path } => {
                 let rel = path
                     .as_deref()
                     .map(|p| relativize_path(p, cwd.unwrap_or(".")));
-                let s_path = rel.as_deref().map(|p| truncate_utf8(p, 512));
+                let s_path = rel
+                    .as_deref()
+                    .map(|p| truncate_utf8(&self.scrubber.scrub(p), 512));
+                let s_query = truncate_utf8(&self.scrubber.scrub(&pattern), 256);
+                let slice_label = if s_query.is_empty() {
+                    "Search".to_string()
+                } else {
+                    format!("Search: {}", truncate_utf8(&s_query, 48))
+                };
                 ToolDetails {
                     kind: Kind::FileAccess,
-                    custom_name: Some("Search".to_string()),
+                    custom_name: Some(slice_label),
                     body: tacho::event::Body::FileAccess(tacho::FileAccess {
-                        path: s_path,
+                        path: s_path.clone(),
                         kind: Some(tacho::FileAccessKind::Search as i32),
-                        query: Some(truncate_utf8(&pattern, 256)),
+                        query: Some(s_query),
                         tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
                     }),
                     digest: blake3_digest_8(&format!("{}:{:?}", pattern, path)),
-                    file_path: path,
+                    file_path: s_path,
                     ..Default::default()
                 }
             }
@@ -204,10 +240,22 @@ impl Recorder {
                 lines_added,
                 lines_removed,
             } => {
-                let rel = relativize_path(&path, cwd.unwrap_or("."));
+                let rel = truncate_utf8(
+                    &self
+                        .scrubber
+                        .scrub(&relativize_path(&path, cwd.unwrap_or("."))),
+                    512,
+                );
                 let digest = blake3_digest_8(&path);
+                let slice_label = match (lines_added, lines_removed) {
+                    (Some(a), Some(r)) => {
+                        format!("Edit: {} (+{}/-{})", truncate_utf8(&rel, 48), a, r)
+                    }
+                    _ if !rel.is_empty() => format!("Edit: {}", truncate_utf8(&rel, 48)),
+                    _ => "Edit".to_string(),
+                };
                 ToolDetails {
-                    custom_name: Some("Edit".to_string()),
+                    custom_name: Some(slice_label),
                     body: tacho::event::Body::ToolCall(tacho::ToolCall {
                         name: Some("Edit".to_string()),
                         input_digest: Some(digest.clone()),

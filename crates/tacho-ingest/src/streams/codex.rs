@@ -74,6 +74,7 @@ impl StreamParser {
                     model: None,
                     parent_session: None,
                     git_tree: None,
+                    role: None,
                 });
             }
             Some("turn.started") => {

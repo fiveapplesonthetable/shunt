@@ -10,14 +10,64 @@
 
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tacho_daemon::{Config, Daemon, DaemonPaths};
 
+fn locate_tacho_bin() -> PathBuf {
+    if let Ok(p) = env::var("TACHO_BIN") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return pb;
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+            let candidate = target_dir.join("tacho");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
+        let candidate = PathBuf::from(dir).join("debug/tacho");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ws_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&manifest_dir);
+    let ws_bin = ws_root.join("target/debug/tacho");
+    if ws_bin.is_file() {
+        return ws_bin;
+    }
+    let status = Command::new("cargo")
+        .args(["build", "-p", "tachograph", "--bin", "tacho"])
+        .current_dir(ws_root)
+        .status()
+        .expect("failed to build tacho binary");
+    assert!(
+        status.success(),
+        "cargo build -p tachograph --bin tacho failed"
+    );
+    if let Ok(exe) = env::current_exe() {
+        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+            let candidate = target_dir.join("tacho");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    ws_bin
+}
+
 #[test]
 fn test_real_cli_binary_end_to_end() {
-    let tp_path = env::var("TACHO_TP").unwrap_or_else(|_| {
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-    });
+    let tp_path = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP");
 
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -29,12 +79,11 @@ fn test_real_cli_binary_end_to_end() {
     let daemon = Daemon::start(paths.clone(), config).expect("Failed to start daemon");
 
     // Locate tacho binary
-    let target_dir =
-        env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "/tmp/tacho-target-daemon".to_string());
-    let tacho_bin = format!("{}/debug/tacho", target_dir);
+    let tacho_bin = locate_tacho_bin();
     assert!(
-        std::path::Path::new(&tacho_bin).exists(),
-        "tacho binary not found at {tacho_bin}"
+        tacho_bin.exists(),
+        "tacho binary not found at {:?}",
+        tacho_bin
     );
 
     let run_cli = |args: &[&str], stdin_data: Option<&[u8]>| -> std::process::Output {
@@ -98,8 +147,9 @@ fn test_real_cli_binary_end_to_end() {
     );
 
     // 3. `tacho hook claude` with SessionStart fixture
-    let fixture_path = "/usr/local/google/home/zezeozue/dev/tachograph/tests/fixtures/hooks/claude/SessionStart.json";
-    let fixture_bytes = fs::read(fixture_path).expect("failed reading SessionStart fixture");
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/hooks/claude/SessionStart.json");
+    let fixture_bytes = fs::read(&fixture_path).expect("failed reading SessionStart fixture");
     let out = run_cli(&["hook", "claude"], Some(&fixture_bytes));
     assert!(
         out.status.success(),

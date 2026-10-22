@@ -35,6 +35,7 @@ fn test_restart_keeps_tracks() {
                     model: Some("gemini-1.5-pro".to_string()),
                     parent_session: None,
                     git_tree: None,
+                    role: None,
                 },
                 1_000_000,
             )

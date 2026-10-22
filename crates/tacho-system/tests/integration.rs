@@ -82,9 +82,8 @@ fn test_system_tracing_lifecycle() {
     let traced_bin = find_perfetto_binary("traced");
     let probes_bin = find_perfetto_binary("traced_probes");
     let perfetto_bin = find_perfetto_binary("perfetto");
-    let tp_bin = env::var("TACHO_TP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| find_perfetto_binary("trace_processor_shell"));
+    let tp_bin = tacho_core::find_trace_processor()
+        .unwrap_or_else(|| find_perfetto_binary("trace_processor_shell"));
 
     let temp_dir = tempfile::tempdir().expect("failed to create tempdir");
     let producer_sock = temp_dir.path().join("producer.sock");

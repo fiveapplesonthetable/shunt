@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::appender::{spawn_appender, AppenderHandle};
+use crate::appender::{spawn_appender_with_hook, AppenderHandle};
 use crate::config::Config;
 use crate::log::EventLog;
 use crate::paths::DaemonPaths;
@@ -48,10 +48,24 @@ impl Daemon {
             .load_all()
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let recorder = Recorder::restore(logged_events.iter());
+        let mut recorder = Recorder::restore(logged_events.iter());
+        recorder.set_detector_config(tacho_core::DetectorConfig {
+            silent_timeout_ns: config.detectors.silent_s * 1_000_000_000,
+            loop_repeats: config.detectors.loop_count,
+            spin_turns: config.detectors.spin_turns,
+            burn_tokens: config.detectors.burn_tokens,
+            burn_window_ns: config.detectors.burn_window_s * 1_000_000_000,
+            failing_repeats: config.detectors.failing_count,
+        });
+
+        let on_stall = config.detectors.on_stall.clone().or_else(|| {
+            std::env::var("TACHO_ON_STALL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
 
         // 3. Spawn appender thread (no in-memory rings; SQLite WAL is the sole source)
-        let (appender, appender_thread) = spawn_appender(recorder, log, 65_536);
+        let (appender, appender_thread) = spawn_appender_with_hook(recorder, log, 65_536, on_stall);
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 

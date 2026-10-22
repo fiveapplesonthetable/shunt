@@ -36,8 +36,32 @@ fn test_canary_secrets_zero_leak() {
     let _ = env.tacho_cmd().arg("status").output();
     assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
 
-    // 1. Seed secrets via tacho hook claude
-    let hook_payload = serde_json::json!({
+    // 1. Seed secrets via tacho hook claude (SessionStart + PreToolUse + PostToolUse)
+    let send_hook = |payload: serde_json::Value| {
+        let mut hook_child = env
+            .tacho_cmd()
+            .args(["hook", "claude"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(mut stdin) = hook_child.stdin.take() {
+            stdin.write_all(payload.to_string().as_bytes()).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+        let hook_out = hook_child.wait_with_output().unwrap();
+        assert!(hook_out.status.success());
+    };
+
+    send_hook(serde_json::json!({
+        "session_id": "session-canary",
+        "agent": "canary",
+        "cwd": format!("/workspace/secret={}", CANARY_SECRETS[0]),
+        "hook_event_name": "SessionStart",
+    }));
+
+    send_hook(serde_json::json!({
         "session_id": "session-canary",
         "cwd": "/workspace",
         "hook_event_name": "PreToolUse",
@@ -45,31 +69,25 @@ fn test_canary_secrets_zero_leak() {
         "tool_name": "Bash",
         "prompt": format!("Please use secret {}", CANARY_SECRETS[0]),
         "tool_input": {
-            "command": format!("curl -H 'Authorization: Bearer {}' https://api.com --password {}", CANARY_SECRETS[7], CANARY_SECRETS[8]),
+            "command": format!(
+                "curl -H 'Authorization: Bearer {}' https://api.com --password {} --key secret={}",
+                CANARY_SECRETS[7], CANARY_SECRETS[8], CANARY_SECRETS[1]
+            ),
             "secret_key": CANARY_SECRETS[1],
         },
+    }));
+
+    send_hook(serde_json::json!({
+        "session_id": "session-canary",
+        "cwd": "/workspace",
+        "hook_event_name": "PostToolUse",
+        "tool_use_id": "toolu_canary_01",
+        "tool_name": "Bash",
         "tool_response": {
+            "exit_code": 0,
             "content": format!("Response containing {} and {}", CANARY_SECRETS[2], CANARY_SECRETS[3]),
         }
-    });
-
-    let mut hook_child = env
-        .tacho_cmd()
-        .args(["hook", "claude"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    if let Some(mut stdin) = hook_child.stdin.take() {
-        stdin
-            .write_all(hook_payload.to_string().as_bytes())
-            .unwrap();
-        stdin.write_all(b"\n").unwrap();
-    }
-    let hook_out = hook_child.wait_with_output().unwrap();
-    assert!(hook_out.status.success());
+    }));
 
     // 2. Seed secrets via stream lines (tacho run)
     let stream_script = env.temp_dir.path().join("canary_stream.sh");
@@ -121,6 +139,20 @@ printf '%s\n' '{{"type":"assistant","session_id":"canary-run","message":{{"conte
     assert!(trace_status.success());
     let trace_bytes = fs::read(&trace_path).unwrap();
     assert_no_leaks("trace snapshot file", &trace_bytes);
+
+    // Verify Command argv was recorded in the trace and scrubbed to <redacted>
+    let argv_rows = env
+        .query_trace(
+            &trace_path,
+            "SELECT string_value FROM args WHERE key LIKE '%argv%';",
+        )
+        .unwrap();
+    let argv_vals: Vec<String> = argv_rows.into_iter().flatten().collect();
+    assert!(
+        argv_vals.iter().any(|s| s.contains("<redacted>")),
+        "Expected Command argv with <redacted> in trace args, got {:?}",
+        argv_vals
+    );
 
     // 5. Check --from-log rebuild
     let rebuild_path = env.home_dir.join("trace/canary_rebuild.perfetto-trace");

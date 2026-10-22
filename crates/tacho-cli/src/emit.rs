@@ -18,7 +18,8 @@ pub fn execute_emit(args: EmitArgs) -> Result<(), String> {
     if args.json {
         let stdin = io::stdin();
         let reader = stdin.lock();
-        let mut count = 0;
+        let mut batch = Vec::with_capacity(256);
+        let mut count = 0usize;
         for line in reader.lines() {
             let line = line.map_err(|e| format!("failed reading stdin: {e}"))?;
             let trimmed = line.trim();
@@ -26,13 +27,21 @@ pub fn execute_emit(args: EmitArgs) -> Result<(), String> {
                 continue;
             }
 
-            let input: serde_json::Value =
-                serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON line: {e}"))?;
-
-            client
-                .send_request(&serde_json::json!({ "input": input }))
-                .map_err(|e| format!("failed to send input to daemon: {e}"))?;
+            let input = tacho_ingest::emit::parse_ndjson_line(trimmed)
+                .map_err(|e| format!("invalid JSON line: {e}"))?;
+            batch.push(input);
             count += 1;
+            if batch.len() >= 256 {
+                client
+                    .send_inputs_batch(&batch)
+                    .map_err(|e| format!("failed to send input batch to daemon: {e}"))?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            client
+                .send_inputs_batch(&batch)
+                .map_err(|e| format!("failed to send input batch to daemon: {e}"))?;
         }
         println!("Emitted {count} events from stdin.");
         return Ok(());

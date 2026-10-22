@@ -12,23 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
 fn find_tacho_bin() -> PathBuf {
-    if let Ok(dir) = env::var("CARGO_TARGET_DIR") {
-        let p = PathBuf::from(dir).join("debug/tacho");
-        if p.is_file() {
-            return p;
-        }
-    }
-    let p = PathBuf::from("/tmp/tacho-target-ring/debug/tacho");
-    if p.is_file() {
-        return p;
-    }
-    // Fall back to building it
-    let status = Command::new("cargo")
-        .args(["build", "-p", "tachograph"])
-        .status()
-        .expect("cargo build failed");
-    assert!(status.success());
-    p
+    PathBuf::from(env!("CARGO_BIN_EXE_tacho"))
 }
 
 struct DaemonProcess {

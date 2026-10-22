@@ -8,10 +8,11 @@
 //! - FAILING: same test/build command failed 3 times in a row
 //! - OFF_BRIEF: a FileEdited outside declared task paths (when declared)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use tacho_proto::tacho;
 
 use crate::classify::CommandClass;
+use crate::input::AgentRole;
 
 /// Configuration thresholds for stall detectors.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,8 +66,11 @@ pub fn blake3_digest_8(text: &str) -> String {
 /// Stateful tracking for one agent's detectors.
 #[derive(Debug, Clone, Default)]
 pub struct AgentDetectorState {
+    pub role: AgentRole,
     pub last_event_ts_ns: u64,
     pub last_cpu_activity_ns: Option<u64>,
+    pub last_cpu_sample: Option<(u64, i64)>, // (ts_ns, cumulative_cpu_us)
+    pub suppress_live_silent: bool,
     pub last_edit_ts_ns: Option<u64>,
     pub last_passing_test_ts_ns: Option<u64>,
     pub commits_succeeded: u32,
@@ -79,6 +83,7 @@ pub struct AgentDetectorState {
     pub burn_window: VecDeque<(u64, u64)>, // (ts_ns, tokens_out)
     pub failing_commands: HashMap<String, usize>, // normalized argv -> consecutive failures
     pub task_declared_paths: Option<Vec<String>>,
+    pub active_stalls: BTreeSet<i32>,
     pub is_stalled: bool,
     pub silent_fired: bool,
     pub last_loop_digest: Option<String>,
@@ -93,16 +98,50 @@ impl AgentDetectorState {
         Self::default()
     }
 
+    /// Enters a stall kind, returning `true` only if this stall kind was not already active.
+    pub fn enter_stall(&mut self, kind: tacho::StallKind) -> bool {
+        let inserted = self.active_stalls.insert(kind as i32);
+        self.is_stalled = !self.active_stalls.is_empty();
+        inserted
+    }
+
+    /// Clears a specific stall kind and updates `is_stalled`.
+    pub fn clear_stall(&mut self, kind: tacho::StallKind) {
+        self.active_stalls.remove(&(kind as i32));
+        self.is_stalled = !self.active_stalls.is_empty();
+    }
+
     /// Records event arrival time and resets silence flag.
     pub fn touch_event(&mut self, ts_ns: u64) {
         self.last_event_ts_ns = self.last_event_ts_ns.max(ts_ns);
         self.silent_fired = false;
+        self.clear_stall(tacho::StallKind::Silent);
     }
 
     /// Records CPU activity for CPU-aware silence detection.
     pub fn touch_cpu_activity(&mut self, ts_ns: u64) {
         self.last_cpu_activity_ns = Some(ts_ns);
         self.silent_fired = false;
+        self.clear_stall(tacho::StallKind::Silent);
+    }
+
+    /// Records a cumulative CPU counter sample (in microseconds) and suppresses `SILENT`
+    /// only when the process-tree CPU rate is at least 50ms/s (50,000 us/s = 0.05 CPU-s/s).
+    pub fn record_cpu_sample(&mut self, ts_ns: u64, cpu_us: i64) {
+        const MIN_ACTIVE_CPU_US_PER_SEC: u128 = 50_000;
+        let (prev_ts, prev_cpu_us) = self.last_cpu_sample.unwrap_or((self.last_event_ts_ns, 0));
+        self.last_cpu_sample = Some((ts_ns, cpu_us));
+
+        let dt_ns = ts_ns.saturating_sub(prev_ts);
+        let d_cpu_us = cpu_us.saturating_sub(prev_cpu_us).max(0) as u128;
+        if dt_ns > 0 {
+            let rate_us_per_s = (d_cpu_us * 1_000_000_000) / (dt_ns as u128);
+            if rate_us_per_s >= MIN_ACTIVE_CPU_US_PER_SEC {
+                self.touch_cpu_activity(ts_ns);
+            }
+        } else if d_cpu_us >= MIN_ACTIVE_CPU_US_PER_SEC {
+            self.touch_cpu_activity(ts_ns);
+        }
     }
 
     /// Configures declared paths for OFF_BRIEF detector.
@@ -110,16 +149,25 @@ impl AgentDetectorState {
         self.task_declared_paths = Some(paths);
     }
 
+    /// Credits worktree progress (git commit or file modification observed in `cwd`),
+    /// resetting SILENT and SPIN stall detectors.
+    pub fn record_worktree_progress(&mut self, ts_ns: u64) {
+        self.touch_event(ts_ns);
+        self.spin_turn_has_progress = true;
+        self.spin_fired = false;
+        self.spin_turns_count = 0;
+        self.clear_stall(tacho::StallKind::Spin);
+    }
+
     /// Evaluates if run ended without a passing test after file edits (CLAIM detector).
     pub fn check_claim(&mut self) -> Option<DetectorFiring> {
-        if self.claim_fired {
+        if self.role != AgentRole::Worker || self.claim_fired {
             return None;
         }
         if let Some(edit_ts) = self.last_edit_ts_ns {
             let needs_test = self.last_passing_test_ts_ns.is_none_or(|t| t < edit_ts);
-            if needs_test {
+            if needs_test && self.enter_stall(tacho::StallKind::StallClaim) {
                 self.claim_fired = true;
-                self.is_stalled = true;
                 return Some(DetectorFiring {
                     kind: tacho::StallKind::StallClaim,
                     repeats: None,
@@ -140,7 +188,15 @@ impl AgentDetectorState {
         is_exited: bool,
         cfg: &DetectorConfig,
     ) -> Option<DetectorFiring> {
-        if is_waiting || is_exited || self.last_event_ts_ns == 0 || self.silent_fired {
+        if is_waiting
+            || is_exited
+            || self.last_event_ts_ns == 0
+            || self.silent_fired
+            || self.suppress_live_silent
+            || self
+                .active_stalls
+                .contains(&(tacho::StallKind::Silent as i32))
+        {
             return None;
         }
 
@@ -153,8 +209,8 @@ impl AgentDetectorState {
         if now_ns >= self.last_event_ts_ns + cfg.silent_timeout_ns {
             let elapsed_ns = now_ns - self.last_event_ts_ns;
             let since_us = elapsed_ns / 1_000;
-            self.is_stalled = true;
             self.silent_fired = true;
+            self.enter_stall(tacho::StallKind::Silent);
             Some(DetectorFiring {
                 kind: tacho::StallKind::Silent,
                 repeats: None,
@@ -171,6 +227,10 @@ impl AgentDetectorState {
 
     /// Evaluates tool begin for repetition (LOOP detector).
     pub fn on_tool_begin(&mut self, digest: &str, cfg: &DetectorConfig) -> Option<DetectorFiring> {
+        if self.role != AgentRole::Worker {
+            return None;
+        }
+
         self.recent_tool_digests.push_back(digest.to_string());
         if self.recent_tool_digests.len() > cfg.loop_repeats {
             self.recent_tool_digests.pop_front();
@@ -179,11 +239,12 @@ impl AgentDetectorState {
         if self.recent_tool_digests.len() == cfg.loop_repeats
             && self.recent_tool_digests.iter().all(|d| d == digest)
         {
-            if self.last_loop_digest.as_deref() == Some(digest) {
+            if self.last_loop_digest.as_deref() == Some(digest)
+                || !self.enter_stall(tacho::StallKind::Loop)
+            {
                 return None;
             }
             self.last_loop_digest = Some(digest.to_string());
-            self.is_stalled = true;
             Some(DetectorFiring {
                 kind: tacho::StallKind::Loop,
                 repeats: Some(cfg.loop_repeats as u32),
@@ -195,10 +256,8 @@ impl AgentDetectorState {
             })
         } else {
             if self.last_loop_digest.as_deref() != Some(digest) {
-                if self.last_loop_digest.is_some() {
-                    self.is_stalled = false;
-                }
                 self.last_loop_digest = None;
+                self.clear_stall(tacho::StallKind::Loop);
             }
             None
         }
@@ -214,29 +273,43 @@ impl AgentDetectorState {
         self.spin_turn_has_progress = true;
         self.spin_fired = false;
         self.last_edit_ts_ns = Some(ts_ns);
-        self.is_stalled = false;
+        self.clear_stall(tacho::StallKind::Spin);
 
-        if let Some(ref declared) = self.task_declared_paths {
-            if !declared.is_empty() {
-                let matches_brief = declared.iter().any(|d| {
-                    path == d
-                        || path.starts_with(&format!("{}/", d.trim_end_matches('/')))
-                        || d.starts_with(&format!("{}/", path.trim_end_matches('/')))
-                });
+        let off_brief_evidence = self.task_declared_paths.as_ref().and_then(|declared| {
+            if declared.is_empty() {
+                return None;
+            }
+            let matches_brief = declared.iter().any(|d| {
+                path == d
+                    || path.starts_with(&format!("{}/", d.trim_end_matches('/')))
+                    || d.starts_with(&format!("{}/", path.trim_end_matches('/')))
+            });
+            if matches_brief {
+                Some(None)
+            } else {
+                Some(Some(format!(
+                    "file '{}' edited outside declared task paths {:?}",
+                    path, declared
+                )))
+            }
+        });
 
-                if !matches_brief {
-                    self.is_stalled = true;
+        match off_brief_evidence {
+            Some(Some(evidence)) => {
+                if self.enter_stall(tacho::StallKind::OffBrief) {
                     return Some(DetectorFiring {
                         kind: tacho::StallKind::OffBrief,
                         repeats: None,
                         since_us: None,
-                        evidence: format!(
-                            "file '{}' edited outside declared task paths {:?}",
-                            path, declared
-                        ),
+                        evidence,
                     });
                 }
+                return None;
             }
+            Some(None) => {
+                self.clear_stall(tacho::StallKind::OffBrief);
+            }
+            None => {}
         }
 
         let _ = cfg;
@@ -258,13 +331,10 @@ impl AgentDetectorState {
         ) {
             self.spin_turn_has_progress = true;
             self.spin_fired = false;
+            self.clear_stall(tacho::StallKind::Spin);
         }
 
         let is_success = exit_code == Some(0);
-        if is_success {
-            self.is_stalled = false;
-        }
-
         if class == CommandClass::Test && is_success {
             self.last_passing_test_ts_ns = Some(ts_ns);
         } else if class == CommandClass::Commit && is_success {
@@ -277,20 +347,22 @@ impl AgentDetectorState {
             let failed = exit_code.map(|c| c != 0).unwrap_or(true);
             let key = argv.trim().to_string();
             if failed {
-                let count = self.failing_commands.entry(key.clone()).or_insert(0);
-                *count += 1;
-                if *count == cfg.failing_repeats {
-                    self.is_stalled = true;
+                let count = {
+                    let entry = self.failing_commands.entry(key).or_insert(0);
+                    *entry += 1;
+                    *entry
+                };
+                if count >= cfg.failing_repeats && self.enter_stall(tacho::StallKind::Failing) {
                     return Some(DetectorFiring {
                         kind: tacho::StallKind::Failing,
-                        repeats: Some(*count as u32),
+                        repeats: Some(count as u32),
                         since_us: None,
-                        evidence: format!("command '{}' failed {} times in a row", argv, *count),
+                        evidence: format!("command '{}' failed {} times in a row", argv, count),
                     });
                 }
             } else {
                 self.failing_commands.insert(key, 0);
-                self.is_stalled = false;
+                self.clear_stall(tacho::StallKind::Failing);
             }
         }
 
@@ -306,15 +378,18 @@ impl AgentDetectorState {
     ) -> Vec<DetectorFiring> {
         let mut firings = Vec::new();
 
-        // 1. SPIN detector
+        // 1. SPIN detector (only for Worker role)
         if self.spin_turn_has_progress {
             self.spin_turns_count = 0;
             self.spin_turn_has_progress = false;
             self.spin_fired = false;
-        } else {
+            self.clear_stall(tacho::StallKind::Spin);
+        } else if self.role == AgentRole::Worker {
             self.spin_turns_count += 1;
-            if self.spin_turns_count >= cfg.spin_turns && !self.spin_fired {
-                self.is_stalled = true;
+            if self.spin_turns_count >= cfg.spin_turns
+                && !self.spin_fired
+                && self.enter_stall(tacho::StallKind::Spin)
+            {
                 self.spin_fired = true;
                 firings.push(DetectorFiring {
                     kind: tacho::StallKind::Spin,
@@ -342,8 +417,7 @@ impl AgentDetectorState {
 
             let limit = self.task_token_budget.unwrap_or(cfg.burn_tokens);
             let sum: u64 = self.burn_window.iter().map(|(_, k)| *k).sum();
-            if sum > limit && !self.burn_fired {
-                self.is_stalled = true;
+            if sum > limit && !self.burn_fired && self.enter_stall(tacho::StallKind::Burn) {
                 self.burn_fired = true;
                 firings.push(DetectorFiring {
                     kind: tacho::StallKind::Burn,
@@ -353,6 +427,7 @@ impl AgentDetectorState {
                 });
             } else if sum <= limit {
                 self.burn_fired = false;
+                self.clear_stall(tacho::StallKind::Burn);
             }
         }
 

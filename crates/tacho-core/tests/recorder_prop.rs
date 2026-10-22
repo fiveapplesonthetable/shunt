@@ -7,7 +7,6 @@
 //!     produces the exact same events, live state, and track registry as continuous execution.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::process::Command;
 
@@ -117,6 +116,7 @@ fn arb_input() -> impl Strategy<Value = Input> {
             model: Some("test-model".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
             source_ts_ns: None,
         }),
         arb_session_key().prop_map(|session| Input::RunEnd {
@@ -383,9 +383,8 @@ proptest! {
     /// with 0 error/data_loss stats, proper slice track nesting, and state strings.
     #[test]
     fn prop_oracle_verification(timed_inputs in arb_input_sequence()) {
-        let tp_path = env::var("TACHO_TP").unwrap_or_else(|_| {
-            "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-        });
+        let tp_path = tacho_core::find_trace_processor()
+            .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP");
 
         let mut rec = Recorder::new();
         let mut events = Vec::new();
@@ -455,9 +454,8 @@ proptest! {
     fn prop_random_track_keys_oracle(
         samples in prop::collection::vec((arb_track_key(), -500i64..500i64), 1..25),
     ) {
-        let tp_path = env::var("TACHO_TP").unwrap_or_else(|_| {
-            "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-        });
+        let tp_path = tacho_core::find_trace_processor()
+            .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP");
 
         let mut rec = Recorder::new();
         let mut events = Vec::new();

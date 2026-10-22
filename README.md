@@ -16,7 +16,7 @@ One lightweight daemon records what every coding agent does into a single SQLite
 
 - **Single Source of Truth:** Everything is stored in `$TACHO_HOME/events.sqlite` with WAL mode. Snapshots are streamed directly from SQLite rows through a zero-allocation O(1) memory encoder.
 - **Resilient Fallback & Graceful Degradation:** If the daemon process crashes, `tacho trace` opens the SQLite WAL file directly in read-only mode. If SQLite encounters a read-only or full disk, in-memory `LiveState` continues updating so agent hooks never block. Dead/zombie worker processes (`ESRCH` / `'Z'`) are automatically reaped, closing open slices with `abandoned = true`.
-- **High-Throughput Ingestion:** Sustains **511,195 inputs/sec** on `api.sock` and over **51,800 inputs/sec** during concurrent 10-million-row snapshot exports.
+- **High-Throughput Ingestion:** Sustains a release-mode floor of **&ge; 50,000 inputs/sec** on `api.sock` (up to **511,195 inputs/sec** peak on an unloaded workstation, and over **51,800 inputs/sec** during concurrent 10-million-row snapshot exports).
 - **Fast Streaming Snapshots:** Exports 100,000 rows in **96.3 ms** (1.04M rows/s), 1,000,000 rows in **790.6 ms** (1.26M rows/s), and 10,000,000 rows (641 MB) in **7.87 s** (1.27M rows/s) with only a **+4.0 MB RSS delta** from 1M to 10M rows.
 - **Supervisor Control Loop & 7 Detectors:** Turns 97 MB of messy worker transcripts into ~180 tokens. Detects `LOOP`, `SPIN`, `BURN`, `FAILING`, `OFF_BRIEF`, CPU-aware `SILENT` (which checks `/proc` CPU counters so long compiles never false-positive), and `CLAIM` (flags runs exiting 0 after edits without passing tests).
 - **Claim Verification (`--diff-claims`):** `tacho report <agent> --diff-claims` cross-references recorded edits, tests, commits, and worktree clean status against agent claims.
@@ -42,7 +42,12 @@ tacho status
 # 4. Export trace snapshot and open in Perfetto UI
 tacho trace -o trace.perfetto-trace
 # Open trace.perfetto-trace in https://ui.perfetto.dev
+
+# Optional: Install pinned Perfetto trace_processor_shell for `tacho query` and oracle tests
+./scripts/oracle.sh
 ```
+
+> **Path Isolation:** By default, persistent state is stored in `$TACHO_HOME` (`${XDG_STATE_HOME:-~/.local/state}/tacho`) and sockets/locks in `$TACHO_RUNTIME` (`${XDG_RUNTIME_DIR:-/tmp}/tacho-$UID`). When `TACHO_HOME` is explicitly set and `TACHO_RUNTIME` is unset, runtime sockets automatically isolate inside `$TACHO_HOME/run` (falling back to `/tmp/tacho-<hash>` if the socket path would exceed 100 bytes).
 
 ---
 
@@ -211,6 +216,18 @@ tacho emit span end custom:pipeline
 ```
 
 Tasks bound with `tacho emit task` enforce `--paths` scope on `OFF_BRIEF`, enforce per-task token/cost budgets on `BURN`, and link restarted runs of the same task with a Perfetto flow arrow (`task_run_flow:<slug>`).
+
+### 5. Live Transcript Tailing (`tacho tail`)
+
+Tails on-disk Claude Code `.jsonl` transcripts via `inotify`, tracking per-file byte offsets in `$TACHO_HOME/tail-offsets.json`:
+
+```bash
+# Continuously watch and ingest transcripts under ~/.claude/projects
+tacho tail ~/.claude/projects
+
+# Ingest new lines once and exit
+tacho tail ~/.claude/projects --once --agent worker-1
+```
 
 ---
 

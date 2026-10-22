@@ -2,7 +2,6 @@
 //!
 //! Verifies: Each snapshot captured under load loads clean in trace_processor_shell with 0 errors.
 
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
@@ -15,9 +14,10 @@ use tacho_daemon::{Config, Daemon, DaemonPaths};
 
 #[test]
 fn test_snapshots_under_load() {
-    let tp_path = env::var("TACHO_TP").unwrap_or_else(|_| {
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-    });
+    let tp_path = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP")
+        .to_string_lossy()
+        .into_owned();
 
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -104,6 +104,7 @@ fn test_snapshots_under_load() {
                 model: Some("claude-3-5".to_string()),
                 parent_session: None,
                 git_tree: None,
+                role: None,
             },
             1_000_000_000,
         )

@@ -21,6 +21,9 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
     if let Some(otlp) = args.otlp {
         config.otlp_addr = Some(otlp);
     }
+    if let Some(on_stall) = args.on_stall {
+        config.detectors.on_stall = Some(on_stall);
+    }
 
     let mut daemon = Daemon::start(paths.clone(), config).map_err(|e| e.to_string())?;
 

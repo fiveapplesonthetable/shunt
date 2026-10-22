@@ -9,7 +9,7 @@ INCLUDE PERFETTO MODULE intervals.intersect;
 CREATE PERFETTO TABLE build_slices AS
 SELECT s.id, s.ts, s.dur
 FROM slice s
-WHERE s.name IN ('Build', 'Test') AND s.dur > 0;
+WHERE (s.name IN ('Build', 'Test') OR s.name LIKE 'Build:%' OR s.name LIKE 'Test:%') AND s.dur > 0;
 
 CREATE PERFETTO TABLE build_endpoints AS
 SELECT ts, 1 AS delta FROM build_slices

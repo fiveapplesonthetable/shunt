@@ -31,6 +31,7 @@ fn test_simulation_silent_and_cpu_awareness() {
             parent_session: None,
             git_tree: None,
             source_ts_ns: Some(ts),
+            role: None,
         },
         ts,
         &mut out,
@@ -182,6 +183,7 @@ fn test_simulation_no_double_firing_on_same_evidence() {
             parent_session: None,
             git_tree: None,
             source_ts_ns: Some(ts),
+            role: None,
         },
         ts,
         &mut out,
@@ -193,7 +195,12 @@ fn test_simulation_no_double_firing_on_same_evidence() {
 
     let count_silent_1 = out
         .iter()
-        .filter(|e| e.kind == Kind::Stall && e.custom_name.as_deref() == Some("StallDetected"))
+        .filter(|e| {
+            e.kind == Kind::Stall
+                && e.custom_name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("Stall"))
+        })
         .count();
     assert_eq!(
         count_silent_1, 1,
@@ -207,7 +214,12 @@ fn test_simulation_no_double_firing_on_same_evidence() {
     }
     let count_silent_2 = out
         .iter()
-        .filter(|e| e.kind == Kind::Stall && e.custom_name.as_deref() == Some("StallDetected"))
+        .filter(|e| {
+            e.kind == Kind::Stall
+                && e.custom_name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("Stall"))
+        })
         .count();
     assert_eq!(
         count_silent_2, 1,
@@ -431,6 +443,7 @@ fn test_simulation_claim_detector() {
             parent_session: None,
             git_tree: None,
             source_ts_ns: Some(ts),
+            role: None,
         },
         ts,
         &mut out,
@@ -551,6 +564,7 @@ fn test_simulation_claim_detector() {
             parent_session: None,
             git_tree: None,
             source_ts_ns: Some(ts_good),
+            role: None,
         },
         ts_good,
         &mut out_good,

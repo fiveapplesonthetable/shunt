@@ -11,6 +11,7 @@ pub mod query;
 pub mod run;
 pub mod status;
 pub mod system;
+pub mod tail;
 pub mod trace;
 
 use clap::Parser;
@@ -88,6 +89,12 @@ fn main() {
         }
         Commands::System(args) => {
             if let Err(e) = system::execute_system(args.command) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Tail(args) => {
+            if let Err(e) = tail::execute_tail(args) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

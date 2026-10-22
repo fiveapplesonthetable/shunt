@@ -107,6 +107,7 @@ fn test_crash_worker() {
             model: Some("gemini-1.5-pro".to_string()),
             parent_session: None,
             git_tree: None,
+            role: None,
         },
         1_000_000_000,
     );
@@ -178,9 +179,10 @@ fn test_crash_worker() {
 
 #[test]
 fn test_random_write_point_sigkill_crash() {
-    let tp = env::var("TACHO_TP").unwrap_or_else(|_| {
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-    });
+    let tp = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP")
+        .to_string_lossy()
+        .into_owned();
     assert!(
         Path::new(&tp).exists(),
         "trace_processor_shell not found at {}",
@@ -331,6 +333,7 @@ fn test_readonly_db_degradation() {
                     model: Some("gemini-1.5-flash".to_string()),
                     parent_session: None,
                     git_tree: None,
+                    role: None,
                 },
                 1_000_000_000,
             )

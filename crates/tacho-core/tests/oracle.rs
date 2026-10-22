@@ -1,7 +1,6 @@
 //! Oracle integration test running trace_processor_shell against synthetic traces.
 
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::process::Command;
 use tacho_core::{encode_snapshot_header, Encoder, Event, Kind, TrackKind, TrackRegistry};
@@ -11,9 +10,8 @@ use tacho_proto::tacho;
 /// runs trace_processor_shell, and verifies stats, tracks, args, and packet sizes.
 #[test]
 fn every_kind_renders() {
-    let tp_path = env::var("TACHO_TP").unwrap_or_else(|_| {
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-    });
+    let tp_path = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP");
 
     let mut registry = TrackRegistry::new();
     registry.register("tacho", None, "tacho", Some("Root"), TrackKind::Group, None);

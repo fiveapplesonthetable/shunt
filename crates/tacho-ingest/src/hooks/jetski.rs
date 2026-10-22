@@ -94,6 +94,7 @@ pub fn map_with_diagnostics(
                 model,
                 parent_session: None,
                 git_tree,
+                role: None,
             }]
         }
         "PreInvocation" => {

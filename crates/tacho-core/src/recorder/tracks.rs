@@ -81,7 +81,14 @@ pub(crate) fn to_proto_edit_kind(k: FileEditKind) -> tacho::FileEditKind {
     }
 }
 
-pub(crate) type TrackHierarchyEntry = (String, Option<String>, String, TrackKind, Option<String>);
+pub(crate) type TrackHierarchyEntry = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    TrackKind,
+    Option<String>,
+);
 
 impl Recorder {
     /// Allocates the next monotonic sequence number.
@@ -119,13 +126,13 @@ impl Recorder {
 
         // Deconstruct hierarchy to ensure all parent tracks exist first
         let parts = self.hierarchy_chain(track_key, default_kind, default_unit);
-        for (key, parent_key, name, kind, unit) in parts {
+        for (key, parent_key, name, desc, kind, unit) in parts {
             if self.registered_tracks.insert(key.clone()) {
                 let entry = self.registry.register(
                     &key,
                     parent_key.as_deref(),
                     &name,
-                    None,
+                    desc.as_deref(),
                     kind,
                     unit.as_deref(),
                 );
@@ -143,7 +150,7 @@ impl Recorder {
                     track_key: "daemon".to_string(),
                     cause_seq: None,
                     agent: None,
-                    custom_name: None,
+                    custom_name: Some(format!("TrackCreated: {}", key)),
                     flow_ids: Vec::new(),
                     terminating_flow_ids: Vec::new(),
                     counter_value: None,
@@ -169,18 +176,38 @@ impl Recorder {
         default_unit: Option<&str>,
     ) -> Vec<TrackHierarchyEntry> {
         let mut chain = Vec::new();
-        let mut add = |k: &str, p: Option<&str>, n: &str, kd: TrackKind, u: Option<&str>| {
+        let mut add = |k: &str,
+                       p: Option<&str>,
+                       n: &str,
+                       desc: Option<&str>,
+                       kd: TrackKind,
+                       u: Option<&str>| {
             chain.push((
                 k.to_string(),
                 p.map(ToString::to_string),
                 n.to_string(),
+                desc.map(ToString::to_string),
                 kd,
                 u.map(ToString::to_string),
             ));
         };
 
-        add("tacho", None, "tacho", TrackKind::Group, None);
-        add("daemon", Some("tacho"), "daemon", TrackKind::Slices, None);
+        add(
+            "tacho",
+            None,
+            "tacho",
+            Some("Tachograph fleet flight recorder root track and cross-agent message bus"),
+            TrackKind::Group,
+            None,
+        );
+        add(
+            "daemon",
+            Some("tacho"),
+            "daemon",
+            Some("Recorder daemon lifecycle, snapshots, clock steps, and track creation events"),
+            TrackKind::Slices,
+            None,
+        );
 
         if track_key == "tacho" || track_key == "daemon" {
             return chain;
@@ -191,6 +218,7 @@ impl Recorder {
                 "daemon/counters",
                 Some("daemon"),
                 "counters",
+                Some("Daemon internal counters"),
                 TrackKind::Counter,
                 Some("count"),
             );
@@ -201,14 +229,60 @@ impl Recorder {
             || track_key.starts_with("host:")
             || track_key.starts_with("host/")
         {
-            add("machine", Some("tacho"), "machine", TrackKind::Group, None);
+            add(
+                "machine",
+                Some("tacho"),
+                "machine",
+                Some("Host machine CPU, memory, load average, and build/test concurrency counters"),
+                TrackKind::Group,
+                None,
+            );
             if track_key != "machine" {
                 let name = track_key
                     .strip_prefix("machine/")
                     .or_else(|| track_key.strip_prefix("host:"))
                     .or_else(|| track_key.strip_prefix("host/"))
                     .unwrap_or(track_key);
-                add(track_key, Some("machine"), name, TrackKind::Counter, None);
+                let (desc, unit) = match name {
+                    "cpu_busy" => (
+                        Some("Host-wide CPU busy percentage across all cores"),
+                        Some("percent"),
+                    ),
+                    "load1" => (
+                        Some("Host 1-minute load average x 1000 (millicpus)"),
+                        Some("load x 1000"),
+                    ),
+                    "mem_used" => (
+                        Some("Host physical memory in use (MemTotal - MemAvailable)"),
+                        Some("bytes"),
+                    ),
+                    "mem_avail" => (
+                        Some("Host available memory for new workloads without swapping"),
+                        Some("bytes"),
+                    ),
+                    "mem_cached" => (
+                        Some("Host page cache + slab reclaimable memory"),
+                        Some("bytes"),
+                    ),
+                    "swap_used" => (Some("Host swap space currently in use"), Some("bytes")),
+                    "active_builds" => (
+                        Some("Number of concurrent agent Build commands executing"),
+                        Some("builds"),
+                    ),
+                    "active_tests" => (
+                        Some("Number of concurrent agent Test commands executing"),
+                        Some("tests"),
+                    ),
+                    _ => (None, default_unit),
+                };
+                add(
+                    track_key,
+                    Some("machine"),
+                    name,
+                    desc,
+                    TrackKind::Counter,
+                    unit,
+                );
             }
             return chain;
         }
@@ -218,6 +292,7 @@ impl Recorder {
                 "providers",
                 Some("tacho"),
                 "providers",
+                Some("Model providers (API errors, rate limits, cumulative token usage)"),
                 TrackKind::Group,
                 None,
             );
@@ -228,6 +303,7 @@ impl Recorder {
                 prov_track,
                 Some("providers"),
                 prov_track,
+                Some("Provider rate-limit and error events"),
                 TrackKind::Slices,
                 None,
             );
@@ -236,15 +312,23 @@ impl Recorder {
                     track_key,
                     Some(prov_track),
                     parts[1],
+                    Some("Cumulative provider counter"),
                     TrackKind::Counter,
-                    None,
+                    default_unit,
                 );
             }
             return chain;
         }
 
         if track_key.starts_with("tasks") || track_key.starts_with("task:") {
-            add("tasks", Some("tacho"), "tasks", TrackKind::Group, None);
+            add(
+                "tasks",
+                Some("tacho"),
+                "tasks",
+                Some("Tracked engineering tasks, state transitions, and code review findings"),
+                TrackKind::Group,
+                None,
+            );
             let sub = track_key.strip_prefix("tasks/").unwrap_or(track_key);
             let parts: Vec<&str> = sub.split('/').collect();
             let task_track = parts[0];
@@ -252,27 +336,42 @@ impl Recorder {
                 task_track,
                 Some("tasks"),
                 task_track,
+                Some("Task queue and assignment lifecycle"),
                 TrackKind::Group,
                 None,
             );
             if parts.len() > 1 {
-                let kind = if parts[1] == "state" {
-                    TrackKind::State
-                } else {
-                    TrackKind::Slices
+                let (kind, desc) = match parts[1] {
+                    "state" => (
+                        TrackKind::State,
+                        Some("Task status (Queued -> InProgress -> Review -> Done/Failed)"),
+                    ),
+                    "review" => (
+                        TrackKind::Slices,
+                        Some("Automated and peer code review slices and findings"),
+                    ),
+                    _ => (TrackKind::Slices, None),
                 };
-                add(track_key, Some(task_track), parts[1], kind, None);
+                add(track_key, Some(task_track), parts[1], desc, kind, None);
             }
             return chain;
         }
 
         if track_key.starts_with("custom") || track_key.starts_with("custom:") {
-            add("custom", Some("tacho"), "custom", TrackKind::Group, None);
+            add(
+                "custom",
+                Some("tacho"),
+                "custom",
+                Some("User-defined custom tracks"),
+                TrackKind::Group,
+                None,
+            );
             if track_key != "custom" {
                 add(
                     track_key,
                     Some("custom"),
                     track_key,
+                    None,
                     default_kind,
                     default_unit,
                 );
@@ -281,47 +380,134 @@ impl Recorder {
         }
 
         if track_key.starts_with("agents") || track_key.starts_with("agent:") {
-            add("agents", Some("tacho"), "agents", TrackKind::Group, None);
+            add(
+                "agents",
+                Some("tacho"),
+                "agents",
+                Some("All monitored coding agents in the fleet"),
+                TrackKind::Group,
+                None,
+            );
             let segs: Vec<&str> = track_key.split('/').collect();
             let agent_key = segs[0];
-            add(agent_key, Some("agents"), agent_key, TrackKind::Group, None);
+            add(
+                agent_key,
+                Some("agents"),
+                agent_key,
+                Some("Agent root track (stall detections and lifecycle alerts)"),
+                TrackKind::Group,
+                None,
+            );
 
             if segs.len() > 1 {
                 if segs[1] == "state" {
                     let st = format!("{}/state", agent_key);
-                    add(&st, Some(agent_key), "state", TrackKind::State, None);
+                    add(
+                        &st,
+                        Some(agent_key),
+                        "state",
+                        Some("Agent state (Idle, Thinking, Tool, Waiting, Stalled, Exited)"),
+                        TrackKind::State,
+                        None,
+                    );
                 } else if segs[1] == "cpu" || segs[1] == "rss" {
-                    let unit = if segs[1] == "cpu" { "us" } else { "bytes" };
+                    let (unit, desc) = if segs[1] == "cpu" {
+                        ("us", "Cumulative CPU time consumed by agent process tree")
+                    } else {
+                        ("bytes", "Resident set size (RSS) of agent process tree")
+                    };
                     add(
                         track_key,
                         Some(agent_key),
                         segs[1],
+                        Some(desc),
                         TrackKind::Counter,
                         Some(unit),
                     );
                 } else if segs[1].starts_with("run:") {
                     let run_key = format!("{}/{}", agent_key, segs[1]);
-                    add(&run_key, Some(agent_key), segs[1], TrackKind::Slices, None);
+                    add(
+                        &run_key,
+                        Some(agent_key),
+                        segs[1],
+                        Some("Agent session run span"),
+                        TrackKind::Slices,
+                        None,
+                    );
 
                     if segs.len() > 2 {
                         let sub_name = segs[2];
-                        let (kind, unit) = match sub_name {
-                            "turns" | "waits" => (TrackKind::Slices, None),
-                            "tokens_in" | "tokens_out" | "tokens_cached" => {
-                                (TrackKind::Counter, Some("tokens"))
-                            }
-                            "cost" => (TrackKind::Counter, Some("micro-USD")),
-                            "cpu" => (TrackKind::Counter, Some("us")),
-                            "rss" => (TrackKind::Counter, Some("bytes")),
-                            _ => (TrackKind::Slices, None),
+                        let (kind, unit, desc) = match sub_name {
+                            "turns" => (
+                                TrackKind::Slices,
+                                None,
+                                Some("Model turns, prompts, sequential tools, and worktree commits"),
+                            ),
+                            "procs" => (
+                                TrackKind::Slices,
+                                None,
+                                Some("Live child processes (forks/execs/exits) in the agent's process tree"),
+                            ),
+                            "waits" => (
+                                TrackKind::Slices,
+                                None,
+                                Some("Blocking waits on subagents, checks, merge queues, or humans"),
+                            ),
+                            "overflow" => (
+                                TrackKind::Slices,
+                                None,
+                                Some("Overflow tool execution lane (>8 concurrent tools)"),
+                            ),
+                            "tokens_in" => (
+                                TrackKind::Counter,
+                                Some("tokens"),
+                                Some("Cumulative input tokens consumed in this run"),
+                            ),
+                            "tokens_out" => (
+                                TrackKind::Counter,
+                                Some("tokens"),
+                                Some("Cumulative output tokens generated in this run"),
+                            ),
+                            "tokens_cached" => (
+                                TrackKind::Counter,
+                                Some("tokens"),
+                                Some("Cumulative prompt cache hit tokens in this run"),
+                            ),
+                            "cost" => (
+                                TrackKind::Counter,
+                                Some("micro-USD"),
+                                Some("Cumulative API cost in micro-USD ($1e-6)"),
+                            ),
+                            "cpu" => (
+                                TrackKind::Counter,
+                                Some("us"),
+                                Some("Cumulative CPU time (user+sys) of the agent process tree"),
+                            ),
+                            "rss" => (
+                                TrackKind::Counter,
+                                Some("bytes"),
+                                Some("Total Resident Set Size (RSS) across the agent process tree"),
+                            ),
+                            "proc_count" => (
+                                TrackKind::Counter,
+                                Some("procs"),
+                                Some("Number of live processes in the agent process tree"),
+                            ),
+                            s if s.starts_with("lane:") => (
+                                TrackKind::Slices,
+                                None,
+                                Some("Parallel tool/command execution lane"),
+                            ),
+                            _ => (default_kind, default_unit, None),
                         };
-                        add(track_key, Some(&run_key), sub_name, kind, unit);
+                        add(track_key, Some(&run_key), sub_name, desc, kind, unit);
                     }
                 } else {
                     add(
                         track_key,
                         Some(agent_key),
                         segs[1],
+                        None,
                         default_kind,
                         default_unit,
                     );
@@ -331,11 +517,19 @@ impl Recorder {
         }
 
         // Fallback for ANY unknown track key: group under `custom`
-        add("custom", Some("tacho"), "custom", TrackKind::Group, None);
+        add(
+            "custom",
+            Some("tacho"),
+            "custom",
+            Some("User-defined custom tracks"),
+            TrackKind::Group,
+            None,
+        );
         add(
             track_key,
             Some("custom"),
             track_key,
+            None,
             default_kind,
             default_unit,
         );

@@ -1,12 +1,13 @@
 //! Session routing and agent run lifecycle management.
 
 use crate::event::Event;
-use crate::input::{SessionKey, WaitOn};
+use crate::input::{AgentRole, SessionKey, WaitOn};
 use crate::kind::Kind;
 use crate::live::AgentLiveState;
 use crate::scrub::{relativize_cwd, truncate_utf8};
 use tacho_proto::tacho;
 
+use super::flow_ord;
 use super::slices::make_abandoned_body;
 use super::{Recorder, RunState};
 
@@ -43,6 +44,7 @@ impl Recorder {
             None,
             None,
             None,
+            None,
             now_ns,
             out,
         );
@@ -64,6 +66,7 @@ impl Recorder {
         model: Option<String>,
         parent_session: Option<String>,
         git_tree: Option<String>,
+        role: Option<AgentRole>,
         ts: u64,
         out: &mut Vec<Event>,
     ) {
@@ -71,6 +74,8 @@ impl Recorder {
         if self.runs.contains_key(&key) {
             return;
         }
+
+        let effective_role = role.unwrap_or_else(|| AgentRole::infer(agent_id, task.as_deref()));
 
         let mut run_state = RunState::new(
             agent_id.to_string(),
@@ -89,25 +94,27 @@ impl Recorder {
 
         let mut terminating_flows = Vec::new();
         let mut flow_ids = Vec::new();
+        let mut parent_run_seq = None;
+        let mut cause_seq = None;
+
         if let Some(ref parent) = parent_session {
-            if let Some(flow_id) = self.subagent_flows.remove(parent) {
-                terminating_flows.push(flow_id);
+            if let Some(p_seq) = self.subagent_flows.remove(parent) {
+                parent_run_seq = Some(p_seq);
+                terminating_flows.push(flow_ord::make(p_seq, flow_ord::SUBAGENT));
             }
         }
         if let Some(ref slug) = task {
+            flow_ids.push(flow_ord::make(slice_id, flow_ord::TASK_RUN));
             if let Some(tmeta) = self.task_meta.get_mut(slug) {
                 let det = self.detectors.entry(agent_id.to_string()).or_default();
                 det.set_declared_paths(tmeta.paths.clone());
                 det.task_token_budget = tmeta.token_budget;
                 det.task_cost_budget_micros = tmeta.cost_budget_micros;
-                let flow_id =
-                    xxhash_rust::xxh3::xxh3_64(format!("task_run_flow:{}", slug).as_bytes())
-                        & 0x7FFF_FFFF_FFFF_FFFF;
-                if tmeta.last_run_seq.is_some() {
-                    terminating_flows.push(flow_id);
+                if let Some(prev_seq) = tmeta.last_run_seq {
+                    cause_seq = Some(prev_seq);
+                    terminating_flows.push(flow_ord::make(prev_seq, flow_ord::TASK_RUN));
                 }
                 tmeta.last_run_seq = Some(slice_id);
-                flow_ids.push(flow_id);
             }
         }
 
@@ -117,7 +124,7 @@ impl Recorder {
             .map(|t| truncate_utf8(&self.scrubber.scrub(t), 128));
         let scrubbed_cwd = cwd
             .as_deref()
-            .map(|c| truncate_utf8(&relativize_cwd(c, None), 512));
+            .map(|c| truncate_utf8(&self.scrubber.scrub(&relativize_cwd(c, None)), 512));
         let scrubbed_model = model
             .as_deref()
             .map(|m| truncate_utf8(&self.scrubber.scrub(m), 128));
@@ -127,7 +134,7 @@ impl Recorder {
             ts_ns: run_ts,
             kind: Kind::Run,
             track_key: run_track,
-            cause_seq: None,
+            cause_seq,
             agent: Some(agent_id.to_string()),
             custom_name: None,
             flow_ids,
@@ -140,7 +147,7 @@ impl Recorder {
                     task: scrubbed_task.clone(),
                     cwd: scrubbed_cwd.clone(),
                     model: scrubbed_model.clone(),
-                    parent_run_seq: None,
+                    parent_run_seq,
                     resume: Some(false),
                     pid,
                     git_tree: git_tree.as_deref().map(|g| truncate_utf8(g, 64)),
@@ -155,13 +162,17 @@ impl Recorder {
             .entry(agent_id.to_string())
             .or_insert_with(|| AgentLiveState::new(agent_id, provider, session_id));
         live_agent.run_n = run_n;
+        live_agent.run_start_ts_ns = run_ts;
         live_agent.model = scrubbed_model;
         live_agent.cwd = scrubbed_cwd;
         live_agent.task = scrubbed_task;
 
         self.runs.insert(key, run_state);
-        let det = self.detectors.entry(agent_id.to_string()).or_default();
-        det.touch_event(ts);
+        {
+            let det = self.detectors.entry(agent_id.to_string()).or_default();
+            det.role = effective_role;
+        }
+        self.touch_agent_event(agent_id, ts);
 
         // Derive initial Idle state
         self.transition_state(
@@ -187,6 +198,7 @@ impl Recorder {
         model: Option<String>,
         parent_session: Option<String>,
         git_tree: Option<String>,
+        role: Option<AgentRole>,
         ts: u64,
         out: &mut Vec<Event>,
     ) {
@@ -212,6 +224,7 @@ impl Recorder {
             model,
             parent_session,
             git_tree,
+            role,
             ts,
             out,
         );
@@ -280,6 +293,34 @@ impl Recorder {
                     body: Some(ab_body),
                 },
             });
+        }
+
+        // Also close any open custom slices (such as `/procs` child process slices) under this run
+        let procs_track = format!("agent:{}/run:{}/procs", agent_id, run_n);
+        if let Some(mut stack) = self.open_custom_slices.remove(&procs_track) {
+            while let Some(custom_id) = stack.pop() {
+                let ab_ts = self.clamp_ts(&procs_track, ts);
+                let ab_seq = self.alloc_seq();
+                out.push(Event {
+                    seq: ab_seq,
+                    ts_ns: ab_ts,
+                    kind: Kind::CustomEnded,
+                    track_key: procs_track.clone(),
+                    cause_seq: None,
+                    agent: Some(agent_id.clone()),
+                    custom_name: None,
+                    flow_ids: Vec::new(),
+                    terminating_flow_ids: Vec::new(),
+                    counter_value: None,
+                    body: tacho::Event {
+                        body: Some(tacho::event::Body::CustomEnded(tacho::CustomEnded {
+                            id: custom_id.as_deref().map(|i| truncate_utf8(i, 128)),
+                            args: Vec::new(),
+                            abandoned: Some(true),
+                        })),
+                    },
+                });
+            }
         }
 
         let track = format!("agent:{}/run:{}", agent_id, run_n);

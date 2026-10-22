@@ -20,9 +20,20 @@ pub fn tacho_bin_path() -> PathBuf {
         }
     }
 
-    let default_target = PathBuf::from("/tmp/tacho-target-ring/debug/tacho");
-    if default_target.is_file() {
-        return default_target;
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+            let candidate = target_dir.join("tacho");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        let candidate = PathBuf::from(dir).join("debug/tacho");
+        if candidate.is_file() {
+            return candidate;
+        }
     }
 
     // Workspace target fallback
@@ -36,39 +47,31 @@ pub fn tacho_bin_path() -> PathBuf {
         return ws_target;
     }
 
-    panic!(
-        "tacho binary not found. Build it with `cargo build -p tachograph --bin tacho` \
-         or set TACHO_BIN."
+    let status = Command::new("cargo")
+        .args(["build", "-p", "tachograph", "--bin", "tacho"])
+        .current_dir(ws_root)
+        .status()
+        .expect("failed to build tacho binary");
+    assert!(
+        status.success(),
+        "cargo build -p tachograph --bin tacho failed"
     );
-}
 
-/// Locates the `trace_processor_shell` binary.
-pub fn trace_processor_path() -> PathBuf {
-    if let Ok(p) = std::env::var("TACHO_TRACE_PROCESSOR") {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return pb;
-        }
-    }
-
-    let pinned = PathBuf::from(
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell",
-    );
-    if pinned.is_file() {
-        return pinned;
-    }
-
-    // Search PATH
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("trace_processor_shell");
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+            let candidate = target_dir.join("tacho");
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
+    ws_target
+}
 
-    panic!("trace_processor_shell binary not found.");
+/// Locates the `trace_processor_shell` binary.
+pub fn trace_processor_path() -> PathBuf {
+    tacho_core::find_trace_processor()
+        .expect("trace_processor_shell binary not found; run scripts/oracle.sh or set TACHO_TP")
 }
 
 /// Locates the `perfetto` binary.

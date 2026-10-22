@@ -14,7 +14,6 @@
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -103,9 +102,10 @@ fn send_input_resilient(sock_path: &Path, input: &Input) -> bool {
 
 #[test]
 fn test_chaos_and_torture() {
-    let tp_path = env::var("TACHO_TP").unwrap_or_else(|_| {
-        "/usr/local/google/home/zezeozue/dev/perfetto/out/release/trace_processor_shell".to_string()
-    });
+    let tp_path = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell not found; run scripts/oracle.sh or set TACHO_TP")
+        .to_string_lossy()
+        .into_owned();
 
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -164,6 +164,7 @@ fn test_chaos_and_torture() {
                                 model: Some("model-v1".to_string()),
                                 parent_session: None,
                                 git_tree: None,
+                                role: None,
                             },
                         );
 
@@ -540,6 +541,7 @@ fn test_chaos_and_torture() {
                                 model: None,
                                 parent_session: None,
                                 git_tree: None,
+                                role: None,
                             },
                         );
 
@@ -670,6 +672,7 @@ fn test_chaos_and_torture() {
                                 model: None,
                                 parent_session: None,
                                 git_tree: None,
+                                role: None,
                             },
                         );
 

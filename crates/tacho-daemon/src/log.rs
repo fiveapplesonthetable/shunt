@@ -5,7 +5,7 @@
 use prost::Message;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
-use tacho_core::{Event, Kind};
+use tacho_core::{Event, Kind, Recorder};
 use tacho_proto::tacho;
 
 /// Persistent event log backed by SQLite in WAL mode.
@@ -30,7 +30,7 @@ impl EventLog {
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "cache_size", -64000)?;
 
-        // Ensure table exists with core 7 columns
+        // Ensure table exists with core columns (flows are derived deterministically from cause_seq * 256 + ordinal)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS events (
                 seq INTEGER PRIMARY KEY,
@@ -54,12 +54,6 @@ impl EventLog {
             [],
         );
 
-        // Optional columns for exact round-trip preservation of flow and counter fields
-        let _ = conn.execute("ALTER TABLE events ADD COLUMN flow_ids TEXT;", []);
-        let _ = conn.execute(
-            "ALTER TABLE events ADD COLUMN terminating_flow_ids TEXT;",
-            [],
-        );
         let _ = conn.execute("ALTER TABLE events ADD COLUMN counter_value INTEGER;", []);
         let _ = conn.execute("ALTER TABLE events ADD COLUMN custom_name TEXT;", []);
 
@@ -81,8 +75,6 @@ impl EventLog {
                 cause_seq INTEGER,
                 agent TEXT,
                 body BLOB NOT NULL,
-                flow_ids TEXT,
-                terminating_flow_ids TEXT,
                 counter_value INTEGER,
                 custom_name TEXT
             );",
@@ -124,8 +116,8 @@ impl EventLog {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, flow_ids, terminating_flow_ids, counter_value, custom_name)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
             )?;
 
             let mut body_buf = Vec::with_capacity(512);
@@ -133,16 +125,6 @@ impl EventLog {
             for ev in iter {
                 body_buf.clear();
                 let _ = ev.body.encode(&mut body_buf);
-                let flow_str = if ev.flow_ids.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&ev.flow_ids).unwrap_or_default())
-                };
-                let term_str = if ev.terminating_flow_ids.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&ev.terminating_flow_ids).unwrap_or_default())
-                };
 
                 stmt.execute(params![
                     ev.seq,
@@ -152,8 +134,6 @@ impl EventLog {
                     ev.cause_seq,
                     ev.agent,
                     &body_buf,
-                    flow_str,
-                    term_str,
                     ev.counter_value,
                     ev.custom_name,
                 ])?;
@@ -198,7 +178,7 @@ impl EventLog {
         until_ns: Option<u64>,
     ) -> rusqlite::Result<Vec<Event>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT seq, ts_ns, kind, track_key, cause_seq, agent, body, flow_ids, terminating_flow_ids, counter_value, custom_name
+            "SELECT seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name
              FROM events
              WHERE (?1 IS NULL OR ts_ns >= ?1) AND (?2 IS NULL OR ts_ns <= ?2)
              ORDER BY seq ASC",
@@ -213,10 +193,8 @@ impl EventLog {
             let agent: Option<String> = row.get(5)?;
             let body_bytes: Vec<u8> = row.get(6)?;
 
-            let flow_str: Option<String> = row.get(7).optional()?.flatten();
-            let term_str: Option<String> = row.get(8).optional()?.flatten();
-            let counter_val: Option<i64> = row.get(9).optional()?.flatten();
-            let custom_name: Option<String> = row.get(10).optional()?.flatten();
+            let counter_val: Option<i64> = row.get(7).optional()?.flatten();
+            let custom_name: Option<String> = row.get(8).optional()?.flatten();
 
             let kind = Kind::ALL
                 .get(kind_int as usize)
@@ -227,12 +205,6 @@ impl EventLog {
 
             let mut ev = Event::new(seq, ts_ns, kind, track_key, cause_seq, agent, body);
 
-            if let Some(flows) = flow_str.and_then(|s| serde_json::from_str::<Vec<u64>>(&s).ok()) {
-                ev = ev.with_flows(flows);
-            }
-            if let Some(terms) = term_str.and_then(|s| serde_json::from_str::<Vec<u64>>(&s).ok()) {
-                ev = ev.with_terminating_flows(terms);
-            }
             if let Some(c) = counter_val {
                 ev = ev.with_counter(c);
             }
@@ -247,6 +219,7 @@ impl EventLog {
         for r in rows {
             events.push(r?);
         }
+        Recorder::populate_flows(&mut events);
         Ok(events)
     }
 }
@@ -266,44 +239,43 @@ mod tests {
         let ev1 = Event::new(
             1,
             1000,
-            Kind::Run,
-            "agent:1/run:1",
+            Kind::TaskQueued,
+            "task:feat-1",
             None,
             Some("agent:1".to_string()),
             tacho::Event {
-                body: Some(tacho::event::Body::Run(tacho::Run {
-                    provider: Some("claude".to_string()),
+                body: Some(tacho::event::Body::TaskQueued(tacho::TaskQueued {
+                    slug: Some("feat-1".to_string()),
                     ..Default::default()
                 })),
             },
-        )
-        .with_flow(42);
+        );
 
         let ev2 = Event::new(
             2,
             2000,
-            Kind::RunEnded,
-            "agent:1/run:1",
+            Kind::TaskState,
+            "task:feat-1/state",
             Some(1),
-            Some("agent:1".to_string()),
+            None,
             tacho::Event {
-                body: Some(tacho::event::Body::RunEnded(tacho::RunEnded {
-                    reason: Some("success".to_string()),
+                body: Some(tacho::event::Body::TaskState(tacho::TaskState {
+                    state: Some(tacho::TaskStatus::TaskDone as i32),
                     ..Default::default()
                 })),
             },
-        )
-        .with_terminating_flow(42);
+        );
 
-        log.insert_batch(&[ev1.clone(), ev2.clone()]).unwrap();
+        log.insert_batch(&[ev1, ev2]).unwrap();
         assert_eq!(log.max_seq().unwrap(), 2);
 
         let loaded = log.load_all().unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].seq, 1);
-        assert_eq!(loaded[0].flow_ids, vec![42]);
+        // Flow IDs are derived deterministically as cause_seq * 256 + ordinal (TASK_STATE = 5 -> 261)
+        assert_eq!(loaded[0].flow_ids, vec![256 + 5]);
         assert_eq!(loaded[1].seq, 2);
-        assert_eq!(loaded[1].terminating_flow_ids, vec![42]);
+        assert_eq!(loaded[1].terminating_flow_ids, vec![256 + 5]);
 
         let range = log.query_range(Some(1500), None).unwrap();
         assert_eq!(range.len(), 1);

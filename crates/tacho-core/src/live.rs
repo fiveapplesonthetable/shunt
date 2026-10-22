@@ -24,6 +24,12 @@ pub struct TimelineItem {
     pub detail: Option<String>,
 }
 
+/// Maximum number of recent commands retained per agent in live state.
+pub const MAX_RECENT_COMMANDS: usize = 64;
+
+/// Maximum number of timeline items retained per agent in live state.
+pub const MAX_TIMELINE_ITEMS: usize = 256;
+
 /// Real-time flight recorder status for a single agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentLiveState {
@@ -35,6 +41,8 @@ pub struct AgentLiveState {
     pub task: Option<String>,
     pub state: String,
     pub state_since_ns: u64,
+    #[serde(default)]
+    pub run_start_ts_ns: u64,
     pub run_n: u32,
     pub turn_n: u32,
     pub last_action: String,
@@ -71,6 +79,7 @@ impl AgentLiveState {
             task: None,
             state: String::new(),
             state_since_ns: 0,
+            run_start_ts_ns: 0,
             run_n: 1,
             turn_n: 0,
             last_action: "-".to_string(),
@@ -86,6 +95,22 @@ impl AgentLiveState {
             commits_succeeded: 0,
             pushes_succeeded: 0,
         }
+    }
+
+    /// Appends a recent command, evicting the oldest if at capacity.
+    pub fn push_recent_command(&mut self, cmd: RecentCommand) {
+        if self.recent_commands.len() >= MAX_RECENT_COMMANDS {
+            self.recent_commands.remove(0);
+        }
+        self.recent_commands.push(cmd);
+    }
+
+    /// Appends a timeline item, evicting the oldest if at capacity.
+    pub fn push_timeline(&mut self, item: TimelineItem) {
+        if self.timeline.len() >= MAX_TIMELINE_ITEMS {
+            self.timeline.remove(0);
+        }
+        self.timeline.push(item);
     }
 }
 
@@ -212,7 +237,18 @@ pub fn render_report(
         None => return format!("Agent '{}' not found in live state.\n", agent_id),
     };
 
-    let start_ts = since_ns.unwrap_or(0);
+    let filter_since = since_ns.unwrap_or(0);
+    let base_ts = since_ns.unwrap_or_else(|| {
+        if agent.run_start_ts_ns > 0 {
+            agent.run_start_ts_ns
+        } else {
+            agent
+                .timeline
+                .first()
+                .map(|i| i.ts_ns)
+                .unwrap_or(agent.state_since_ns)
+        }
+    });
     let mut out = String::new();
     out.push_str(&format!(
         "=== Agent Report: {} (Run {}, State: {}, Total Tokens Out: {}) ===\n",
@@ -235,14 +271,14 @@ pub fn render_report(
     let items: Vec<_> = agent
         .timeline
         .iter()
-        .filter(|item| item.ts_ns >= start_ts)
+        .filter(|item| item.ts_ns >= filter_since)
         .collect();
 
     if items.is_empty() {
         out.push_str("(no activity in requested time window)\n");
     } else {
         for item in items {
-            let offset_ns = item.ts_ns.saturating_sub(start_ts);
+            let offset_ns = item.ts_ns.saturating_sub(base_ts);
             let offset_str = format_duration(offset_ns);
             out.push_str(&format!(
                 "[+{:<4}] {:<12} {}",

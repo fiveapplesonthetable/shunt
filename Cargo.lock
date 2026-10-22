@@ -1174,6 +1174,7 @@ dependencies = [
 name = "tacho-system"
 version = "0.1.0"
 dependencies = [
+ "tacho-core",
  "tempfile",
 ]
 
@@ -1189,6 +1190,7 @@ dependencies = [
  "signal-hook",
  "tacho-core",
  "tacho-daemon",
+ "tacho-ingest",
  "tacho-system",
  "tempfile",
 ]

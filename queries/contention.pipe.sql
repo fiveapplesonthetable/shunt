@@ -9,7 +9,7 @@ PERFETTO PRAGMA pipelines = 1;
 CREATE PERFETTO TABLE build_slices AS
 SELECT s.ts, s.dur
 FROM slice s
-WHERE s.name IN ('Build', 'Test') AND s.dur > 0;
+WHERE (s.name IN ('Build', 'Test') OR s.name LIKE 'Build:%' OR s.name LIKE 'Test:%') AND s.dur > 0;
 
 CREATE PERFETTO TABLE flattened AS
 FROM build_slices

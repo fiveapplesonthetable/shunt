@@ -11,7 +11,7 @@ use tacho_proto::tacho;
 
 pub(crate) use super::tool::{make_abandoned_body, make_tool_end_body, OpenToolSlice};
 use super::tracks::{command_class_name, to_proto_edit_kind};
-use super::Recorder;
+use super::{flow_ord, Recorder};
 
 impl Recorder {
     pub(crate) fn update_active_cmd_counter(
@@ -57,7 +57,9 @@ impl Recorder {
                 run.lane_allocator.allocate_begin(slice_id, details.kind)
             },
         );
-        if details.kind == Kind::ToolCall && details.custom_name.as_deref() == Some("Subagent") {
+        let is_subagent =
+            details.kind == Kind::ToolCall && details.custom_name.as_deref() == Some("Subagent");
+        if is_subagent {
             self.subagent_flows.insert(tool_use_id.clone(), slice_id);
         }
         self.emit(
@@ -71,6 +73,12 @@ impl Recorder {
             Some(details.body),
             out,
         );
+        if is_subagent {
+            if let Some(ev) = out.iter_mut().rfind(|e| e.seq == slice_id) {
+                ev.flow_ids
+                    .push(flow_ord::make(slice_id, flow_ord::SUBAGENT));
+            }
+        }
         self.update_active_cmd_counter(details.command_class, 1, ts, out);
         if let Some(agent) = self.live.agents.get_mut(&agent_id) {
             agent.last_action = details.custom_name.clone().unwrap_or(tool_name.clone());
@@ -83,9 +91,10 @@ impl Recorder {
             ts,
             out,
         );
+        let mut triggered_stall = false;
         if let Some((edit_k, added, removed)) = details.file_edit {
             if let Some(ref path) = details.file_path {
-                self.record_file_edit(
+                if self.record_file_edit(
                     path.clone(),
                     edit_k,
                     added,
@@ -96,8 +105,24 @@ impl Recorder {
                     &run_key,
                     ts,
                     out,
-                );
+                ) {
+                    triggered_stall = true;
+                }
             }
+        }
+        self.touch_agent_event(&agent_id, ts);
+        let cfg = self.detector_cfg.clone();
+        let firing = if let Some(det) = self.detectors.get_mut(&agent_id) {
+            det.on_tool_begin(&details.digest, &cfg)
+        } else {
+            None
+        };
+        if let Some(f) = firing {
+            triggered_stall = true;
+            if let Some(ev) = out.iter_mut().rfind(|e| e.seq == slice_id) {
+                ev.flow_ids.push(flow_ord::make(slice_id, flow_ord::STALL));
+            }
+            self.handle_detector_firings(&agent_id, vec![f], Some(slice_id), ts, out);
         }
         if let Some(run) = self.runs.get_mut(&run_key) {
             run.open_tools.insert(
@@ -112,21 +137,9 @@ impl Recorder {
                     command_class: details.command_class,
                     file_path: None,
                     file_edit: None,
+                    triggered_stall,
                 },
             );
-        }
-        let cfg = self.detector_cfg.clone();
-        let firing = if let Some(det) = self.detectors.get_mut(&agent_id) {
-            det.touch_event(ts);
-            det.on_tool_begin(&details.digest, &cfg)
-        } else {
-            None
-        };
-        if let Some(f) = firing {
-            if let Some(ev) = out.iter_mut().rfind(|e| e.seq == slice_id) {
-                ev.flow_ids.push(slice_id);
-            }
-            self.handle_detector_firings(&agent_id, vec![f], Some(slice_id), ts, out);
         }
     }
 
@@ -143,10 +156,22 @@ impl Recorder {
         run_key: &(String, u32),
         ts: u64,
         out: &mut Vec<Event>,
-    ) {
+    ) -> bool {
         let proto_k = edit_k.map(to_proto_edit_kind);
+        let scrubbed_path = truncate_utf8(&self.scrubber.scrub(&path), 512);
+        let fe_label = match (added, removed) {
+            (Some(a), Some(r)) => {
+                format!(
+                    "FileEdited: {} (+{}/-{})",
+                    truncate_utf8(&scrubbed_path, 48),
+                    a,
+                    r
+                )
+            }
+            _ => format!("FileEdited: {}", truncate_utf8(&scrubbed_path, 48)),
+        };
         let fe_body = tacho::event::Body::FileEdited(tacho::FileEdited {
-            path: Some(truncate_utf8(&path, 512)),
+            path: Some(scrubbed_path),
             kind: proto_k.map(|k| k as i32),
             lines_added: added,
             lines_removed: removed,
@@ -159,7 +184,7 @@ impl Recorder {
             None,
             Some(parent_seq),
             Some(agent_id.to_string()),
-            None,
+            Some(fe_label),
             Some(fe_body),
             out,
         );
@@ -169,18 +194,22 @@ impl Recorder {
         if let Some(agent) = self.live.agents.get_mut(agent_id) {
             agent.last_edit_ts_ns = Some(ts);
         }
+        self.touch_agent_event(agent_id, ts);
         let cfg = self.detector_cfg.clone();
         let firing = if let Some(det) = self.detectors.get_mut(agent_id) {
-            det.touch_event(ts);
             det.on_file_edited(&path, ts, &cfg)
         } else {
             None
         };
         if let Some(f) = firing {
             if let Some(ev) = out.iter_mut().rfind(|e| e.seq == parent_seq) {
-                ev.flow_ids.push(parent_seq);
+                ev.flow_ids
+                    .push(flow_ord::make(parent_seq, flow_ord::STALL));
             }
             self.handle_detector_firings(agent_id, vec![f], Some(parent_seq), ts, out);
+            true
+        } else {
+            false
         }
     }
 
@@ -194,7 +223,7 @@ impl Recorder {
         out: &mut Vec<Event>,
     ) {
         if let Some(agent) = self.live.agents.get_mut(agent_id) {
-            agent.recent_commands.push(RecentCommand {
+            agent.push_recent_command(RecentCommand {
                 argv: argv.clone(),
                 class: command_class_name(class).to_string(),
                 exit_code,
@@ -208,9 +237,9 @@ impl Recorder {
                 agent.pushes_succeeded += 1;
             }
         }
+        self.touch_agent_event(agent_id, ts);
         let cfg = self.detector_cfg.clone();
         let firing = if let Some(det) = self.detectors.get_mut(agent_id) {
-            det.touch_event(ts);
             det.on_command_ended(&argv, class, exit_code, ts, &cfg)
         } else {
             None
@@ -281,15 +310,10 @@ impl Recorder {
                 Some(end_body),
                 out,
             );
-            if let (Some(argv), Some(class)) = (tool.argv, tool.command_class) {
-                self.record_command_completion(argv, class, exit_code, &agent_id, ts, out);
-            }
             if !error && exit_code.unwrap_or(0) == 0 {
                 if let Some(det) = self.detectors.get_mut(&agent_id) {
-                    if det.silent_fired {
-                        det.silent_fired = false;
-                        det.is_stalled = false;
-                    }
+                    det.silent_fired = false;
+                    det.clear_stall(tacho::StallKind::Silent);
                 }
             }
             let is_turn_open = self
@@ -297,12 +321,7 @@ impl Recorder {
                 .get(&run_key)
                 .map(|r| r.turn_open)
                 .unwrap_or(false);
-            let is_stalled = self
-                .detectors
-                .get(&agent_id)
-                .map(|d| d.is_stalled)
-                .unwrap_or(false);
-            let (next_st, next_enum) = if is_stalled {
+            let (next_st, next_enum) = if tool.triggered_stall {
                 ("Stalled", tacho::AgentStateType::Stalled)
             } else if is_turn_open {
                 ("Thinking", tacho::AgentStateType::Thinking)
@@ -310,6 +329,9 @@ impl Recorder {
                 ("Idle", tacho::AgentStateType::Idle)
             };
             self.transition_state(&agent_id, next_st, next_enum, "tool ended", ts, out);
+            if let (Some(argv), Some(class)) = (tool.argv, tool.command_class) {
+                self.record_command_completion(argv, class, exit_code, &agent_id, ts, out);
+            }
         } else {
             let track = format!("agent:{}/run:{}/turns", agent_id, run_n);
             let err_body = tacho::event::Body::TraceError(tacho::TraceError {

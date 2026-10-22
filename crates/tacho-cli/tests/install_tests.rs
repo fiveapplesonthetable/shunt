@@ -171,9 +171,7 @@ fn test_concurrent_installs_processes() {
     let config_path = config_dir.join("settings.json");
     fs::write(&config_path, "{\n  \"user_setting\": 123\n}\n").unwrap();
 
-    let tacho_bin = std::env::var("CARGO_TARGET_DIR")
-        .map(|d| std::path::PathBuf::from(d).join("debug/tacho"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/tacho-target-ring/debug/tacho"));
+    let tacho_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tacho"));
 
     let mut procs = Vec::new();
     for _ in 0..10 {

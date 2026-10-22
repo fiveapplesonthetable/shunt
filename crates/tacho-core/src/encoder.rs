@@ -353,14 +353,21 @@ fn event_category(event: &Event) -> Option<&'static str> {
                     _ => Some("build"),
                 }
             } else if let Some(custom) = &event.custom_name {
-                match custom.as_str() {
-                    "Build" => Some("build"),
-                    "Test" => Some("test"),
-                    "Commit" => Some("commit"),
-                    "Push" => Some("push"),
-                    "Fetch" => Some("fetch"),
-                    "Rebase" => Some("rebase"),
-                    _ => Some("build"),
+                let s = custom.as_str();
+                if s.starts_with("Build") {
+                    Some("build")
+                } else if s.starts_with("Test") {
+                    Some("test")
+                } else if s.starts_with("Commit") {
+                    Some("commit")
+                } else if s.starts_with("Push") {
+                    Some("push")
+                } else if s.starts_with("Fetch") {
+                    Some("fetch")
+                } else if s.starts_with("Rebase") {
+                    Some("rebase")
+                } else {
+                    Some("build")
                 }
             } else {
                 Some("build")
@@ -368,11 +375,15 @@ fn event_category(event: &Event) -> Option<&'static str> {
         }
         Kind::ToolCall | Kind::ToolCallEnded => {
             if let Some(custom) = &event.custom_name {
-                match custom.as_str() {
-                    "Edit" => Some("edit"),
-                    "Read" => Some("read"),
-                    "Search" => Some("search"),
-                    _ => Some("edit"),
+                let s = custom.as_str();
+                if s.starts_with("Edit") {
+                    Some("edit")
+                } else if s.starts_with("Read") {
+                    Some("read")
+                } else if s.starts_with("Search") {
+                    Some("search")
+                } else {
+                    Some("edit")
                 }
             } else {
                 Some("edit")
@@ -394,6 +405,17 @@ fn event_category(event: &Event) -> Option<&'static str> {
         Kind::Stall => Some("stall"),
         Kind::TaskQueued | Kind::TaskState => Some("task"),
         Kind::AgentState => Some("state"),
+        Kind::Milestone => Some("milestone"),
+        Kind::Prompt => Some("prompt"),
+        Kind::Message => Some("message"),
+        Kind::Review | Kind::ReviewEnded | Kind::ReviewFinding => Some("review"),
+        Kind::Custom | Kind::CustomEnded => {
+            if event.track_key.ends_with("/procs") {
+                Some("proc")
+            } else {
+                Some("custom")
+            }
+        }
         _ => None,
     }
 }

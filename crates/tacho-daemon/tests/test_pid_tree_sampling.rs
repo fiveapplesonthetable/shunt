@@ -51,6 +51,7 @@ fn test_per_run_process_tree_sampling() {
                 model: None,
                 parent_session: None,
                 git_tree: None,
+                role: None,
             },
             now_ns,
         )

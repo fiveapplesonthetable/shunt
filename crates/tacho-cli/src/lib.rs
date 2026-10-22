@@ -11,4 +11,5 @@ pub mod query;
 pub mod run;
 pub mod status;
 pub mod system;
+pub mod tail;
 pub mod trace;
