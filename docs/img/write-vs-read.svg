@@ -1,0 +1,244 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 520" width="100%" height="auto">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .text-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 13.5px; font-weight: 600; fill: #202124; }
+      .text-col-head { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 13px; font-weight: 600; fill: #1a73e8; }
+      .text-step { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11px; font-weight: 500; fill: #202124; }
+      .text-desc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 10px; fill: #5f6368; }
+      .text-skip { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #9aa0a6; font-style: italic; }
+      .text-badge { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 10px; font-weight: 600; }
+      .text-stage { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11px; font-weight: 600; fill: #70757a; text-transform: uppercase; letter-spacing: 0.5px; }
+      
+      .b-active-blue   { fill: #e8f0fe; stroke: #aecbfa; stroke-width: 1.2; rx: 3px; }
+      .b-active-green  { fill: #e6f4ea; stroke: #a8dab5; stroke-width: 1.2; rx: 3px; }
+      .b-active-amber  { fill: #fef7e0; stroke: #fdd663; stroke-width: 1.2; rx: 3px; }
+      .b-active-red    { fill: #fce8e6; stroke: #fad2cf; stroke-width: 1.2; rx: 3px; }
+      .b-active-purple { fill: #f3e8fd; stroke: #d7aefb; stroke-width: 1.2; rx: 3px; }
+      .b-skipped       { fill: #ffffff; stroke: #dadce0; stroke-width: 1; stroke-dasharray: 4,3; rx: 3px; }
+      
+      .grid-line { stroke: #eeeeee; stroke-width: 1; }
+      
+      @media (prefers-color-scheme: dark) {
+        .bg { fill: #202124; }
+        .text-title { fill: #e8eaed; }
+        .text-col-head { fill: #8ab4f8; }
+        .text-step { fill: #e8eaed; }
+        .text-desc { fill: #9aa0a6; }
+        .text-skip { fill: #5f6368; }
+        .text-stage { fill: #9aa0a6; }
+        
+        .b-active-blue   { fill: #1c2b46; stroke: #4285f4; }
+        .b-active-green  { fill: #133420; stroke: #34a853; }
+        .b-active-amber  { fill: #3c3214; stroke: #f9ab00; }
+        .b-active-red    { fill: #3c1e1e; stroke: #ea4335; }
+        .b-active-purple { fill: #2d1e3e; stroke: #af5cf7; }
+        .b-skipped       { fill: #202124; stroke: #444746; }
+        .grid-line { stroke: #303134; }
+      }
+    </style>
+  </defs>
+
+  <rect width="1020" height="520" class="bg"/>
+
+  <text x="24" y="30" class="text-title">Step-by-step path comparison: solid boxes execute; dashed boxes are completely eliminated</text>
+
+  <!-- Horizontal Stage Dividers -->
+  <line x1="20" y1="120" x2="1000" y2="120" class="grid-line"/>
+  <line x1="20" y1="190" x2="1000" y2="190" class="grid-line"/>
+  <line x1="20" y1="260" x2="1000" y2="260" class="grid-line"/>
+  <line x1="20" y1="330" x2="1000" y2="330" class="grid-line"/>
+  <line x1="20" y1="400" x2="1000" y2="400" class="grid-line"/>
+
+  <!-- Stage Labels (Left Margin) -->
+  <text x="24" y="85" class="text-stage">1. Ingest</text>
+  <text x="24" y="155" class="text-stage">2. Queue</text>
+  <text x="24" y="225" class="text-stage">3. Transform</text>
+  <text x="24" y="295" class="text-stage">4. Memory</text>
+  <text x="24" y="365" class="text-stage">5. Storage</text>
+  <text x="24" y="435" class="text-stage">6. Render</text>
+
+  <!-- COLUMN 1: Hook Ingest -->
+  <g transform="translate(130, 42)">
+    <rect width="205" height="24" rx="3" fill="#e8f0fe"/>
+    <text x="12" y="17" class="text-col-head">Path A · Hook Ingest</text>
+    
+    <!-- Stage 1 -->
+    <g transform="translate(0, 30)">
+      <rect width="205" height="42" class="b-active-blue"/>
+      <text x="8" y="17" class="text-step">Connect to api.sock</text>
+      <text x="8" y="32" class="text-desc">&lt; 5 ms deadline; aborts if slow</text>
+    </g>
+
+    <!-- Stage 2 -->
+    <g transform="translate(0, 100)">
+      <rect width="205" height="42" class="b-active-green"/>
+      <text x="8" y="17" class="text-step">Channel push &amp; return</text>
+      <text x="8" y="32" class="text-desc">Non-blocking; exits 0 immediately</text>
+    </g>
+
+    <!-- Stage 3 (Skipped) -->
+    <g transform="translate(0, 170)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Skipped: async in appender</text>
+    </g>
+
+    <!-- Stage 4 (Skipped) -->
+    <g transform="translate(0, 240)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Skipped: no memory locks</text>
+    </g>
+
+    <!-- Stage 5 (Skipped) -->
+    <g transform="translate(0, 310)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Skipped: 0 disk I/O on hook</text>
+    </g>
+
+    <!-- Stage 6 (Skipped) -->
+    <g transform="translate(0, 380)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Skipped: no trace encoding</text>
+    </g>
+  </g>
+
+  <!-- COLUMN 2: Appender Batch -->
+  <g transform="translate(350, 42)">
+    <rect width="205" height="24" rx="3" fill="#fef7e0"/>
+    <text x="12" y="17" class="text-col-head" fill="#b06000">Path B · Appender Batch</text>
+    
+    <!-- Stage 1 (Skipped) -->
+    <g transform="translate(0, 30)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Skipped: accepts from channel</text>
+    </g>
+
+    <!-- Stage 2 -->
+    <g transform="translate(0, 100)">
+      <rect width="205" height="42" class="b-active-blue"/>
+      <text x="8" y="17" class="text-step">Drain channel batch</text>
+      <text x="8" y="32" class="text-desc">Up to 256 events or 50 ms</text>
+    </g>
+
+    <!-- Stage 3 -->
+    <g transform="translate(0, 170)">
+      <rect width="205" height="42" class="b-active-amber"/>
+      <text x="8" y="17" class="text-step">Scrub, classify, allocate lanes</text>
+      <text x="8" y="32" class="text-desc">Single-threaded, zero locks</text>
+    </g>
+
+    <!-- Stage 4 -->
+    <g transform="translate(0, 240)">
+      <rect width="205" height="42" class="b-active-green"/>
+      <text x="8" y="17" class="text-step">Atomic LiveState swap</text>
+      <text x="8" y="32" class="text-desc">ArcSwap update; no readers blocked</text>
+    </g>
+
+    <!-- Stage 5 -->
+    <g transform="translate(0, 310)">
+      <rect width="205" height="42" class="b-active-red"/>
+      <text x="8" y="17" class="text-step">SQLite WAL commit</text>
+      <text x="8" y="32" class="text-desc">Batched prepared INSERT; synchronous</text>
+    </g>
+
+    <!-- Stage 6 (Skipped) -->
+    <g transform="translate(0, 380)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Skipped: trace encoded on demand</text>
+    </g>
+  </g>
+
+  <!-- COLUMN 3: Live Status / Watch -->
+  <g transform="translate(570, 42)">
+    <rect width="205" height="24" rx="3" fill="#e6f4ea"/>
+    <text x="12" y="17" class="text-col-head" fill="#137333">Path C · Live status / watch</text>
+    
+    <!-- Stage 1 -->
+    <g transform="translate(0, 30)">
+      <rect width="205" height="42" class="b-active-blue"/>
+      <text x="8" y="17" class="text-step">Request status / watch</text>
+      <text x="8" y="32" class="text-desc">Unix socket or CLI query</text>
+    </g>
+
+    <!-- Stage 2 (Skipped) -->
+    <g transform="translate(0, 100)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Bypasses appender channel</text>
+    </g>
+
+    <!-- Stage 3 (Skipped) -->
+    <g transform="translate(0, 170)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Already scrubbed in LiveState</text>
+    </g>
+
+    <!-- Stage 4 -->
+    <g transform="translate(0, 240)">
+      <rect width="205" height="42" class="b-active-green"/>
+      <text x="8" y="17" class="text-step">Read ArcSwap&lt;LiveState&gt;</text>
+      <text x="8" y="32" class="text-desc">Direct lock-free memory load</text>
+    </g>
+
+    <!-- Stage 5 (Skipped) -->
+    <g transform="translate(0, 310)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">0 disk reads: pure RAM</text>
+    </g>
+
+    <!-- Stage 6 -->
+    <g transform="translate(0, 380)">
+      <rect width="205" height="42" class="b-active-purple"/>
+      <text x="8" y="17" class="text-step">Format summary / tokens</text>
+      <text x="8" y="32" class="text-desc">&lt; 200 tokens JSON / human</text>
+    </g>
+  </g>
+
+  <!-- COLUMN 4: Trace Snapshot -->
+  <g transform="translate(790, 42)">
+    <rect width="205" height="24" rx="3" fill="#f3e8fd"/>
+    <text x="12" y="17" class="text-col-head" fill="#7627bb">Path D · tacho trace</text>
+    
+    <!-- Stage 1 -->
+    <g transform="translate(0, 30)">
+      <rect width="205" height="42" class="b-active-blue"/>
+      <text x="8" y="17" class="text-step">Connect trace.sock / RO DB</text>
+      <text x="8" y="32" class="text-desc">Fallback to disk if daemon down</text>
+    </g>
+
+    <!-- Stage 2 (Skipped) -->
+    <g transform="translate(0, 100)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Does not touch ingest channel</text>
+    </g>
+
+    <!-- Stage 3 (Skipped) -->
+    <g transform="translate(0, 170)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Stored pre-scrubbed in DB</text>
+    </g>
+
+    <!-- Stage 4 -->
+    <g transform="translate(0, 240)">
+      <rect width="205" height="42" class="b-active-green"/>
+      <text x="8" y="17" class="text-step">Fetch track descriptors</text>
+      <text x="8" y="32" class="text-desc">Registry folded from TrackCreated</text>
+    </g>
+
+    <!-- Stage 5 -->
+    <g transform="translate(0, 310)">
+      <rect width="205" height="42" class="b-active-red"/>
+      <text x="8" y="17" class="text-step">Read SQLite WAL cursor</text>
+      <text x="8" y="32" class="text-desc">Concurrent non-blocking WAL read</text>
+    </g>
+
+    <!-- Stage 6 -->
+    <g transform="translate(0, 380)">
+      <rect width="205" height="42" class="b-active-purple"/>
+      <text x="8" y="17" class="text-step">Stream Perfetto protobuf</text>
+      <text x="8" y="32" class="text-desc">Chunked streaming; bounded memory</text>
+    </g>
+  </g>
+
+  <!-- Summary Footer -->
+  <text x="24" y="490" class="text-desc">• Hook ingest returns in &lt; 5 ms with zero disk writes. Live status/watch reads ArcSwap memory without disk reads. Trace snapshots stream directly from SQLite WAL without inflating RAM.</text>
+</svg>

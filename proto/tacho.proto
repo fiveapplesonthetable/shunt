@@ -163,6 +163,7 @@ message Command {
   optional string check_name = 4;      // <= 128
   optional bool via_wrap = 5;
   optional string program = 6;         // <= 64
+  optional string tool_use_id = 7;     // <= 128
 }
 
 message CommandEnded {
@@ -179,6 +180,7 @@ message FileAccess {
   optional string path = 1;            // <= 512
   optional FileAccessKind kind = 2;
   optional string query = 3;           // <= 256
+  optional string tool_use_id = 4;     // <= 128
 }
 
 message FileAccessEnded {
@@ -235,7 +237,7 @@ message Stall {
 message ProviderError {
   optional string provider = 1;        // <= 64
   optional string error_code = 2;      // <= 64
-  optional string message = 3;         // <= 256
+  optional string message = 3;         // <= 120, scrubbed and truncated free text
   optional bool rate_limit = 4;
   optional uint64 retry_after_ms = 5;
 }

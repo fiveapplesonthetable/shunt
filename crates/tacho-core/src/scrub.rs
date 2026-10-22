@@ -4,23 +4,58 @@
 //! the trace. All scrubbing happens before truncation. Truncation is always
 //! performed at valid UTF-8 character boundaries and appends `…`.
 
-use regex::Regex;
+use regex::{Captures, Regex};
 use std::path::{Path, PathBuf};
 
 /// Privacy scrubber that replaces credentials and secret shapes with `<redacted>`.
 #[derive(Debug)]
 pub struct Scrubber {
-    auth_bearer: Regex,
-    flags: Regex,
-    kv_pairs: Regex,
-    url_userinfo: Regex,
+    line_continuation: Regex,
+    pem_block: Regex,
     aws_token: Regex,
-    gcp_token: Regex,
+    gcp_ya29: Regex,
+    gcp_aiza: Regex,
     github_token: Regex,
     anthropic_token: Regex,
     openai_token: Regex,
     slack_token: Regex,
-    pem_block: Regex,
+    jwt_token: Regex,
+    stripe_token: Regex,
+    npm_token: Regex,
+    pypi_token: Regex,
+    gitlab_token: Regex,
+    netrc_password: Regex,
+    url_userinfo: Regex,
+    header_dquoted: Regex,
+    header_squoted: Regex,
+    header_unquoted: Regex,
+    auth_scheme: Regex,
+    auth_bearer: Regex,
+    auth_general: Regex,
+    flag_quoted: Regex,
+    flag_unquoted: Regex,
+    flag_space_quoted: Regex,
+    flag_space_unquoted: Regex,
+    short_p_dquoted: Regex,
+    short_p_squoted: Regex,
+    short_p_attached: Regex,
+    short_p_space: Regex,
+    short_u_dquoted: Regex,
+    short_u_squoted: Regex,
+    short_u_unquoted: Regex,
+    short_u_attached: Regex,
+    short_u_colon_only: Regex,
+    assign_quoted: Regex,
+    assign_unquoted: Regex,
+    json_dquoted_dquoted: Regex,
+    json_squoted_squoted: Regex,
+    json_dquoted_squoted: Regex,
+    json_squoted_dquoted: Regex,
+    json_dquoted_unquoted: Regex,
+    json_squoted_unquoted: Regex,
+    json_unquoted_dquoted: Regex,
+    json_unquoted_squoted: Regex,
+    json_unquoted_unquoted: Regex,
     hex_run: Regex,
     base64_run: Regex,
 }
@@ -35,26 +70,128 @@ impl Scrubber {
     /// Creates a new scrubber compiled with standard secret patterns.
     pub fn new() -> Self {
         Self {
-            auth_bearer: Regex::new(
-                r"(?i)\b((?:Authorization\s*:\s*)?(?:Bearer\s+))[A-Za-z0-9._~+/-]+=*",
+            line_continuation: Regex::new(r"[ \t]*\\(?:\r?\n)[ \t]*").unwrap(),
+            pem_block: Regex::new(
+                r"(?s)(?i)-----BEGIN [A-Z0-9 _-]+-----.*?-----END [A-Z0-9 _-]+-----",
             )
             .unwrap(),
-            flags: Regex::new(r#"(?i)(--(?:token|password|secret|api-key)(?:=|\s+))[^\s;&"']+"#)
-                .unwrap(),
-            kv_pairs: Regex::new(r#"(?i)\b(key|secret|token|password)=([^\s;&"']+)"#).unwrap(),
-            url_userinfo: Regex::new(r"([a-zA-Z][a-zA-Z0-9+.-]*://)(?:[^:@\s]+(?::[^@\s]*)?@)")
-                .unwrap(),
-            aws_token: Regex::new(r"\bA[KS]IA[0-9A-Z]{16}\b").unwrap(),
-            gcp_token: Regex::new(r"\bAIza[0-9A-Za-z\-_]{30,}\b").unwrap(),
+            aws_token: Regex::new(r"(?i)\bA[KS]IA[0-9A-Z]{16}\b").unwrap(),
+            gcp_ya29: Regex::new(r"(?i)\bya29\.[0-9A-Za-z\-_]+\b").unwrap(),
+            gcp_aiza: Regex::new(r"(?i)\bAIza[0-9A-Za-z\-_]{30,}\b").unwrap(),
             github_token: Regex::new(
-                r"\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}|github_pat_[A-Za-z0-9_]{82})\b",
+                r"(?i)\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}|github_pat_[A-Za-z0-9_]{20,255})\b",
             )
             .unwrap(),
-            anthropic_token: Regex::new(r"\bsk-ant-[a-zA-Z0-9_\-]{32,}\b").unwrap(),
-            openai_token: Regex::new(r"\bsk-(?:proj-|none-)?[a-zA-Z0-9_\-]{32,}\b").unwrap(),
-            slack_token: Regex::new(r"\bxox[baprs]-[0-9a-zA-Z\-]{10,}\b").unwrap(),
-            pem_block: Regex::new(r"(?s)-----BEGIN [A-Z0-9 _-]+-----.*?-----END [A-Z0-9 _-]+-----")
+            anthropic_token: Regex::new(r"(?i)\bsk-ant-[a-zA-Z0-9_\-]{32,}\b").unwrap(),
+            openai_token: Regex::new(r"(?i)\bsk-(?:proj-|none-)?[a-zA-Z0-9_\-]{32,}\b").unwrap(),
+            slack_token: Regex::new(r"(?i)\bxox[abprs]-[0-9a-zA-Z\-]{10,}\b").unwrap(),
+            jwt_token: Regex::new(
+                r"(?i)\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+            )
+            .unwrap(),
+            stripe_token: Regex::new(
+                r"(?i)\b(?:(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,}|whsec_[0-9a-zA-Z]{24,})\b",
+            )
+            .unwrap(),
+            npm_token: Regex::new(r"\bnpm_[A-Za-z0-9]{20,255}\b").unwrap(),
+            pypi_token: Regex::new(r"\bpypi-[A-Za-z0-9_\-]{20,255}\b").unwrap(),
+            gitlab_token: Regex::new(r"\bglpat-[A-Za-z0-9\-]{20,}\b").unwrap(),
+            netrc_password: Regex::new(
+                r#"(?i)(^|[\s;&|])((?:(?:machine|default)\s+\S+\s+)?(?:login\s+\S+\s+)?password\s+)(".*?"|'.*?'|[^\s;&"']+)"#,
+            )
+            .unwrap(),
+            url_userinfo: Regex::new(r"([a-zA-Z][a-zA-Z0-9+.-]*://)(?:[^:@\s/]+(?::[^@\s/]*)?@)")
                 .unwrap(),
+            header_dquoted: Regex::new(
+                r#"(?i)(-H\s+|--header\s+|--header=)"(Authorization|Proxy-Authorization|Cookie|Set-Cookie|X-[a-zA-Z0-9_-]*(?:Key|Token)|[a-zA-Z0-9_-]*(?:Token|Secret|Key|Auth))\s*:\s*([^"]+)""#,
+            )
+            .unwrap(),
+            header_squoted: Regex::new(
+                r#"(?i)(-H\s+|--header\s+|--header=)'(Authorization|Proxy-Authorization|Cookie|Set-Cookie|X-[a-zA-Z0-9_-]*(?:Key|Token)|[a-zA-Z0-9_-]*(?:Token|Secret|Key|Auth))\s*:\s*([^']+)'"#,
+            )
+            .unwrap(),
+            header_unquoted: Regex::new(
+                r#"(?i)(^|[\r\n]|[\s;&|])(Cookie|Set-Cookie)\s*:\s*([^\r\n;&|]+)"#,
+            )
+            .unwrap(),
+            auth_scheme: Regex::new(
+                r#"(?i)((?:Authorization|Proxy-Authorization)\s*:\s*[a-zA-Z0-9_-]+)(?:\s|\\\r?\n)+(".*?"|'.*?'|[^\s;&"'\\][^\s;&"']*)"#,
+            )
+            .unwrap(),
+            auth_bearer: Regex::new(
+                r#"(?i)(^|[^-\w])(Bearer|Basic)(?:\s|\\\r?\n)+(".*?"|'.*?'|[^\s;&"'\\][^\s;&"']*)"#,
+            )
+            .unwrap(),
+            auth_general: Regex::new(
+                r#"(?i)((?:Authorization|Proxy-Authorization)\s*:\s*)(?:\s|\\\r?\n)*(".*?"|'.*?'|[^\s;&"'\\][^\s;&"']*)"#,
+            )
+            .unwrap(),
+            flag_quoted: Regex::new(r#"(?i)(--[a-zA-Z0-9_-]+)\s*=\s*(?:\\\r?\n\s*)?(".*?"|'.*?')"#).unwrap(),
+            flag_unquoted: Regex::new(r#"(?i)(--[a-zA-Z0-9_-]+)\s*=\s*(?:\\\r?\n\s*)?([^\s;&"'\\][^\s;&"']*)"#).unwrap(),
+            flag_space_quoted: Regex::new(r#"(?i)(--[a-zA-Z0-9_-]+)(?:\s|\\\r?\n)+(".*?"|'.*?')"#).unwrap(),
+            flag_space_unquoted: Regex::new(r#"(?i)(--[a-zA-Z0-9_-]+)(?:\s|\\\r?\n)+([^\s;&"'\\][^\s;&"']*)"#).unwrap(),
+            short_p_dquoted: Regex::new(r#"(?i)(^|[\s;&|])(-p)(\s*(?:\\\r?\n\s*)?)"([^"]*)""#).unwrap(),
+            short_p_squoted: Regex::new(r#"(?i)(^|[\s;&|])(-p)(\s*(?:\\\r?\n\s*)?)'([^']*)'"#).unwrap(),
+            short_p_attached: Regex::new(r#"(?i)(^|[\s;&|])(-p)([^\s;&"'\\][^\s;&"']*)"#).unwrap(),
+            short_p_space: Regex::new(r#"(?i)(^|[\s;&|])(-p)(?:\s|\\\r?\n)+([^\s;&"'\\][^\s;&"']*)"#).unwrap(),
+            short_u_dquoted: Regex::new(
+                r#"(?i)(^|[\s;&|])(-u|--user)(=|\s+|\\\r?\n+)"([^:\s;&"]*):\s*([^@\s;&"]*)""#,
+            )
+            .unwrap(),
+            short_u_squoted: Regex::new(
+                r#"(?i)(^|[\s;&|])(-u|--user)(=|\s+|\\\r?\n)+'([^:\s;&']*):\s*([^@\s;&']*)'"#,
+            )
+            .unwrap(),
+            short_u_unquoted: Regex::new(
+                r#"(?i)(^|[\s;&|])(-u|--user)(=|\s+|\\\r?\n)+([^:\s;&"'\\][^:\s;&"']*):\s*([^@\s;&"']+)"#,
+            )
+            .unwrap(),
+            short_u_attached: Regex::new(
+                r#"(?i)(^|[\s;&|])-u([^:\s;&"'\\][^:\s;&"']*):\s*([^@\s;&"']+)"#,
+            )
+            .unwrap(),
+            short_u_colon_only: Regex::new(
+                r#"(?i)(^|[\s;&|])(-u|--user)(=|\s+|\\\r?\n)+:\s*([^@\s;&"']+)"#,
+            )
+            .unwrap(),
+            assign_quoted: Regex::new(r#"(?i)\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:\\\r?\n\s*)?(".*?"|'.*?')"#).unwrap(),
+            assign_unquoted: Regex::new(r#"(?i)\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:\\\r?\n\s*)?([^\s;&"'\\][^\s;&"']*)"#).unwrap(),
+            json_dquoted_dquoted: Regex::new(
+                r#"(?i)"([a-zA-Z0-9_-]+)"(?:\s*:\s*(?:\\\r?\n\s*)?)"([^"]*)""#,
+            )
+            .unwrap(),
+            json_squoted_squoted: Regex::new(
+                r#"(?i)'([a-zA-Z0-9_-]+)'(?:\s*:\s*(?:\\\r?\n\s*)?)'([^']*)'"#,
+            )
+            .unwrap(),
+            json_dquoted_squoted: Regex::new(
+                r#"(?i)"([a-zA-Z0-9_-]+)"(?:\s*:\s*(?:\\\r?\n\s*)?)'([^']*)'"#,
+            )
+            .unwrap(),
+            json_squoted_dquoted: Regex::new(
+                r#"(?i)'([a-zA-Z0-9_-]+)'(?:\s*:\s*(?:\\\r?\n\s*)?)"([^"]*)""#,
+            )
+            .unwrap(),
+            json_dquoted_unquoted: Regex::new(
+                r#"(?i)"([a-zA-Z0-9_-]+)"(?:\s*:\s*(?:\\\r?\n\s*)?)([^\s,;}{"'\\][^\s,;}{"']*)"#,
+            )
+            .unwrap(),
+            json_squoted_unquoted: Regex::new(
+                r#"(?i)'([a-zA-Z0-9_-]+)'(?:\s*:\s*(?:\\\r?\n\s*)?)([^\s,;}{"'\\][^\s,;}{"']*)"#,
+            )
+            .unwrap(),
+            json_unquoted_dquoted: Regex::new(
+                r#"(?i)\b([a-zA-Z0-9_-]+)(?:\s*:\s*(?:\\\r?\n\s*)?)"([^"]*)""#,
+            )
+            .unwrap(),
+            json_unquoted_squoted: Regex::new(
+                r#"(?i)\b([a-zA-Z0-9_-]+)(?:\s*:\s*(?:\\\r?\n\s*)?)'([^']*)'"#,
+            )
+            .unwrap(),
+            json_unquoted_unquoted: Regex::new(
+                r#"(?i)\b([a-zA-Z0-9_-]+)(?:\s*:\s*(?:\\\r?\n\s*)?)([^\s,;}{"'\\][^\s,;}{"']*)"#,
+            )
+            .unwrap(),
             hex_run: Regex::new(r"\b[0-9a-fA-F]{32,}\b").unwrap(),
             base64_run: Regex::new(r"\b[A-Za-z0-9+/]{32,}={0,2}").unwrap(),
         }
@@ -62,14 +199,63 @@ impl Scrubber {
 
     /// Scrubs secrets from text, replacing sensitive tokens with `<redacted>`.
     pub fn scrub(&self, input: &str) -> String {
-        let mut s = input.to_string();
+        // Normalise shell line continuations (\ + newline + leading spaces -> one space) before tokenising
+        let mut s = self.line_continuation.replace_all(input, " ").into_owned();
 
-        // 1. PEM blocks
+        // 1. PEM blocks across lines
         s = self.pem_block.replace_all(&s, "<redacted>").into_owned();
 
-        // 2. Specific vendor token shapes
+        // 2. Sensitive quoted headers (-H 'Authorization: ...', -H 'Cookie: ...', etc.)
+        s = self
+            .header_dquoted
+            .replace_all(&s, |caps: &Captures| {
+                let prefix = &caps[1];
+                let header_name = &caps[2];
+                let val = caps[3].trim();
+
+                if header_name.eq_ignore_ascii_case("Authorization")
+                    || header_name.eq_ignore_ascii_case("Proxy-Authorization")
+                {
+                    if let Some((scheme, _rest)) = val.split_once(' ') {
+                        if !scheme.is_empty() {
+                            return format!("{}\"{}: {} <redacted>\"", prefix, header_name, scheme);
+                        }
+                    }
+                }
+                format!("{}\"{}: <redacted>\"", prefix, header_name)
+            })
+            .into_owned();
+
+        s = self
+            .header_squoted
+            .replace_all(&s, |caps: &Captures| {
+                let prefix = &caps[1];
+                let header_name = &caps[2];
+                let val = caps[3].trim();
+
+                if header_name.eq_ignore_ascii_case("Authorization")
+                    || header_name.eq_ignore_ascii_case("Proxy-Authorization")
+                {
+                    if let Some((scheme, _rest)) = val.split_once(' ') {
+                        if !scheme.is_empty() {
+                            return format!("{}'{}: {} <redacted>'", prefix, header_name, scheme);
+                        }
+                    }
+                }
+                format!("{}'{}: <redacted>'", prefix, header_name)
+            })
+            .into_owned();
+
+        // 3. Sensitive unquoted headers (Cookie, Set-Cookie)
+        s = self
+            .header_unquoted
+            .replace_all(&s, "${1}${2}: <redacted>")
+            .into_owned();
+
+        // 4. Specific vendor token shapes (all case-insensitive)
         s = self.aws_token.replace_all(&s, "<redacted>").into_owned();
-        s = self.gcp_token.replace_all(&s, "<redacted>").into_owned();
+        s = self.gcp_ya29.replace_all(&s, "<redacted>").into_owned();
+        s = self.gcp_aiza.replace_all(&s, "<redacted>").into_owned();
         s = self.github_token.replace_all(&s, "<redacted>").into_owned();
         s = self
             .anthropic_token
@@ -77,34 +263,542 @@ impl Scrubber {
             .into_owned();
         s = self.openai_token.replace_all(&s, "<redacted>").into_owned();
         s = self.slack_token.replace_all(&s, "<redacted>").into_owned();
-
-        // 3. Flags (--token=val, --password val)
-        s = self.flags.replace_all(&s, "${1}<redacted>").into_owned();
-
-        // 4. Key-value pairs (key=val, secret=val)
+        s = self.jwt_token.replace_all(&s, "<redacted>").into_owned();
+        s = self.stripe_token.replace_all(&s, "<redacted>").into_owned();
+        s = self.npm_token.replace_all(&s, "<redacted>").into_owned();
+        s = self.pypi_token.replace_all(&s, "<redacted>").into_owned();
+        s = self.gitlab_token.replace_all(&s, "<redacted>").into_owned();
         s = self
-            .kv_pairs
-            .replace_all(&s, "${1}=<redacted>")
+            .netrc_password
+            .replace_all(&s, |caps: &Captures| {
+                let delim = &caps[1];
+                let prefix = &caps[2];
+                let val = &caps[3];
+                let quote = if val.starts_with('"') {
+                    "\""
+                } else if val.starts_with('\'') {
+                    "'"
+                } else {
+                    ""
+                };
+                format!("{}{}{}<redacted>{}", delim, prefix, quote, quote)
+            })
             .into_owned();
 
-        // 5. Auth / Bearer headers
-        s = self
-            .auth_bearer
-            .replace_all(&s, "${1}<redacted>")
-            .into_owned();
-
-        // 6. URL userinfo (https://user:pass@host -> https://<redacted>@host)
+        // 3. URL userinfo (https://user:pass@host -> https://<redacted>@host)
         s = self
             .url_userinfo
             .replace_all(&s, "${1}<redacted>@")
             .into_owned();
 
-        // 7. Base64 and hex runs of 32+ chars
-        s = self.hex_run.replace_all(&s, "<redacted>").into_owned();
-        s = self.base64_run.replace_all(&s, "<redacted>").into_owned();
+        // 4. Auth & Bearer headers
+        s = self
+            .auth_scheme
+            .replace_all(&s, "${1} <redacted>")
+            .into_owned();
+        s = self
+            .auth_bearer
+            .replace_all(&s, "${1}${2} <redacted>")
+            .into_owned();
+        s = self
+            .auth_general
+            .replace_all(&s, |caps: &Captures| {
+                let val = &caps[2];
+                if val == "<redacted>"
+                    || val.eq_ignore_ascii_case("bearer")
+                    || val.eq_ignore_ascii_case("basic")
+                    || val.eq_ignore_ascii_case("apikey")
+                    || val.eq_ignore_ascii_case("token")
+                    || val.eq_ignore_ascii_case("key")
+                    || val.eq_ignore_ascii_case("secret")
+                {
+                    caps[0].to_string()
+                } else {
+                    format!("{}<redacted>", &caps[1])
+                }
+            })
+            .into_owned();
+
+        // 5. Short flags -u (user:pass style) and -p (password style)
+        s = self
+            .short_u_dquoted
+            .replace_all(&s, "${1}${2}${3}\"${4}:<redacted>\"")
+            .into_owned();
+        s = self
+            .short_u_squoted
+            .replace_all(&s, "${1}${2}${3}'${4}:<redacted>'")
+            .into_owned();
+        s = self
+            .short_u_unquoted
+            .replace_all(&s, "${1}${2}${3}${4}:<redacted>")
+            .into_owned();
+        s = self
+            .short_u_attached
+            .replace_all(&s, "${1}-u${2}:<redacted>")
+            .into_owned();
+        s = self
+            .short_u_colon_only
+            .replace_all(&s, "${1}${2}${3}:<redacted>")
+            .into_owned();
+
+        s = self
+            .short_p_dquoted
+            .replace_all(&s, "${1}${2}${3}\"<redacted>\"")
+            .into_owned();
+        s = self
+            .short_p_squoted
+            .replace_all(&s, "${1}${2}${3}'<redacted>'")
+            .into_owned();
+        s = self
+            .short_p_attached
+            .replace_all(&s, |caps: &Captures| {
+                let full = format!("p{}", &caps[3].to_ascii_lowercase());
+                if full.starts_with("pthread")
+                    || full == "pipe"
+                    || full.starts_with("print")
+                    || full.starts_with("prune")
+                    || full == "pedantic"
+                    || full == "pie"
+                    || full == "pic"
+                    || full == "pg"
+                {
+                    caps[0].to_string()
+                } else {
+                    format!("{}-p<redacted>", &caps[1])
+                }
+            })
+            .into_owned();
+
+        // Space-separated -p <val>: redact only if not preceded by known non-secret commands like cargo, mkdir, git, cp
+        s = self
+            .short_p_space
+            .replace_all(&s, |caps: &Captures| {
+                let match_start = caps.get(0).unwrap().start();
+                let prefix = &s[..match_start];
+                if is_non_secret_p_context(prefix) {
+                    caps[0].to_string()
+                } else {
+                    format!("{}-p <redacted>", &caps[1])
+                }
+            })
+            .into_owned();
+
+        // 6. Long flags (--token="val", --token val, --api_key=val, etc.)
+        s = self
+            .flag_quoted
+            .replace_all(&s, |caps: &Captures| {
+                let flag = &caps[1];
+                if is_sensitive_name(&flag[2..]) {
+                    let val = &caps[2];
+                    let quote = &val[..1];
+                    format!("{}={}<redacted>{}", flag, quote, quote)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .flag_unquoted
+            .replace_all(&s, |caps: &Captures| {
+                let flag = &caps[1];
+                if is_sensitive_name(&flag[2..]) {
+                    format!("{}=<redacted>", flag)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .flag_space_quoted
+            .replace_all(&s, |caps: &Captures| {
+                let flag = &caps[1];
+                if is_sensitive_name(&flag[2..]) {
+                    let val = &caps[2];
+                    let quote = &val[..1];
+                    format!("{} {}<redacted>{}", flag, quote, quote)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .flag_space_unquoted
+            .replace_all(&s, |caps: &Captures| {
+                let flag = &caps[1];
+                if is_sensitive_name(&flag[2..]) {
+                    format!("{} <redacted>", flag)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        // 7. Assignments / Environment variables / Key-value pairs
+        s = self
+            .assign_quoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    let val = &caps[2];
+                    let quote = &val[..1];
+                    format!("{}={}<redacted>{}", key, quote, quote)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .assign_unquoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("{}=<redacted>", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        // 8. JSON and YAML structures ("key": "val", 'key': 'val', key: val)
+        s = self
+            .json_dquoted_dquoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("\"{}\": \"<redacted>\"", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_squoted_squoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("'{}': '<redacted>'", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_dquoted_squoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("\"{}\": '<redacted>'", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_squoted_dquoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("'{}': \"<redacted>\"", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_dquoted_unquoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("\"{}\": <redacted>", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_squoted_unquoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("'{}': <redacted>", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_unquoted_dquoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("{}: \"<redacted>\"", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_unquoted_squoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                if is_sensitive_name(key) {
+                    format!("{}: '<redacted>'", key)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        s = self
+            .json_unquoted_unquoted
+            .replace_all(&s, |caps: &Captures| {
+                let key = &caps[1];
+                let val = &caps[2];
+                if key.eq_ignore_ascii_case("authorization")
+                    || key.eq_ignore_ascii_case("proxy-authorization")
+                {
+                    caps[0].to_string()
+                } else if is_sensitive_name(key) {
+                    if val.eq_ignore_ascii_case("bearer")
+                        || val.eq_ignore_ascii_case("basic")
+                        || val == "<redacted>"
+                    {
+                        caps[0].to_string()
+                    } else {
+                        format!("{}: <redacted>", key)
+                    }
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .into_owned();
+
+        // 9. Hex runs >= 32 characters (excluding 40-hex Git commit SHAs and SHA256 digests in checksum/docker context)
+        s = self
+            .hex_run
+            .replace_all(&s, |caps: &Captures| {
+                let m = &caps[0];
+                let match_start = caps.get(0).unwrap().start();
+                if is_exempt_value_shape(&s, match_start, m, false) {
+                    m.to_string()
+                } else {
+                    "<redacted>".to_string()
+                }
+            })
+            .into_owned();
+
+        // 10. Base64 runs >= 32 characters (excluding file paths, Git SHAs, digests, identifiers, and non-secrets)
+        s = self
+            .base64_run
+            .replace_all(&s, |caps: &Captures| {
+                let m = &caps[0];
+                let match_start = caps.get(0).unwrap().start();
+                if is_exempt_value_shape(&s, match_start, m, true) {
+                    m.to_string()
+                } else {
+                    "<redacted>".to_string()
+                }
+            })
+            .into_owned();
 
         s
     }
+}
+
+/// Helper to determine if a hex or base64 value shape should be exempted from redaction.
+fn is_exempt_value_shape(s: &str, pos: usize, m: &str, is_base64: bool) -> bool {
+    if is_git_sha_40(m) || is_digest_context(s, pos, m) {
+        return true;
+    }
+    if is_base64 && (is_likely_file_path(m) || is_likely_identifier_or_test_name(m)) {
+        return true;
+    }
+    false
+}
+
+/// Checks if a string is a 40-hex Git commit SHA.
+#[inline]
+fn is_git_sha_40(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Checks if a 64-hex string is in an artifact digest or checksum context.
+fn is_digest_context(s: &str, pos: usize, hex: &str) -> bool {
+    if hex.len() != 64 {
+        return false;
+    }
+    let prefix = &s[..pos];
+    if prefix.ends_with("sha256:")
+        || prefix.ends_with("sha512:")
+        || prefix.ends_with("sha1:")
+        || prefix.ends_with("blake3:")
+    {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("sha256sum")
+        || lower.contains("shasum")
+        || lower.contains("b2sum")
+        || lower.contains("md5sum")
+        || lower.contains("checksum")
+        || lower.contains(".sha256")
+    {
+        return true;
+    }
+    let end = pos + hex.len();
+    if end < s.len() {
+        let suffix = &s[end..];
+        if suffix.starts_with("  ") || suffix.starts_with(" *") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks if a run of 32+ characters consists entirely of ASCII alphabetic characters,
+/// indicating an identifier or test name rather than a high-entropy secret.
+fn is_likely_identifier_or_test_name(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Checks if a word before `-p` belongs to a known tool where `-p` is not a password.
+fn is_non_secret_p_context(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end();
+    let last_word = trimmed.split_whitespace().last().unwrap_or("");
+    let last_program = last_word.rsplit('/').next().unwrap_or(last_word);
+    matches!(
+        last_program,
+        "cargo" | "mkdir" | "git" | "cp" | "rm" | "test" | "build" | "check" | "clippy" | "run"
+    )
+}
+
+/// Determines whether a flag or variable name is sensitive.
+fn is_sensitive_name(raw: &str) -> bool {
+    let clean = raw.trim_start_matches('-');
+    let lower = clean.to_ascii_lowercase();
+    let norm = lower.replace('-', "_");
+
+    if norm.ends_with("_stdin")
+        || norm.ends_with("-stdin")
+        || norm.ends_with("_prompt")
+        || norm.ends_with("-prompt")
+    {
+        return false;
+    }
+
+    match norm.as_str() {
+        "token"
+        | "secret"
+        | "password"
+        | "passwd"
+        | "pass"
+        | "pwd"
+        | "key"
+        | "api_key"
+        | "apikey"
+        | "auth"
+        | "authorization"
+        | "proxy_authorization"
+        | "credential"
+        | "credentials"
+        | "private_key"
+        | "session"
+        | "session_id"
+        | "cookie"
+        | "set_cookie"
+        | "bearer"
+        | "pgpass"
+        | "pgpassword"
+        | "whsec" => return true,
+        _ => {}
+    }
+
+    if norm.ends_with("_key")
+        || norm.ends_with("_token")
+        || norm.ends_with("_secret")
+        || norm.ends_with("_password")
+        || norm.ends_with("_passwd")
+        || norm.ends_with("_pass")
+        || norm.ends_with("_pwd")
+        || norm.ends_with("_auth")
+        || norm.ends_with("_credential")
+        || norm.ends_with("_credentials")
+        || norm.ends_with("password")
+        || norm.ends_with("passwd")
+        || norm.ends_with("token")
+        || norm.ends_with("secret")
+        || norm.ends_with("apikey")
+        || norm.ends_with("api_key")
+        || norm.ends_with("privatekey")
+        || norm.ends_with("private_key")
+        || norm.ends_with("credential")
+        || norm.ends_with("credentials")
+        || norm.ends_with("authorization")
+        || norm.ends_with("cookie")
+        || norm.starts_with("key_")
+        || norm.starts_with("token_")
+        || norm.starts_with("secret_")
+        || norm.starts_with("password_")
+        || norm.starts_with("passwd_")
+        || norm.starts_with("auth_")
+        || norm.starts_with("api_key")
+        || norm.starts_with("apikey")
+        || norm.starts_with("private_key")
+        || norm.starts_with("whsec")
+    {
+        return true;
+    }
+
+    if norm.contains("api_key")
+        || norm.contains("apikey")
+        || norm.contains("private_key")
+        || norm.contains("auth_token")
+        || norm.contains("access_token")
+        || norm.contains("secret_key")
+        || norm.contains("refresh_token")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Checks if a string containing slashes is a filesystem path rather than base64 data.
+fn is_likely_file_path(s: &str) -> bool {
+    if !s.contains('/') {
+        return false;
+    }
+    if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || s.starts_with("~/") {
+        return true;
+    }
+    let extensions = [
+        ".rs", ".ts", ".js", ".jsx", ".tsx", ".py", ".go", ".c", ".h", ".cpp", ".cc", ".java",
+        ".json", ".toml", ".yaml", ".yml", ".md", ".txt", ".sh", ".proto", ".lock", ".xml",
+        ".html", ".css", ".sql", ".log",
+    ];
+    for ext in &extensions {
+        if s.ends_with(ext) {
+            return true;
+        }
+    }
+    if !s.contains('=') && !s.contains('+') {
+        let all_short = s.split('/').all(|part| part.len() <= 30);
+        if all_short {
+            return true;
+        }
+    }
+    false
 }
 
 /// Truncates a string to at most `max_bytes` at a valid UTF-8 character boundary.
@@ -176,7 +870,6 @@ pub fn relativize_path(path: &str, cwd: &str) -> String {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    // components[0] is root "/"
     let parts: Vec<&str> = components
         .iter()
         .map(|s| s.as_str())
@@ -210,107 +903,15 @@ pub fn relativize_cwd(cwd: &str, home: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_scrub_auth_bearer() {
-        let scrubber = Scrubber::new();
-        let input = "curl -H 'Authorization: Bearer my-secret-token-12345' https://example.com";
-        let out = scrubber.scrub(input);
-        assert!(
-            out.contains("Authorization: Bearer <redacted>"),
-            "got: {}",
-            out
-        );
-        assert!(!out.contains("my-secret-token"));
-    }
-
-    #[test]
-    fn test_scrub_flags() {
-        let scrubber = Scrubber::new();
-        let input = "tool --token=xyz123 --password secret456 --api-key=supersecret --secret shhh";
-        let out = scrubber.scrub(input);
-        assert!(out.contains("--token=<redacted>"));
-        assert!(out.contains("--password <redacted>"));
-        assert!(out.contains("--api-key=<redacted>"));
-        assert!(out.contains("--secret <redacted>"));
-    }
-
-    #[test]
-    fn test_scrub_kv_pairs() {
-        let scrubber = Scrubber::new();
-        let input = "app key=mykey secret=mysecret token=mytoken password=mypass";
-        let out = scrubber.scrub(input);
-        assert!(out.contains("key=<redacted>"));
-        assert!(out.contains("secret=<redacted>"));
-        assert!(out.contains("token=<redacted>"));
-        assert!(out.contains("password=<redacted>"));
-    }
-
-    #[test]
-    fn test_scrub_url_userinfo() {
-        let scrubber = Scrubber::new();
-        let input = "git clone https://zezeozue:secretpass@github.com/repo.git";
-        let out = scrubber.scrub(input);
-        assert!(out.contains("https://<redacted>@github.com/repo.git"));
-        assert!(!out.contains("secretpass"));
-    }
-
-    #[test]
-    fn test_scrub_vendor_tokens() {
-        let scrubber = Scrubber::new();
-        assert_eq!(
-            scrubber.scrub("AWS: AKIAIOSFODNN7EXAMPLE"),
-            "AWS: <redacted>"
-        );
-        assert_eq!(
-            scrubber.scrub("GCP: AIzaSyD-1234567890abcdefghijklmnopqrstuv"),
-            "GCP: <redacted>"
-        );
-        assert_eq!(
-            scrubber.scrub("GitHub: ghp_1234567890abcdefghijklmnopqrstuvwxyzAB"),
-            "GitHub: <redacted>"
-        );
-        assert_eq!(
-            scrubber.scrub("Anthropic: sk-ant-api03-1234567890abcdefghijklmnopqrstuvwxyz123456"),
-            "Anthropic: <redacted>"
-        );
-        assert_eq!(
-            scrubber.scrub("OpenAI: sk-proj-1234567890abcdefghijklmnopqrstuvwxyz123456"),
-            "OpenAI: <redacted>"
-        );
-        assert_eq!(
-            scrubber.scrub("Slack: xoxb-1234567890-1234567890123-abc"),
-            "Slack: <redacted>"
-        );
-    }
-
-    #[test]
-    fn test_scrub_pem_block() {
-        let scrubber = Scrubber::new();
-        let pem =
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0...\n-----END RSA PRIVATE KEY-----";
-        let out = scrubber.scrub(pem);
-        assert_eq!(out, "<redacted>");
-    }
-
-    #[test]
-    fn test_scrub_hex_and_base64_runs() {
-        let scrubber = Scrubber::new();
-        let hex = "hash 0123456789abcdef0123456789abcdef";
-        assert_eq!(scrubber.scrub(hex), "hash <redacted>");
-
-        let b64 = "token YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=";
-        assert_eq!(scrubber.scrub(b64), "token <redacted>");
-    }
+    use proptest::prelude::*;
 
     #[test]
     fn test_truncate_utf8() {
         assert_eq!(truncate_utf8("hello world", 5), "he…");
         assert_eq!(truncate_utf8("hello", 10), "hello");
         assert_eq!(truncate_utf8("hello", 0), "");
-        // Multi-byte character: '€' is 3 bytes (0xE2, 0x82, 0xAC)
-        let s = "€€€"; // 9 bytes
-        let t = truncate_utf8(s, 6); // max 6 bytes: 3 bytes for '€', 3 for '…'
+        let s = "€€€";
+        let t = truncate_utf8(s, 6);
         assert_eq!(t, "€…");
         assert!(t.len() <= 6);
     }
@@ -338,5 +939,719 @@ mod tests {
         );
         assert_eq!(relativize_cwd("/home/user", Some("/home/user")), "~");
         assert_eq!(relativize_cwd("/var/tmp", Some("/home/user")), "/var/tmp");
+    }
+
+    static SCRUB_TABLE: &[(&str, &str)] = &[
+            // 1. Quoted flags
+            (
+                "tool --token=\"secret123\"",
+                "tool --token=\"<redacted>\"",
+            ),
+            (
+                "tool --token='secret123'",
+                "tool --token='<redacted>'",
+            ),
+            (
+                "tool --password \"shhh\"",
+                "tool --password \"<redacted>\"",
+            ),
+            (
+                "tool --password 'shhh'",
+                "tool --password '<redacted>'",
+            ),
+            (
+                "tool --secret=\"topsecret\"",
+                "tool --secret=\"<redacted>\"",
+            ),
+            (
+                "tool --secret='topsecret'",
+                "tool --secret='<redacted>'",
+            ),
+            (
+                "tool --api-key=\"abcde12345\"",
+                "tool --api-key=\"<redacted>\"",
+            ),
+            (
+                "tool --api-key='abcde12345'",
+                "tool --api-key='<redacted>'",
+            ),
+            (
+                "tool --api_key=\"abcde12345\"",
+                "tool --api_key=\"<redacted>\"",
+            ),
+            (
+                "tool --api_key='abcde12345'",
+                "tool --api_key='<redacted>'",
+            ),
+
+            // 2. Underscore and hyphen flags (unquoted)
+            (
+                "tool --api_key=mysecret",
+                "tool --api_key=<redacted>",
+            ),
+            (
+                "tool --api_key mysecret",
+                "tool --api_key <redacted>",
+            ),
+            (
+                "tool --api-key=mysecret",
+                "tool --api-key=<redacted>",
+            ),
+            (
+                "tool --api-key mysecret",
+                "tool --api-key <redacted>",
+            ),
+            (
+                "tool --auth_token=mysecret",
+                "tool --auth_token=<redacted>",
+            ),
+            (
+                "tool --auth-token mysecret",
+                "tool --auth-token <redacted>",
+            ),
+            (
+                "tool --private_key=mysecret",
+                "tool --private_key=<redacted>",
+            ),
+            (
+                "tool --private-key mysecret",
+                "tool --private-key <redacted>",
+            ),
+            (
+                "tool --session_id=mysecret",
+                "tool --session_id=<redacted>",
+            ),
+            (
+                "tool --cookie mysecret",
+                "tool --cookie <redacted>",
+            ),
+            (
+                "tool --bearer mysecret",
+                "tool --bearer <redacted>",
+            ),
+            (
+                "tool --password shhh",
+                "tool --password <redacted>",
+            ),
+            (
+                "tool --token xyz123",
+                "tool --token <redacted>",
+            ),
+
+            // 3. Short flags (-p and -u)
+            (
+                "mysql -p'mypass'",
+                "mysql -p'<redacted>'",
+            ),
+            (
+                "mysql -p\"mypass\"",
+                "mysql -p\"<redacted>\"",
+            ),
+            (
+                "mysql -ppassword123",
+                "mysql -p<redacted>",
+            ),
+            (
+                "mysql -p password123",
+                "mysql -p <redacted>",
+            ),
+            (
+                "psql -p secret",
+                "psql -p <redacted>",
+            ),
+            (
+                "tool -p 'pass'",
+                "tool -p '<redacted>'",
+            ),
+            (
+                "tool -p \"pass\"",
+                "tool -p \"<redacted>\"",
+            ),
+            (
+                "curl -u user:pass",
+                "curl -u user:<redacted>",
+            ),
+            (
+                "curl -u 'user:pass'",
+                "curl -u 'user:<redacted>'",
+            ),
+            (
+                "curl -u \"user:pass\"",
+                "curl -u \"user:<redacted>\"",
+            ),
+            (
+                "curl -uuser:pass",
+                "curl -uuser:<redacted>",
+            ),
+            (
+                "curl --user user:pass",
+                "curl --user user:<redacted>",
+            ),
+            (
+                "curl --user=user:pass",
+                "curl --user=user:<redacted>",
+            ),
+            (
+                "curl -u :secretpass",
+                "curl -u :<redacted>",
+            ),
+
+            // 4. Prefixed env vars / assignments
+            (
+                "MY_API_KEY=val",
+                "MY_API_KEY=<redacted>",
+            ),
+            (
+                "FOO_KEY=val",
+                "FOO_KEY=<redacted>",
+            ),
+            (
+                "DATABASE_PASSWORD=val",
+                "DATABASE_PASSWORD=<redacted>",
+            ),
+            (
+                "DATABASE_PASSWORD=\"val\"",
+                "DATABASE_PASSWORD=\"<redacted>\"",
+            ),
+            (
+                "DATABASE_PASSWORD='val'",
+                "DATABASE_PASSWORD='<redacted>'",
+            ),
+            (
+                "GITHUB_TOKEN=secret",
+                "GITHUB_TOKEN=<redacted>",
+            ),
+            (
+                "SLACK_TOKEN=secret",
+                "SLACK_TOKEN=<redacted>",
+            ),
+            (
+                "APP_SECRET=secret",
+                "APP_SECRET=<redacted>",
+            ),
+            (
+                "SECRET_KEY=val",
+                "SECRET_KEY=<redacted>",
+            ),
+            (
+                "AUTH_TOKEN=val",
+                "AUTH_TOKEN=<redacted>",
+            ),
+            (
+                "ACCESS_TOKEN=val",
+                "ACCESS_TOKEN=<redacted>",
+            ),
+            (
+                "REFRESH_TOKEN=val",
+                "REFRESH_TOKEN=<redacted>",
+            ),
+            (
+                "export MY_API_KEY=val",
+                "export MY_API_KEY=<redacted>",
+            ),
+            (
+                "key=mykey",
+                "key=<redacted>",
+            ),
+            (
+                "secret=mysecret",
+                "secret=<redacted>",
+            ),
+            (
+                "token=mytoken",
+                "token=<redacted>",
+            ),
+            (
+                "password=mypass",
+                "password=<redacted>",
+            ),
+            (
+                "passwd=mypasswd",
+                "passwd=<redacted>",
+            ),
+
+            // 5. JSON in argv
+            (
+                "{\"token\": \"secret\"}",
+                "{\"token\": \"<redacted>\"}",
+            ),
+            (
+                "{\"api_key\": \"secret\"}",
+                "{\"api_key\": \"<redacted>\"}",
+            ),
+            (
+                "{\"password\": \"secret\"}",
+                "{\"password\": \"<redacted>\"}",
+            ),
+            (
+                "{\"private_key\": \"secret\"}",
+                "{\"private_key\": \"<redacted>\"}",
+            ),
+            (
+                "{\"secret\": \"val\"}",
+                "{\"secret\": \"<redacted>\"}",
+            ),
+            (
+                "{'token': 'secret'}",
+                "{'token': '<redacted>'}",
+            ),
+            (
+                "{'password': 'secret'}",
+                "{'password': '<redacted>'}",
+            ),
+
+            // 6. YAML and key-value pairs
+            (
+                "token: secret",
+                "token: <redacted>",
+            ),
+            (
+                "token: \"secret\"",
+                "token: \"<redacted>\"",
+            ),
+            (
+                "token: 'secret'",
+                "token: '<redacted>'",
+            ),
+            (
+                "password: secret",
+                "password: <redacted>",
+            ),
+            (
+                "api_key: secret",
+                "api_key: <redacted>",
+            ),
+
+            // 7. URL userinfo
+            (
+                "git clone https://zezeozue:secretpass@github.com/repo.git",
+                "git clone https://<redacted>@github.com/repo.git",
+            ),
+            (
+                "curl http://admin:pass123@example.com/api",
+                "curl http://<redacted>@example.com/api",
+            ),
+            (
+                "git clone git+ssh://git:key123@example.com/repo.git",
+                "git clone git+ssh://<redacted>@example.com/repo.git",
+            ),
+
+            // 8. Auth & Bearer headers
+            (
+                "curl -H 'Authorization: Bearer my-secret-token-12345' https://example.com",
+                "curl -H 'Authorization: Bearer <redacted>' https://example.com",
+            ),
+            (
+                "curl -H \"Authorization: Bearer secret\"",
+                "curl -H \"Authorization: Bearer <redacted>\"",
+            ),
+            (
+                "curl -H 'Authorization: Basic dXNlcjpwYXNz'",
+                "curl -H 'Authorization: Basic <redacted>'",
+            ),
+            (
+                "Bearer my-secret-token-xyz",
+                "Bearer <redacted>",
+            ),
+
+            // 9. Vendor tokens
+            (
+                concat!("AWS: AKIA", "IOSFODNN7EXAMPLE"),
+                "AWS: <redacted>",
+            ),
+            (
+                concat!("aws: akia", "iosfodnn7example"),
+                "aws: <redacted>",
+            ),
+            (
+                concat!("ASIA", "IOSFODNN7EXAMPLE"),
+                "<redacted>",
+            ),
+            (
+                concat!("gcp token: ya29.", "a0AfH6SMCx1234567890abcdef"),
+                "gcp token: <redacted>",
+            ),
+            (
+                concat!("GCP: AIza", "SyD-1234567890abcdefghijklmnopqrstuv"),
+                "GCP: <redacted>",
+            ),
+            (
+                concat!("GitHub: ghp_", "1234567890abcdefghijklmnopqrstuvwxyzAB"),
+                "GitHub: <redacted>",
+            ),
+            (
+                concat!("GitHub: gho_", "1234567890abcdefghijklmnopqrstuvwxyzAB"),
+                "GitHub: <redacted>",
+            ),
+            (
+                concat!("GitHub: ghs_", "1234567890abcdefghijklmnopqrstuvwxyzAB"),
+                "GitHub: <redacted>",
+            ),
+            (
+                concat!(
+                    "GitHub PAT: github_pat_",
+                    "11ABCD1234567890abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrstuvwxyz12"
+                ),
+                "GitHub PAT: <redacted>",
+            ),
+            (
+                concat!(
+                    "Anthropic: sk-ant-",
+                    "api03-1234567890abcdefghijklmnopqrstuvwxyz123456"
+                ),
+                "Anthropic: <redacted>",
+            ),
+            (
+                concat!("OpenAI: sk-", "1234567890abcdefghijklmnopqrstuvwxyz123456"),
+                "OpenAI: <redacted>",
+            ),
+            (
+                concat!(
+                    "OpenAI: sk-proj-",
+                    "1234567890abcdefghijklmnopqrstuvwxyz123456"
+                ),
+                "OpenAI: <redacted>",
+            ),
+            (
+                concat!("Slack: xoxb-", "1234567890-1234567890123-abc"),
+                "Slack: <redacted>",
+            ),
+            (
+                concat!("Slack: xoxp-", "1234567890-1234567890123-abc"),
+                "Slack: <redacted>",
+            ),
+            (
+                concat!("Slack: xoxa-", "1234567890-1234567890123-abc"),
+                "Slack: <redacted>",
+            ),
+            (
+                concat!("Slack: xoxr-", "1234567890-1234567890123-abc"),
+                "Slack: <redacted>",
+            ),
+            (
+                "jwt: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+                "jwt: <redacted>",
+            ),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0...\n-----END RSA PRIVATE KEY-----",
+                "<redacted>",
+            ),
+            (
+                "-----begin private key-----\nmieo...\n-----end private key-----",
+                "<redacted>",
+            ),
+
+            // 10. Hex runs & Base64 runs (>= 32 chars)
+            (
+                "hash 0123456789abcdef0123456789abcdef",
+                "hash <redacted>",
+            ),
+            (
+                "secret: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "secret: <redacted>",
+            ),
+            (
+                "token YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=",
+                "token <redacted>",
+            ),
+            (
+                "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0==",
+                "<redacted>",
+            ),
+
+            // 11. Benign lines (at least 20 lines that MUST REMAIN UNTOUCHED)
+            (
+                "git checkout 0123456789abcdef0123456789abcdef01234567",
+                "git checkout 0123456789abcdef0123456789abcdef01234567",
+            ),
+            (
+                "commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                "commit 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            ),
+            (
+                "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            ),
+            (
+                "git reset --hard 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                "git reset --hard 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            ),
+            (
+                "ls -la /usr/local/google/home/zezeozue/dev/tachograph/crates/tacho-core/src/scrub.rs",
+                "ls -la /usr/local/google/home/zezeozue/dev/tachograph/crates/tacho-core/src/scrub.rs",
+            ),
+            (
+                "cat /var/log/syslog/extra_long_directory_name/service.log",
+                "cat /var/log/syslog/extra_long_directory_name/service.log",
+            ),
+            (
+                "cargo test test_order_550e8400-e29b-41d4-a716-446655440000",
+                "cargo test test_order_550e8400-e29b-41d4-a716-446655440000",
+            ),
+            (
+                "pytest tests/test_user_123e4567-e89b-12d3-a456-426614174000.py",
+                "pytest tests/test_user_123e4567-e89b-12d3-a456-426614174000.py",
+            ),
+            (
+                "mkdir -p /tmp/test_dir/nested",
+                "mkdir -p /tmp/test_dir/nested",
+            ),
+            (
+                "cargo test -p core --lib",
+                "cargo test -p core --lib",
+            ),
+            (
+                "cargo build -p tacho-core",
+                "cargo build -p tacho-core",
+            ),
+            (
+                "git checkout -p",
+                "git checkout -p",
+            ),
+            (
+                "git push origin main",
+                "git push origin main",
+            ),
+            (
+                "echo 'hello world'",
+                "echo 'hello world'",
+            ),
+            (
+                "pwd",
+                "pwd",
+            ),
+            (
+                "RUST_LOG=debug cargo run",
+                "RUST_LOG=debug cargo run",
+            ),
+            (
+                "python3 -m pytest tests/unit",
+                "python3 -m pytest tests/unit",
+            ),
+            (
+                "curl -H 'Content-Type: application/json' https://api.example.com/items",
+                "curl -H 'Content-Type: application/json' https://api.example.com/items",
+            ),
+            (
+                "docker build -t my-image:v1.0.0 .",
+                "docker build -t my-image:v1.0.0 .",
+            ),
+            (
+                "PGPASSWORD=mysecret123 psql -h localhost",
+                "PGPASSWORD=<redacted> psql -h localhost",
+            ),
+            (
+                "PGPASS=mysecret123 psql",
+                "PGPASS=<redacted> psql",
+            ),
+            (
+                "curl -H 'X-Api-Key: secret123' https://api.example.com",
+                "curl -H 'X-Api-Key: <redacted>' https://api.example.com",
+            ),
+            (
+                "curl --header=\"Authorization: Bearer my-secret-token\"",
+                "curl --header=\"Authorization: Bearer <redacted>\"",
+            ),
+            (
+                "mysql -uroot -psecret123",
+                "mysql -uroot -p<redacted>",
+            ),
+            (
+                "docker login -u myuser -p mysecretpass",
+                "docker login -u myuser -p <redacted>",
+            ),
+            (
+                "machine github.com login user password mynetrcpassword",
+                "machine github.com login user password <redacted>",
+            ),
+            (
+                concat!("stripe key: sk_", "live_51Abcdefghijklmnopqrstuvw"),
+                "stripe key: <redacted>",
+            ),
+            (
+                concat!("npm: npm_", "0123456789abcdefghijklmnopqrstuv"),
+                "npm: <redacted>",
+            ),
+            (
+                concat!("gitlab: glpat-", "abcdefghijklmnopqrst"),
+                "gitlab: <redacted>",
+            ),
+            (
+                "curl --token \\\n  mysecret123",
+                "curl --token <redacted>",
+            ),
+            (
+                "export MY_SECRET_TOKEN=\\\n  secretvalue",
+                "export MY_SECRET_TOKEN=<redacted>",
+            ),
+            (
+                "tar -czf archive.tar.gz src/ tests/",
+                "tar -czf archive.tar.gz src/ tests/",
+            ),
+            (
+                "gcc -pthread -O2 test.c",
+                "gcc -pthread -O2 test.c",
+            ),
+            (
+                "clang -pipe test.c",
+                "clang -pipe test.c",
+            ),
+            (
+                "find . -print",
+                "find . -print",
+            ),
+            (
+                "echo \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  empty.txt\" | sha256sum -c",
+                "echo \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  empty.txt\" | sha256sum -c",
+            ),
+            (
+                "docker pull ubuntu@sha256:7247f6e5c5214238d1759b61373d1546573f76e3473ff00c036ac143cc84981a",
+                "docker pull ubuntu@sha256:7247f6e5c5214238d1759b61373d1546573f76e3473ff00c036ac143cc84981a",
+            ),
+            (
+                "cargo test testUserRegistrationWithValidEmailAndPasswordConfirmation",
+                "cargo test testUserRegistrationWithValidEmailAndPasswordConfirmation",
+            ),
+            (
+                "docker login --password-stdin",
+                "docker login --password-stdin",
+            ),
+            (
+                "curl --token \\\nsecrettoken1234567890 https://api.com",
+                "curl --token <redacted> https://api.com",
+            ),
+            (
+                "mysql -u root -p\\\nsecretpassword123",
+                "mysql -u root -p <redacted>",
+            ),
+            (
+                "curl -u \\\nmyuser:secretpassword123 https://api.com",
+                "curl -u myuser:<redacted> https://api.com",
+            ),
+            (
+                "echo '{\"token\": \\\n\"secrettoken123\"}'",
+                "echo '{\"token\": \"<redacted>\"}'",
+            ),
+            (
+                "curl -H 'Authorization: ApiKey mytoken123' https://api.com",
+                "curl -H 'Authorization: ApiKey <redacted>' https://api.com",
+            ),
+            (
+                "curl -H 'Authorization: Bearer \\\nmysecret123' https://api.com",
+                "curl -H 'Authorization: Bearer <redacted>' https://api.com",
+            ),
+            (
+                concat!(
+                    "stripe listen --whsec whsec_",
+                    "1234567890abcdef1234567890abcdef"
+                ),
+                "stripe listen --whsec <redacted>",
+            ),
+            (
+                "cat <<EOF > ~/.netrc\nmachine api.com\nlogin u\npassword p\nEOF",
+                "cat <<EOF > ~/.netrc\nmachine api.com\nlogin u\npassword <redacted>\nEOF",
+            ),
+            (
+                "echo 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  target.tar.gz' | sha256sum -c",
+                "echo 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  target.tar.gz' | sha256sum -c",
+            ),
+            (
+                "curl -H 'Proxy-Authorization: Basic dXNlcjpwYXNz' https://example.com",
+                "curl -H 'Proxy-Authorization: Basic <redacted>' https://example.com",
+            ),
+            (
+                "curl -H 'Cookie: session=12345; user=alice' https://example.com",
+                "curl -H 'Cookie: <redacted>' https://example.com",
+            ),
+            (
+                "curl -H 'Set-Cookie: session=12345; Secure; HttpOnly' https://example.com",
+                "curl -H 'Set-Cookie: <redacted>' https://example.com",
+            ),
+            (
+                "curl -H 'X-Auth-Token: secrettoken12345' https://example.com",
+                "curl -H 'X-Auth-Token: <redacted>' https://example.com",
+            ),
+        ];
+
+    #[test]
+    fn test_scrubber_table() {
+        let scrubber = Scrubber::new();
+        assert!(
+            SCRUB_TABLE.len() >= 80,
+            "Must test at least 80 cases, got {}",
+            SCRUB_TABLE.len()
+        );
+
+        for &(input, expected) in SCRUB_TABLE {
+            let actual = scrubber.scrub(input);
+            assert_eq!(
+                actual, expected,
+                "Scrubbing {:?} produced {:?}, expected {:?}",
+                input, actual, expected
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn test_scrub_idempotent(s in ".*") {
+            let scrubber = Scrubber::new();
+            let first = scrubber.scrub(&s);
+            let second = scrubber.scrub(&first);
+            prop_assert_eq!(first, second);
+        }
+
+        #[test]
+        fn test_scrub_no_panic_arbitrary_utf8(s in "\\PC*") {
+            let scrubber = Scrubber::new();
+            let _ = scrubber.scrub(&s);
+        }
+
+        #[test]
+        fn test_scrub_leak_cases_with_line_continuations(
+            case_idx in 0..150usize,
+            boundary_idx in 0..50usize,
+            crlf in proptest::bool::ANY,
+            spaces in 0..3usize,
+        ) {
+            let scrubber = Scrubber::new();
+            let leak_cases: Vec<(&str, &str)> = SCRUB_TABLE
+                .iter()
+                .copied()
+                .filter(|(_, exp)| exp.contains("<redacted>"))
+                .collect();
+            prop_assume!(!leak_cases.is_empty());
+            let (input, _expected) = leak_cases[case_idx % leak_cases.len()];
+
+            let boundaries: Vec<usize> = input
+                .char_indices()
+                .filter(|&(i, c)| {
+                    if c.is_whitespace() && c != '\n' && c != '\r' {
+                        let prev = if i > 0 { input[..i].chars().next_back() } else { None };
+                        let next = input[i..].chars().nth(1);
+                        prev != Some('\\') && next != Some('\\')
+                    } else {
+                        c == '=' && i + 1 < input.len() && !input[..i].contains("://")
+                    }
+                })
+                .map(|(i, c)| if c == '=' { i + 1 } else { i })
+                .collect();
+
+            if !boundaries.is_empty() {
+                let idx = boundaries[boundary_idx % boundaries.len()];
+                let nl = if crlf { "\\\r\n" } else { "\\\n" };
+                let pad = " ".repeat(spaces);
+                let continuation = format!(" {}{}", nl, pad);
+                let wrapped = format!("{}{}{}", &input[..idx], continuation, &input[idx..]);
+
+                let scrubbed = scrubber.scrub(&wrapped);
+                prop_assert!(
+                    scrubbed.contains("<redacted>"),
+                    "Wrapped input {:?} scrubbed to {:?}, expected to contain <redacted>",
+                    wrapped,
+                    scrubbed
+                );
+            }
+        }
     }
 }

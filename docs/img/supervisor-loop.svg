@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 540" width="100%" height="auto">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .text-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #202124; }
+      .text-section { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; fill: #3c4043; text-transform: uppercase; letter-spacing: 0.5px; }
+      .text-worker { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 11px; font-weight: 500; fill: #b06000; }
+      .text-sup { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 11px; font-weight: 500; fill: #1a73e8; }
+      .text-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11px; fill: #3c4043; }
+      .text-desc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 10px; fill: #5f6368; }
+      .text-token-count { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 13px; font-weight: 700; fill: #188038; }
+      .text-bloat { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 13px; font-weight: 700; fill: #d93025; }
+      
+      .box-worker { fill: #fef7e0; stroke: #fdd663; stroke-width: 1.2; rx: 4px; }
+      .box-filter { fill: #f1f3f4; stroke: #dadce0; stroke-width: 1.2; rx: 6px; }
+      .box-sup { fill: #e8f0fe; stroke: #8ab4f8; stroke-width: 1.5; rx: 6px; }
+      .box-callout { fill: #e6f4ea; stroke: #34a853; stroke-width: 1.2; rx: 4px; }
+      
+      .arrow { stroke: #5f6368; stroke-width: 1.3; fill: none; marker-end: url(#ah); }
+      .arrow-blue { stroke: #1a73e8; stroke-width: 1.5; fill: none; marker-end: url(#aha); }
+      .arrow-green { stroke: #188038; stroke-width: 1.5; fill: none; marker-end: url(#ahg); }
+      .arrow-red { stroke: #d93025; stroke-width: 1.5; fill: none; marker-end: url(#ahr); }
+
+      @media (prefers-color-scheme: dark) {
+        .bg { fill: #202124; }
+        .text-title { fill: #e8eaed; }
+        .text-section { fill: #bdc1c6; }
+        .text-worker { fill: #fdd663; }
+        .text-sup { fill: #8ab4f8; }
+        .text-body { fill: #e8eaed; }
+        .text-desc { fill: #9aa0a6; }
+        .text-token-count { fill: #81c995; }
+        .text-bloat { fill: #f28b82; }
+        
+        .box-worker { fill: #3c3214; stroke: #f9ab00; }
+        .box-filter { fill: #2d2f31; stroke: #5f6368; }
+        .box-sup { fill: #1c2b46; stroke: #4285f4; }
+        .box-callout { fill: #133420; stroke: #34a853; }
+        
+        .arrow { stroke: #9aa0a6; }
+        .arrow-blue { stroke: #8ab4f8; }
+        .arrow-green { stroke: #81c995; }
+        .arrow-red { stroke: #f28b82; }
+      }
+    </style>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#5f6368"/>
+    </marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#1a73e8"/>
+    </marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#188038"/>
+    </marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#d93025"/>
+    </marker>
+  </defs>
+
+  <rect width="1020" height="540" class="bg"/>
+
+  <text x="30" y="30" class="text-title">The Supervisor Control Loop: turning 97 MB of worker logs into ~200 tokens</text>
+
+  <!-- COLUMN 1: N CHEAP WORKERS -->
+  <text x="30" y="65" class="text-section">1 · N Worker Agents (Cheap Models)</text>
+
+  <!-- Worker 1 -->
+  <g transform="translate(30, 80)">
+    <rect width="240" height="95" class="box-worker"/>
+    <text x="14" y="24" class="text-worker">TACHO_AGENT=worker-1</text>
+    <text x="14" y="42" class="text-body">Task: Compiler fix · Flash</text>
+    <text x="14" y="58" class="text-desc">Runs: cargo build, rustc errors</text>
+    <text x="14" y="78" class="text-bloat">35 MB raw compiler logs</text>
+  </g>
+
+  <!-- Worker 2 -->
+  <g transform="translate(30, 190)">
+    <rect width="240" height="95" class="box-worker"/>
+    <text x="14" y="24" class="text-worker">TACHO_AGENT=worker-2</text>
+    <text x="14" y="42" class="text-body">Task: Test runner · Haiku</text>
+    <text x="14" y="58" class="text-desc">Runs: pytest -v, stack traces</text>
+    <text x="14" y="78" class="text-bloat">42 MB raw test stdout</text>
+  </g>
+
+  <!-- Worker 3 -->
+  <g transform="translate(30, 300)">
+    <rect width="240" height="95" class="box-worker"/>
+    <text x="14" y="24" class="text-worker">TACHO_AGENT=worker-3</text>
+    <text x="14" y="42" class="text-body">Task: Linter &amp; format · Small</text>
+    <text x="14" y="58" class="text-desc">Runs: eslint, prettier, diffs</text>
+    <text x="14" y="78" class="text-bloat">20 MB raw diff text</text>
+  </g>
+
+  <!-- Total Raw Bloat Callout -->
+  <g transform="translate(30, 415)">
+    <text x="14" y="20" class="text-bloat">Total: 97 MB / ~25M tokens</text>
+    <text x="14" y="38" class="text-desc">If streamed directly to supervisor, context exhausts in minutes.</text>
+  </g>
+
+  <!-- Arrows from Workers to Tachograph -->
+  <path d="M270,127 L330,230" class="arrow-red"/>
+  <path d="M270,237 L330,240" class="arrow-red"/>
+  <path d="M270,347 L330,250" class="arrow-red"/>
+
+  <!-- COLUMN 2: TACHOGRAPH FILTER & ABSTRACTION -->
+  <text x="330" y="65" class="text-section">2 · Tachograph Flight Recorder</text>
+
+  <g transform="translate(330, 80)">
+    <rect width="280" height="315" class="box-filter"/>
+    <text x="16" y="26" class="text-title">Tachograph Daemon</text>
+    
+    <!-- Sub-boxes for reduction features -->
+    <g transform="translate(12, 42)">
+      <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
+      <text x="10" y="20" class="text-body" font-weight="600">Privacy &amp; Content Firewall</text>
+      <text x="10" y="36" class="text-desc">0 prose, 0 file content, 0 output stored</text>
+    </g>
+
+    <g transform="translate(12, 102)">
+      <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
+      <text x="10" y="20" class="text-body" font-weight="600">Command Classifier</text>
+      <text x="10" y="36" class="text-desc">"cargo test --lib" → CommandClass::Test</text>
+    </g>
+
+    <g transform="translate(12, 162)">
+      <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
+      <text x="10" y="20" class="text-body" font-weight="600">Live State Machine</text>
+      <text x="10" y="36" class="text-desc">Thinking → Tool → Waiting → Idle/Stalled</text>
+    </g>
+
+    <g transform="translate(12, 222)">
+      <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
+      <text x="10" y="20" class="text-body" font-weight="600">Anomaly Detectors</text>
+      <text x="10" y="36" class="text-desc">Identical call loop, tool hang, churn</text>
+    </g>
+
+    <text x="16" y="295" class="text-desc">All events stamped to 8-byte digest + durations</text>
+  </g>
+
+  <!-- Compression ratio banner -->
+  <g transform="translate(330, 415)">
+    <rect width="280" height="40" class="box-callout"/>
+    <text x="14" y="25" class="text-token-count">99.998% Context Reduction</text>
+  </g>
+
+  <!-- Arrows from Tachograph to Supervisor -->
+  <path d="M610,180 L670,180" class="arrow-green"/>
+  <path d="M670,280 L610,280" class="arrow-blue"/>
+
+  <!-- COLUMN 3: STRONG SUPERVISOR AGENT -->
+  <text x="670" y="65" class="text-section">3 · Strong Supervisor Agent (e.g. Claude Opus)</text>
+
+  <g transform="translate(670, 80)">
+    <rect width="320" height="315" class="box-sup"/>
+    <text x="16" y="26" class="text-title">Supervisor Control Loop</text>
+    <text x="16" y="42" class="text-desc">Watches entire swarm without reading worker logs</text>
+
+    <!-- Step 1: Watch -->
+    <g transform="translate(14, 55)">
+      <rect width="292" height="48" fill="#ffffff" stroke="#aecbfa" rx="3"/>
+      <text x="10" y="19" class="text-sup">tacho watch --until stalled|idle|exit</text>
+      <text x="10" y="35" class="text-desc">Blocks at 0 tokens until any worker needs attention</text>
+    </g>
+
+    <!-- Step 2: Status -->
+    <g transform="translate(14, 115)">
+      <rect width="292" height="60" fill="#ffffff" stroke="#aecbfa" rx="3"/>
+      <text x="10" y="19" class="text-sup">tacho status --json</text>
+      <text x="10" y="35" class="text-token-count">Payload: ~180 tokens</text>
+      <text x="10" y="50" class="text-desc">State, current slice, elapsed ms, token usage</text>
+    </g>
+
+    <!-- Step 3: Targeted Anomaly Drilldown -->
+    <g transform="translate(14, 187)">
+      <rect width="292" height="52" fill="#ffffff" stroke="#aecbfa" rx="3"/>
+      <text x="10" y="19" class="text-sup">tacho report worker-k  (only on stall)</text>
+      <text x="10" y="35" class="text-desc">Diagnose loop / failed command without noise</text>
+    </g>
+
+    <!-- Step 4: Intervene -->
+    <g transform="translate(14, 251)">
+      <rect width="292" height="48" fill="#ffffff" stroke="#aecbfa" rx="3"/>
+      <text x="10" y="19" class="text-sup">Direct Workers (Kill, Nudge, Reseed)</text>
+      <text x="10" y="35" class="text-desc">High-level steering commands</text>
+    </g>
+  </g>
+
+  <!-- Loop back arrow from Step 4 back to Workers -->
+  <path d="M830,395 C830,470 150,470 150,400" class="arrow-blue"/>
+  <text x="450" y="485" class="text-sup">Steering &amp; Intervention (Kill, Reassign, Unstick)</text>
+
+  <!-- Bottom Legend -->
+  <text x="30" y="520" class="text-desc">• Result: One strong supervisor orchestrates an arbitrary number of parallel workers without context window rot, token budget blow-ups, or lost anomaly visibility.</text>
+</svg>

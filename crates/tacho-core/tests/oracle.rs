@@ -390,6 +390,7 @@ fn create_all_events(base_ts: u64) -> Vec<Event> {
                 check_name: Some("unit_test".to_string()),
                 via_wrap: Some(false),
                 program: Some("cargo".to_string()),
+                tool_use_id: Some("call-cmd-1".to_string()),
             })),
         },
     ));
@@ -430,6 +431,7 @@ fn create_all_events(base_ts: u64) -> Vec<Event> {
                 path: Some("src/lib.rs".to_string()),
                 kind: Some(tacho::FileAccessKind::Read as i32),
                 query: Some("fn main".to_string()),
+                tool_use_id: Some("call-file-1".to_string()),
             })),
         },
     ));

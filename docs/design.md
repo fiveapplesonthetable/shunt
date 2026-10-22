@@ -1,8 +1,8 @@
 # tachograph: design
 
 A flight recorder for coding agents. One small daemon per machine records what
-every agent on it does, as a typed Perfetto trace held in memory, and answers
-two kinds of reader: a person opening the trace in ui.perfetto.dev, and an agent
+every agent on it does into a single SQLite WAL event log, and answers two kinds
+of reader: a person opening a Perfetto trace in ui.perfetto.dev, and an agent
 asking "what are my workers doing" in a few hundred tokens.
 
 The binary is `tacho`. The crate is `tachograph`.
@@ -14,11 +14,12 @@ document disagree, one of them is a bug.
 
 Goals:
 
-1. Always on, bounded memory. Recording costs a fixed amount of RAM and a few
-   microseconds per event, forever.
+1. One source of truth. The SQLite WAL event log holds every event at full
+   resolution; every trace is rendered from those rows through one encoder.
 2. A snapshot at any moment, without stopping anything: `tacho trace` writes a
    `.perfetto-trace` that opens in ui.perfetto.dev and loads in
-   `trace_processor` with zero import errors.
+   `trace_processor` with zero import errors — even if the daemon is wedged or
+   dead (by reading `events.sqlite` directly).
 3. Everything an agent does is typed: turns, tool calls, commands (classified as
    build, test, push, ...), file reads and edits, waits, messages, stalls,
    tokens and cost. Durations are slices, points are instants, quantities are
@@ -42,17 +43,18 @@ A supervisor with a shell calls the CLI; that is the integration surface.
 
 ```
  claude hooks ─┐
- gemini hooks ─┤   api.sock (NDJSON)          ┌─ ring: core     8 MiB ─┐
- jetski hooks ─┼──────────────┐               │                        │
- tacho emit   ─┘              ▼               ├─ ring: agents  64 MiB ─┼─► snapshot thread ─► trace.sock ─► tacho trace
-                     ┌─────────────────┐      │                        │        ▲
- tacho run -- cmd ──►│ appender thread │──────┼─ ring: machine  8 MiB ─┘        │ (clone)
-  (stream-json)      │ stamp, scrub,   │      │                                 │
- OTLP :4318 ────────►│ classify, lane, │──────┴─► SQLite event log        traced (optional)
- sampler (/proc) ───►│ log, encode,    │              │
-                     │ ring, fold      │              └─► tacho trace --from-log
-                     └─────────────────┘
-                              │
+ gemini hooks ─┤   api.sock (NDJSON)
+ jetski hooks ─┼──────────────┐
+ tacho emit   ─┘              ▼
+                     ┌─────────────────┐        WAL (single writer,
+ tacho run -- cmd ──►│ appender thread │──────► SQLite event log ◄───────┐
+  (stream-json)      │ stamp, scrub,   │        (events.sqlite)          │
+ OTLP :4318 ────────►│ classify, lane, │               │                 │
+ sampler (/proc) ───►│ log, fold       │               ▼                 │
+                     └─────────────────┘        snapshot reader ──► tacho trace
+                              │                  (trace.sock or          ▲
+                              │                   direct RO open)        │ (clone)
+                              │                                    traced (optional)
                               └─► live state (fold) ─► tacho status / report / watch
 ```
 
@@ -62,12 +64,17 @@ threads and blocking sockets. Threads:
 
 - **acceptors**: one per listening source (api.sock, OTLP, each `tacho run`
   connection). They parse input into `Input` values and send them on one
-  bounded channel. They never touch the log, rings or state.
+  bounded channel. They never touch the log or state.
 - **appender**: the only consumer of the channel and the only writer of the
-  log, the rings, the track registry and the live state. Single writer makes
-  every ring single-producer and the seqlock lock-free.
-- **snapshot**: owns `trace.sock`. Copies rings. Shares only the rings and the
-  registry snapshot with the appender. Answers even when the appender is stuck.
+  SQLite WAL log, the track registry and the live state. It batches inserts
+  into one transaction per channel drain (up to 256 events or 50 ms) with
+  `synchronous = NORMAL` and a prepared statement.
+- **snapshot**: owns `trace.sock`. Opens its own read-only SQLite connection
+  (WAL readers never block the writer and the writer never blocks readers) and
+  streams rows through the core encoder. Shares only the registry snapshot with
+  the appender. Answers even when the appender is stuck; and if the daemon is
+  dead (`SIGKILL`), `tacho trace` opens `events.sqlite` read-only in the CLI
+  process and runs the same function.
 - **sampler**: every `sample_interval` (default 2 s) reads /proc and sends
   counter samples to the appender.
 - **query**: serves status/report/watch on api.sock from a read-mostly copy of
@@ -305,43 +312,31 @@ written) carries `cause_seq` and no arrow. SQL joins on it.
 - `Kind::ALL` in Rust, the `Event.body` oneof and the extension field list
   agree; a test holds it.
 
-## 6. The rings
+## 6. The durable log and packet sequences
 
-### 6.1 Three rings by class
+### 6.1 One SQLite WAL table
 
-| ring    | holds                                                     | default |
-|---------|-----------------------------------------------------------|---------|
-| core    | daemon, tasks, agent state, milestones, providers, custom | 8 MiB   |
-| agents  | runs, turns, tool calls, commands, files, waits, messages | 64 MiB  |
-| machine | every sampled counter                                     | 8 MiB   |
+`$TACHO_HOME/events.sqlite` is opened in `WAL` mode with `synchronous = NORMAL`.
+One table, `events(seq INTEGER PRIMARY KEY, ts_ns INTEGER, kind INTEGER,
+track_key TEXT, cause_seq INTEGER, agent TEXT, body BLOB)`, indexed on `ts_ns`.
+Every event — including sampled machine and per-run process-tree counters — is a
+row in this table.
 
-Configurable in `$TACHO_HOME/config.toml`. A kind's ring is a function of its
-kind in the same `match` that maps it to a packet type.
+Retention is bounded by `retention_days` (default 7 in `$TACHO_HOME/config.toml`),
+pruned hourly by the appender in small batches so pruning never stalls ingest.
+`tacho status` reports the database size.
 
-### 6.2 Chunks
-
-A ring is n chunks of 4096 bytes: `gen: AtomicU32` (odd while being written),
-`len: AtomicU32`, `words: [AtomicU64; 511]`. A chunk holds whole framed
-packets; a packet never straddles chunks. All safe Rust over atomics.
-
-Write: `gen += 1` (Release), store words (Relaxed), `len = new` (Release),
-`gen += 1` (Release). Read: `g1 = gen` (Acquire), if odd retry later; copy
-`len` then `words[..len]`; `fence(Acquire)`; `g2 = gen`; equal means whole.
-After 3 failed attempts the chunk is counted skipped. Wrap overwrites the
-oldest chunk whole and increments `overwritten`.
-
-loom checks one writer and one reader over every interleaving.
-
-### 6.3 Interning
+### 6.2 Packet sequences and interning
 
 Event names come from the closed `Kind` enum; interned id = discriminant + 1,
-constant per build. Each snapshot header writes the full name dictionary per
-sequence with `SEQ_INCREMENTAL_STATE_CLEARED`; every ring packet carries
+constant per build. Each trace header writes the full name dictionary per
+packet sequence with `SEQ_INCREMENTAL_STATE_CLEARED`; every event packet carries
 `SEQ_NEEDS_INCREMENTAL_STATE` and `name_iid`. Nothing else is interned.
 Custom span names (open set) are written inline as `name`.
 
-Sequences: one per ring. Sequence ids are `0x7AC0_0001..=0x7AC0_0003`, far from
-the small integers traced assigns, so a merged system trace cannot collide.
+Events are partitioned across three Perfetto packet sequences by class (`core`,
+`agents`, `machine`) with sequence ids `0x7AC0_0001..=0x7AC0_0003`, far from
+the small integers `traced` assigns, so a merged system trace cannot collide.
 
 ## 7. Detectors
 
@@ -424,26 +419,28 @@ Also a `--json` form reading one Input per line on stdin for bulk use.
 
 ## 9. Snapshot
 
-`tacho trace [-o FILE] [--since 2h] [--system] [--stdout]` asks the snapshot
-thread on trace.sock (falling back from api.sock if needed). Written, in order:
+`tacho trace [-o FILE] [--since 2h] [--until TIME] [--system] [--stdout]` asks
+the snapshot thread on `trace.sock` (falling back to `api.sock`, and if the
+daemon is unreachable or unresponsive within 2 s, opening
+`$TACHO_HOME/events.sqlite` read-only in the CLI process itself). Written, in
+order:
 
 1. `ExtensionDescriptor` with `tacho.proto`'s descriptor set.
 2. `ClockSnapshot` (REALTIME and BOOTTIME now) with
    `primary_trace_clock = REALTIME`.
-3. Per ring sequence: `TracePacketDefaults` (`timestamp_clock_id = REALTIME`),
+3. Per sequence: `TracePacketDefaults` (`timestamp_clock_id = REALTIME`),
    full `InternedData`, `SEQ_INCREMENTAL_STATE_CLEARED`.
-4. Every `TrackDescriptor` in the registry, in creation order.
-5. Chunks of core, agents, machine, oldest to newest.
-6. A `Snapshot` begin/end on `daemon` with bytes per ring, chunks overwritten
-   and skipped (also written to the core ring).
+4. Every `TrackDescriptor` in the registry (folded from `TrackCreated` rows),
+   in creation order.
+5. Every matching row from `events` in `seq` order, streamed through the core
+   encoder without buffering all rows in memory.
+6. A `Snapshot` begin/end on `daemon` with row and byte counts.
 
 Timestamps are CLOCK_REALTIME in nanoseconds (microsecond resolution). The
 daemon clamps a backwards wall-clock step and records `ClockStepped`.
 
-`--since` filters during the copy by reading each packet's timestamp field
-without decoding the rest. `--from-log SINCE [UNTIL]` rebuilds from rows with
-the same encoder; the result equals a ring snapshot of the same window byte for
-byte, except the ClockSnapshot and the final Snapshot slice (section 12).
+`--since` and `--until` (or `--from-log SINCE [UNTIL]` as an alias) filter via
+the `ts_ns` index in SQLite and run through the exact same encoder.
 
 On SIGTERM and SIGINT the daemon writes `$TACHO_HOME/trace/last.perfetto-trace`
 before exiting.
@@ -551,46 +548,40 @@ Required tests, named by the sentence they prove:
 1. every kind renders: each Kind with all fields set appears once on its
    track with the expected args keys (generated from the descriptor); every
    packet is under 2 KiB.
-2. the chunk seqlock is correct under every interleaving (loom).
-3. overwrite keeps the newest and counts what it lost.
-4. snapshots under load are whole: one writer at full speed for 1M events,
-   four snapshot threads in a loop; every snapshot loads clean, seqs within a
-   sequence strictly increase, and form a contiguous suffix minus reported
-   skips.
-5. the write path does not allocate after warm-up (counting allocator).
-6. a ring snapshot equals the log rebuild of the same window.
-7. a restart keeps the tracks: same uuid per key across restart.
-8. any interleaving nests: proptest over random begin/end/instant streams
+2. snapshots under load are whole: one writer at full speed, four concurrent
+   snapshot readers in a loop; every snapshot loads clean in the oracle and
+   seqs strictly increase.
+3. the encoder does not allocate after warm-up (counting allocator).
+4. a dead or wedged daemon still produces a trace: with the appender blocked
+   (`trace.sock`) and with the daemon `SIGKILL`ed (direct read-only SQLite
+   fallback), `tacho trace` returns a loadable file.
+5. a restart keeps the tracks: same uuid per key across restart, and
+   `Recorder::restore(events)` followed by more inputs produces the exact same
+   events as never restarting.
+6. any interleaving nests: proptest over random begin/end/instant streams
    from many runs, including ends without begins and begins without ends;
    Trace Processor reports zero nesting errors and every input slice appears.
-9. hooks never hurt the agent: daemon absent, daemon wedged, malformed JSON,
+7. hooks never hurt the agent: daemon absent, daemon wedged, malformed JSON,
    10 MB payload; the hook exits 0 within budget and prints nothing.
-10. sources fuzz clean: cargo-fuzz targets for hook payloads, stream-json
-    lines, OTLP bodies and `emit --json` lines; no panics.
-11. status agrees with SQL: for scripted fleets, `tacho status --json` equals
-    `agents-now` over a snapshot taken at the same seq.
-12. secrets stay out (the canary).
-13. the system merge loads: with an unprivileged traced running the default
+8. sources fuzz clean: cargo-fuzz targets for hook payloads, stream-json
+   lines, OTLP bodies and `emit --json` lines; no panics.
+9. status agrees with SQL: for scripted fleets, `tacho status --json` equals
+   `agents-now` over a snapshot taken at the same seq.
+10. secrets stay out (the canary).
+11. the system merge loads: with an unprivileged traced running the default
     profile, `tacho trace --system` loads clean, and `system-during-builds`
     attributes a scripted `cargo build`-like child's CPU to its agent.
-14. the wedged daemon still answers: with the appender blocked, `tacho trace`
-    via trace.sock returns a loadable file.
-15. the enum, the oneof and the extension list agree.
+12. the enum, the oneof and the extension list agree.
 
-Benchmarks (criterion, reported not asserted): encode+write per kind, hook
-round trip (process start to exit), emit throughput, snapshot of full rings,
-`--from-log` rebuild rate.
+Benchmarks (reported not asserted): encode per kind, hook round trip (process
+start to exit), ingest throughput, snapshot time and peak RSS at 100k, 1M and
+10M rows, and ingest throughput while a 10M-row snapshot streams.
 
 ## 13. Compromises
 
 - Late causes draw no arrow; `cause_seq` and SQL cover them.
-- Sampled counters exist only in the machine ring; the log keeps one sample a
-  minute, so a `--from-log` rebuild is coarser for counters. Test 6 excludes
-  sampled counters.
 - State tracks need a recent viewer; ui.perfetto.dev is recent.
 - The extension range is unregistered upstream; only our own descriptor
   interprets it.
-- Chunk slack (under 5% at typical packet sizes) is the price of chunks
-  readable on their own.
 - Hooks see what the agent reports. A command an agent runs outside its tool
   interface is invisible unless the run is wrapped and system tracing is on.

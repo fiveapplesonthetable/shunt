@@ -1,0 +1,253 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 620" width="100%" height="auto">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .ui-header { fill: #f1f3f4; stroke: #dadce0; stroke-width: 1; }
+      .ui-sidebar { fill: #f8f9fa; stroke: #dadce0; stroke-width: 1; }
+      .text-ui { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11px; fill: #202124; }
+      .text-ui-bold { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11.5px; font-weight: 600; fill: #202124; }
+      .text-track-name { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 10.5px; font-weight: 500; fill: #1a73e8; }
+      .text-slice-label { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 10px; font-weight: 500; fill: #202124; }
+      .text-time { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 9.5px; fill: #70757a; }
+      
+      .track-row { fill: #ffffff; stroke: #e8eaed; stroke-width: 1; }
+      .track-row-alt { fill: #fafafa; stroke: #e8eaed; stroke-width: 1; }
+      .group-header { fill: #edf2fa; stroke: #dadce0; stroke-width: 1; }
+      
+      /* Slice Colors */
+      .s-run      { fill: #e8f0fe; stroke: #aecbfa; stroke-width: 1; rx: 2px; }
+      .s-turn     { fill: #d2e3fc; stroke: #8ab4f8; stroke-width: 1; rx: 2px; }
+      .s-build    { fill: #fef7e0; stroke: #fdd663; stroke-width: 1; rx: 2px; }
+      .s-test     { fill: #e6f4ea; stroke: #a8dab5; stroke-width: 1; rx: 2px; }
+      .s-tool     { fill: #fce8e6; stroke: #fad2cf; stroke-width: 1; rx: 2px; }
+      .s-subagent { fill: #f3e8fd; stroke: #d7aefb; stroke-width: 1; rx: 2px; }
+      .s-wait     { fill: #f1f3f4; stroke: #bdc1c6; stroke-width: 1; stroke-dasharray: 2,2; rx: 2px; }
+      
+      /* State Band Colors */
+      .st-thinking { fill: #aecbfa; }
+      .st-tool     { fill: #fdd663; }
+      .st-stalled  { fill: #f28b82; }
+      .st-idle     { fill: #dadce0; }
+      
+      /* Counter charts */
+      .chart-line { stroke: #1a73e8; stroke-width: 1.5; fill: none; }
+      .chart-area { fill: #e8f0fe; opacity: 0.6; }
+      .chart-sys  { stroke: #34a853; stroke-width: 1.2; fill: none; }
+      
+      /* Flow Arrow */
+      .flow-arrow { stroke: #9334e6; stroke-width: 2; fill: none; marker-end: url(#ahv); }
+
+      @media (prefers-color-scheme: dark) {
+        .bg { fill: #202124; }
+        .ui-header { fill: #2d2f31; stroke: #444746; }
+        .ui-sidebar { fill: #28292a; stroke: #444746; }
+        .text-ui { fill: #e8eaed; }
+        .text-ui-bold { fill: #e8eaed; }
+        .text-track-name { fill: #8ab4f8; }
+        .text-slice-label { fill: #e8eaed; }
+        .text-time { fill: #9aa0a6; }
+        
+        .track-row { fill: #202124; stroke: #303134; }
+        .track-row-alt { fill: #242528; stroke: #303134; }
+        .group-header { fill: #1f2733; stroke: #3c4043; }
+        
+        .s-run      { fill: #1a273b; stroke: #4285f4; }
+        .s-turn     { fill: #17365d; stroke: #5b9bf8; }
+        .s-build    { fill: #3c3214; stroke: #f9ab00; }
+        .s-test     { fill: #133420; stroke: #34a853; }
+        .s-tool     { fill: #3c1e1e; stroke: #ea4335; }
+        .s-subagent { fill: #2d1e3e; stroke: #af5cf7; }
+        .s-wait     { fill: #303134; stroke: #5f6368; }
+        
+        .st-thinking { fill: #4285f4; }
+        .st-tool     { fill: #f9ab00; }
+        .st-stalled  { fill: #ea4335; }
+        .st-idle     { fill: #5f6368; }
+        
+        .chart-line { stroke: #8ab4f8; }
+        .chart-area { fill: #1c2b46; opacity: 0.6; }
+        .chart-sys  { stroke: #81c995; }
+        .flow-arrow { stroke: #c58af9; }
+      }
+    </style>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#9334e6"/>
+    </marker>
+  </defs>
+
+  <rect width="1020" height="620" class="bg"/>
+
+  <!-- PERFETTO VIEWER TIMELINE HEADER -->
+  <rect x="0" y="0" width="1020" height="36" class="ui-header"/>
+  <text x="14" y="22" class="text-ui-bold">ui.perfetto.dev</text>
+  <text x="120" y="22" class="text-desc">Trace viewer · Tachograph + traced merged flight record</text>
+  
+  <!-- Time ruler ticks -->
+  <g transform="translate(240, 0)">
+    <text x="0" y="24" class="text-time">00:00.000</text>
+    <text x="150" y="24" class="text-time">00:02.000</text>
+    <text x="300" y="24" class="text-time">00:04.000</text>
+    <text x="450" y="24" class="text-time">00:06.000</text>
+    <text x="600" y="24" class="text-time">00:08.000</text>
+    <text x="740" y="24" class="text-time">00:10.000</text>
+  </g>
+
+  <!-- Left Sidebar Divider -->
+  <line x1="230" y1="36" x2="230" y2="620" stroke="#dadce0" stroke-width="1"/>
+
+  <!-- ==================== TRACK GROUP: MACHINE ==================== -->
+  <g transform="translate(0, 36)">
+    <rect width="1020" height="22" class="group-header"/>
+    <text x="10" y="15" class="text-ui-bold">▼ machine</text>
+
+    <!-- Track: cpu_busy -->
+    <g transform="translate(0, 22)">
+      <rect width="1020" height="28" class="track-row"/>
+      <text x="24" y="18" class="text-track-name">machine/cpu_busy</text>
+      <!-- Chart path -->
+      <path d="M240,24 Q320,12 400,6 T560,20 T720,4 T880,18 L980,22 L980,28 L240,28 Z" class="chart-area"/>
+      <path d="M240,24 Q320,12 400,6 T560,20 T720,4 T880,18 L980,22" class="chart-line"/>
+    </g>
+
+    <!-- Track: mem_used -->
+    <g transform="translate(0, 50)">
+      <rect width="1020" height="26" class="track-row-alt"/>
+      <text x="24" y="17" class="text-track-name">machine/mem_used</text>
+      <path d="M240,18 L450,14 L700,8 L980,6" class="chart-line"/>
+    </g>
+  </g>
+
+  <!-- ==================== TRACK GROUP: AGENT WORKER-1 ==================== -->
+  <g transform="translate(0, 112)">
+    <rect width="1020" height="22" class="group-header"/>
+    <text x="10" y="15" class="text-ui-bold">▼ agent:worker-1</text>
+    <text x="140" y="15" class="text-desc">Claude Code (Sonnet 3.5)</text>
+
+    <!-- Track 1: state band -->
+    <g transform="translate(0, 22)">
+      <rect width="1020" height="20" class="track-row"/>
+      <text x="24" y="14" class="text-track-name">state</text>
+      <!-- State segments -->
+      <rect x="240" y="2" width="60" height="16" class="st-thinking"/>
+      <text x="244" y="13" class="text-slice-label">Thinking</text>
+      <rect x="300" y="2" width="180" height="16" class="st-tool"/>
+      <text x="304" y="13" class="text-slice-label">Tool</text>
+      <rect x="480" y="2" width="80" height="16" class="st-thinking"/>
+      <rect x="560" y="2" width="160" height="16" class="st-stalled"/>
+      <text x="564" y="13" class="text-slice-label">Stalled (Loop)</text>
+      <rect x="720" y="2" width="100" height="16" class="st-tool"/>
+      <rect x="820" y="2" width="160" height="16" class="st-idle"/>
+      <text x="824" y="13" class="text-slice-label">Idle</text>
+    </g>
+
+    <!-- Track 2: run:1/turns (Nested stack) -->
+    <g transform="translate(0, 42)">
+      <rect width="1020" height="85" class="track-row-alt"/>
+      <text x="24" y="20" class="text-track-name">run:1/turns</text>
+      <text x="24" y="34" class="text-desc">nested slice stack</text>
+
+      <!-- Run 1 Outer Slice -->
+      <rect x="240" y="4" width="740" height="76" class="s-run"/>
+      <text x="246" y="16" class="text-slice-label">Run 1</text>
+
+      <!-- Turn 1 -->
+      <rect x="250" y="20" width="280" height="56" class="s-turn"/>
+      <text x="256" y="32" class="text-slice-label">Turn 1</text>
+
+      <!-- Turn 1 children: Build, Test, Subagent -->
+      <rect x="260" y="36" width="70" height="34" class="s-build"/>
+      <text x="264" y="52" class="text-slice-label">Build (cargo)</text>
+
+      <rect x="335" y="36" width="80" height="34" class="s-test"/>
+      <text x="340" y="52" class="text-slice-label">Test (pytest)</text>
+
+      <!-- Tool call spawning Subagent (Source of flow arrow) -->
+      <rect x="420" y="36" width="100" height="34" class="s-subagent" id="subagent-trigger"/>
+      <text x="425" y="52" class="text-slice-label">Subagent "sub-1"</text>
+
+      <!-- Turn 2 -->
+      <rect x="540" y="20" width="300" height="56" class="s-turn"/>
+      <text x="546" y="32" class="text-slice-label">Turn 2</text>
+      <rect x="550" y="36" width="140" height="34" class="s-tool"/>
+      <text x="556" y="52" class="text-slice-label">Tool: edit_file</text>
+    </g>
+
+    <!-- Track 3: run:1/lane:1 (Parallel tool calls) -->
+    <g transform="translate(0, 127)">
+      <rect width="1020" height="30" class="track-row"/>
+      <text x="24" y="20" class="text-track-name">run:1/lane:1</text>
+      <!-- Parallel read slice during build -->
+      <rect x="280" y="4" width="90" height="22" class="s-tool"/>
+      <text x="286" y="18" class="text-slice-label">read_file("foo.rs")</text>
+    </g>
+
+    <!-- Track 4: run:1/waits -->
+    <g transform="translate(0, 157)">
+      <rect width="1020" height="26" class="track-row-alt"/>
+      <text x="24" y="17" class="text-track-name">run:1/waits</text>
+      <rect x="700" y="4" width="120" height="18" class="s-wait"/>
+      <text x="708" y="16" class="text-slice-label">Wait (swarm board)</text>
+    </g>
+
+    <!-- Track 5: run:1/tokens_out -->
+    <g transform="translate(0, 183)">
+      <rect width="1020" height="24" class="track-row"/>
+      <text x="24" y="16" class="text-track-name">run:1/tokens_out</text>
+      <path d="M240,20 L300,16 L450,12 L550,6 L800,2" class="chart-line"/>
+    </g>
+  </g>
+
+  <!-- ==================== TRACK GROUP: SUBAGENT SUB-1 ==================== -->
+  <g transform="translate(0, 319)">
+    <rect width="1020" height="22" class="group-header"/>
+    <text x="10" y="15" class="text-ui-bold">▼ agent:sub-1</text>
+    <text x="110" y="15" class="text-desc">Delegated Verifier</text>
+
+    <!-- Track: run:1/turns -->
+    <g transform="translate(0, 22)">
+      <rect width="1020" height="50" class="track-row"/>
+      <text x="24" y="20" class="text-track-name">run:1/turns</text>
+      <!-- Subagent Run 1 joined by flow arrow! -->
+      <rect x="470" y="6" width="320" height="38" class="s-run" id="subagent-target"/>
+      <text x="476" y="22" class="text-slice-label">Run 1 (Triggered by parent Subagent tool call)</text>
+      <rect x="485" y="20" width="120" height="20" class="s-test"/>
+      <text x="490" y="34" class="text-slice-label">Verify Presubmits</text>
+    </g>
+  </g>
+
+  <!-- ==================== TRACK GROUP: SYSTEM (TRACED) ==================== -->
+  <g transform="translate(0, 391)">
+    <rect width="1020" height="22" class="group-header"/>
+    <text x="10" y="15" class="text-ui-bold">▼ system (perfetto traced)</text>
+    <text x="170" y="15" class="text-desc">Aligned by ClockSnapshot (REALTIME &lt;-&gt; BOOTTIME)</text>
+
+    <!-- Track: CPU Sched slices -->
+    <g transform="translate(0, 22)">
+      <rect width="1020" height="28" class="track-row"/>
+      <text x="24" y="18" class="text-track-name">CPU 0 Sched</text>
+      <rect x="260" y="5" width="68" height="18" fill="#c2e7ff"/>
+      <text x="264" y="17" class="text-slice-label">rustc (build)</text>
+      <rect x="335" y="5" width="78" height="18" fill="#ceead6"/>
+      <text x="340" y="17" class="text-slice-label">python (test)</text>
+      <rect x="485" y="5" width="118" height="18" fill="#ceead6"/>
+      <text x="490" y="17" class="text-slice-label">cargo test</text>
+    </g>
+
+    <!-- Track: Process RSS -->
+    <g transform="translate(0, 50)">
+      <rect width="1020" height="26" class="track-row-alt"/>
+      <text x="24" y="17" class="text-track-name">proc: cargo / rustc RSS</text>
+      <path d="M260,20 L300,10 L328,22 M485,22 L540,8 L603,22" class="chart-sys"/>
+    </g>
+  </g>
+
+  <!-- ==================== FLOW ARROW (Subagent ToolCall -> Subagent Run) ==================== -->
+  <path d="M470,184 C490,240 450,290 470,340" class="flow-arrow"/>
+  <text x="495" y="270" class="text-ui-bold" fill="#9334e6">Flow: Subagent spawn</text>
+  <text x="495" y="284" class="text-desc">Explicit flow arrow links origin tool call to child run</text>
+
+  <!-- Footer Info -->
+  <g transform="translate(0, 580)">
+    <text x="14" y="20" class="text-desc">• Merged Perfetto timeline: agent high-level intent (turns/tools) perfectly aligned with OS-level execution (CPU sched/RSS/kernel counters) via paired monotonic clock synchronization.</text>
+  </g>
+</svg>

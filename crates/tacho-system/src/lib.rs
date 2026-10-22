@@ -201,13 +201,9 @@ impl Perfetto {
         self.consumer_sock.as_deref()
     }
 
-    /// Returns the effective runtime directory.
+    /// Returns the effective runtime directory ($TACHO_RUNTIME / $XDG_RUNTIME_DIR/tacho / $TACHO_HOME/run).
     fn effective_runtime_dir(&self) -> PathBuf {
-        self.runtime_dir.clone().unwrap_or_else(|| {
-            env::var("TACHO_RUNTIME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| env::temp_dir())
-        })
+        self.runtime_dir.clone().unwrap_or_else(resolve_runtime_dir)
     }
 
     /// Applies configured environment variables to child commands.
@@ -273,7 +269,7 @@ impl Perfetto {
         }
 
         let runtime_dir = self.effective_runtime_dir();
-        fs::create_dir_all(&runtime_dir)?;
+        ensure_dir_0700(&runtime_dir)?;
 
         let cfg_text = profile.config_text()?;
         let cfg_file = runtime_dir.join("tacho-system.cfg");
@@ -321,8 +317,8 @@ impl Perfetto {
 
     /// Stops the active `tacho-system` tracing session gracefully.
     ///
-    /// Sends `SIGTERM` to the background process and waits for the session
-    /// to disappear from traced.
+    /// Reads the PID file, verifies process ownership by current user, sends `SIGTERM`,
+    /// and waits for the session to disappear from traced.
     pub fn stop(&self) -> Result<(), SystemError> {
         if self.status()?.is_none() {
             return Ok(());
@@ -331,11 +327,15 @@ impl Perfetto {
         let runtime_dir = self.effective_runtime_dir();
         let pid_file = runtime_dir.join("tacho-system.pid");
 
+        let mut target_pid: Option<u32> = None;
         if let Ok(content) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = content.trim().parse::<u32>() {
-                let _ = Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .output();
+                if is_pid_owned_by_current_user(pid) {
+                    target_pid = Some(pid);
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .output();
+                }
             }
         }
 
@@ -350,16 +350,18 @@ impl Perfetto {
         }
 
         if !stopped {
-            // Fallback: kill background perfetto processes targeting tacho-system
-            let _ = Command::new("pkill")
-                .args(["-TERM", "-f", "perfetto.*tacho-system"])
-                .output();
-
-            for _ in 0..20 {
-                thread::sleep(Duration::from_millis(100));
-                if self.status()?.is_none() {
-                    stopped = true;
-                    break;
+            if let Some(pid) = target_pid {
+                if is_pid_owned_by_current_user(pid) {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .output();
+                    for _ in 0..10 {
+                        thread::sleep(Duration::from_millis(100));
+                        if self.status()?.is_none() {
+                            stopped = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -472,6 +474,79 @@ perfetto --query
     }
 }
 
+/// Resolves `$TACHO_RUNTIME`:
+/// 1. `$TACHO_RUNTIME`
+/// 2. `$XDG_RUNTIME_DIR/tacho`
+/// 3. `$TACHO_HOME/run`
+/// 4. `$HOME/.local/state/tacho/run`
+fn resolve_runtime_dir() -> PathBuf {
+    if let Ok(val) = env::var("TACHO_RUNTIME") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val);
+        }
+    }
+    if let Ok(val) = env::var("XDG_RUNTIME_DIR") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val).join("tacho");
+        }
+    }
+    if let Ok(val) = env::var("TACHO_HOME") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val).join("run");
+        }
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".local/state/tacho/run")
+}
+
+/// Creates a directory recursively with mode 0700 if it does not exist,
+/// or sets mode 0700 on existing directories.
+pub fn ensure_dir_0700(path: &Path) -> io::Result<()> {
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !path.exists() {
+        DirBuilder::new().mode(0o700).recursive(true).create(path)?;
+    } else {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Checks if a given PID is currently running and owned by the current user's UID.
+fn is_pid_owned_by_current_user(pid: u32) -> bool {
+    let status_path = format!("/proc/{pid}/status");
+    if let Ok(status) = fs::read_to_string(&status_path) {
+        for line in status.lines() {
+            if line.starts_with("Uid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(proc_uid) = parts[1].parse::<u32>() {
+                        return proc_uid == get_current_uid();
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Gets the effective UID of the current process.
+fn get_current_uid() -> u32 {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("Uid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(uid) = parts[1].parse::<u32>() {
+                        return uid;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
 /// Parses the output of `perfetto --query` to locate a specific tracing session.
 fn parse_session_info(stdout: &str, target_name: &str) -> Result<Option<SessionInfo>, SystemError> {
     let mut in_sessions = false;
@@ -491,7 +566,7 @@ fn parse_session_info(stdout: &str, target_name: &str) -> Result<Option<SessionI
         // Columns: ID UID STATE BUF (#) KB DUR (s) #DS STARTED NAME
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 9 {
-            let name = parts[8];
+            let name = parts[8..].join(" ");
             if name == target_name {
                 let id = parts[0].parse::<u32>().map_err(|e| {
                     SystemError::ParseError(format!(
@@ -511,7 +586,7 @@ fn parse_session_info(stdout: &str, target_name: &str) -> Result<Option<SessionI
                     state,
                     buffer_size_kb,
                     num_data_sources,
-                    name: name.to_string(),
+                    name,
                 }));
             }
         }
@@ -612,6 +687,18 @@ ID      UID     STATE      BUF (#) KB   DUR (s)   #DS  STARTED  NAME
 
         let missing = parse_session_info(sample_output, "nonexistent").unwrap();
         assert!(missing.is_none());
+
+        let space_sample = r#"
+TRACING SESSIONS:
+
+ID      UID     STATE      BUF (#) KB   DUR (s)   #DS  STARTED  NAME
+===     ===     =====      ==========   =======   ===  =======  ====
+1       430560  STARTED    (1) 32768    0         2    15:14:19 session with spaces
+"#;
+        let spaced = parse_session_info(space_sample, "session with spaces")
+            .unwrap()
+            .expect("should handle session names with spaces");
+        assert_eq!(spaced.name, "session with spaces");
     }
 
     #[test]

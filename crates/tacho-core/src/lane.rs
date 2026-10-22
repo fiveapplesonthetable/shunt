@@ -217,8 +217,10 @@ impl LaneAllocator {
             }
         }
 
-        // 4. Remaining open slices (waits, dedicated)
-        for (slice_id, (kind, assigned)) in self.open_slices.drain() {
+        // 4. Remaining open slices (waits, dedicated), sorted LIFO (newest first)
+        let mut remaining: Vec<_> = self.open_slices.drain().collect();
+        remaining.sort_by_key(|&(id, _)| std::cmp::Reverse(id));
+        for (slice_id, (kind, assigned)) in remaining {
             let track_key = match assigned {
                 AssignedTrack::Run => self.run_track.clone(),
                 AssignedTrack::TurnsTurn | AssignedTrack::TurnsTool => self.turns_track.clone(),

@@ -51,13 +51,17 @@ impl Encoder {
 
         // 2. Build TrackEvent (TracePacket field 11)
         // 9: optional Type type = 9;
-        let te_type = match event.kind.track_event_type() {
-            TrackEventType::SliceBegin => 1,
-            TrackEventType::SliceEnd => 2,
-            TrackEventType::Instant => 3,
-            TrackEventType::Counter => 4,
-            TrackEventType::State => 5,
-            TrackEventType::Unspecified => 0,
+        let te_type = if event.counter_value.is_some() {
+            4 // TYPE_COUNTER
+        } else {
+            match event.kind.track_event_type() {
+                TrackEventType::SliceBegin => 1,
+                TrackEventType::SliceEnd => 2,
+                TrackEventType::Instant => 3,
+                TrackEventType::Counter => 4,
+                TrackEventType::State => 5,
+                TrackEventType::Unspecified => 0,
+            }
         };
         encode_varint_field(9, te_type, &mut self.track_event_buf);
 
@@ -70,16 +74,49 @@ impl Encoder {
 
         // Event name / name_iid (omitted on SliceEnd to merge into the open slice)
         if !event.kind.is_end() {
-            if event.kind == Kind::Custom {
+            if let Some(custom) = &event.custom_name {
+                encode_string_field(23, custom, &mut self.track_event_buf);
+            } else if event.kind == Kind::AgentState {
+                let state_name = match &event.body.body {
+                    Some(tacho::event::Body::AgentState(s)) => {
+                        match s
+                            .state
+                            .and_then(|v| tacho::AgentStateType::try_from(v).ok())
+                        {
+                            Some(tacho::AgentStateType::Idle) => "Idle",
+                            Some(tacho::AgentStateType::Thinking) => "Thinking",
+                            Some(tacho::AgentStateType::Tool) => "Tool",
+                            Some(tacho::AgentStateType::Waiting) => "Waiting",
+                            Some(tacho::AgentStateType::Stalled) => "Stalled",
+                            Some(tacho::AgentStateType::Exited) => "Exited",
+                            _ => "AgentState",
+                        }
+                    }
+                    _ => "AgentState",
+                };
+                encode_string_field(23, state_name, &mut self.track_event_buf);
+            } else if event.kind == Kind::TaskState {
+                let state_name = match &event.body.body {
+                    Some(tacho::event::Body::TaskState(s)) => {
+                        match s.state.and_then(|v| tacho::TaskStatus::try_from(v).ok()) {
+                            Some(tacho::TaskStatus::TaskQueued) => "Queued",
+                            Some(tacho::TaskStatus::TaskInProgress) => "InProgress",
+                            Some(tacho::TaskStatus::TaskReview) => "Review",
+                            Some(tacho::TaskStatus::TaskDone) => "Done",
+                            Some(tacho::TaskStatus::TaskFailed) => "Failed",
+                            Some(tacho::TaskStatus::TaskCancelled) => "Cancelled",
+                            _ => "TaskState",
+                        }
+                    }
+                    _ => "TaskState",
+                };
+                encode_string_field(23, state_name, &mut self.track_event_buf);
+            } else if event.kind == Kind::Custom {
                 let body_name = match &event.body.body {
                     Some(tacho::event::Body::Custom(c)) => c.name.as_deref(),
                     _ => None,
                 };
-                let custom_name = event
-                    .custom_name
-                    .as_deref()
-                    .or(body_name)
-                    .unwrap_or(event.kind.display_name());
+                let custom_name = body_name.unwrap_or(event.kind.display_name());
                 // 23: string name = 23; (inline for custom open set)
                 encode_string_field(23, custom_name, &mut self.track_event_buf);
             } else {

@@ -1,3 +1,8 @@
 target/
 *.perfetto-trace
 /scratch/
+
+# Fuzzing & proptest artifacts
+fuzz/corpus/
+fuzz/artifacts/
+*.proptest-regressions

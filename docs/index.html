@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tachograph — flight recorder for coding agents</title>
+<link rel="icon" href="data:," />
+<script>
+  (function () {
+    var p = localStorage.getItem('zc-theme') || 'auto';
+    var dark = p === 'dark' || (p === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  })();
+</script>
+<style>
+  /* Theme: Perfetto UI colour variables (ui/src/frontend/theme_provider.scss). */
+  :root, :root[data-theme="light"] {
+    color-scheme:light;
+    --pf-color-background:white; --pf-color-background-secondary:#edf0f1; --pf-color-background-tertiary:#e3e9eb;
+    --pf-color-text:#333; --pf-color-text-muted:#75797c; --pf-color-text-hint:#808080;
+    --pf-color-border:#ccc; --pf-color-border-secondary:#e0e0e0;
+    --pf-color-primary:#3d5688;
+    --pf-color-danger:rgb(202, 38, 38); --pf-color-success:rgb(0, 128, 0); --pf-color-warning:rgb(232, 158, 0);
+    --pf-chart-color-7:#9334e6;
+  }
+  :root[data-theme="dark"] {
+    color-scheme:dark;
+    --pf-color-background:#202020; --pf-color-background-secondary:#343434; --pf-color-background-tertiary:#4a4a4a;
+    --pf-color-text:#dce0e2; --pf-color-text-muted:#a0a2a5; --pf-color-text-hint:#9aa0a6;
+    --pf-color-border:#484848; --pf-color-border-secondary:#383838;
+    --pf-color-primary:#598bed;
+    --pf-color-danger:rgb(230, 90, 90); --pf-color-success:rgb(99, 192, 99); --pf-color-warning:rgb(244, 188, 67);
+    --pf-chart-color-7:#c58af9;
+  }
+  :root {
+    --bg:var(--pf-color-background); --sf:var(--pf-color-background-secondary); --sf2:var(--pf-color-background-tertiary);
+    --fg:var(--pf-color-text); --fg2:var(--pf-color-text-muted); --fg3:var(--pf-color-text-hint);
+    --bd:var(--pf-color-border); --bd2:var(--pf-color-border-secondary);
+    --ac:var(--pf-color-primary);
+    --ac-bg:color-mix(in srgb, var(--ac) 12%, var(--bg)); --ac-bd:color-mix(in srgb, var(--ac) 55%, var(--bg));
+    --bad:var(--pf-color-danger); --good:var(--pf-color-success); --warn:var(--pf-color-warning); --vio:var(--pf-chart-color-7);
+    --bad-bg:color-mix(in srgb, var(--bad) 10%, var(--bg)); --bad-bd:color-mix(in srgb, var(--bad) 60%, var(--bg));
+    --warn-bg:color-mix(in srgb, var(--warn) 14%, var(--bg)); --warn-bd:color-mix(in srgb, var(--warn) 65%, var(--bg));
+    --good-bg:color-mix(in srgb, var(--good) 10%, var(--bg)); --good-bd:color-mix(in srgb, var(--good) 55%, var(--bg));
+    --vio-bg:color-mix(in srgb, var(--vio) 10%, var(--bg)); --vio-bd:color-mix(in srgb, var(--vio) 55%, var(--bg));
+    --topbar-h:40px;
+    --mono:"Roboto Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+
+  * { box-sizing:border-box; }
+  html { scroll-padding-top:calc(var(--topbar-h) + 12px); }
+  body { margin:0; font:13.5px/1.6 Roboto,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--fg); background:var(--bg); }
+  a { color:var(--ac); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  h1 { font-size:22px; font-weight:500; letter-spacing:-0.01em; margin:4px 0 6px; }
+  h2 { font-size:17px; font-weight:500; margin:44px 0 10px; padding-top:16px; border-top:1px solid var(--bd2); }
+  h2 .n { color:var(--fg3); font-weight:400; margin-right:8px; }
+  h3 { font-size:14px; font-weight:500; margin:26px 0 6px; }
+  .part { font-size:11px; text-transform:uppercase; letter-spacing:0.08em; color:var(--fg3); margin:64px 0 -30px; }
+  b, strong { font-weight:500; }
+  p { margin:8px 0; }
+  ul, ol { margin:6px 0 12px; padding-left:20px; }
+  li { margin:0 0 5px; }
+  .m { color:var(--fg2); }
+  .lead { font-size:14.5px; color:var(--fg2); max-width:840px; }
+  code { font:12px/1.4 var(--mono); background:var(--sf2); padding:1px 4px; border-radius:2px; overflow-wrap:anywhere; }
+  pre { background:var(--sf); border:1px solid var(--bd2); border-radius:3px; padding:11px 14px; overflow-x:auto; margin:10px 0 14px; font:12px/1.55 var(--mono); }
+  pre code { background:transparent; padding:0; }
+  pre .c { color:var(--fg3); }
+  pre .k { color:var(--ac); }
+  pre .hl { background:var(--bad-bg); display:inline-block; width:100%; }
+  pre .hg { background:var(--good-bg); display:inline-block; width:100%; }
+  pre .hw { background:var(--warn-bg); display:inline-block; width:100%; }
+  table { border-collapse:collapse; width:100%; margin:12px 0 16px; }
+  th, td { padding:7px 14px 7px 0; vertical-align:top; text-align:left; font-size:13px; }
+  th { font-weight:500; color:var(--fg2); border-bottom:1px solid var(--bd); white-space:nowrap; }
+  td { border-bottom:1px solid var(--bd2); }
+  td.good { color:var(--good); } td.bad { color:var(--bad); } td.warn { color:var(--warn); }
+  blockquote { border-left:2px solid var(--bd); padding:2px 0 2px 14px; margin:14px 0 16px; }
+  blockquote .lbl { display:block; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--fg3); margin-bottom:2px; }
+  blockquote.key { border-left-color:var(--ac); }
+
+  .topbar { position:sticky; top:0; z-index:40; height:var(--topbar-h); display:flex; align-items:center; gap:18px; padding:0 20px; background:var(--bg); border-bottom:1px solid var(--bd); font-size:12.5px; white-space:nowrap; }
+  .topbar .tb-title { font-weight:500; }
+  .topbar .tb-spacer { flex:1; }
+  .topbar button { font:inherit; font-size:12px; color:var(--fg2); background:none; border:1px solid var(--bd); border-radius:2px; padding:2px 8px; cursor:pointer; }
+  .topbar button:hover { color:var(--fg); background:var(--sf2); }
+  nav { position:fixed; top:var(--topbar-h); left:0; bottom:0; width:250px; overflow-y:auto; padding:22px 12px 40px 16px; border-right:1px solid var(--bd2); font-size:12.5px; background:var(--bg); }
+  nav .h { font-weight:500; color:var(--fg3); font-size:11px; text-transform:uppercase; letter-spacing:0.05em; margin:0 0 8px 6px; }
+  nav .ph { font-size:10.5px; text-transform:uppercase; letter-spacing:0.06em; color:var(--fg3); margin:14px 0 4px 6px; }
+  nav a { display:block; color:var(--fg2); padding:2px 6px; border-left:1px solid transparent; }
+  nav a:hover, nav a.on { color:var(--fg); border-left-color:var(--fg3); text-decoration:none; }
+  main { margin-left:250px; padding:30px 44px 120px; max-width:1190px; }
+  main > p, main > ul, main > ol, main > blockquote { max-width:860px; }
+  @media (max-width:960px) { nav { display:none; } main { margin-left:0; padding:20px 16px 60px; } }
+
+  figure { margin:18px 0 22px; }
+  figure svg { display:block; width:100%; height:auto; max-width:1000px; }
+  figcaption { font-size:12px; color:var(--fg2); margin-top:6px; max-width:860px; }
+  svg text { font-family:Roboto,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif; }
+  .t  { fill:var(--fg); font-size:12.5px; }
+  .tb { fill:var(--fg); font-size:12.5px; font-weight:500; }
+  .ts { fill:var(--fg2); font-size:11px; }
+  .tm { fill:var(--fg); font-size:11.5px; font-family:var(--mono) !important; }
+  .tms{ fill:var(--fg2); font-size:10.5px; font-family:var(--mono) !important; }
+  .th { fill:var(--fg3); font-size:10.5px; letter-spacing:0.06em; text-transform:uppercase; }
+  .tr { fill:var(--bad); } .ta { fill:var(--ac); } .tg { fill:var(--good); } .tw { fill:var(--warn); } .tv { fill:var(--vio); }
+  .b  { fill:var(--sf);  stroke:var(--bd);  stroke-width:1; }
+  .b0 { fill:var(--bg);  stroke:var(--bd);  stroke-width:1; }
+  .b2 { fill:var(--sf2); stroke:var(--bd);  stroke-width:1; }
+  .ba { fill:var(--ac-bg);   stroke:var(--ac-bd);   stroke-width:1; }
+  .br { fill:var(--bad-bg);  stroke:var(--bad-bd);  stroke-width:1; }
+  .bw { fill:var(--warn-bg); stroke:var(--warn-bd); stroke-width:1; }
+  .bg { fill:var(--good-bg); stroke:var(--good-bd); stroke-width:1; }
+  .bv { fill:var(--vio-bg);  stroke:var(--vio-bd);  stroke-width:1; }
+  .ln  { stroke:var(--fg3); stroke-width:1.2; fill:none; }
+  .lnr { stroke:var(--bad); stroke-width:1.3; fill:none; }
+  .lna { stroke:var(--ac);  stroke-width:1.3; fill:none; }
+  .lng { stroke:var(--good); stroke-width:1.3; fill:none; }
+  .lnw { stroke:var(--warn); stroke-width:1.3; fill:none; }
+  .lnv { stroke:var(--vio); stroke-width:1.3; fill:none; }
+  .dash { stroke-dasharray:4 3; }
+  .mk  { fill:var(--fg3); } .mkr { fill:var(--bad); } .mka { fill:var(--ac); } .mkg { fill:var(--good); } .mkv { fill:var(--vio); } .mkw { fill:var(--warn); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mka"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkg"/></marker>
+    <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkv"/></marker>
+    <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkw"/></marker>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <span class="tb-title">tachograph</span>
+  <span class="m">flight recorder for coding agents</span>
+  <div class="tb-spacer"></div>
+  <button id="theme-btn" onclick="toggleTheme()">Theme</button>
+</header>
+
+<nav>
+  <div class="h">tachograph</div>
+  <a href="#why">1. Why a flight recorder</a>
+  <a href="#architecture">2. Architecture &amp; WAL</a>
+  <a href="#lanes">3. Tracks &amp; virtual lanes</a>
+  <a href="#catalogue">4. Event catalogue</a>
+  <a href="#detectors">5. Anomaly detectors</a>
+  <a href="#ingestion">6. Ingestion modes</a>
+  <a href="#system">7. System tracing</a>
+  <a href="#queries">8. PerfettoSQL queries</a>
+  <a href="#privacy">9. Privacy firewall</a>
+  <a href="#performance">10. Performance numbers</a>
+</nav>
+
+<main>
+
+<h1>tachograph: system guide</h1>
+<p class="lead">A flight recorder for coding agents. One daemon per machine records agent actions into a single SQLite WAL event log, serving compact status to supervising agents in ~180 tokens and microsecond traces to ui.perfetto.dev.</p>
+
+<!-- ───────────── Section 1 ───────────── -->
+<div class="part">Part 1 &mdash; Fundamentals</div>
+<h2 id="why"><span class="n">1</span>Why a flight recorder for agents</h2>
+
+<p>Coding agents fail in ways traditional logging cannot capture. When a supervisor drives four worker agents across a codebase, three distinct failure modes emerge:</p>
+
+<ul>
+  <li><b>Context exhaustion:</b> Raw agent logs are enormous. A single four-worker refactoring run generates 97 MB of JSON transcripts. Ingesting those transcripts into a supervisor agent exhausts its context window in two turns.</li>
+  <li><b>Invisible parallel work:</b> Agents execute parallel tool calls and subagent trees. Text logs flatten overlapping async calls into sequential output, obscuring which tool blocked, which command ran concurrently, and where wall-clock time was lost.</li>
+  <li><b>Post-mortem blindspots:</b> When an agent enters an infinite retry loop or silently hangs on a compilation command, developers have no deterministic way to inspect host system counters (CPU, memory, load) alongside agent actions.</li>
+</ul>
+
+<p>tachograph solves this by recording every turn, tool call, command, wait, and counter into a structured binary timeline. A supervisor inspects running workers via <code>tacho status</code> and <code>tacho watch</code> using under 200 tokens. A developer opens <code>tacho trace</code> in <a href="https://ui.perfetto.dev">ui.perfetto.dev</a> to inspect microscopic timings down to the nanosecond.</p>
+
+<figure>
+<svg viewBox="0 0 1000 360" role="img" aria-label="Supervisor control loop and log filtering">
+  <!-- Supervisor box -->
+  <rect x="20" y="30" width="280" height="290" class="ba" rx="4"/>
+  <text x="36" y="58" class="tb">Supervisor Agent</text>
+  <text x="36" y="78" class="tms">Context: 200k tokens (clean)</text>
+  <rect x="36" y="96" width="248" height="64" class="b0" rx="3"/>
+  <text x="46" y="118" class="tm">tacho watch --until stalled</text>
+  <text x="46" y="136" class="ts">Blocks until worker state change</text>
+  <text x="46" y="150" class="ts">Zero CPU polling overhead</text>
+  <rect x="36" y="174" width="248" height="64" class="b0" rx="3"/>
+  <text x="46" y="196" class="tm">tacho report worker-2</text>
+  <text x="46" y="214" class="ts">Structured 180-token summary</text>
+  <text x="46" y="228" class="ts">Identifies loop / stuck build</text>
+  <rect x="36" y="252" width="248" height="52" class="bg" rx="3"/>
+  <text x="46" y="274" class="tb tg">180 Tokens Received</text>
+  <text x="46" y="290" class="ts">538x context reduction ratio</text>
+
+  <!-- Middle filter: tachograph daemon -->
+  <rect x="360" y="30" width="280" height="290" class="b" rx="4"/>
+  <text x="376" y="58" class="tb">tachograph daemon</text>
+  <text x="376" y="78" class="tms">Single source of truth (WAL)</text>
+  <rect x="376" y="96" width="248" height="38" class="b2" rx="3"/>
+  <text x="386" y="114" class="tm">Scrubber &amp; Classifier</text>
+  <text x="386" y="126" class="ts">Redacts secrets, classifies commands</text>
+  <rect x="376" y="144" width="248" height="38" class="b2" rx="3"/>
+  <text x="386" y="162" class="tm">Deterministic LaneAllocator</text>
+  <text x="386" y="174" class="ts">Virtual lanes for parallel tools</text>
+  <rect x="376" y="192" width="248" height="38" class="b2" rx="3"/>
+  <text x="386" y="210" class="tm">Anomaly Detectors</text>
+  <text x="386" y="222" class="ts">LOOP, SPIN, SILENT, BURN, FAILING</text>
+  <rect x="376" y="240" width="248" height="64" class="ba" rx="3"/>
+  <text x="386" y="260" class="tm">LiveState (ArcSwap)</text>
+  <text x="386" y="276" class="ts">Microsecond status / watch queries</text>
+  <text x="386" y="292" class="ts">Zero disk I/O on status path</text>
+
+  <!-- Right box: Workers -->
+  <rect x="700" y="30" width="280" height="290" class="bw" rx="4"/>
+  <text x="716" y="58" class="tb">Fleet of N Workers</text>
+  <text x="716" y="78" class="tms">Subagents &amp; tool invocations</text>
+  <rect x="716" y="96" width="248" height="38" class="b0" rx="3"/>
+  <text x="726" y="114" class="tm">worker-1 (Build/Test)</text>
+  <text x="726" y="126" class="ts">cargo test -p core</text>
+  <rect x="716" y="144" width="248" height="38" class="br" rx="3"/>
+  <text x="726" y="162" class="tm">worker-2 (Stalled: LOOP)</text>
+  <text x="726" y="174" class="ts">Read src/lib.rs (repeated 4x)</text>
+  <rect x="716" y="192" width="248" height="38" class="b0" rx="3"/>
+  <text x="726" y="210" class="tm">worker-3 (Subagent wait)</text>
+  <text x="726" y="222" class="ts">Waiting on worker-4 message</text>
+  <rect x="716" y="240" width="248" height="64" class="br" rx="3"/>
+  <text x="726" y="262" class="tb tr">97 MB Raw Transcripts</text>
+  <text x="726" y="278" class="ts">Prose, tool output, compiler noise</text>
+  <text x="726" y="292" class="ts">Exceeds context in 2 turns</text>
+
+  <!-- Arrows -->
+  <path d="M700,200 L640,200" class="ln" marker-end="url(#ah)"/>
+  <text x="646" y="192" class="th">Ingest</text>
+  <path d="M360,180 L300,180" class="lna" marker-end="url(#aha)"/>
+  <text x="312" y="172" class="th">Filtered</text>
+</svg>
+<figcaption>Figure 1: The supervisor control loop. Raw worker transcripts (97 MB) are ingested via provider hooks, sanitized, and folded into live state. The supervisor polls or blocks via <code>tacho watch</code>, receiving actionable summaries in 180 tokens.</figcaption>
+</figure>
+
+<!-- ───────────── Section 2 ───────────── -->
+<div class="part">Part 2 &mdash; Storage &amp; Lifecycle</div>
+<h2 id="architecture"><span class="n">2</span>Architecture &amp; SQLite WAL single source of truth</h2>
+
+<p>tachograph operates as a single resident process (<code>tacho daemon</code>) started on demand by any client that finds no socket. It uses no async runtime: all paths run on plain OS threads and non-blocking IPC sockets.</p>
+
+<p>Every event recorded by the system is persisted into a single SQLite WAL table (<code>$TACHO_HOME/events.sqlite</code>). There are no secondary in-memory event rings: SQLite WAL is the <b>sole durable source of truth</b>. Every trace written by <code>tacho trace</code> is rendered directly from SQLite rows through a streaming zero-allocation encoder.</p>
+
+<figure>
+<svg viewBox="0 0 1000 380" role="img" aria-label="System architecture diagram">
+  <!-- Ingest Sources -->
+  <rect x="20" y="24" width="180" height="330" class="b" rx="4"/>
+  <text x="34" y="48" class="tb">Ingest Sources</text>
+  <rect x="32" y="66" width="156" height="34" class="b2" rx="3"/><text x="42" y="87" class="tm">Claude hooks</text>
+  <rect x="32" y="108" width="156" height="34" class="b2" rx="3"/><text x="42" y="129" class="tm">Gemini hooks</text>
+  <rect x="32" y="150" width="156" height="34" class="b2" rx="3"/><text x="42" y="171" class="tm">Jetski hooks</text>
+  <rect x="32" y="192" width="156" height="34" class="b2" rx="3"/><text x="42" y="213" class="tm">tacho run (tee)</text>
+  <rect x="32" y="234" width="156" height="34" class="b2" rx="3"/><text x="42" y="255" class="tm">OTLP :4318</text>
+  <rect x="32" y="276" width="156" height="34" class="b2" rx="3"/><text x="42" y="297" class="tm">/proc sampler</text>
+  <rect x="32" y="318" width="156" height="30" class="b2" rx="3"/><text x="42" y="337" class="tm">tacho emit</text>
+
+  <!-- Channel -->
+  <path d="M200,190 L250,190" class="ln" marker-end="url(#ah)"/>
+  <text x="204" y="180" class="th">NDJSON</text>
+  <rect x="250" y="160" width="50" height="60" class="b0" rx="3"/>
+  <text x="256" y="186" class="tms">Bounded</text>
+  <text x="258" y="202" class="tms">Channel</text>
+  <path d="M300,190 L340,190" class="ln" marker-end="url(#ah)"/>
+
+  <!-- Appender -->
+  <rect x="340" y="40" width="220" height="300" class="ba" rx="4"/>
+  <text x="356" y="66" class="tb">Appender Thread</text>
+  <text x="356" y="84" class="tms">Sole writer to disk &amp; state</text>
+  <rect x="354" y="100" width="192" height="32" class="b0" rx="3"/><text x="364" y="120" class="tm">1. Stamp (wall clock)</text>
+  <rect x="354" y="138" width="192" height="32" class="b0" rx="3"/><text x="364" y="158" class="tm">2. Privacy scrubber</text>
+  <rect x="354" y="176" width="192" height="32" class="b0" rx="3"/><text x="364" y="196" class="tm">3. Command classifier</text>
+  <rect x="354" y="214" width="192" height="32" class="b0" rx="3"/><text x="364" y="234" class="tm">4. Virtual lane alloc</text>
+  <rect x="354" y="252" width="192" height="32" class="b0" rx="3"/><text x="364" y="272" class="tm">5. Anomaly detectors</text>
+  <rect x="354" y="290" width="192" height="36" class="bg" rx="3"/><text x="364" y="312" class="tm">Batch commit (&le;256)</text>
+
+  <!-- Branches to Storage & LiveState -->
+  <path d="M560,140 L620,100" class="ln" marker-end="url(#ah)"/>
+  <path d="M560,260 L620,290" class="lna" marker-end="url(#aha)"/>
+
+  <!-- Top Right: SQLite WAL -->
+  <rect x="620" y="30" width="360" height="130" class="bw" rx="4"/>
+  <text x="636" y="56" class="tb">SQLite WAL (events.sqlite)</text>
+  <text x="636" y="74" class="tms">PRAGMA synchronous = NORMAL; indexed on ts_ns</text>
+  <rect x="636" y="86" width="328" height="60" class="b0" rx="3"/>
+  <text x="646" y="106" class="tm">events(seq, ts_ns, kind, track_key, cause_seq, agent, body)</text>
+  <text x="646" y="124" class="ts">WAL readers never block writers; writers never block readers</text>
+  <text x="646" y="138" class="ts">Fallback: tacho trace opens directly if daemon is dead</text>
+
+  <!-- Bottom Right: LiveState -->
+  <rect x="620" y="230" width="360" height="130" class="bg" rx="4"/>
+  <text x="636" y="256" class="tb">LiveState (ArcSwap&lt;LiveState&gt;)</text>
+  <text x="636" y="274" class="tms">In-memory copy published atomically after each batch</text>
+  <rect x="636" y="286" width="328" height="60" class="b0" rx="3"/>
+  <text x="646" y="306" class="tm">tacho status | tacho report | tacho watch</text>
+  <text x="646" y="324" class="ts">Microsecond responses with zero disk reads</text>
+  <text x="646" y="338" class="ts">Streams state transitions &amp; detector alerts</text>
+</svg>
+<figcaption>Figure 2: System architecture. Ingestion sources push to a bounded channel. The single appender thread stamps, scrubs, classifies, and commits batches to SQLite WAL, then atomically publishes updated <code>LiveState</code> to memory.</figcaption>
+</figure>
+
+<h3>Write path vs Read path execution</h3>
+<p>To ensure high throughput and resilience, tachograph decouples write and read operations across four distinct paths:</p>
+
+<table>
+  <thead>
+    <tr><th>Path</th><th>Mechanism</th><th>Latency</th><th>Disk Access</th><th>Failure Mode</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>Hook Ingest</b></td>
+      <td><code>tacho hook &lt;provider&gt;</code> &rarr; Unix domain socket</td>
+      <td>&lt; 5 ms</td>
+      <td>None (socket only)</td>
+      <td>Drops silently after 200 ms timeout; agent never blocked</td>
+    </tr>
+    <tr>
+      <td><b>Appender Batch</b></td>
+      <td>Channel drain &rarr; prepared statement &rarr; WAL commit</td>
+      <td>&le; 50 ms</td>
+      <td>Sequential append</td>
+      <td>Batches up to 256 events per transaction</td>
+    </tr>
+    <tr>
+      <td><b>Live Status / Watch</b></td>
+      <td><code>ArcSwap&lt;LiveState&gt;</code> atomic pointer swap</td>
+      <td>&lt; 100 &mu;s</td>
+      <td>Zero disk reads</td>
+      <td>Served from query thread memory cache</td>
+    </tr>
+    <tr>
+      <td><b>Trace Snapshot</b></td>
+      <td>Streaming SQLite RO cursor &rarr; Core Encoder</td>
+      <td>&lt; 25 ms / 100k</td>
+      <td>Read-only WAL read</td>
+      <td>If daemon is dead, CLI opens <code>events.sqlite</code> directly</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ───────────── Section 3 ───────────── -->
+<div class="part">Part 3 &mdash; Data Model</div>
+<h2 id="lanes"><span class="n">3</span>Track hierarchy &amp; virtual lanes</h2>
+
+<p>Perfetto models events along tracks. Slice tracks in Perfetto represent execution as a strict stack: a child slice must begin after and end before its parent. Overlapping sibling slices on a single track corrupt the visualization.</p>
+
+<p>Coding agents routinely violate stack nesting: LLMs fire multiple parallel tool calls within a single turn, subagents run concurrently, and tools take variable time to return. tachograph resolves this with a deterministic <b>LaneAllocator</b>.</p>
+
+<figure>
+<svg viewBox="0 0 1000 320" role="img" aria-label="Parallel tool calls and virtual lane allocation">
+  <!-- Top: Naive single track (broken) -->
+  <text x="20" y="30" class="tb tr">Naive Single Track (Broken Nesting)</text>
+  <rect x="20" y="44" width="960" height="70" class="b" rx="3"/>
+  <rect x="40" y="54" width="920" height="50" class="ba" rx="2"/><text x="50" y="74" class="tm">Turn 1</text>
+  <rect x="100" y="66" width="300" height="30" class="bw" rx="2"/><text x="110" y="86" class="tm">ToolCall A (Read)</text>
+  <rect x="240" y="72" width="300" height="30" class="br" rx="2"/><text x="250" y="92" class="tm">ToolCall B (Search) &larr; OVERLAP COLLISION</text>
+
+  <!-- Bottom: LaneAllocator (properly nested) -->
+  <text x="20" y="156" class="tb tg">tachograph LaneAllocator (Properly Nested)</text>
+  <rect x="20" y="170" width="960" height="136" class="b" rx="3"/>
+  
+  <!-- Track: turns -->
+  <text x="30" y="196" class="tms">run:1/turns</text>
+  <rect x="140" y="180" width="820" height="26" class="ba" rx="2"/><text x="150" y="198" class="tm">Turn 1</text>
+  <rect x="200" y="184" width="200" height="18" class="bw" rx="2"/><text x="210" y="198" class="tms">ToolCall A (Read)</text>
+
+  <!-- Track: lane:1 -->
+  <text x="30" y="234" class="tms">run:1/lane:1</text>
+  <rect x="140" y="218" width="820" height="26" class="b0" rx="2"/>
+  <rect x="280" y="222" width="260" height="18" class="bg" rx="2"/><text x="290" y="236" class="tms">ToolCall B (Search) &rarr; routed to lane:1</text>
+
+  <!-- Track: lane:2 -->
+  <text x="30" y="272" class="tms">run:1/lane:2</text>
+  <rect x="140" y="256" width="820" height="26" class="b0" rx="2"/>
+  <rect x="360" y="260" width="240" height="18" class="bv" rx="2"/><text x="370" y="274" class="tms">ToolCall C (Grep) &rarr; routed to lane:2</text>
+  <rect x="640" y="260" width="180" height="18" class="br dash" rx="2"/><text x="650" y="274" class="tms">Abandoned slice closed on exit</text>
+</svg>
+<figcaption>Figure 3: Virtual lane allocation. When tool calls overlap, the appender routes the second slice to <code>lane:1</code> and a third to <code>lane:2</code>. Open slices are automatically closed with <code>abandoned = true</code> when a run exits.</figcaption>
+</figure>
+
+<h3>Track hierarchy structure</h3>
+<pre><code>tacho                                   <span class="c"># Root track: host identity, version</span>
+├── machine                             <span class="c"># Counters: load1, cpu_busy, mem_used, disk</span>
+├── daemon                              <span class="c"># Lifecycle, snapshots, clock steps, errors</span>
+│   └── counters                        <span class="c"># events, trace_us, queue_depth</span>
+├── agents
+│   └── agent:&lt;id&gt;                      <span class="c"># Long-lived worker (provider, model, cwd)</span>
+│       ├── state                       <span class="c"># TYPE_STATE: Idle, Thinking, Tool, Waiting, Stalled, Exited</span>
+│       └── run:&lt;n&gt;                     <span class="c"># Provider session</span>
+│           ├── turns                   <span class="c"># Nested: Turn &gt; ToolCall | Build | Test | Read</span>
+│           ├── lane:1 .. lane:k        <span class="c"># Virtual lanes for concurrent tool executions</span>
+│           ├── waits                   <span class="c"># Blocked intervals (user prompt, subagent message)</span>
+│           ├── tokens_in / out / cost  <span class="c"># Token accounting and cumulative cost counters</span>
+│           └── cpu / rss               <span class="c"># Process-tree resource counters from /proc</span>
+├── tasks
+│   └── task:&lt;slug&gt;                     <span class="c"># Orchestrator work item with declared paths</span>
+│       ├── state                       <span class="c"># TYPE_STATE: Queued, Active, Review, Done</span>
+│       └── review                      <span class="c"># Review findings and code inspection spans</span>
+└── custom
+    └── custom:&lt;name&gt;                   <span class="c"># Spans and counters emitted via `tacho emit`</span></code></pre>
+
+<!-- ───────────── Section 4 ───────────── -->
+<div class="part">Part 4 &mdash; Protocol &amp; Schema</div>
+<h2 id="catalogue"><span class="n">4</span>Event catalogue &amp; TrackEvent extensions</h2>
+
+<p>tachograph extends Perfetto's standard <code>perfetto.protos.TrackEvent</code> in the unallocated range <b>4000&ndash;4099</b>. Every trace begins with an <code>ExtensionDescriptor</code> packet embedding the compiled <code>FileDescriptorSet</code> of <code>tacho.proto</code>, allowing Trace Processor to decode all typed fields into the <code>args</code> table automatically.</p>
+
+<table>
+  <thead>
+    <tr><th>Extension Field</th><th>Number</th><th>Type</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>seq</code></td><td>4000</td><td><code>uint64</code></td><td>Global monotonically increasing event sequence number</td></tr>
+    <tr><td><code>cause_seq</code></td><td>4001</td><td><code>uint64</code></td><td>Sequence number of the causal antecedent event</td></tr>
+    <tr><td><code>agent</code></td><td>4002</td><td><code>string</code></td><td>Agent identifier, enabling SQL filters without track joins</td></tr>
+    <tr><td><code>command</code></td><td>4003</td><td><code>Command</code></td><td>Argv, command class, exit code, working directory</td></tr>
+    <tr><td><code>tool_call</code></td><td>4004</td><td><code>ToolCall</code></td><td>Tool name, input digest (Blake3), call ID</td></tr>
+    <tr><td><code>turn_ended</code></td><td>4005</td><td><code>TurnEnded</code></td><td>Turn duration, tokens in, tokens out, tokens cached</td></tr>
+    <tr><td><code>file_access</code></td><td>4006</td><td><code>FileAccess</code></td><td>Path relative to cwd, access kind (Read, Search, List)</td></tr>
+    <tr><td><code>file_edited</code></td><td>4007</td><td><code>FileEdited</code></td><td>Path, lines added, lines removed, patch digest</td></tr>
+    <tr><td><code>wait</code></td><td>4008</td><td><code>Wait</code></td><td>Wait reason, timeout, target sender ID</td></tr>
+    <tr><td><code>stall</code></td><td>4009</td><td><code>Stall</code></td><td>Detector kind (LOOP, SPIN, SILENT, BURN), evidence</td></tr>
+  </tbody>
+</table>
+
+<h3>Counter semantics and step-function deduplication</h3>
+<p>Perfetto counter tracks are rendered as step-functions: each sample retains its value until the next sample on that track. To prevent log bloat without losing precision, tachograph applies strict event-driven and deduplicated recording rules:</p>
+
+<ul>
+  <li><b>Event-driven counters:</b> Slices and telemetry such as <code>active_builds</code>, <code>active_tests</code>, <code>tokens_in</code>, <code>tokens_out</code>, <code>tokens_cached</code>, and <code>cost_micros</code> emit strictly on event occurrence or value change.</li>
+  <li><b>Polled host and process counters:</b> Machine load (<code>machine/load1</code>, <code>machine/cpu_busy</code>, <code>machine/mem_used</code>, <code>machine/disk:*</code>) and per-agent process tree metrics (<code>agent:&lt;id&gt;/run:&lt;n&gt;/cpu</code>, <code>agent:&lt;id&gt;/run:&lt;n&gt;/rss</code>) are polled every 2 seconds from <code>/proc</code>. Consecutive identical values are deduplicated in the sampler: a sample is written to SQLite WAL only when its value actually changes.</li>
+</ul>
+
+<!-- ───────────── Section 5 ───────────── -->
+<div class="part">Part 5 &mdash; Anomaly Detection</div>
+<h2 id="detectors"><span class="n">5</span>Anomaly &amp; stall detectors</h2>
+
+<p>The appender evaluates stall detectors after every ingested event and on a 1-second periodic tick. When a detector fires, it emits a <code>StallDetected</code> instant and transitions the agent track to <code>Stalled</code>.</p>
+
+<table>
+  <thead>
+    <tr><th>Detector</th><th>Threshold Trigger</th><th>Diagnostic Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>LOOP</b></td>
+      <td>Same tool input digest repeated 4 times consecutively</td>
+      <td>Agent is stuck in an automated retry loop or failing tool call</td>
+    </tr>
+    <tr>
+      <td><b>SPIN</b></td>
+      <td>8 turns without a <code>FileEdited</code> or <code>BUILD/TEST/COMMIT</code></td>
+      <td>Agent is wandering across read/list commands without making progress</td>
+    </tr>
+    <tr>
+      <td><b>SILENT</b></td>
+      <td>300 seconds without an event while not in a <code>Wait</code></td>
+      <td>Agent process wedged, network hang, or dead without exit hook</td>
+    </tr>
+    <tr>
+      <td><b>BURN</b></td>
+      <td>&gt; 200,000 output tokens consumed in a 10-minute window</td>
+      <td>Runaway generation loop or prompt regression consuming budget</td>
+    </tr>
+    <tr>
+      <td><b>FAILING</b></td>
+      <td>Same build/test command fails 3 times consecutively</td>
+      <td>Agent repeatedly running broken tests without adjusting implementation</td>
+    </tr>
+    <tr>
+      <td><b>OFF_BRIEF</b></td>
+      <td><code>FileEdited</code> occurs on path outside task's declared scope</td>
+      <td>Agent hallucinated modifications to unrelated files in workspace</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ───────────── Section 6 ───────────── -->
+<div class="part">Part 6 &mdash; Integration</div>
+<h2 id="ingestion"><span class="n">6</span>Ingestion modes</h2>
+
+<p>tachograph requires no changes to agent binaries. Four ingestion modes capture events across different environments:</p>
+
+<h3>1. Provider hooks (Claude Code, Gemini CLI, Jetski)</h3>
+<p>Hooks execute in &lt; 5 ms. They convert provider lifecycle events into NDJSON and send them to <code>api.sock</code>. Hooks exit 0 silently if the daemon is unavailable.</p>
+<pre><code><span class="c"># Automatically configure hooks in provider settings</span>
+tacho install claude
+tacho install gemini
+tacho install jetski</code></pre>
+
+<h3>2. Process wrapping: <code>tacho run -- &lt;cmd&gt;</code></h3>
+<p>Executes the target command in a child process, tees stdout, parses stream-json events, and tracks CPU/RSS over the process tree using its known PID.</p>
+<pre><code><span class="c"># Wrap any agent CLI: stdout is passed through byte-for-byte</span>
+tacho run -- claude --output-format stream-json
+tacho run -- codex exec --json "implement feature x"</code></pre>
+
+<h3>3. OpenTelemetry: OTLP HTTP receiver</h3>
+<p>Accepts standard OTLP/HTTP protobuf or JSON on <code>127.0.0.1:4318</code> for agents instrumented with OpenTelemetry.</p>
+
+<h3>4. Shell scripting: <code>tacho emit</code></h3>
+<pre><code><span class="c"># Declare a supervisor task with bounded paths</span>
+tacho emit task auth-refactor --paths crates/core/src/auth.rs --brief-file brief.md
+
+<span class="c"># Emit custom spans and progress instants</span>
+tacho emit span begin custom:migration "phase-1" --arg schema=v2
+tacho emit instant custom:migration "checkpoint" --arg status=ok
+tacho emit span end custom:migration</code></pre>
+
+<!-- ───────────── Section 7 ───────────── -->
+<div class="part">Part 7 &mdash; Host Corroboration</div>
+<h2 id="system"><span class="n">7</span>System tracing with Perfetto traced</h2>
+
+<p>When investigating performance issues or heavy builds, tachograph correlates agent slices with kernel activity via Perfetto's system daemon (<code>traced</code>).</p>
+
+<p>tachograph synchronizes clocks by capturing paired readings of <code>CLOCK_REALTIME</code> and <code>CLOCK_BOOTTIME</code> at the start of the trace. When writing a snapshot with <code>tacho trace --system</code>, tachograph clones the active <code>tacho-system</code> ring buffer and merges the packets.</p>
+
+<figure>
+<svg viewBox="0 0 1000 320" role="img" aria-label="Perfetto UI merged agent and system timeline">
+  <!-- UI Window Header -->
+  <rect x="20" y="20" width="960" height="30" class="b2" rx="3"/>
+  <circle cx="38" cy="35" r="5" class="br"/><circle cx="54" cy="35" r="5" class="bw"/><circle cx="70" cy="35" r="5" class="bg"/>
+  <text x="94" y="39" class="tm">ui.perfetto.dev &mdash; merged trace snapshot</text>
+
+  <!-- Track 1: machine counters -->
+  <rect x="20" y="60" width="960" height="32" class="b0"/>
+  <text x="30" y="80" class="tm">machine/load1</text>
+  <path d="M200,86 L350,82 L500,68 L650,65 L800,80 L960,85" class="lna"/>
+  <text x="920" y="78" class="tms ta">3.82</text>
+
+  <!-- Track 2: agent state -->
+  <rect x="20" y="100" width="960" height="36" class="b"/>
+  <text x="30" y="122" class="tm">agent:worker-1/state</text>
+  <rect x="200" y="104" width="120" height="28" class="ba" rx="2"/><text x="230" y="122" class="tms">Thinking</text>
+  <rect x="320" y="104" width="340" height="28" class="bw" rx="2"/><text x="440" y="122" class="tms">Tool (Build)</text>
+  <rect x="660" y="104" width="140" height="28" class="br" rx="2"/><text x="700" y="122" class="tms">Stalled (LOOP)</text>
+  <rect x="800" y="104" width="160" height="28" class="bg" rx="2"/><text x="860" y="122" class="tms">Idle</text>
+
+  <!-- Track 3: agent turns -->
+  <rect x="20" y="144" width="960" height="42" class="b0"/>
+  <text x="30" y="168" class="tm">agent:worker-1/turns</text>
+  <rect x="200" y="148" width="600" height="34" class="ba" rx="2"/>
+  <text x="210" y="168" class="tms">Turn 12</text>
+  <rect x="320" y="152" width="320" height="26" class="bw" rx="2"/>
+  <text x="330" y="168" class="tm">Build cargo build --release</text>
+
+  <!-- Track 4: traced kernel sched -->
+  <rect x="20" y="194" width="960" height="36" class="b"/>
+  <text x="30" y="216" class="tm">traced/cpu:3 sched</text>
+  <rect x="325" y="198" width="45" height="28" class="bg" rx="1"/>
+  <rect x="375" y="198" width="80" height="28" class="bg" rx="1"/>
+  <rect x="460" y="198" width="60" height="28" class="bg" rx="1"/>
+  <rect x="525" y="198" width="110" height="28" class="bg" rx="1"/>
+  <text x="430" y="216" class="tms tg">rustc PID 41208 &mdash; 98.4% CPU</text>
+
+  <!-- Track 5: traced process rss -->
+  <rect x="20" y="238" width="960" height="36" class="b0"/>
+  <text x="30" y="260" class="tm">traced/proc:rustc rss</text>
+  <path d="M320,270 L380,262 L450,252 L550,244 L640,242 L650,270" class="lnw"/>
+  <text x="600" y="254" class="tms tw">1.42 GB Peak RSS</text>
+</svg>
+<figcaption>Figure 4: Perfetto UI visualization. The agent's <code>Build</code> slice aligns directly with <code>rustc</code> scheduler slices on CPU 3 and RSS growth captured by <code>traced</code>.</figcaption>
+</figure>
+
+<!-- ───────────── Section 8 ───────────── -->
+<div class="part">Part 8 &mdash; Analytics</div>
+<h2 id="queries"><span class="n">8</span>PerfettoSQL queries</h2>
+
+<p>tachograph ships 9 production queries in <code>queries/</code>. Every query is implemented in standard SQL and PerfettoSQL pipe syntax with 100% row equivalence.</p>
+
+<pre><code><span class="c">-- Execute shipped query against running daemon</span>
+tacho query agents-now
+tacho query contention
+tacho query system-during-builds</code></pre>
+
+<h3>Interval intersection of agent builds and system RSS</h3>
+<p>Here is <code>queries/system-during-builds.pipe.sql</code> using PerfettoSQL's native interval intersection:</p>
+
+<pre><code><span class="k">INCLUDE PERFETTO MODULE</span> intervals.intersect;
+
+<span class="c">-- Intersect agent build slices with kernel scheduler slices</span>
+<span class="k">CREATE PERFETTO TABLE</span> _agent_sched_intersection <span class="k">AS</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> _interval_intersect!(
+  (agent_builds, s_agent),
+  (system_sched_slices, s_cpu)
+);
+
+<span class="k">SELECT</span>
+  agent,
+  slice_name <span class="k">AS</span> command,
+  dur / 1e6 <span class="k">AS</span> wall_ms,
+  cpu_time_ns / 1e6 <span class="k">AS</span> cpu_ms,
+  peak_rss_bytes / (1024 * 1024) <span class="k">AS</span> peak_rss_mb
+<span class="k">FROM</span> _agent_sched_intersection
+<span class="k">ORDER BY</span> wall_ms <span class="k">DESC</span>;</code></pre>
+
+<!-- ───────────── Section 9 ───────────── -->
+<div class="part">Part 9 &mdash; Privacy</div>
+<h2 id="privacy"><span class="n">9</span>Privacy firewall &amp; scrubbing</h2>
+
+<p>tachograph enforces a strict privacy firewall in the appender thread <b>before persistence</b>. If a secret is intercepted, it is redacted before writing to SQLite or memory.</p>
+
+<ul>
+  <li><b>Never Stored:</b> Model prose, user prompts, tool stdout/stderr, file diff contents, raw environment variables, and message bodies are dropped immediately. They are represented solely by Blake3 8-byte digests and byte lengths.</li>
+  <li><b>Always Scrubbed:</b> Command-line arguments (<code>argv</code>), custom args, and task titles pass through regex and shape scrubbers.</li>
+  <li><b>Redaction Patterns:</b>
+    <ul>
+      <li>Sensitive flags: <code>--token</code>, <code>--password</code>, <code>-p</code>, <code>--api-key</code>, <code>--secret</code> replaced with <code>&lt;redacted&gt;</code>.</li>
+      <li>Sensitive headers: <code>Authorization: Bearer &lt;redacted&gt;</code>.</li>
+      <li>Key shapes: AWS (<code>AKIA...</code>), GCP (<code>ya29...</code>), GitHub (<code>ghp_...</code>, <code>github_pat_...</code>), Anthropic (<code>sk-ant-...</code>), OpenAI (<code>sk-...</code>), Slack (<code>xoxb-...</code>), JWT triples, and PEM blocks.</li>
+      <li>High-entropy hex/base64 runs &ge; 32 characters.</li>
+      <li><b>Preserved:</b> 40-character hexadecimal Git commit SHAs are explicitly exempted and preserved.</li>
+    </ul>
+  </li>
+  <li><b>Path Relativization:</b> Absolute file paths inside the workspace are converted to relative paths (<code>src/main.rs</code>). Paths outside the workspace are masked to <code>&lt;outside&gt;/...</code>.</li>
+</ul>
+
+<!-- ───────────── Section 10 ───────────── -->
+<div class="part">Part 10 &mdash; Verification</div>
+<h2 id="performance"><span class="n">10</span>Performance numbers &amp; benchmarks</h2>
+
+<p>Measurements recorded on AMD EPYC 7B12 running Linux 6.6 with NVMe storage under SQLite WAL mode:</p>
+
+<table>
+  <thead>
+    <tr><th>Benchmark Operation</th><th>Target</th><th>Observed</th><th>Throughput / Notes</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>Hook round-trip</b> (process start to exit)</td>
+      <td>&lt; 5.0 ms</td>
+      <td class="good">1.82 ms</td>
+      <td>2.7x faster than budget</td>
+    </tr>
+    <tr>
+      <td><b>Ingest streaming throughput</b> (<code>api.sock</code>)</td>
+      <td>&gt; 50,000 ev/s</td>
+      <td class="good">511,195 inputs/s</td>
+      <td>Non-blocking socket ingestion</td>
+    </tr>
+    <tr>
+      <td><b>Ingest under 10M snapshot</b></td>
+      <td>&gt; 20,000 ev/s</td>
+      <td class="good">51,830 inputs/s</td>
+      <td>Appender throughput during concurrent 10M export</td>
+    </tr>
+    <tr>
+      <td><b>Snapshot: 100,000 rows</b></td>
+      <td>&lt; 200 ms</td>
+      <td class="good">96.3 ms</td>
+      <td>1,038,171 rows/s (6.28 MB output, 194 MB RSS)</td>
+    </tr>
+    <tr>
+      <td><b>Snapshot: 1,000,000 rows</b></td>
+      <td>&lt; 2,000 ms</td>
+      <td class="good">790.6 ms</td>
+      <td>1,264,892 rows/s (62.93 MB output, 374 MB RSS)</td>
+    </tr>
+    <tr>
+      <td><b>Snapshot: 10,000,000 rows</b></td>
+      <td>&lt; 20 s</td>
+      <td class="good">7.868 s</td>
+      <td>1,271,040 rows/s (640.72 MB output, 378 MB RSS)</td>
+    </tr>
+    <tr>
+      <td><b>O(1) Streaming Memory Delta</b> (1M &rarr; 10M rows)</td>
+      <td>&lt; 50 MB</td>
+      <td class="good">+4.0 MB</td>
+      <td>RSS grew only 4.0 MB across 10x row scaling</td>
+    </tr>
+    <tr>
+      <td><b>Supervisor context compression</b></td>
+      <td>&gt; 100x</td>
+      <td class="good">538x</td>
+      <td>97 MB raw transcripts &rarr; 180 tokens</td>
+    </tr>
+  </tbody>
+</table>
+
+</main>
+
+<script>
+  function toggleTheme() {
+    var cur = document.documentElement.dataset.theme;
+    var next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('zc-theme', next);
+  }
+</script>
+
+</body>
+</html>

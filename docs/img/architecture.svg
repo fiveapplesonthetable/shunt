@@ -1,0 +1,262 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 540" width="100%" height="auto">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .text-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #202124; }
+      .text-head { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; fill: #3c4043; text-transform: uppercase; letter-spacing: 0.5px; }
+      .text-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11.5px; fill: #3c4043; }
+      .text-muted { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 10px; fill: #70757a; }
+      .text-mono { font-family: "Roboto Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 11px; fill: #202124; }
+      .box { fill: #f8f9fa; stroke: #dadce0; stroke-width: 1.2; rx: 4px; }
+      .box-source { fill: #f1f3f4; stroke: #bdc1c6; stroke-width: 1.2; rx: 4px; }
+      .box-appender { fill: #e8f0fe; stroke: #aecbfa; stroke-width: 1.5; rx: 6px; }
+      .box-db { fill: #fef7e0; stroke: #fdd663; stroke-width: 1.5; rx: 6px; }
+      .box-live { fill: #e6f4ea; stroke: #a8dab5; stroke-width: 1.5; rx: 6px; }
+      .box-out { fill: #f3e8fd; stroke: #d7aefb; stroke-width: 1.5; rx: 6px; }
+      .box-step { fill: #ffffff; stroke: #c6dafc; stroke-width: 1; rx: 3px; }
+      .arrow { stroke: #5f6368; stroke-width: 1.3; fill: none; marker-end: url(#ah); }
+      .arrow-accent { stroke: #1a73e8; stroke-width: 1.5; fill: none; marker-end: url(#aha); }
+      .arrow-dashed { stroke: #70757a; stroke-width: 1.2; stroke-dasharray: 4,3; fill: none; marker-end: url(#ah); }
+      .tag { font-family: "Roboto Mono", ui-monospace, monospace; font-size: 9.5px; fill: #1a73e8; }
+      @media (prefers-color-scheme: dark) {
+        .bg { fill: #202124; }
+        .text-title { fill: #e8eaed; }
+        .text-head { fill: #bdc1c6; }
+        .text-body { fill: #e8eaed; }
+        .text-muted { fill: #9aa0a6; }
+        .text-mono { fill: #e8eaed; }
+        .box { fill: #292a2d; stroke: #5f6368; }
+        .box-source { fill: #303134; stroke: #5f6368; }
+        .box-appender { fill: #1c2b46; stroke: #4285f4; }
+        .box-db { fill: #3c3214; stroke: #f9ab00; }
+        .box-live { fill: #133420; stroke: #34a853; }
+        .box-out { fill: #2d1e3e; stroke: #af5cf7; }
+        .box-step { fill: #202124; stroke: #4285f4; }
+        .arrow { stroke: #9aa0a6; }
+        .arrow-accent { stroke: #8ab4f8; }
+        .arrow-dashed { stroke: #9aa0a6; }
+        .tag { fill: #8ab4f8; }
+      }
+    </style>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#5f6368"/>
+    </marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1 L10,5 L0,9 z" fill="#1a73e8"/>
+    </marker>
+  </defs>
+
+  <!-- Background Canvas -->
+  <rect width="1020" height="540" class="bg"/>
+
+  <!-- COLUMN 1: INGESTION SOURCES -->
+  <text x="25" y="32" class="text-head">1 · Ingestion Sources</text>
+
+  <!-- Claude Code Hooks -->
+  <g transform="translate(25, 45)">
+    <rect width="170" height="50" class="box-source"/>
+    <text x="12" y="22" class="text-title">Claude Code</text>
+    <text x="12" y="38" class="text-muted">Pre/PostToolUse · Subagent</text>
+  </g>
+
+  <!-- Gemini CLI Hooks -->
+  <g transform="translate(25, 105)">
+    <rect width="170" height="50" class="box-source"/>
+    <text x="12" y="22" class="text-title">Gemini CLI</text>
+    <text x="12" y="38" class="text-muted">Before/AfterTool · Session</text>
+  </g>
+
+  <!-- Jetski Hooks -->
+  <g transform="translate(25, 165)">
+    <rect width="170" height="50" class="box-source"/>
+    <text x="12" y="22" class="text-title">Jetski Hooks</text>
+    <text x="12" y="38" class="text-muted">Pre/PostInvocation</text>
+  </g>
+
+  <!-- tacho run (subprocess tee) -->
+  <g transform="translate(25, 225)">
+    <rect width="170" height="50" class="box-source"/>
+    <text x="12" y="22" class="text-title">tacho run -- cmd</text>
+    <text x="12" y="38" class="text-muted">PTY/pipe tee · stream-json</text>
+  </g>
+
+  <!-- OTLP HTTP Server -->
+  <g transform="translate(25, 285)">
+    <rect width="170" height="50" class="box-source"/>
+    <text x="12" y="22" class="text-title">OTLP Receiver</text>
+    <text x="12" y="38" class="text-muted">:4318 proto/json · gzip</text>
+  </g>
+
+  <!-- tacho emit -->
+  <g transform="translate(25, 345)">
+    <rect width="170" height="50" class="box-source"/>
+    <text x="12" y="22" class="text-title">tacho emit</text>
+    <text x="12" y="38" class="text-muted">span · instant · counter</text>
+  </g>
+
+  <!-- /proc Sampler -->
+  <g transform="translate(25, 405)">
+    <rect width="170" height="50" class="box-source"/>
+    <text x="12" y="22" class="text-title">/proc Sampler</text>
+    <text x="12" y="38" class="text-muted">1 Hz load1, mem, cpu, disk</text>
+  </g>
+
+  <!-- Bounded Channel -->
+  <g transform="translate(225, 185)">
+    <rect width="40" height="150" class="box" stroke-dasharray="3,3"/>
+    <text x="20" y="30" class="text-muted" transform="rotate(90, 20, 30)" text-anchor="start">Bounded Channel (2048)</text>
+  </g>
+
+  <!-- Arrows from Sources to Bounded Channel -->
+  <path d="M195,70 L225,200" class="arrow"/>
+  <path d="M195,130 L225,220" class="arrow"/>
+  <path d="M195,190 L225,240" class="arrow"/>
+  <path d="M195,250 L225,260" class="arrow"/>
+  <path d="M195,310 L225,280" class="arrow"/>
+  <path d="M195,370 L225,300" class="arrow"/>
+  <path d="M195,430 L225,320" class="arrow"/>
+
+  <!-- COLUMN 2: SINGLE-THREADED APPENDER -->
+  <text x="295" y="32" class="text-head">2 · Daemon Appender Thread</text>
+
+  <g transform="translate(295, 45)">
+    <rect width="250" height="410" class="box-appender"/>
+    <text x="18" y="26" class="text-title">Single Appender Thread</text>
+    <text x="18" y="42" class="text-muted">Exclusive writer: no lock contention</text>
+
+    <!-- Step 1: Clock Snapshot -->
+    <g transform="translate(14, 56)">
+      <rect width="222" height="46" class="box-step"/>
+      <text x="10" y="20" class="text-title">1. Clock Snapshot</text>
+      <text x="10" y="35" class="text-muted">CLOCK_REALTIME + CLOCK_BOOTTIME</text>
+    </g>
+
+    <!-- Step 2: Privacy Scrubber -->
+    <g transform="translate(14, 110)">
+      <rect width="222" height="52" class="box-step"/>
+      <text x="10" y="19" class="text-title">2. Privacy Scrubber</text>
+      <text x="10" y="33" class="text-muted">\ line unwrap · vendor tokens · PEM</text>
+      <text x="10" y="46" class="text-muted">headers · userinfo · base64/hex runs</text>
+    </g>
+
+    <!-- Step 3: Command Classifier -->
+    <g transform="translate(14, 170)">
+      <rect width="222" height="46" class="box-step"/>
+      <text x="10" y="19" class="text-title">3. Command Classifier</text>
+      <text x="10" y="34" class="text-muted">Peel wrappers · 12 classes (BUILD/TEST)</text>
+    </g>
+
+    <!-- Step 4: Lane Allocator -->
+    <g transform="translate(14, 224)">
+      <rect width="222" height="52" class="box-step"/>
+      <text x="10" y="19" class="text-title">4. Lane Allocator</text>
+      <text x="10" y="33" class="text-muted">Open-slice nesting table per run</text>
+      <text x="10" y="46" class="text-muted">Assigns parallel calls to lane:1..k</text>
+    </g>
+
+    <!-- Step 5: Live State Fold -->
+    <g transform="translate(14, 284)">
+      <rect width="222" height="52" class="box-step"/>
+      <text x="10" y="19" class="text-title">5. State Machine &amp; Detectors</text>
+      <text x="10" y="33" class="text-muted">Idle, Thinking, Tool, Waiting, Stalled</text>
+      <text x="10" y="46" class="text-muted">Loop &amp; hang detector triggers</text>
+    </g>
+
+    <!-- Step 6: WAL Commit -->
+    <g transform="translate(14, 344)">
+      <rect width="222" height="52" class="box-step"/>
+      <text x="10" y="19" class="text-title">6. Batch WAL Transaction</text>
+      <text x="10" y="33" class="text-muted">Batch: up to 256 events or 50 ms</text>
+      <text x="10" y="46" class="text-muted">synchronous = NORMAL</text>
+    </g>
+  </g>
+
+  <!-- Channel to Appender -->
+  <path d="M265,260 L295,260" class="arrow-accent"/>
+
+  <!-- COLUMN 3: STORAGE & DISPATCH -->
+  <text x="585" y="32" class="text-head">3 · Storage &amp; Live State</text>
+
+  <!-- SQLite WAL (Single Source of Truth) -->
+  <g transform="translate(585, 45)">
+    <rect width="200" height="195" class="box-db"/>
+    <text x="14" y="24" class="text-title">SQLite WAL Log</text>
+    <text x="14" y="40" class="tag">events.sqlite (WAL mode)</text>
+    <line x1="14" y1="50" x2="186" y2="50" stroke="#fdd663" stroke-width="1"/>
+    <text x="14" y="68" class="text-body">• Single source of truth</text>
+    <text x="14" y="86" class="text-body">• TrackCreated registry</text>
+    <text x="14" y="104" class="text-body">• Full event sequence</text>
+    <text x="14" y="122" class="text-body">• 100% resolution</text>
+    <text x="14" y="140" class="text-body">• Auto-retention pruner</text>
+    <text x="14" y="158" class="text-muted">Concurrent read: WAL cursor</text>
+    <text x="14" y="174" class="text-muted">Direct fallback if daemon dead</text>
+  </g>
+
+  <!-- Live State in Memory -->
+  <g transform="translate(585, 260)">
+    <rect width="200" height="195" class="box-live"/>
+    <text x="14" y="24" class="text-title">In-Memory LiveState</text>
+    <text x="14" y="40" class="tag">ArcSwap&lt;LiveState&gt;</text>
+    <line x1="14" y1="50" x2="186" y2="50" stroke="#a8dab5" stroke-width="1"/>
+    <text x="14" y="68" class="text-body">• Zero-alloc atomic swap</text>
+    <text x="14" y="86" class="text-body">• Active agent tracks</text>
+    <text x="14" y="104" class="text-body">• Current state &amp; slice</text>
+    <text x="14" y="122" class="text-body">• Token &amp; cost counters</text>
+    <text x="14" y="140" class="text-body">• Open wait conditions</text>
+    <text x="14" y="158" class="text-muted">Answers queries instantly</text>
+    <text x="14" y="174" class="text-muted">without touching disk or DB</text>
+  </g>
+
+  <!-- Appender to Storage/Live State -->
+  <path d="M545,142 L585,142" class="arrow-accent"/>
+  <path d="M545,357 L585,357" class="arrow-accent"/>
+
+  <!-- COLUMN 4: CONSUMPTION INTERFACES -->
+  <text x="825" y="32" class="text-head">4 · Readers &amp; Tools</text>
+
+  <!-- tacho trace (Perfetto) -->
+  <g transform="translate(825, 45)">
+    <rect width="170" height="100" class="box-out"/>
+    <text x="12" y="22" class="text-title">tacho trace</text>
+    <text x="12" y="38" class="text-muted">Snapshot stream (.perfetto-trace)</text>
+    <text x="12" y="56" class="text-body">ui.perfetto.dev</text>
+    <text x="12" y="72" class="text-body">trace_processor</text>
+    <text x="12" y="88" class="text-muted">Zero import errors</text>
+  </g>
+
+  <!-- Optional traced Merge -->
+  <g transform="translate(825, 160)">
+    <rect width="170" height="80" class="box"/>
+    <text x="12" y="22" class="text-title">System Tracing</text>
+    <text x="12" y="38" class="text-muted">Perfetto traced clone</text>
+    <text x="12" y="56" class="text-body">tacho trace --system</text>
+    <text x="12" y="72" class="text-muted">Merged by ClockSnapshot</text>
+  </g>
+
+  <!-- Live CLI inspection -->
+  <g transform="translate(825, 260)">
+    <rect width="170" height="110" class="box-out"/>
+    <text x="12" y="22" class="text-title">Supervisor CLI</text>
+    <text x="12" y="40" class="text-mono">tacho status</text>
+    <text x="12" y="58" class="text-mono">tacho watch</text>
+    <text x="12" y="76" class="text-mono">tacho report</text>
+    <text x="12" y="94" class="text-muted">&lt; 200 tokens per check</text>
+  </g>
+
+  <!-- Analytical Queries -->
+  <g transform="translate(825, 385)">
+    <rect width="170" height="70" class="box-out"/>
+    <text x="12" y="22" class="text-title">tacho query &lt;name&gt;</text>
+    <text x="12" y="40" class="text-muted">9 PerfettoSQL queries</text>
+    <text x="12" y="56" class="text-muted">Standard &amp; pipe syntax</text>
+  </g>
+
+  <!-- Arrows to Consumption -->
+  <path d="M785,110 L825,95" class="arrow-accent"/>
+  <path d="M785,185 L825,185" class="arrow-dashed"/>
+  <path d="M785,315 L825,315" class="arrow-accent"/>
+  <path d="M785,142 C805,142 805,420 825,420" class="arrow"/>
+
+  <!-- Footer note -->
+  <text x="25" y="505" class="text-muted">Tachograph architecture: single appender writer guarantees zero lock contention; SQLite WAL is the sole durable source of truth; live state answers in microseconds.</text>
+</svg>
