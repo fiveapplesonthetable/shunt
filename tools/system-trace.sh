@@ -36,7 +36,7 @@ trap cleanup EXIT
 echo "Starting background tacho-system tracing session..."
 "${PERFETTO}" \
   --background \
-  --config "${SCRIPT_DIR}/system-default.cfg" \
+  --config "${SCRIPT_DIR}/../crates/tacho-system/configs/system-default.cfg" \
   -o "${WORK_DIR}/system_bg.pftrace" \
   --txt > "${WORK_DIR}/perfetto_session.log" 2>&1
 

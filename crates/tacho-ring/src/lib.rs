@@ -105,9 +105,9 @@ impl SnapshotStats {
 /// - `len`: valid payload bytes currently stored in this chunk (0..=4088).
 /// - `words`: 511 64-bit atomic words storing payload data in little-endian byte order.
 pub struct Chunk {
-    pub gen: AtomicU32,
-    pub len: AtomicU32,
-    pub words: [AtomicU64; CHUNK_WORDS],
+    gen: AtomicU32,
+    len: AtomicU32,
+    words: [AtomicU64; CHUNK_WORDS],
 }
 
 impl Chunk {
