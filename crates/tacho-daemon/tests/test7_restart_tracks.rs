@@ -34,6 +34,7 @@ fn test_restart_keeps_tracks() {
                     cwd: Some("/repo".to_string()),
                     model: Some("gemini-1.5-pro".to_string()),
                     parent_session: None,
+                    git_tree: None,
                 },
                 1_000_000,
             )
@@ -50,6 +51,7 @@ fn test_restart_keeps_tracks() {
                     input: ToolInput::Shell {
                         argv: "git status".to_string(),
                         cwd: Some("/repo".to_string()),
+                        git_tree: None,
                     },
                 },
                 2_000_000,

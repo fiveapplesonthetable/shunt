@@ -66,6 +66,13 @@ pub fn blake3_digest_8(text: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct AgentDetectorState {
     pub last_event_ts_ns: u64,
+    pub last_cpu_activity_ns: Option<u64>,
+    pub last_edit_ts_ns: Option<u64>,
+    pub last_passing_test_ts_ns: Option<u64>,
+    pub commits_succeeded: u32,
+    pub pushes_succeeded: u32,
+    pub task_token_budget: Option<u64>,
+    pub task_cost_budget_micros: Option<u64>,
     pub recent_tool_digests: VecDeque<String>,
     pub spin_turns_count: usize,
     pub spin_turn_has_progress: bool,
@@ -73,6 +80,11 @@ pub struct AgentDetectorState {
     pub failing_commands: HashMap<String, usize>, // normalized argv -> consecutive failures
     pub task_declared_paths: Option<Vec<String>>,
     pub is_stalled: bool,
+    pub silent_fired: bool,
+    pub last_loop_digest: Option<String>,
+    pub spin_fired: bool,
+    pub burn_fired: bool,
+    pub claim_fired: bool,
 }
 
 impl AgentDetectorState {
@@ -81,9 +93,43 @@ impl AgentDetectorState {
         Self::default()
     }
 
-    /// Records event arrival time and clears stalled state on non-evidence events.
+    /// Records event arrival time and resets silence flag.
     pub fn touch_event(&mut self, ts_ns: u64) {
         self.last_event_ts_ns = self.last_event_ts_ns.max(ts_ns);
+        self.silent_fired = false;
+    }
+
+    /// Records CPU activity for CPU-aware silence detection.
+    pub fn touch_cpu_activity(&mut self, ts_ns: u64) {
+        self.last_cpu_activity_ns = Some(ts_ns);
+        self.silent_fired = false;
+    }
+
+    /// Configures declared paths for OFF_BRIEF detector.
+    pub fn set_declared_paths(&mut self, paths: Vec<String>) {
+        self.task_declared_paths = Some(paths);
+    }
+
+    /// Evaluates if run ended without a passing test after file edits (CLAIM detector).
+    pub fn check_claim(&mut self) -> Option<DetectorFiring> {
+        if self.claim_fired {
+            return None;
+        }
+        if let Some(edit_ts) = self.last_edit_ts_ns {
+            let needs_test = self.last_passing_test_ts_ns.is_none_or(|t| t < edit_ts);
+            if needs_test {
+                self.claim_fired = true;
+                self.is_stalled = true;
+                return Some(DetectorFiring {
+                    kind: tacho::StallKind::StallClaim,
+                    repeats: None,
+                    since_us: None,
+                    evidence: "run ended after file edits without a subsequent passing TEST"
+                        .to_string(),
+                });
+            }
+        }
+        None
     }
 
     /// Checks for silence timeout (SILENT detector) on tick.
@@ -94,14 +140,21 @@ impl AgentDetectorState {
         is_exited: bool,
         cfg: &DetectorConfig,
     ) -> Option<DetectorFiring> {
-        if is_waiting || is_exited || self.last_event_ts_ns == 0 {
+        if is_waiting || is_exited || self.last_event_ts_ns == 0 || self.silent_fired {
             return None;
+        }
+
+        if let Some(last_cpu) = self.last_cpu_activity_ns {
+            if now_ns.saturating_sub(last_cpu) < cfg.silent_timeout_ns {
+                return None;
+            }
         }
 
         if now_ns >= self.last_event_ts_ns + cfg.silent_timeout_ns {
             let elapsed_ns = now_ns - self.last_event_ts_ns;
             let since_us = elapsed_ns / 1_000;
             self.is_stalled = true;
+            self.silent_fired = true;
             Some(DetectorFiring {
                 kind: tacho::StallKind::Silent,
                 repeats: None,
@@ -126,6 +179,10 @@ impl AgentDetectorState {
         if self.recent_tool_digests.len() == cfg.loop_repeats
             && self.recent_tool_digests.iter().all(|d| d == digest)
         {
+            if self.last_loop_digest.as_deref() == Some(digest) {
+                return None;
+            }
+            self.last_loop_digest = Some(digest.to_string());
             self.is_stalled = true;
             Some(DetectorFiring {
                 kind: tacho::StallKind::Loop,
@@ -137,13 +194,27 @@ impl AgentDetectorState {
                 ),
             })
         } else {
+            if self.last_loop_digest.as_deref() != Some(digest) {
+                if self.last_loop_digest.is_some() {
+                    self.is_stalled = false;
+                }
+                self.last_loop_digest = None;
+            }
             None
         }
     }
 
     /// Evaluates file edits for task path compliance (OFF_BRIEF detector) and progress.
-    pub fn on_file_edited(&mut self, path: &str, cfg: &DetectorConfig) -> Option<DetectorFiring> {
+    pub fn on_file_edited(
+        &mut self,
+        path: &str,
+        ts_ns: u64,
+        cfg: &DetectorConfig,
+    ) -> Option<DetectorFiring> {
         self.spin_turn_has_progress = true;
+        self.spin_fired = false;
+        self.last_edit_ts_ns = Some(ts_ns);
+        self.is_stalled = false;
 
         if let Some(ref declared) = self.task_declared_paths {
             if !declared.is_empty() {
@@ -178,6 +249,7 @@ impl AgentDetectorState {
         argv: &str,
         class: CommandClass,
         exit_code: Option<i32>,
+        ts_ns: u64,
         cfg: &DetectorConfig,
     ) -> Option<DetectorFiring> {
         if matches!(
@@ -185,6 +257,20 @@ impl AgentDetectorState {
             CommandClass::Build | CommandClass::Test | CommandClass::Commit
         ) {
             self.spin_turn_has_progress = true;
+            self.spin_fired = false;
+        }
+
+        let is_success = exit_code == Some(0);
+        if is_success {
+            self.is_stalled = false;
+        }
+
+        if class == CommandClass::Test && is_success {
+            self.last_passing_test_ts_ns = Some(ts_ns);
+        } else if class == CommandClass::Commit && is_success {
+            self.commits_succeeded += 1;
+        } else if class == CommandClass::Push && is_success {
+            self.pushes_succeeded += 1;
         }
 
         if matches!(class, CommandClass::Build | CommandClass::Test) {
@@ -193,7 +279,7 @@ impl AgentDetectorState {
             if failed {
                 let count = self.failing_commands.entry(key.clone()).or_insert(0);
                 *count += 1;
-                if *count >= cfg.failing_repeats {
+                if *count == cfg.failing_repeats {
                     self.is_stalled = true;
                     return Some(DetectorFiring {
                         kind: tacho::StallKind::Failing,
@@ -204,6 +290,7 @@ impl AgentDetectorState {
                 }
             } else {
                 self.failing_commands.insert(key, 0);
+                self.is_stalled = false;
             }
         }
 
@@ -223,10 +310,12 @@ impl AgentDetectorState {
         if self.spin_turn_has_progress {
             self.spin_turns_count = 0;
             self.spin_turn_has_progress = false;
+            self.spin_fired = false;
         } else {
             self.spin_turns_count += 1;
-            if self.spin_turns_count >= cfg.spin_turns {
+            if self.spin_turns_count >= cfg.spin_turns && !self.spin_fired {
                 self.is_stalled = true;
+                self.spin_fired = true;
                 firings.push(DetectorFiring {
                     kind: tacho::StallKind::Spin,
                     repeats: Some(self.spin_turns_count as u32),
@@ -251,18 +340,19 @@ impl AgentDetectorState {
                 }
             }
 
+            let limit = self.task_token_budget.unwrap_or(cfg.burn_tokens);
             let sum: u64 = self.burn_window.iter().map(|(_, k)| *k).sum();
-            if sum > cfg.burn_tokens {
+            if sum > limit && !self.burn_fired {
                 self.is_stalled = true;
+                self.burn_fired = true;
                 firings.push(DetectorFiring {
                     kind: tacho::StallKind::Burn,
                     repeats: Some(sum as u32),
                     since_us: None,
-                    evidence: format!(
-                        "tokens_out {} in last 10m exceeded limit {}",
-                        sum, cfg.burn_tokens
-                    ),
+                    evidence: format!("tokens_out {} in last 10m exceeded limit {}", sum, limit),
                 });
+            } else if sum <= limit {
+                self.burn_fired = false;
             }
         }
 
@@ -310,13 +400,13 @@ mod tests {
         let cfg = DetectorConfig::default();
 
         assert!(state
-            .on_command_ended("cargo test", CommandClass::Test, Some(1), &cfg)
+            .on_command_ended("cargo test", CommandClass::Test, Some(1), 1_000, &cfg)
             .is_none());
         assert!(state
-            .on_command_ended("cargo test", CommandClass::Test, Some(1), &cfg)
+            .on_command_ended("cargo test", CommandClass::Test, Some(1), 2_000, &cfg)
             .is_none());
         let firing = state
-            .on_command_ended("cargo test", CommandClass::Test, Some(1), &cfg)
+            .on_command_ended("cargo test", CommandClass::Test, Some(1), 3_000, &cfg)
             .expect("should fire on 3rd failure");
         assert_eq!(firing.kind, tacho::StallKind::Failing);
         assert_eq!(firing.repeats, Some(3));
@@ -339,9 +429,9 @@ mod tests {
         let cfg = DetectorConfig::default();
         state.task_declared_paths = Some(vec!["src/main.rs".to_string(), "Cargo.toml".to_string()]);
 
-        assert!(state.on_file_edited("src/main.rs", &cfg).is_none());
+        assert!(state.on_file_edited("src/main.rs", 1_000, &cfg).is_none());
         let firing = state
-            .on_file_edited("secret/keys.pem", &cfg)
+            .on_file_edited("secret/keys.pem", 2_000, &cfg)
             .expect("should fire off-brief");
         assert_eq!(firing.kind, tacho::StallKind::OffBrief);
     }

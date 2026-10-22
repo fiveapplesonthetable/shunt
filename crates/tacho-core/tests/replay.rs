@@ -97,6 +97,7 @@ fn test_replay_claude_parallel_tools() {
                         cwd,
                         model: Some("claude-3-5-sonnet".to_string()),
                         parent_session: None,
+                        git_tree: None,
                         source_ts_ns: Some(now_ns),
                     },
                     now_ns,
@@ -134,6 +135,7 @@ fn test_replay_claude_parallel_tools() {
                         cwd,
                         model: Some("claude-3-5-sonnet".to_string()),
                         parent_session: parent_tool,
+                        git_tree: None,
                         source_ts_ns: Some(now_ns),
                     },
                     now_ns,
@@ -159,6 +161,7 @@ fn test_replay_claude_parallel_tools() {
                     "Bash" => ToolInput::Shell {
                         argv: tool_in_val["command"].as_str().unwrap_or("").to_string(),
                         cwd: None,
+                        git_tree: None,
                     },
                     _ => ToolInput::Other {
                         input_digest: None,
@@ -341,6 +344,7 @@ fn test_replay_jetski_session() {
                         cwd,
                         model: v["modelName"].as_str().map(String::from),
                         parent_session: None,
+                        git_tree: None,
                         source_ts_ns: Some(now_ns),
                     },
                     now_ns,
@@ -369,6 +373,7 @@ fn test_replay_jetski_session() {
                     "run_command" => ToolInput::Shell {
                         argv: args["CommandLine"].as_str().unwrap_or("").to_string(),
                         cwd: None,
+                        git_tree: None,
                     },
                     "read_file" => ToolInput::FileRead {
                         path: args["Path"].as_str().unwrap_or("").to_string(),

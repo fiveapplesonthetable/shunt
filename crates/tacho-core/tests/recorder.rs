@@ -23,6 +23,7 @@ fn test_recorder_basic_lifecycle() {
             cwd: Some("/workspace".to_string()),
             model: Some("claude-3-5-sonnet".to_string()),
             parent_session: None,
+            git_tree: None,
             source_ts_ns: Some(1_000_000),
         },
         1_000_000,
@@ -53,6 +54,7 @@ fn test_recorder_basic_lifecycle() {
             input: ToolInput::Shell {
                 argv: "cargo test -- -p core".to_string(),
                 cwd: None,
+                git_tree: None,
             },
             source_ts_ns: Some(3_000_000),
         },
@@ -134,6 +136,7 @@ fn test_recorder_abandoned_slices_drained() {
             cwd: None,
             model: None,
             parent_session: None,
+            git_tree: None,
             source_ts_ns: Some(1_000_000),
         },
         1_000_000,
@@ -158,6 +161,7 @@ fn test_recorder_abandoned_slices_drained() {
             input: ToolInput::Shell {
                 argv: "sleep 100".to_string(),
                 cwd: None,
+                git_tree: None,
             },
             source_ts_ns: Some(3_000_000),
         },
@@ -208,6 +212,7 @@ fn test_recorder_deterministic_restore() {
             cwd: Some("/app".to_string()),
             model: Some("gemini-1.5-pro".to_string()),
             parent_session: None,
+            git_tree: None,
             source_ts_ns: Some(10_000),
         },
         10_000,
@@ -232,6 +237,7 @@ fn test_recorder_deterministic_restore() {
             input: ToolInput::Shell {
                 argv: "echo hi".to_string(),
                 cwd: None,
+                git_tree: None,
             },
             source_ts_ns: Some(30_000),
         },
@@ -340,6 +346,10 @@ fn test_repro_deterministic_restore() {
                 brief_digest: Some("brief_hash".to_string()),
                 brief_bytes: Some(256),
                 paths: vec!["src/main.rs".to_string()],
+                agent: None,
+                base_commit: None,
+                token_budget: None,
+                cost_budget_micros: None,
             },
             1010000000u64,
         ),
@@ -375,6 +385,10 @@ fn test_repro_deterministic_restore() {
                 brief_digest: Some("brief_hash".to_string()),
                 brief_bytes: Some(256),
                 paths: vec!["src/main.rs".to_string()],
+                agent: None,
+                base_commit: None,
+                token_budget: None,
+                cost_budget_micros: None,
             },
             701019000000u64,
         ),
@@ -435,6 +449,7 @@ fn test_repro_deterministic_restore_failure_2() {
                 cwd: Some("/workspace".into()),
                 model: Some("test-model".into()),
                 parent_session: None,
+                git_tree: None,
             },
             1003000000,
         ),
@@ -449,6 +464,7 @@ fn test_repro_deterministic_restore_failure_2() {
                 cwd: Some("/workspace".into()),
                 model: Some("test-model".into()),
                 parent_session: None,
+                git_tree: None,
             },
             1006000000,
         ),
@@ -463,6 +479,7 @@ fn test_repro_deterministic_restore_failure_2() {
                 cwd: Some("/workspace".into()),
                 model: Some("test-model".into()),
                 parent_session: None,
+                git_tree: None,
             },
             1009000000,
         ),
@@ -579,6 +596,7 @@ fn test_repro_deterministic_restore_failure_2() {
                 cwd: Some("/workspace".into()),
                 model: Some("test-model".into()),
                 parent_session: None,
+                git_tree: None,
             },
             701026000000,
         ),
@@ -653,6 +671,10 @@ fn test_repro_deterministic_restore_failure_2() {
                 brief_digest: Some("brief_hash".into()),
                 brief_bytes: Some(256),
                 paths: vec!["src/main.rs".into()],
+                agent: None,
+                base_commit: None,
+                token_budget: None,
+                cost_budget_micros: None,
             },
             1401039000000,
         ),
@@ -792,6 +814,129 @@ fn test_repro_deterministic_restore_failure_2() {
 }
 
 #[test]
+fn test_repro_deterministic_restore_claim_stall() {
+    let timed_inputs: Vec<(Input, u64)> = vec![
+        (
+            Input::ToolBegin {
+                source_ts_ns: Some(1003000000),
+                session: SessionKey::new("jetski", "sess-2"),
+                tool_use_id: "call_1".into(),
+                tool_name: "tool".into(),
+                input: ToolInput::FileEdit {
+                    path: "src/lib.rs".into(),
+                    kind: Some(FileEditKind::Edit),
+                    lines_added: Some(1),
+                    lines_removed: Some(0),
+                },
+            },
+            1003000000,
+        ),
+        (
+            Input::RunStart {
+                source_ts_ns: None,
+                provider: "claude".into(),
+                session_id: "sess-1".into(),
+                agent: Some("agent-claude".into()),
+                task: Some("Prop task".into()),
+                pid: Some(1234),
+                cwd: Some("/workspace".into()),
+                model: Some("test-model".into()),
+                parent_session: None,
+                git_tree: None,
+            },
+            1006000000,
+        ),
+        (
+            Input::RunEnd {
+                source_ts_ns: Some(1009000000),
+                session: SessionKey::new("gemini", "sess-3"),
+                exit_code: Some(0),
+                reason: Some("run ended".into()),
+            },
+            1009000000,
+        ),
+        (
+            Input::RunEnd {
+                source_ts_ns: None,
+                session: SessionKey::new("claude", "sess-1"),
+                exit_code: Some(0),
+                reason: Some("run ended".into()),
+            },
+            1007000000,
+        ),
+        (
+            Input::RunStart {
+                source_ts_ns: Some(1010000000),
+                provider: "gemini".into(),
+                session_id: "sess-3".into(),
+                agent: Some("agent-gemini".into()),
+                task: Some("Prop task".into()),
+                pid: Some(1234),
+                cwd: Some("/workspace".into()),
+                model: Some("test-model".into()),
+                parent_session: None,
+                git_tree: None,
+            },
+            1010000000,
+        ),
+        (
+            Input::TurnEnd {
+                source_ts_ns: None,
+                session: SessionKey::new("claude", "sess-1"),
+                input_tokens: Some(473),
+                output_tokens: Some(408),
+                cached_tokens: Some(10),
+                text_bytes: Some(50),
+                cost_micros: Some(25),
+            },
+            701010000000,
+        ),
+        (
+            Input::RunEnd {
+                source_ts_ns: Some(701013000000),
+                session: SessionKey::new("jetski", "sess-2"),
+                exit_code: Some(0),
+                reason: Some("run ended".into()),
+            },
+            701013000000,
+        ),
+    ];
+
+    let k = 4;
+
+    let mut rec1 = Recorder::new();
+    let mut events1 = Vec::new();
+    for (inp, now) in &timed_inputs {
+        rec1.apply(inp.clone(), *now, &mut events1);
+    }
+
+    let mut rec_prefix = Recorder::new();
+    let mut events_prefix = Vec::new();
+    for (inp, now) in &timed_inputs[..k] {
+        rec_prefix.apply(inp.clone(), *now, &mut events_prefix);
+    }
+
+    let mut rec2 = Recorder::restore(events_prefix.iter());
+
+    let mut events_restored = Vec::new();
+    for (inp, now) in &timed_inputs[k..] {
+        rec2.apply(inp.clone(), *now, &mut events_restored);
+    }
+
+    let continuous_suffix = &events1[events_prefix.len()..];
+    assert_eq!(events_restored.len(), continuous_suffix.len());
+    for (i, (r, c)) in events_restored
+        .iter()
+        .zip(continuous_suffix.iter())
+        .enumerate()
+    {
+        assert_eq!(r.seq, c.seq, "seq mismatch at {}", i);
+        assert_eq!(r.kind, c.kind, "kind mismatch at {}", i);
+        assert_eq!(r.track_key, c.track_key, "track_key mismatch at {}", i);
+    }
+}
+
+#[test]
 fn test_counter_sample_consecutive_deduplication() {
     let mut rec = Recorder::new();
     let mut events = Vec::new();
@@ -922,6 +1067,7 @@ fn test_bench_restore_1m_rows() {
                 model: Some("claude-3-5".to_string()),
                 parent_run_seq: None,
                 resume: None,
+                git_tree: None,
             })),
         },
     });

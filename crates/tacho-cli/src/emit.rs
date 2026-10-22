@@ -52,19 +52,41 @@ pub fn execute_emit(args: EmitArgs) -> Result<(), String> {
             slug,
             paths,
             brief_file,
+            agent,
+            base_commit,
+            token_budget,
+            cost_budget,
         } => {
-            let description = if let Some(bf) = brief_file {
-                fs::read_to_string(&bf).ok()
+            let (brief_bytes, brief_digest) = if let Some(bf) = brief_file {
+                if let Ok(bytes) = fs::read(&bf) {
+                    let len = bytes.len() as u64;
+                    let digest = blake3::hash(&bytes).to_hex()[..16].to_string();
+                    (Some(len), Some(digest))
+                } else {
+                    (None, None)
+                }
             } else {
-                None
+                (None, None)
             };
+            let parsed_paths: Vec<String> = paths
+                .map(|p| {
+                    p.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             serde_json::json!({
-                "type": "task_update",
+                "type": "task",
                 "source_ts_ns": now_ns,
-                "task": slug,
-                "status": "in_progress",
-                "paths": paths.map(|p| p.split(',').map(String::from).collect::<Vec<_>>()),
-                "description": description,
+                "slug": slug,
+                "paths": parsed_paths,
+                "brief_bytes": brief_bytes,
+                "brief_digest": brief_digest,
+                "agent": agent,
+                "base_commit": base_commit,
+                "token_budget": token_budget,
+                "cost_budget_micros": cost_budget,
             })
         }
         EmitSubcommands::State {
@@ -72,14 +94,38 @@ pub fn execute_emit(args: EmitArgs) -> Result<(), String> {
             state,
             because,
         } => {
-            serde_json::json!({
-                "type": "custom",
-                "source_ts_ns": now_ns,
-                "track": target,
-                "op": "state",
-                "name": state,
-                "args": because.map(|b| vec![serde_json::json!({"key": "because", "value": b})]),
-            })
+            if target.starts_with("task:") || target.starts_with("task/") {
+                let slug = target
+                    .strip_prefix("task:")
+                    .or_else(|| target.strip_prefix("task/"))
+                    .unwrap_or(&target);
+                let state_lower = state.to_lowercase();
+                let state_snake = match state_lower.as_str() {
+                    "queued" => "queued",
+                    "inprogress" | "in_progress" => "in_progress",
+                    "review" => "review",
+                    "done" => "done",
+                    "failed" => "failed",
+                    "cancelled" | "canceled" => "cancelled",
+                    other => other,
+                };
+                serde_json::json!({
+                    "type": "task_state",
+                    "source_ts_ns": now_ns,
+                    "slug": slug,
+                    "state": state_snake,
+                    "because": because,
+                })
+            } else {
+                serde_json::json!({
+                    "type": "custom",
+                    "source_ts_ns": now_ns,
+                    "track": target,
+                    "op": "state",
+                    "name": state,
+                    "args": because.map(|b| vec![serde_json::json!({"key": "because", "value": b})]),
+                })
+            }
         }
         EmitSubcommands::Span { action } => match action {
             SpanAction::Begin {
@@ -124,11 +170,10 @@ pub fn execute_emit(args: EmitArgs) -> Result<(), String> {
         }
         EmitSubcommands::Counter { track, value, unit } => {
             serde_json::json!({
-                "type": "custom",
+                "type": "counter_sample",
                 "source_ts_ns": now_ns,
-                "track": track,
-                "op": "counter",
-                "counter_value": value,
+                "track_key": track,
+                "value": value,
                 "unit": unit,
             })
         }

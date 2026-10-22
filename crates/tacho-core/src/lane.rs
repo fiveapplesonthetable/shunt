@@ -178,6 +178,20 @@ impl LaneAllocator {
         Ok(track_key)
     }
 
+    /// Drains any open tool slice on the turns track before Turn ends.
+    pub fn drain_turns_tool(&mut self) -> Option<AbandonedSlice> {
+        if let Some(tool_id) = self.turns_tool_open.take() {
+            if let Some((kind, _)) = self.open_slices.remove(&tool_id) {
+                return Some(AbandonedSlice {
+                    slice_id: tool_id,
+                    kind,
+                    track_key: self.turns_track.clone(),
+                });
+            }
+        }
+        None
+    }
+
     /// Closes all remaining open slices on run termination with `abandoned = true`.
     pub fn drain_abandoned(&mut self) -> Vec<AbandonedSlice> {
         let mut abandoned = Vec::new();

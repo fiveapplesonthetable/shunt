@@ -1,220 +1,38 @@
 //! Slice lifecycle (Turn, Tool, Wait, Prompt) and lane allocation.
 
-use crate::classify::{classify, CommandClass};
-use crate::detect::blake3_digest_8;
+use crate::classify::CommandClass;
 use crate::event::Event;
 use crate::input::{FileEditKind, SessionKey, ToolInput};
 use crate::kind::Kind;
 use crate::lane::LaneError;
 use crate::live::RecentCommand;
-use crate::scrub::{relativize_cwd, relativize_path, truncate_utf8};
+use crate::scrub::truncate_utf8;
 use tacho_proto::tacho;
 
-use super::tracks::{command_class_name, to_proto_cmd_class, to_proto_edit_kind};
+pub(crate) use super::tool::{make_abandoned_body, make_tool_end_body, OpenToolSlice};
+use super::tracks::{command_class_name, to_proto_edit_kind};
 use super::Recorder;
 
-/// Metadata for an active tool execution slice.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct OpenToolSlice {
-    pub(crate) slice_id: u64,
-    pub(crate) tool_use_id: String,
-    pub(crate) tool_name: String,
-    pub(crate) kind: Kind,
-    pub(crate) assigned_track: String,
-    pub(crate) argv: Option<String>,
-    pub(crate) command_class: Option<CommandClass>,
-    pub(crate) file_path: Option<String>,
-    pub(crate) file_edit: Option<(Option<FileEditKind>, Option<u32>, Option<u32>)>,
-}
-
-struct ToolDetails {
-    kind: Kind,
-    custom_name: Option<String>,
-    body: tacho::event::Body,
-    argv: Option<String>,
-    command_class: Option<CommandClass>,
-    file_path: Option<String>,
-    file_edit: Option<(Option<FileEditKind>, Option<u32>, Option<u32>)>,
-    digest: String,
-}
-
-fn make_tool_end_body(
-    end_kind: Kind,
-    exit: Option<i32>,
-    bytes: Option<u64>,
-    error: bool,
-) -> tacho::event::Body {
-    match end_kind {
-        Kind::CommandEnded => tacho::event::Body::CommandEnded(tacho::CommandEnded {
-            exit,
-            timed_out: Some(false),
-            stdout_bytes: bytes,
-            stderr_bytes: None,
-            tests_run: None,
-            tests_failed: None,
-            abandoned: Some(false),
-        }),
-        Kind::FileAccessEnded => tacho::event::Body::FileAccessEnded(tacho::FileAccessEnded {
-            bytes_read: bytes,
-            items_found: None,
-            error: Some(error),
-            abandoned: Some(false),
-        }),
-        _ => tacho::event::Body::ToolCallEnded(tacho::ToolCallEnded {
-            error: Some(error),
-            result_bytes: bytes,
-            abandoned: Some(false),
-        }),
-    }
-}
-
-fn make_simple_tool_call(
-    name: &str,
-    digest: &str,
-    bytes: Option<u64>,
-    id: &str,
-) -> tacho::event::Body {
-    tacho::event::Body::ToolCall(tacho::ToolCall {
-        name: Some(truncate_utf8(name, 64)),
-        input_digest: Some(digest.to_string()),
-        input_bytes: bytes,
-        tool_use_id: Some(truncate_utf8(id, 128)),
-    })
-}
-
 impl Recorder {
-    fn resolve_tool_details(
-        &self,
-        tool_in: ToolInput,
-        tool_use_id: &str,
-        tool_name: &str,
-        cwd: Option<&str>,
-    ) -> ToolDetails {
-        match tool_in {
-            ToolInput::Shell {
-                argv,
-                cwd: tool_cwd,
-            } => {
-                let s_argv = truncate_utf8(&self.scrubber.scrub(&argv), 512);
-                let eff_cwd = tool_cwd.as_deref().or(cwd);
-                let s_cwd = eff_cwd.map(|c| truncate_utf8(&relativize_cwd(c, None), 512));
-                let words: Vec<&str> = argv.split_whitespace().collect();
-                let class = classify(&words);
-                let proto_class = to_proto_cmd_class(class);
-                ToolDetails {
-                    kind: Kind::Command,
-                    custom_name: Some(command_class_name(class).to_string()),
-                    body: tacho::event::Body::Command(tacho::Command {
-                        argv: Some(s_argv),
-                        cwd: s_cwd,
-                        class: Some(proto_class as i32),
-                        check_name: None,
-                        via_wrap: Some(false),
-                        program: None,
-                        tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
-                    }),
-                    argv: Some(argv.clone()),
-                    command_class: Some(class),
-                    file_path: None,
-                    file_edit: None,
-                    digest: blake3_digest_8(&argv),
-                }
+    pub(crate) fn update_active_cmd_counter(
+        &mut self,
+        class: Option<CommandClass>,
+        delta: i64,
+        ts: u64,
+        out: &mut Vec<Event>,
+    ) {
+        let (track, unit, cnt) = match class {
+            Some(CommandClass::Build) => {
+                self.active_builds = (self.active_builds + delta).max(0);
+                ("machine/active_builds", "builds", self.active_builds)
             }
-            ToolInput::FileRead { path } => {
-                let rel = relativize_path(&path, cwd.unwrap_or("."));
-                let digest = blake3_digest_8(&path);
-                ToolDetails {
-                    kind: Kind::FileAccess,
-                    custom_name: Some("Read".to_string()),
-                    body: tacho::event::Body::FileAccess(tacho::FileAccess {
-                        path: Some(truncate_utf8(&rel, 512)),
-                        kind: Some(tacho::FileAccessKind::Read as i32),
-                        query: None,
-                        tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
-                    }),
-                    argv: None,
-                    command_class: None,
-                    file_path: Some(path),
-                    file_edit: None,
-                    digest,
-                }
+            Some(CommandClass::Test) => {
+                self.active_tests = (self.active_tests + delta).max(0);
+                ("machine/active_tests", "tests", self.active_tests)
             }
-            ToolInput::FileSearch { pattern, path } => {
-                let rel = path
-                    .as_deref()
-                    .map(|p| relativize_path(p, cwd.unwrap_or(".")));
-                let s_path = rel.as_deref().map(|p| truncate_utf8(p, 512));
-                let digest = blake3_digest_8(&format!("{}:{:?}", pattern, path));
-                ToolDetails {
-                    kind: Kind::FileAccess,
-                    custom_name: Some("Search".to_string()),
-                    body: tacho::event::Body::FileAccess(tacho::FileAccess {
-                        path: s_path,
-                        kind: Some(tacho::FileAccessKind::Search as i32),
-                        query: Some(truncate_utf8(&pattern, 256)),
-                        tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
-                    }),
-                    argv: None,
-                    command_class: None,
-                    file_path: path,
-                    file_edit: None,
-                    digest,
-                }
-            }
-            ToolInput::FileEdit {
-                path,
-                kind,
-                lines_added,
-                lines_removed,
-            } => {
-                let digest = blake3_digest_8(&path);
-                ToolDetails {
-                    kind: Kind::ToolCall,
-                    custom_name: Some("Edit".to_string()),
-                    body: tacho::event::Body::ToolCall(tacho::ToolCall {
-                        name: Some("Edit".to_string()),
-                        input_digest: Some(digest.clone()),
-                        input_bytes: None,
-                        tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
-                    }),
-                    argv: None,
-                    command_class: None,
-                    file_path: Some(path),
-                    file_edit: Some((kind, lines_added, lines_removed)),
-                    digest,
-                }
-            }
-            ToolInput::Subagent { description_len } => {
-                let digest = blake3_digest_8(&format!("subagent:{}", tool_use_id));
-                ToolDetails {
-                    kind: Kind::ToolCall,
-                    custom_name: Some("Subagent".to_string()),
-                    body: make_simple_tool_call("Subagent", &digest, description_len, tool_use_id),
-                    argv: None,
-                    command_class: None,
-                    file_path: None,
-                    file_edit: None,
-                    digest,
-                }
-            }
-            ToolInput::Other {
-                input_digest,
-                input_bytes,
-            } => {
-                let digest = input_digest.unwrap_or_else(|| blake3_digest_8(tool_name));
-                ToolDetails {
-                    kind: Kind::ToolCall,
-                    custom_name: Some(tool_name.to_string()),
-                    body: make_simple_tool_call(tool_name, &digest, input_bytes, tool_use_id),
-                    argv: None,
-                    command_class: None,
-                    file_path: None,
-                    file_edit: None,
-                    digest,
-                }
-            }
-        }
+            _ => return,
+        };
+        self.handle_counter_sample(track.to_string(), cnt, Some(unit.to_string()), ts, out);
     }
 
     /// Handles `Input::ToolBegin`.
@@ -232,12 +50,13 @@ impl Recorder {
         let slice_id = self.alloc_seq();
         let cwd = self.runs.get(&run_key).and_then(|r| r.cwd.clone());
         let details = self.resolve_tool_details(tool_in, &tool_use_id, &tool_name, cwd.as_deref());
-        let assigned_track = if let Some(run) = self.runs.get_mut(&run_key) {
-            run.tool_calls_count += 1;
-            run.lane_allocator.allocate_begin(slice_id, details.kind)
-        } else {
-            format!("agent:{}/run:{}/turns", agent_id, run_n)
-        };
+        let assigned_track = self.runs.get_mut(&run_key).map_or_else(
+            || format!("agent:{}/run:{}/turns", agent_id, run_n),
+            |run| {
+                run.tool_calls_count += 1;
+                run.lane_allocator.allocate_begin(slice_id, details.kind)
+            },
+        );
         if details.kind == Kind::ToolCall && details.custom_name.as_deref() == Some("Subagent") {
             self.subagent_flows.insert(tool_use_id.clone(), slice_id);
         }
@@ -250,6 +69,18 @@ impl Recorder {
             Some(agent_id.clone()),
             details.custom_name.clone(),
             Some(details.body),
+            out,
+        );
+        self.update_active_cmd_counter(details.command_class, 1, ts, out);
+        if let Some(agent) = self.live.agents.get_mut(&agent_id) {
+            agent.last_action = details.custom_name.clone().unwrap_or(tool_name.clone());
+        }
+        self.transition_state(
+            &agent_id,
+            "Tool",
+            tacho::AgentStateType::Tool,
+            "tool begin",
+            ts,
             out,
         );
         if let Some((edit_k, added, removed)) = details.file_edit {
@@ -284,17 +115,6 @@ impl Recorder {
                 },
             );
         }
-        if let Some(agent) = self.live.agents.get_mut(&agent_id) {
-            agent.last_action = details.custom_name.unwrap_or(tool_name);
-        }
-        self.transition_state(
-            &agent_id,
-            "Tool",
-            tacho::AgentStateType::Tool,
-            "tool begin",
-            ts,
-            out,
-        );
         let cfg = self.detector_cfg.clone();
         let firing = if let Some(det) = self.detectors.get_mut(&agent_id) {
             det.touch_event(ts);
@@ -303,7 +123,10 @@ impl Recorder {
             None
         };
         if let Some(f) = firing {
-            self.handle_detector_firings(&agent_id, vec![f], ts, out);
+            if let Some(ev) = out.iter_mut().rfind(|e| e.seq == slice_id) {
+                ev.flow_ids.push(slice_id);
+            }
+            self.handle_detector_firings(&agent_id, vec![f], Some(slice_id), ts, out);
         }
     }
 
@@ -343,15 +166,21 @@ impl Recorder {
         if let Some(run) = self.runs.get_mut(run_key) {
             run.files_edited_count += 1;
         }
+        if let Some(agent) = self.live.agents.get_mut(agent_id) {
+            agent.last_edit_ts_ns = Some(ts);
+        }
         let cfg = self.detector_cfg.clone();
         let firing = if let Some(det) = self.detectors.get_mut(agent_id) {
             det.touch_event(ts);
-            det.on_file_edited(&path, &cfg)
+            det.on_file_edited(&path, ts, &cfg)
         } else {
             None
         };
         if let Some(f) = firing {
-            self.handle_detector_firings(agent_id, vec![f], ts, out);
+            if let Some(ev) = out.iter_mut().rfind(|e| e.seq == parent_seq) {
+                ev.flow_ids.push(parent_seq);
+            }
+            self.handle_detector_firings(agent_id, vec![f], Some(parent_seq), ts, out);
         }
     }
 
@@ -371,16 +200,23 @@ impl Recorder {
                 exit_code,
                 ts_ns: ts,
             });
+            if class == CommandClass::Test && exit_code == Some(0) {
+                agent.last_passing_test_ts_ns = Some(ts);
+            } else if class == CommandClass::Commit && exit_code == Some(0) {
+                agent.commits_succeeded += 1;
+            } else if class == CommandClass::Push && exit_code == Some(0) {
+                agent.pushes_succeeded += 1;
+            }
         }
         let cfg = self.detector_cfg.clone();
         let firing = if let Some(det) = self.detectors.get_mut(agent_id) {
             det.touch_event(ts);
-            det.on_command_ended(&argv, class, exit_code, &cfg)
+            det.on_command_ended(&argv, class, exit_code, ts, &cfg)
         } else {
             None
         };
         if let Some(f) = firing {
-            self.handle_detector_firings(agent_id, vec![f], ts, out);
+            self.handle_detector_firings(agent_id, vec![f], None, ts, out);
         }
     }
 
@@ -404,6 +240,7 @@ impl Recorder {
             .and_then(|r| r.open_tools.remove(&tool_use_id));
 
         if let Some(tool) = open_tool {
+            self.update_active_cmd_counter(tool.command_class, -1, ts, out);
             let end_kind = tool.kind.pairing().unwrap_or(tool.kind);
             let track_res = if let Some(run) = self.runs.get_mut(&run_key) {
                 run.lane_allocator.allocate_end(tool.slice_id, tool.kind)
@@ -447,12 +284,27 @@ impl Recorder {
             if let (Some(argv), Some(class)) = (tool.argv, tool.command_class) {
                 self.record_command_completion(argv, class, exit_code, &agent_id, ts, out);
             }
+            if !error && exit_code.unwrap_or(0) == 0 {
+                if let Some(det) = self.detectors.get_mut(&agent_id) {
+                    if det.silent_fired {
+                        det.silent_fired = false;
+                        det.is_stalled = false;
+                    }
+                }
+            }
             let is_turn_open = self
                 .runs
                 .get(&run_key)
                 .map(|r| r.turn_open)
                 .unwrap_or(false);
-            let (next_st, next_enum) = if is_turn_open {
+            let is_stalled = self
+                .detectors
+                .get(&agent_id)
+                .map(|d| d.is_stalled)
+                .unwrap_or(false);
+            let (next_st, next_enum) = if is_stalled {
+                ("Stalled", tacho::AgentStateType::Stalled)
+            } else if is_turn_open {
                 ("Thinking", tacho::AgentStateType::Thinking)
             } else {
                 ("Idle", tacho::AgentStateType::Idle)
@@ -460,22 +312,6 @@ impl Recorder {
             self.transition_state(&agent_id, next_st, next_enum, "tool ended", ts, out);
         } else {
             let track = format!("agent:{}/run:{}/turns", agent_id, run_n);
-            let body = tacho::event::Body::ToolCallEnded(tacho::ToolCallEnded {
-                error: Some(error),
-                result_bytes,
-                abandoned: Some(false),
-            });
-            self.emit(
-                &track,
-                Kind::ToolCallEnded,
-                ts,
-                None,
-                None,
-                Some(agent_id.clone()),
-                Some("UnmatchedToolCallEnded".to_string()),
-                Some(body),
-                out,
-            );
             let err_body = tacho::event::Body::TraceError(tacho::TraceError {
                 message: Some(format!("unmatched end for tool_use_id {}", tool_use_id)),
                 track_key: Some(track),

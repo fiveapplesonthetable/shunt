@@ -103,6 +103,7 @@ fn test_snapshots_under_load() {
                 cwd: Some("/dev".to_string()),
                 model: Some("claude-3-5".to_string()),
                 parent_session: None,
+                git_tree: None,
             },
             1_000_000_000,
         )
@@ -120,6 +121,7 @@ fn test_snapshots_under_load() {
                 input: ToolInput::Shell {
                     argv: format!("echo test-{}", i / 2),
                     cwd: Some("/dev".to_string()),
+                    git_tree: None,
                 },
             }
         } else {

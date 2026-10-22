@@ -104,3 +104,162 @@ fn test_watch_until_stalled_and_report() {
         "Report does not include timeline: {report_str}"
     );
 }
+
+#[test]
+fn test_report_diff_claims() {
+    let env = TestEnv::new().unwrap();
+
+    // Ensure daemon is ready
+    let _ = env.tacho_cmd().arg("status").output();
+    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+
+    let send_hook = |payload: serde_json::Value| {
+        let mut child = env
+            .tacho_cmd()
+            .args(["hook", "claude"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(payload.to_string().as_bytes()).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+        assert!(child.wait().unwrap().success());
+    };
+
+    // 1. Session start for agent `verified-worker`
+    send_hook(serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "sess-verified",
+        "agent": "verified-worker",
+        "cwd": env.home_dir.to_str().unwrap(),
+    }));
+
+    // 2. File edit
+    send_hook(serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-edit-1",
+        "tool_name": "Edit",
+        "tool_input": { "path": "src/lib.rs" },
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-edit-1",
+        "tool_response": { "exit_code": 0 },
+    }));
+
+    // 3. Passing test after edit
+    send_hook(serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-test-1",
+        "tool_name": "Bash",
+        "tool_input": { "command": "cargo test" },
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-test-1",
+        "tool_response": { "exit_code": 0 },
+    }));
+
+    // 4. Successful commit and push
+    send_hook(serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-commit-1",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git commit -m 'feat'" },
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-commit-1",
+        "tool_response": { "exit_code": 0 },
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-push-1",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push" },
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "sess-verified",
+        "tool_use_id": "tool-push-1",
+        "tool_response": { "exit_code": 0 },
+    }));
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    // 5. Test `tacho report verified-worker --diff-claims`
+    let report_out = env
+        .tacho_cmd()
+        .args(["report", "verified-worker", "--diff-claims"])
+        .output()
+        .expect("tacho report --diff-claims failed");
+    assert!(report_out.status.success());
+
+    let report_str = String::from_utf8_lossy(&report_out.stdout);
+    println!("Report diff-claims output:\n{}", report_str);
+
+    assert!(report_str.contains("=== Claim Verification: verified-worker ==="));
+    assert!(report_str.contains("Test After Last Edit: VERIFIED"));
+    assert!(report_str.contains("Commits Succeeded:    1"));
+    assert!(report_str.contains("Pushes Succeeded:     1"));
+    assert!(report_str.contains("Claim Stall Flags:    NONE"));
+    assert!(report_str.contains("Git Worktree Status:"));
+
+    // Verify brevity (< 100 tokens, approx 400 chars)
+    assert!(
+        report_str.len() < 500,
+        "Report summary is too long (expected <100 tokens): {} bytes",
+        report_str.len()
+    );
+
+    // 6. Test unverified worker: edits without subsequent passing test
+    send_hook(serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "sess-unverified",
+        "agent": "unverified-worker",
+        "cwd": env.home_dir.to_str().unwrap(),
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-unverified",
+        "tool_use_id": "tool-edit-bad",
+        "tool_name": "Edit",
+        "tool_input": { "path": "src/main.rs" },
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "sess-unverified",
+        "tool_use_id": "tool-edit-bad",
+        "tool_response": { "exit_code": 0 },
+    }));
+    send_hook(serde_json::json!({
+        "hook_event_name": "SessionEnd",
+        "session_id": "sess-unverified",
+        "reason": "done",
+    }));
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    let unverified_out = env
+        .tacho_cmd()
+        .args(["report", "unverified-worker", "--diff-claims"])
+        .output()
+        .expect("tacho report --diff-claims failed");
+    assert!(unverified_out.status.success());
+    let unverified_str = String::from_utf8_lossy(&unverified_out.stdout);
+    println!("Unverified output:\n{}", unverified_str);
+
+    assert!(unverified_str.contains("=== Claim Verification: unverified-worker ==="));
+    assert!(unverified_str.contains("Test After Last Edit: UNVERIFIED"));
+}

@@ -72,6 +72,7 @@ fn arb_tool_input() -> impl Strategy<Value = ToolInput> {
         .prop_map(|cmd| ToolInput::Shell {
             argv: cmd.to_string(),
             cwd: None,
+            git_tree: None,
         }),
         prop_oneof![Just("src/main.rs"), Just("Cargo.toml"), Just("README.md"),].prop_map(|path| {
             ToolInput::FileRead {
@@ -115,6 +116,7 @@ fn arb_input() -> impl Strategy<Value = Input> {
             cwd: Some("/workspace".to_string()),
             model: Some("test-model".to_string()),
             parent_session: None,
+            git_tree: None,
             source_ts_ns: None,
         }),
         arb_session_key().prop_map(|session| Input::RunEnd {
@@ -207,6 +209,10 @@ fn arb_input() -> impl Strategy<Value = Input> {
             brief_digest: Some("brief_hash".to_string()),
             brief_bytes: Some(256),
             paths: vec!["src/main.rs".to_string()],
+            agent: None,
+            base_commit: None,
+            token_budget: None,
+            cost_budget_micros: None,
             source_ts_ns: None,
         }),
         Just(Input::TaskState {

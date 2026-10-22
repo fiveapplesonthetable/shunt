@@ -146,6 +146,12 @@ pub fn get_embedded_query(name: &str) -> Option<&'static str> {
         "contention.pipe" | "contention.pipe.sql" => {
             Some(include_str!("../../../queries/contention.pipe.sql"))
         }
+        "verified-trees" | "verified-trees.sql" => {
+            Some(include_str!("../../../queries/verified-trees.sql"))
+        }
+        "verified-trees.pipe" | "verified-trees.pipe.sql" => {
+            Some(include_str!("../../../queries/verified-trees.pipe.sql"))
+        }
         _ => None,
     }
 }
@@ -185,6 +191,6 @@ pub fn resolve_query_sql(query_arg: &str) -> Result<String, String> {
     }
 
     Err(format!(
-        "could not find shipped query or file matching '{query_arg}'. Shipped queries: agents-now, open-waits, failing-commands, time-by-class, edits-by-file, tokens-by-agent, stalls, system-during-builds, contention (or .pipe variants)"
+        "could not find shipped query or file matching '{query_arg}'. Shipped queries: agents-now, open-waits, failing-commands, time-by-class, edits-by-file, tokens-by-agent, stalls, system-during-builds, contention, verified-trees (or .pipe variants)"
     ))
 }

@@ -148,6 +148,7 @@ fn test_scripted_fleet_queries() {
             cwd: Some("/home/dev/project".to_string()),
             model: Some("claude-3-5".to_string()),
             parent_session: None,
+            git_tree: None,
         },
         base_ts,
         &mut events,
@@ -172,6 +173,7 @@ fn test_scripted_fleet_queries() {
             input: ToolInput::Shell {
                 argv: "cargo build --release".to_string(),
                 cwd: None,
+                git_tree: None,
             },
         },
         base_ts + 2_000_000_000,
@@ -206,6 +208,7 @@ fn test_scripted_fleet_queries() {
                 input: ToolInput::Shell {
                     argv: "cargo test -p core".to_string(),
                     cwd: None,
+                    git_tree: None,
                 },
             },
             t_begin,
@@ -285,6 +288,7 @@ fn test_scripted_fleet_queries() {
             cwd: Some("/home/dev/project".to_string()),
             model: Some("gemini-2.5".to_string()),
             parent_session: None,
+            git_tree: None,
         },
         base_ts,
         &mut events,
@@ -406,6 +410,7 @@ fn test_scripted_fleet_queries() {
             input: ToolInput::Shell {
                 argv: "cargo check".to_string(),
                 cwd: None,
+                git_tree: None,
             },
         },
         base_ts + 14_000_000_000,
@@ -453,6 +458,7 @@ fn test_scripted_fleet_queries() {
             cwd: Some("/home/dev/project".to_string()),
             model: Some("jetski-1".to_string()),
             parent_session: None,
+            git_tree: None,
         },
         base_ts,
         &mut events,
@@ -478,6 +484,7 @@ fn test_scripted_fleet_queries() {
             input: ToolInput::Shell {
                 argv: "cargo build".to_string(),
                 cwd: None,
+                git_tree: None,
             },
         },
         base_ts + 11_000_000_000,
@@ -875,12 +882,6 @@ fn test_scripted_fleet_queries() {
                 "4".to_string()
             ],
             vec![
-                "worker-2".to_string(),
-                "LOOP".to_string(),
-                "tool input digest e3f85dfb5b619eeb repeated 4 times in a row".to_string(),
-                "4".to_string()
-            ],
-            vec![
                 "worker-1".to_string(),
                 "FAILING".to_string(),
                 "command 'cargo test -p core' failed 3 times in a row".to_string(),
@@ -1127,6 +1128,7 @@ fn test_system_during_builds_with_real_traced() {
             cwd: Some("/home/dev".to_string()),
             model: Some("claude-3-5".to_string()),
             parent_session: None,
+            git_tree: None,
         },
         start_wall_ns,
         &mut events,
@@ -1141,6 +1143,7 @@ fn test_system_during_builds_with_real_traced() {
             input: ToolInput::Shell {
                 argv: "cargo build --release".to_string(),
                 cwd: None,
+                git_tree: None,
             },
         },
         start_wall_ns,

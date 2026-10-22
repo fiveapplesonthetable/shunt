@@ -6,10 +6,13 @@
 //!
 //! Pure crate: no IO, no threads, no clocks. All wall-clock timestamps are supplied as `now_ns`.
 
+mod apply;
 mod counters;
+mod restore;
 mod routing;
 mod slices;
 mod state;
+mod tool;
 mod tracks;
 
 use std::collections::{HashMap, HashSet};
@@ -26,7 +29,18 @@ use crate::scrub::{truncate_utf8, Scrubber};
 use crate::track::TrackRegistry;
 
 pub(crate) use counters::ProviderCounters;
-pub(crate) use slices::OpenToolSlice;
+pub(crate) use tool::OpenToolSlice;
+
+/// Metadata and configuration for a tracked task.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TaskMeta {
+    pub paths: Vec<String>,
+    pub agent: Option<String>,
+    pub base_commit: Option<String>,
+    pub token_budget: Option<u64>,
+    pub cost_budget_micros: Option<u64>,
+    pub last_run_seq: Option<u64>,
+}
 
 /// Internal flight recorder state for a single agent session run.
 #[derive(Debug, Clone)]
@@ -97,10 +111,13 @@ pub struct Recorder {
     pub(crate) detectors: HashMap<String, AgentDetectorState>, // agent_id -> detector state
     pub(crate) providers: HashMap<String, ProviderCounters>, // provider -> counters
     pub(crate) tasks: HashMap<String, Vec<String>>,          // task_slug -> declared paths
-    pub(crate) custom_flows: HashMap<String, u64>,           // flow_name -> origin seq
-    pub(crate) message_flows: HashMap<String, u64>,          // message_id -> origin seq
-    pub(crate) subagent_flows: HashMap<String, u64>,         // tool_use_id -> origin seq
+    pub(crate) task_meta: HashMap<String, TaskMeta>,
+    pub(crate) custom_flows: HashMap<String, u64>, // flow_name -> origin seq
+    pub(crate) message_flows: HashMap<String, u64>, // message_id -> origin seq
+    pub(crate) subagent_flows: HashMap<String, u64>, // tool_use_id -> origin seq
     pub(crate) last_counter_value: HashMap<String, i64>, // track_key -> last emitted counter value
+    pub(crate) active_builds: i64,
+    pub(crate) active_tests: i64,
     pub(crate) live: LiveState,
 }
 
@@ -126,10 +143,13 @@ impl Recorder {
             detectors: HashMap::new(),
             providers: HashMap::new(),
             tasks: HashMap::new(),
+            task_meta: HashMap::new(),
             custom_flows: HashMap::new(),
             message_flows: HashMap::new(),
             subagent_flows: HashMap::new(),
             last_counter_value: HashMap::new(),
+            active_builds: 0,
+            active_tests: 0,
             live: LiveState::new(),
         }
     }
@@ -197,219 +217,7 @@ impl Recorder {
             });
         }
 
-        match input {
-            Input::RunStart {
-                provider,
-                session_id,
-                agent,
-                task,
-                pid,
-                cwd,
-                model,
-                parent_session,
-                ..
-            } => {
-                self.handle_run_start(
-                    provider,
-                    session_id,
-                    agent,
-                    task,
-                    pid,
-                    cwd,
-                    model,
-                    parent_session,
-                    ts,
-                    out,
-                );
-            }
-
-            Input::RunEnd {
-                session,
-                exit_code,
-                reason,
-                ..
-            } => {
-                self.handle_run_end(session, exit_code, reason, ts, out);
-            }
-
-            Input::Prompt {
-                session,
-                text_len,
-                digest,
-                ..
-            } => {
-                self.handle_prompt(session, text_len, digest, ts, out);
-            }
-
-            Input::TurnStart { session, model, .. } => {
-                self.handle_turn_start(session, model, ts, out);
-            }
-
-            Input::TurnEnd {
-                session,
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                text_bytes,
-                cost_micros,
-                ..
-            } => {
-                self.handle_turn_end(
-                    session,
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
-                    text_bytes,
-                    cost_micros,
-                    ts,
-                    out,
-                );
-            }
-
-            Input::ToolBegin {
-                session,
-                tool_use_id,
-                tool_name,
-                input: tool_in,
-                ..
-            } => {
-                self.handle_tool_begin(session, tool_use_id, tool_name, tool_in, ts, out);
-            }
-
-            Input::ToolEnd {
-                session,
-                tool_use_id,
-                error,
-                result_bytes,
-                exit_code,
-                ..
-            } => {
-                self.handle_tool_end(
-                    session,
-                    tool_use_id,
-                    error,
-                    result_bytes,
-                    exit_code,
-                    ts,
-                    out,
-                );
-            }
-
-            Input::Wait {
-                session,
-                target,
-                on,
-                ..
-            } => {
-                self.handle_wait(session, target, on, ts, out);
-            }
-
-            Input::WaitEnd {
-                session, timed_out, ..
-            } => {
-                self.handle_wait_end(session, timed_out, ts, out);
-            }
-
-            Input::Message {
-                from,
-                to,
-                id,
-                bytes,
-                dir,
-                ..
-            } => {
-                self.handle_message(from, to, id, bytes, dir, ts, out);
-            }
-
-            Input::Compacted {
-                session,
-                tokens_before,
-                tokens_after,
-                bytes_compacted,
-                ..
-            } => {
-                self.handle_compacted(
-                    session,
-                    tokens_before,
-                    tokens_after,
-                    bytes_compacted,
-                    ts,
-                    out,
-                );
-            }
-
-            Input::ProviderError {
-                provider,
-                error_code,
-                message,
-                rate_limit,
-                retry_after_ms,
-                ..
-            } => {
-                self.handle_provider_error(
-                    provider,
-                    error_code,
-                    message,
-                    rate_limit,
-                    retry_after_ms,
-                    ts,
-                    out,
-                );
-            }
-
-            Input::Task {
-                slug,
-                brief_digest,
-                brief_bytes,
-                paths,
-                ..
-            } => {
-                self.handle_task(slug, brief_digest, brief_bytes, paths, ts, out);
-            }
-
-            Input::TaskState {
-                slug,
-                state,
-                because,
-                ..
-            } => {
-                self.handle_task_state(slug, state, because, ts, out);
-            }
-
-            Input::Finding {
-                task,
-                severity,
-                path,
-                line,
-                title,
-                ..
-            } => {
-                self.handle_finding(task, severity, path, line, title, ts, out);
-            }
-
-            Input::Custom {
-                track,
-                op,
-                name,
-                id,
-                args,
-                value,
-                flow_out,
-                flow_in,
-                ..
-            } => {
-                self.handle_custom(track, op, name, id, args, value, flow_out, flow_in, ts, out);
-            }
-
-            Input::CounterSample {
-                track_key,
-                value,
-                unit,
-                ..
-            } => {
-                self.handle_counter_sample(track_key, value, unit, ts, out);
-            }
-        }
+        self.dispatch_input(input, ts, out);
     }
 
     /// Periodic tick for time-based detectors (e.g. SILENT detector).
@@ -432,46 +240,8 @@ impl Recorder {
             };
 
             if let Some(f) = firing {
-                self.handle_detector_firings(&agent_id, vec![f], now_ns, out);
+                self.handle_detector_firings(&agent_id, vec![f], None, now_ns, out);
             }
-        }
-    }
-
-    /// Deterministically rebuilds an identical flight recorder state machine from logged events.
-    pub fn restore<'a>(events: impl Iterator<Item = &'a Event>) -> Self {
-        let mut rec = Recorder::new();
-        for event in events {
-            rec.apply_restored_event(event);
-        }
-        rec
-    }
-
-    fn apply_restored_event(&mut self, event: &Event) {
-        self.next_seq = self.next_seq.max(event.seq + 1);
-        self.track_last_ts
-            .insert(event.track_key.clone(), event.ts_ns);
-        if let Some(v) = event.counter_value {
-            self.last_counter_value.insert(event.track_key.clone(), v);
-        }
-
-        match event.kind {
-            Kind::TrackCreated => self.restore_track_created(event),
-            Kind::Run | Kind::RunEnded => self.restore_run_event(event),
-            Kind::Turn
-            | Kind::TurnEnded
-            | Kind::Command
-            | Kind::ToolCall
-            | Kind::FileAccess
-            | Kind::CommandEnded
-            | Kind::ToolCallEnded
-            | Kind::FileAccessEnded
-            | Kind::Wait
-            | Kind::WaitEnded
-            | Kind::FileEdited => self.restore_slice_event(event),
-            Kind::AgentState | Kind::Custom | Kind::Stall | Kind::TaskQueued => {
-                self.restore_state_or_counter_event(event)
-            }
-            _ => {}
         }
     }
 }

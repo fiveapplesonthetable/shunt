@@ -116,8 +116,10 @@ fn test_replay_claude_sequential() {
         .unwrap();
     let slice_names: Vec<String> = slices.into_iter().flatten().collect();
     assert!(
-        slice_names.iter().any(|s| s.contains("View")),
-        "Expected View slice in {:?}",
+        slice_names
+            .iter()
+            .any(|s| s.contains("View") || s.contains("Read")),
+        "Expected View/Read slice in {:?}",
         slice_names
     );
 }

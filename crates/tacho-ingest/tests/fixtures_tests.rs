@@ -45,6 +45,7 @@ fn test_claude_session_start() {
             cwd: Some("/Users/developer/project".to_string()),
             model: None,
             parent_session: None,
+            git_tree: None,
         }]
     );
 }
@@ -92,6 +93,7 @@ fn test_claude_pre_tool_use() {
             input: ToolInput::Shell {
                 argv: "cargo test --workspace".to_string(),
                 cwd: None,
+                git_tree: None,
             },
         }]
     );
@@ -237,6 +239,7 @@ fn test_gemini_session_start() {
             cwd: Some("/workspace".to_string()),
             model: Some("gemini-1.5-pro".to_string()),
             parent_session: None,
+            git_tree: None,
         }]
     );
 }
@@ -284,6 +287,7 @@ fn test_gemini_before_tool() {
             input: ToolInput::Shell {
                 argv: "pytest tests/".to_string(),
                 cwd: None,
+                git_tree: None,
             },
         }]
     );
@@ -372,6 +376,7 @@ fn test_jetski_session_start() {
             cwd: Some("/google/src/cloud/zezeozue/workspace/google3".to_string()),
             model: Some("auto".to_string()),
             parent_session: None,
+            git_tree: None,
         }]
     );
 }
@@ -410,6 +415,7 @@ fn test_jetski_pre_tool_use() {
             input: ToolInput::Shell {
                 argv: "blaze test //my/project:test".to_string(),
                 cwd: None,
+                git_tree: None,
             },
         }]
     );

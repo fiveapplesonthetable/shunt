@@ -21,19 +21,22 @@ pub struct SnapshotStats {
     pub events: u64,
 }
 
-/// Rebuilds the `TrackRegistry` by folding all persisted `TrackCreated` rows from the event log.
-pub fn build_registry_from_conn(conn: &Connection) -> io::Result<TrackRegistry> {
+/// Rebuilds the `TrackRegistry` by folding persisted `TrackCreated` rows up to `max_seq`.
+pub fn build_registry_from_conn_up_to(
+    conn: &Connection,
+    max_seq: Option<u64>,
+) -> io::Result<TrackRegistry> {
     let mut reg_stmt = conn
         .prepare(
             "SELECT seq, ts_ns, kind, track_key, cause_seq, agent, body, flow_ids, terminating_flow_ids, counter_value, custom_name
              FROM events
-             WHERE kind = ?1
+             WHERE kind = ?1 AND (?2 IS NULL OR seq <= ?2)
              ORDER BY seq ASC",
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut rows = reg_stmt
-        .query([Kind::TrackCreated as u32])
+        .query(rusqlite::params![Kind::TrackCreated as u32, max_seq])
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut events = Vec::new();
@@ -57,7 +60,116 @@ pub fn build_registry_from_conn(conn: &Connection) -> io::Result<TrackRegistry> 
     }
 
     let rec = Recorder::restore(events.iter());
-    Ok(rec.registry().clone())
+    let mut reg = rec.registry().clone();
+
+    // Ensure any track with counter samples is registered as TrackKind::Counter
+    let mut counter_stmt = conn
+        .prepare(
+            "SELECT DISTINCT track_key, custom_name
+             FROM events
+             WHERE counter_value IS NOT NULL AND (?1 IS NULL OR seq <= ?1)",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut counter_rows = counter_stmt
+        .query(rusqlite::params![max_seq])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    while let Some(row) = counter_rows
+        .next()
+        .map_err(|e| io::Error::other(e.to_string()))?
+    {
+        let track_key: String = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
+        let unit: Option<String> = row.get(1).map_err(|e| io::Error::other(e.to_string()))?;
+        if let Some(entry) = reg.get_by_key_mut(&track_key) {
+            entry.kind = tacho_core::TrackKind::Counter;
+            if entry.counter_unit.is_none() {
+                entry.counter_unit = unit;
+            }
+        } else {
+            reg.register(
+                &track_key,
+                None,
+                &track_key,
+                None,
+                tacho_core::TrackKind::Counter,
+                unit.as_deref(),
+            );
+        }
+    }
+
+    // Ensure any track with state events (TaskState, AgentState) is registered as TrackKind::State
+    let mut state_stmt = conn
+        .prepare(
+            "SELECT DISTINCT track_key
+             FROM events
+             WHERE kind IN (?1, ?2) AND (?3 IS NULL OR seq <= ?3)",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut state_rows = state_stmt
+        .query(rusqlite::params![
+            Kind::TaskState as u32,
+            Kind::AgentState as u32,
+            max_seq
+        ])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    while let Some(row) = state_rows
+        .next()
+        .map_err(|e| io::Error::other(e.to_string()))?
+    {
+        let track_key: String = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
+        if let Some(entry) = reg.get_by_key_mut(&track_key) {
+            entry.kind = tacho_core::TrackKind::State;
+        } else {
+            reg.register(
+                &track_key,
+                None,
+                &track_key,
+                None,
+                tacho_core::TrackKind::State,
+                None,
+            );
+        }
+    }
+
+    // Ensure ALL tracks appearing in events up to max_seq are registered in registry
+    let mut all_tracks_stmt = conn
+        .prepare(
+            "SELECT DISTINCT track_key
+             FROM events
+             WHERE (?1 IS NULL OR seq <= ?1)",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut all_tracks_rows = all_tracks_stmt
+        .query(rusqlite::params![max_seq])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    while let Some(row) = all_tracks_rows
+        .next()
+        .map_err(|e| io::Error::other(e.to_string()))?
+    {
+        let track_key: String = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
+        if reg.get_by_key(&track_key).is_none() {
+            reg.register(
+                &track_key,
+                None,
+                &track_key,
+                None,
+                tacho_core::TrackKind::Slices,
+                None,
+            );
+        }
+    }
+
+    Ok(reg)
+}
+
+/// Rebuilds the `TrackRegistry` by folding all persisted `TrackCreated` rows from the event log.
+pub fn build_registry_from_conn(conn: &Connection) -> io::Result<TrackRegistry> {
+    build_registry_from_conn_up_to(conn, None)
 }
 
 /// Writes a complete flight recorder snapshot to `w`, streaming rows directly from SQLite.
@@ -67,7 +179,37 @@ pub fn write_snapshot_conn(
     until: Option<u64>,
     w: &mut impl Write,
 ) -> io::Result<SnapshotStats> {
-    let registry = build_registry_from_conn(conn)?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let max_seq: Option<u64> = tx
+        .query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))
+        .unwrap_or(None);
+
+    let max_seq = match max_seq {
+        Some(s) => s,
+        None => {
+            let registry = TrackRegistry::new();
+            let start_time = SystemTime::now();
+            let now_ns = start_time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let boottime_ns = get_boottime_ns();
+            let mut writer = io::BufWriter::with_capacity(8192, w);
+            let mut header_bytes = Vec::with_capacity(8192);
+            encode_snapshot_header(&registry, now_ns, boottime_ns, &mut header_bytes);
+            writer.write_all(&header_bytes)?;
+            writer.flush()?;
+            return Ok(SnapshotStats {
+                bytes: header_bytes.len() as u64,
+                events: 0,
+            });
+        }
+    };
+
+    let registry = build_registry_from_conn_up_to(&tx, Some(max_seq))?;
 
     let start_time = SystemTime::now();
     let now_ns = start_time
@@ -86,17 +228,17 @@ pub fn write_snapshot_conn(
     let mut total_bytes = header_bytes.len() as u64;
 
     // 5. Query events ordered by seq ASC (streaming, O(1) memory)
-    let mut stmt = conn
+    let mut stmt = tx
         .prepare(
             "SELECT seq, ts_ns, kind, track_key, cause_seq, agent, body, flow_ids, terminating_flow_ids, counter_value, custom_name
              FROM events
-             WHERE (?1 IS NULL OR ts_ns >= ?1) AND (?2 IS NULL OR ts_ns <= ?2)
+             WHERE (?1 IS NULL OR ts_ns >= ?1) AND (?2 IS NULL OR ts_ns <= ?2) AND seq <= ?3
              ORDER BY seq ASC",
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut rows = stmt
-        .query(rusqlite::params![since, until])
+        .query(rusqlite::params![since, until, max_seq])
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut encoder = Encoder::new();

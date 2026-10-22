@@ -31,6 +31,9 @@ impl Recorder {
             return;
         }
 
+        if state_str != "Stalled" && state_str != "Exited" {
+            live_agent.flags.clear();
+        }
         live_agent.state = state_str.to_string();
         live_agent.state_since_ns = ts;
 
@@ -65,6 +68,7 @@ impl Recorder {
         &mut self,
         agent_id: &str,
         firings: Vec<DetectorFiring>,
+        cause_slice_id: Option<u64>,
         ts: u64,
         out: &mut Vec<Event>,
     ) {
@@ -76,6 +80,7 @@ impl Recorder {
                 tacho::StallKind::Burn => "BURN",
                 tacho::StallKind::Failing => "FAILING",
                 tacho::StallKind::OffBrief => "OFF_BRIEF",
+                tacho::StallKind::StallClaim => "CLAIM",
                 _ => "STALL",
             };
 
@@ -83,17 +88,18 @@ impl Recorder {
             self.ensure_track(&agent_track, ts, out);
             let stall_ts = self.clamp_ts(&agent_track, ts);
             let seq = self.alloc_seq();
+            let terminating_flows = cause_slice_id.map(|cs| vec![cs]).unwrap_or_default();
 
             out.push(Event {
                 seq,
                 ts_ns: stall_ts,
                 kind: Kind::Stall,
                 track_key: agent_track,
-                cause_seq: None,
+                cause_seq: cause_slice_id,
                 agent: Some(agent_id.to_string()),
                 custom_name: Some("StallDetected".to_string()),
                 flow_ids: Vec::new(),
-                terminating_flow_ids: Vec::new(),
+                terminating_flow_ids: terminating_flows,
                 counter_value: None,
                 body: tacho::Event {
                     body: Some(tacho::event::Body::Stall(tacho::Stall {
@@ -129,12 +135,17 @@ impl Recorder {
     }
 
     /// Handles `Input::Task`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_task(
         &mut self,
         slug: String,
         brief_digest: Option<String>,
         brief_bytes: Option<u64>,
         paths: Vec<String>,
+        agent: Option<String>,
+        base_commit: Option<String>,
+        token_budget: Option<u64>,
+        cost_budget_micros: Option<u64>,
         ts: u64,
         out: &mut Vec<Event>,
     ) {
@@ -144,9 +155,28 @@ impl Recorder {
         let seq = self.alloc_seq();
 
         self.tasks.insert(slug.clone(), paths.clone());
-        for det in self.detectors.values_mut() {
-            det.task_declared_paths = Some(paths.clone());
+        let meta = self.task_meta.entry(slug.clone()).or_default();
+        meta.paths = paths.clone();
+        meta.agent = agent.clone();
+        meta.base_commit = base_commit;
+        meta.token_budget = token_budget;
+        meta.cost_budget_micros = cost_budget_micros;
+
+        if let Some(ref agent_id) = agent {
+            let det = self.detectors.entry(agent_id.clone()).or_default();
+            det.set_declared_paths(paths.clone());
+            det.task_token_budget = token_budget;
+            det.task_cost_budget_micros = cost_budget_micros;
+        } else {
+            for det in self.detectors.values_mut() {
+                det.task_declared_paths = Some(paths.clone());
+                det.task_token_budget = token_budget;
+                det.task_cost_budget_micros = cost_budget_micros;
+            }
         }
+
+        let flow_id = xxhash_rust::xxh3::xxh3_64(format!("task_flow:{}", slug).as_bytes())
+            & 0x7FFF_FFFF_FFFF_FFFF;
 
         out.push(Event {
             seq,
@@ -154,9 +184,9 @@ impl Recorder {
             kind: Kind::TaskQueued,
             track_key: track,
             cause_seq: None,
-            agent: None,
+            agent: agent.clone(),
             custom_name: None,
-            flow_ids: Vec::new(),
+            flow_ids: vec![flow_id],
             terminating_flow_ids: Vec::new(),
             counter_value: None,
             body: tacho::Event {
@@ -198,6 +228,18 @@ impl Recorder {
             .as_deref()
             .map(|b| truncate_utf8(&self.scrubber.scrub(b), 128));
 
+        let flow_id = xxhash_rust::xxh3::xxh3_64(format!("task_flow:{}", slug).as_bytes())
+            & 0x7FFF_FFFF_FFFF_FFFF;
+        let is_terminal = matches!(
+            state,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+        );
+        let next_flows = if is_terminal {
+            Vec::new()
+        } else {
+            vec![flow_id]
+        };
+
         out.push(Event {
             seq,
             ts_ns: t_ts,
@@ -206,8 +248,8 @@ impl Recorder {
             cause_seq: None,
             agent: None,
             custom_name: Some(state_str.to_string()),
-            flow_ids: Vec::new(),
-            terminating_flow_ids: Vec::new(),
+            flow_ids: next_flows,
+            terminating_flow_ids: vec![flow_id],
             counter_value: None,
             body: tacho::Event {
                 body: Some(tacho::event::Body::TaskState(tacho::TaskState {
@@ -369,78 +411,5 @@ impl Recorder {
                 })),
             },
         });
-    }
-
-    /// Restores agent state, stall flags, or cumulative counters.
-    pub(crate) fn restore_state_or_counter_event(&mut self, event: &Event) {
-        match event.kind {
-            Kind::AgentState => {
-                let segs: Vec<&str> = event.track_key.split('/').collect();
-                let agent_id = segs[0].strip_prefix("agent:").unwrap_or(segs[0]);
-                if let Some(agent) = self.live.agents.get_mut(agent_id) {
-                    if let Some(ref name) = event.custom_name {
-                        agent.state = name.clone();
-                        agent.state_since_ns = event.ts_ns;
-                    }
-                }
-            }
-            Kind::Custom => {
-                if let Some(val) = event.counter_value {
-                    let segs: Vec<&str> = event.track_key.split('/').collect();
-                    if segs.len() > 2
-                        && segs[0].starts_with("agent:")
-                        && segs[1].starts_with("run:")
-                    {
-                        let agent_id = segs[0].strip_prefix("agent:").unwrap();
-                        let run_n: u32 = segs[1].strip_prefix("run:").unwrap().parse().unwrap_or(1);
-                        if let Some(run) = self.runs.get_mut(&(agent_id.to_string(), run_n)) {
-                            match segs[2] {
-                                "tokens_in" => run.cumulative_tokens_in = val as u64,
-                                "tokens_out" => {
-                                    run.cumulative_tokens_out = val as u64;
-                                    if let Some(agent) = self.live.agents.get_mut(agent_id) {
-                                        agent.tokens_out = val as u64;
-                                    }
-                                }
-                                "tokens_cached" => run.cumulative_tokens_cached = val as u64,
-                                "cost" => run.cumulative_cost_micros = val as u64,
-                                _ => {}
-                            }
-                        }
-                    } else if segs.len() > 1 && segs[0].starts_with("provider:") {
-                        let prov_name = segs[0].strip_prefix("provider:").unwrap();
-                        let prov_entry = self.providers.entry(prov_name.to_string()).or_default();
-                        match segs[1] {
-                            "tokens_out" => prov_entry.cumulative_tokens_out = val as u64,
-                            "cost" => prov_entry.cumulative_cost_micros = val as u64,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Kind::TaskQueued => {
-                if let Some(tacho::event::Body::TaskQueued(tq)) = &event.body.body {
-                    if let Some(ref slug) = tq.slug {
-                        let paths = tq.paths.clone();
-                        self.tasks.insert(slug.clone(), paths.clone());
-                        for det in self.detectors.values_mut() {
-                            det.task_declared_paths = Some(paths.clone());
-                        }
-                    }
-                }
-            }
-            Kind::Stall => {
-                let segs: Vec<&str> = event.track_key.split('/').collect();
-                let agent_id = segs[0].strip_prefix("agent:").unwrap_or(segs[0]);
-                if let Some(agent) = self.live.agents.get_mut(agent_id) {
-                    if let Some(ref custom) = event.custom_name {
-                        if !agent.flags.contains(custom) {
-                            agent.flags.push(custom.clone());
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 }

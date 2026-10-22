@@ -93,6 +93,7 @@ impl StreamParser {
                         cwd: self.cwd.clone(),
                         model: self.model.clone(),
                         parent_session: None,
+                        git_tree: None,
                     });
                 }
             }

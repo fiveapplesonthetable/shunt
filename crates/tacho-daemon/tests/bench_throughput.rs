@@ -515,6 +515,7 @@ fn bench_snapshot_scaling_and_peak_rss() {
                 input: tacho_core::ToolInput::Shell {
                     argv: "echo hi".to_string(),
                     cwd: None,
+                    git_tree: None,
                 },
             }
         } else {

@@ -34,6 +34,11 @@ pub fn map_with_diagnostics(
         Some("SessionStart") => {
             let cwd = obj.get("cwd").and_then(|v| v.as_str()).map(String::from);
             let model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
+            let git_tree = obj
+                .get("git_tree")
+                .or_else(|| obj.get("tree"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             vec![Input::RunStart {
                 source_ts_ns: Some(env.invoked_at_ns),
@@ -45,6 +50,7 @@ pub fn map_with_diagnostics(
                 cwd,
                 model,
                 parent_session: None,
+                git_tree,
             }]
         }
         Some("BeforeAgent") => {

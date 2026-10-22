@@ -73,6 +73,7 @@ impl StreamParser {
                     cwd: None,
                     model: None,
                     parent_session: None,
+                    git_tree: None,
                 });
             }
             Some("turn.started") => {
@@ -134,6 +135,7 @@ impl StreamParser {
                                 input: ToolInput::Shell {
                                     argv: cmd,
                                     cwd: None,
+                                    git_tree: None,
                                 },
                             });
 

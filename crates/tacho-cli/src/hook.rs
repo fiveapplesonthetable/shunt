@@ -95,6 +95,22 @@ pub fn record_hook_drop(home_dir: &Path) {
     let _ = fs::write(&drop_file, (count + 1).to_string());
 }
 
+fn resolve_git_tree(cwd: Option<&Path>) -> Option<String> {
+    let dir = cwd.unwrap_or_else(|| Path::new("."));
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD^{tree}"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// Maps hook payloads from Claude, Gemini, or Jetski into generic Input JSON objects.
 fn map_hook_payload(provider: Provider, val: &serde_json::Value) -> Vec<serde_json::Value> {
     let now_ns = SystemTime::now()
@@ -135,13 +151,19 @@ fn map_hook_payload(provider: Provider, val: &serde_json::Value) -> Vec<serde_js
             let agent_id = std::env::var("TACHO_AGENT")
                 .ok()
                 .or_else(|| val.get("agent").and_then(|v| v.as_str()).map(String::from));
+            let cwd_str = val.get("cwd").and_then(|v| v.as_str());
+            let cwd_path = cwd_str.map(Path::new);
+            let git_tree = resolve_git_tree(cwd_path);
             result.push(serde_json::json!({
                 "type": "run_start",
                 "source_ts_ns": now_ns,
                 "provider": provider_str,
                 "session_id": session_id,
                 "agent": agent_id,
-                "cwd": val.get("cwd").and_then(|v| v.as_str()),
+                "pid": val.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32),
+                "task": val.get("task").and_then(|v| v.as_str()),
+                "cwd": cwd_str,
+                "git_tree": git_tree,
                 "model": val.get("model").or_else(|| val.get("modelName")).and_then(|v| v.as_str()),
             }));
         }
@@ -183,16 +205,65 @@ fn map_hook_payload(provider: Provider, val: &serde_json::Value) -> Vec<serde_js
                 "0"
             };
 
+            let tool_in = val.get("tool_input").or_else(|| val.get("input"));
+            let input = if let Some(cmd) = tool_in
+                .and_then(|ti| ti.get("command").or_else(|| ti.get("cmd")))
+                .and_then(|v| v.as_str())
+            {
+                let cwd_str = val.get("cwd").and_then(|v| v.as_str());
+                let cwd_path = cwd_str.map(Path::new);
+                let git_tree = resolve_git_tree(cwd_path);
+                serde_json::json!({
+                    "tool": "shell",
+                    "argv": cmd,
+                    "cwd": cwd_str,
+                    "git_tree": git_tree,
+                })
+            } else if tool_name == "Edit"
+                || tool_name == "StrReplace"
+                || tool_name == "Write"
+                || tool_name == "write_file"
+                || tool_name == "edit_file"
+            {
+                let path = tool_in
+                    .and_then(|ti| {
+                        ti.get("path")
+                            .or_else(|| ti.get("file_path"))
+                            .or_else(|| ti.get("filePath"))
+                    })
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                serde_json::json!({
+                    "tool": "file_edit",
+                    "path": path,
+                })
+            } else if tool_name == "View" || tool_name == "Read" || tool_name == "read_file" {
+                let path = tool_in
+                    .and_then(|ti| {
+                        ti.get("path")
+                            .or_else(|| ti.get("file_path"))
+                            .or_else(|| ti.get("filePath"))
+                    })
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                serde_json::json!({
+                    "tool": "file_read",
+                    "path": path,
+                })
+            } else {
+                serde_json::json!({
+                    "tool": "other",
+                    "input_bytes": tool_in.map(|ti| ti.to_string().len()).unwrap_or(0),
+                })
+            };
+
             result.push(serde_json::json!({
                 "type": "tool_begin",
                 "source_ts_ns": now_ns,
                 "session": session_key,
                 "tool_use_id": tool_id,
                 "tool_name": tool_name,
-                "input": {
-                    "tool": "other",
-                    "input_bytes": val.get("tool_input").map(|ti| ti.to_string().len()).unwrap_or(0),
-                }
+                "input": input,
             }));
         }
         "PostToolUse" | "AfterTool" => {
@@ -205,14 +276,86 @@ fn map_hook_payload(provider: Provider, val: &serde_json::Value) -> Vec<serde_js
             } else {
                 "0"
             };
-            let has_error = val.get("error").map(|e| !e.is_null()).unwrap_or(false);
+            let tool_resp = val.get("tool_response").or_else(|| val.get("response"));
+            let mut exit_code = tool_resp
+                .and_then(|r| {
+                    r.get("exit_code")
+                        .or_else(|| r.get("exitCode"))
+                        .or_else(|| r.get("returncode"))
+                        .or_else(|| r.get("status"))
+                })
+                .and_then(|v| v.as_i64())
+                .map(|c| c as i32);
+            let mut error = exit_code.map(|c| c != 0).unwrap_or(false);
+            if let Some(err) = val
+                .get("error")
+                .or_else(|| tool_resp.and_then(|r| r.get("error")))
+                .or_else(|| tool_resp.and_then(|r| r.get("is_error")))
+            {
+                if !err.is_null()
+                    && (err.as_bool() == Some(true)
+                        || err.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                {
+                    error = true;
+                }
+            }
+            if error && exit_code.is_none() {
+                exit_code = Some(1);
+            }
 
             result.push(serde_json::json!({
                 "type": "tool_end",
                 "source_ts_ns": now_ns,
                 "session": session_key,
                 "tool_use_id": tool_id,
-                "error": has_error,
+                "error": error,
+                "exit_code": exit_code,
+            }));
+        }
+        "TurnEnd" | "AssistantMessage" => {
+            let tin = val
+                .get("input_tokens")
+                .or_else(|| val.get("inputTokens"))
+                .and_then(|v| v.as_u64());
+            let tout = val
+                .get("output_tokens")
+                .or_else(|| val.get("outputTokens"))
+                .and_then(|v| v.as_u64());
+            let cost = val
+                .get("cost_micros")
+                .or_else(|| val.get("costMicros"))
+                .and_then(|v| v.as_u64());
+            result.push(serde_json::json!({
+                "type": "turn_end",
+                "source_ts_ns": now_ns,
+                "session": session_key,
+                "input_tokens": tin,
+                "output_tokens": tout,
+                "cost_micros": cost,
+            }));
+        }
+        "Wait" | "WaitBegin" => {
+            let on_str = val.get("on").and_then(|v| v.as_str());
+            let on_val = match on_str {
+                Some("subagent") => serde_json::json!("subagent"),
+                Some("input") => serde_json::json!("input"),
+                Some("message") => serde_json::json!("message"),
+                Some("rate_limit") => serde_json::json!("rate_limit"),
+                _ => serde_json::json!("other"),
+            };
+            result.push(serde_json::json!({
+                "type": "wait",
+                "source_ts_ns": now_ns,
+                "session": session_key,
+                "target": val.get("target").and_then(|v| v.as_str()),
+                "on": on_val,
+            }));
+        }
+        "WaitEnd" => {
+            result.push(serde_json::json!({
+                "type": "wait_end",
+                "source_ts_ns": now_ns,
+                "session": session_key,
             }));
         }
         _ => {

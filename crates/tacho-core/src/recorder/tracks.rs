@@ -7,7 +7,6 @@ use crate::kind::Kind;
 use crate::track::TrackKind;
 use tacho_proto::tacho;
 
-use super::slices::OpenToolSlice;
 use super::Recorder;
 
 pub(crate) fn command_class_name(class: CommandClass) -> &'static str {
@@ -198,10 +197,17 @@ impl Recorder {
             return chain;
         }
 
-        if track_key.starts_with("machine") {
+        if track_key.starts_with("machine")
+            || track_key.starts_with("host:")
+            || track_key.starts_with("host/")
+        {
             add("machine", Some("tacho"), "machine", TrackKind::Group, None);
             if track_key != "machine" {
-                let name = track_key.strip_prefix("machine/").unwrap_or(track_key);
+                let name = track_key
+                    .strip_prefix("machine/")
+                    .or_else(|| track_key.strip_prefix("host:"))
+                    .or_else(|| track_key.strip_prefix("host/"))
+                    .unwrap_or(track_key);
                 add(track_key, Some("machine"), name, TrackKind::Counter, None);
             }
             return chain;
@@ -368,113 +374,5 @@ impl Recorder {
             body: tacho::Event { body },
         });
         s
-    }
-
-    /// Restores a registered track from a persisted `TrackCreated` event.
-    pub(crate) fn restore_track_created(&mut self, event: &Event) {
-        if let Some(tacho::event::Body::TrackCreated(tc)) = &event.body.body {
-            if let Some(ref key) = tc.key {
-                self.registered_tracks.insert(key.clone());
-                let chain = self.hierarchy_chain(key, TrackKind::Slices, None);
-                for (k, parent_k, name, kind, unit) in chain {
-                    if &k == key {
-                        self.registry.register(
-                            &k,
-                            parent_k.as_deref(),
-                            tc.name.as_deref().unwrap_or(&name),
-                            None,
-                            kind,
-                            unit.as_deref(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Restores slice allocation state from Turn, Tool, Command, and File events.
-    pub(crate) fn restore_slice_event(&mut self, event: &Event) {
-        let segs: Vec<&str> = event.track_key.split('/').collect();
-        let agent_id = segs[0].strip_prefix("agent:").unwrap_or(segs[0]);
-        let run_n = segs
-            .get(1)
-            .and_then(|s| s.strip_prefix("run:"))
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1);
-
-        let Some(run) = self.runs.get_mut(&(agent_id.to_string(), run_n)) else {
-            return;
-        };
-
-        match event.kind {
-            Kind::Turn => {
-                run.lane_allocator.allocate_begin(event.seq, Kind::Turn);
-                run.turn_open = true;
-                run.turn_begin_seq = Some(event.seq);
-                run.current_turn_n += 1;
-                if let Some(agent) = self.live.agents.get_mut(agent_id) {
-                    agent.turn_n = run.current_turn_n;
-                }
-            }
-            Kind::TurnEnded => {
-                let _ = run
-                    .lane_allocator
-                    .allocate_end(event.cause_seq.unwrap_or(0), Kind::Turn);
-                run.turn_open = false;
-                run.turn_begin_seq = None;
-            }
-            Kind::Command | Kind::ToolCall | Kind::FileAccess => {
-                run.lane_allocator.allocate_begin(event.seq, event.kind);
-                run.tool_calls_count += 1;
-                let (tid_opt, argv, cmd_class, file_path, file_edit) = match &event.body.body {
-                    Some(tacho::event::Body::Command(c)) => {
-                        let class = c.class.and_then(from_proto_cmd_class);
-                        (c.tool_use_id.clone(), c.argv.clone(), class, None, None)
-                    }
-                    Some(tacho::event::Body::FileAccess(f)) => {
-                        (f.tool_use_id.clone(), None, None, f.path.clone(), None)
-                    }
-                    Some(tacho::event::Body::ToolCall(t)) => {
-                        (t.tool_use_id.clone(), None, None, None, None)
-                    }
-                    _ => (None, None, None, None, None),
-                };
-                if let Some(tid) = tid_opt {
-                    run.open_tools.insert(
-                        tid.clone(),
-                        OpenToolSlice {
-                            slice_id: event.seq,
-                            tool_use_id: tid,
-                            tool_name: event.custom_name.clone().unwrap_or_default(),
-                            kind: event.kind,
-                            assigned_track: event.track_key.clone(),
-                            argv,
-                            command_class: cmd_class,
-                            file_path,
-                            file_edit,
-                        },
-                    );
-                }
-            }
-            Kind::CommandEnded | Kind::ToolCallEnded | Kind::FileAccessEnded => {
-                let begin_kind = event.kind.pairing().unwrap_or(event.kind);
-                if let Some(cause) = event.cause_seq {
-                    let _ = run.lane_allocator.allocate_end(cause, begin_kind);
-                    run.open_tools.retain(|_, slice| slice.slice_id != cause);
-                }
-            }
-            Kind::Wait => {
-                run.lane_allocator.allocate_begin(event.seq, Kind::Wait);
-            }
-            Kind::WaitEnded => {
-                if let Some(cause) = event.cause_seq {
-                    let _ = run.lane_allocator.allocate_end(cause, Kind::Wait);
-                }
-            }
-            Kind::FileEdited => {
-                run.files_edited_count += 1;
-            }
-            _ => {}
-        }
     }
 }

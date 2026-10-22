@@ -298,6 +298,7 @@ fn create_all_events(base_ts: u64) -> Vec<Event> {
                 task: Some("task-42".to_string()),
                 parent_run_seq: Some(1),
                 resume: Some(false),
+                git_tree: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()),
             })),
         },
     ));
@@ -391,6 +392,7 @@ fn create_all_events(base_ts: u64) -> Vec<Event> {
                 via_wrap: Some(false),
                 program: Some("cargo".to_string()),
                 tool_use_id: Some("call-cmd-1".to_string()),
+                git_tree: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()),
             })),
         },
     ));

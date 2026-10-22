@@ -119,6 +119,18 @@ pub enum EmitSubcommands {
         /// Path to task brief file.
         #[arg(long)]
         brief_file: Option<PathBuf>,
+        /// Assigned agent identifier.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Base commit SHA.
+        #[arg(long)]
+        base_commit: Option<String>,
+        /// Token budget for this task.
+        #[arg(long)]
+        token_budget: Option<u64>,
+        /// Cost budget in micros for this task.
+        #[arg(long)]
+        cost_budget: Option<u64>,
     },
 
     /// Update an agent or task state.
@@ -318,6 +330,12 @@ pub struct ReportArgs {
     /// Example: --since 30m
     #[arg(long)]
     pub since: Option<String>,
+
+    /// Show claim verification summary (edits, test after last edit, commits, pushes, CLAIM flags, git worktree status).
+    ///
+    /// Example: --diff-claims
+    #[arg(long)]
+    pub diff_claims: bool,
 }
 
 #[derive(Args, Debug)]

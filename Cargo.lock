@@ -1119,6 +1119,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "crossbeam-channel",
+ "flate2",
  "libc",
  "prost",
  "rusqlite",
@@ -1180,6 +1181,7 @@ dependencies = [
 name = "tachograph"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "libc",
  "serde",

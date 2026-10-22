@@ -29,6 +29,61 @@ pub enum TrackKind {
     State,
 }
 
+/// Computes the deterministic sibling order rank based on track role and name.
+/// - state = 1
+/// - turns = 1
+/// - run:N = 10 + N
+/// - lane:K = 10 + K
+/// - overflow = 50
+/// - waits = 60
+/// - tokens_in = 100
+/// - tokens_out = 101
+/// - tokens_cached = 102
+/// - cost = 103
+/// - cpu = 110
+/// - rss = 111
+pub fn compute_track_rank(key: &str, name: &str) -> i32 {
+    if name == "state" || key.ends_with("/state") {
+        return 1;
+    }
+    if name == "turns" || key.ends_with("/turns") {
+        return 1;
+    }
+    let target_name = if name.is_empty() || name == key {
+        key.rsplit('/').next().unwrap_or(name)
+    } else {
+        name
+    };
+
+    if let Some(lane_str) = target_name.strip_prefix("lane:") {
+        if let Ok(k) = lane_str.parse::<i32>() {
+            return 10 + k;
+        }
+    }
+    if let Some(run_str) = target_name.strip_prefix("run:") {
+        if let Ok(n) = run_str.parse::<i32>() {
+            return 10 + n;
+        }
+    }
+    match target_name {
+        "overflow" => 50,
+        "waits" => 60,
+        "tokens_in" => 100,
+        "tokens_out" => 101,
+        "tokens_cached" => 102,
+        "cost" => 103,
+        "cpu" => 110,
+        "rss" => 111,
+        "daemon" => 1,
+        "agents" => 2,
+        "tasks" => 3,
+        "machine" => 4,
+        "providers" => 5,
+        "custom" => 200,
+        _ => 500,
+    }
+}
+
 /// Metadata describing a single track.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackEntry {
@@ -69,7 +124,7 @@ impl TrackRegistry {
     }
 
     /// Registers a new track or returns the existing entry if already registered.
-    /// On hash collision with another key, it retries with key#2, key#3, etc.
+    /// Computes deterministic sibling order rank based on track role.
     pub fn register(
         &mut self,
         key: &str,
@@ -78,6 +133,22 @@ impl TrackRegistry {
         description: Option<&str>,
         kind: TrackKind,
         counter_unit: Option<&str>,
+    ) -> &TrackEntry {
+        let rank = compute_track_rank(key, name);
+        self.register_with_rank(key, parent_key, name, description, kind, counter_unit, rank)
+    }
+
+    /// Registers a new track with an explicit sibling order rank.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_rank(
+        &mut self,
+        key: &str,
+        parent_key: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        kind: TrackKind,
+        counter_unit: Option<&str>,
+        rank: i32,
     ) -> &TrackEntry {
         if let Some(&idx) = self.key_to_idx.get(key) {
             return &self.tracks[idx];
@@ -102,7 +173,6 @@ impl TrackRegistry {
             uuid = compute_uuid(&candidate_key);
         }
 
-        let rank = self.tracks.len() as i32;
         let entry = TrackEntry {
             key: key.to_string(),
             uuid,
@@ -127,6 +197,12 @@ impl TrackRegistry {
     /// Finds a track by textual key.
     pub fn get_by_key(&self, key: &str) -> Option<&TrackEntry> {
         self.key_to_idx.get(key).map(|&idx| &self.tracks[idx])
+    }
+
+    /// Finds a track by textual key mutably.
+    pub fn get_by_key_mut(&mut self, key: &str) -> Option<&mut TrackEntry> {
+        let idx = *self.key_to_idx.get(key)?;
+        Some(&mut self.tracks[idx])
     }
 
     /// Finds a track by UUID.
@@ -191,5 +267,49 @@ pub fn encode_track_descriptor(entry: &TrackEntry, buf: &mut Vec<u8>) {
     if entry.kind == TrackKind::State {
         // StateDescriptor is an empty message
         encode_bytes_field(18, &[], buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_track_ranks() {
+        assert_eq!(compute_track_rank("agent:worker-1/state", "state"), 1);
+        assert_eq!(compute_track_rank("agent:worker-1/run:1", "run:1"), 11);
+        assert_eq!(compute_track_rank("agent:worker-1/run:2", "run:2"), 12);
+        assert_eq!(compute_track_rank("agent:worker-1/run:1/turns", "turns"), 1);
+        assert_eq!(
+            compute_track_rank("agent:worker-1/run:1/lane:0", "lane:0"),
+            10
+        );
+        assert_eq!(
+            compute_track_rank("agent:worker-1/run:1/lane:1", "lane:1"),
+            11
+        );
+        assert_eq!(
+            compute_track_rank("agent:worker-1/run:1/overflow", "overflow"),
+            50
+        );
+        assert_eq!(
+            compute_track_rank("agent:worker-1/run:1/waits", "waits"),
+            60
+        );
+        assert_eq!(
+            compute_track_rank("agent:worker-1/run:1/tokens_in", "tokens_in"),
+            100
+        );
+        assert_eq!(
+            compute_track_rank("agent:worker-1/run:1/tokens_out", "tokens_out"),
+            101
+        );
+        assert_eq!(
+            compute_track_rank("agent:worker-1/run:1/tokens_cached", "tokens_cached"),
+            102
+        );
+        assert_eq!(compute_track_rank("agent:worker-1/run:1/cost", "cost"), 103);
+        assert_eq!(compute_track_rank("agent:worker-1/run:1/cpu", "cpu"), 110);
+        assert_eq!(compute_track_rank("agent:worker-1/run:1/rss", "rss"), 111);
     }
 }

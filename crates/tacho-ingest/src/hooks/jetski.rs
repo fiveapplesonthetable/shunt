@@ -77,6 +77,12 @@ pub fn map_with_diagnostics(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            let git_tree = obj
+                .get("git_tree")
+                .or_else(|| obj.get("tree"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
             vec![Input::RunStart {
                 source_ts_ns: Some(env.invoked_at_ns),
                 provider: "jetski".to_string(),
@@ -87,6 +93,7 @@ pub fn map_with_diagnostics(
                 cwd,
                 model,
                 parent_session: None,
+                git_tree,
             }]
         }
         "PreInvocation" => {

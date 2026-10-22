@@ -153,6 +153,8 @@ pub enum ToolInput {
     Shell {
         argv: String,
         cwd: Option<String>,
+        #[serde(default)]
+        git_tree: Option<String>,
     },
     FileRead {
         path: String,
@@ -200,6 +202,8 @@ pub enum Input {
         model: Option<String>,
         #[serde(default)]
         parent_session: Option<String>,
+        #[serde(default)]
+        git_tree: Option<String>,
     },
     RunEnd {
         #[serde(default)]
@@ -321,6 +325,14 @@ pub enum Input {
         brief_bytes: Option<u64>,
         #[serde(default)]
         paths: Vec<String>,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        base_commit: Option<String>,
+        #[serde(default)]
+        token_budget: Option<u64>,
+        #[serde(default)]
+        cost_budget_micros: Option<u64>,
     },
     TaskState {
         #[serde(default)]
@@ -411,6 +423,7 @@ mod tests {
                 cwd: Some("/home/dev".to_string()),
                 model: Some("claude-3-5".to_string()),
                 parent_session: None,
+                git_tree: None,
             },
             Input::ToolBegin {
                 source_ts_ns: None,
@@ -420,6 +433,7 @@ mod tests {
                 input: ToolInput::Shell {
                     argv: "cargo test".to_string(),
                     cwd: Some("/home/dev".to_string()),
+                    git_tree: None,
                 },
             },
             Input::Finding {

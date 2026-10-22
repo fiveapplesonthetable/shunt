@@ -125,6 +125,13 @@ impl Encoder {
             }
         }
 
+        // 22: repeated string categories = 22;
+        if !event.kind.is_end() {
+            if let Some(category) = event_category(event) {
+                encode_string_field(22, category, &mut self.track_event_buf);
+            }
+        }
+
         // 30: int64 counter_value = 30;
         if let Some(val) = event.counter_value {
             encode_varint_field(30, val as u64, &mut self.track_event_buf);
@@ -324,5 +331,69 @@ pub fn encode_snapshot_header(
         // TracePacket.track_descriptor = 60
         encode_bytes_field(60, &desc_buf, &mut packet_buf);
         frame_packet(&packet_buf, out);
+    }
+}
+
+fn event_category(event: &Event) -> Option<&'static str> {
+    if event.counter_value.is_some() {
+        return Some("counter");
+    }
+    match event.kind {
+        Kind::Run | Kind::RunEnded => Some("run"),
+        Kind::Turn | Kind::TurnEnded => Some("turn"),
+        Kind::Command | Kind::CommandEnded => {
+            if let Some(tacho::event::Body::Command(c)) = &event.body.body {
+                match c.class {
+                    Some(2) => Some("build"),
+                    Some(3) => Some("test"),
+                    Some(7) => Some("commit"),
+                    Some(8) => Some("push"),
+                    Some(9) => Some("fetch"),
+                    Some(10) => Some("rebase"),
+                    _ => Some("build"),
+                }
+            } else if let Some(custom) = &event.custom_name {
+                match custom.as_str() {
+                    "Build" => Some("build"),
+                    "Test" => Some("test"),
+                    "Commit" => Some("commit"),
+                    "Push" => Some("push"),
+                    "Fetch" => Some("fetch"),
+                    "Rebase" => Some("rebase"),
+                    _ => Some("build"),
+                }
+            } else {
+                Some("build")
+            }
+        }
+        Kind::ToolCall | Kind::ToolCallEnded => {
+            if let Some(custom) = &event.custom_name {
+                match custom.as_str() {
+                    "Edit" => Some("edit"),
+                    "Read" => Some("read"),
+                    "Search" => Some("search"),
+                    _ => Some("edit"),
+                }
+            } else {
+                Some("edit")
+            }
+        }
+        Kind::FileAccess | Kind::FileAccessEnded => {
+            if let Some(tacho::event::Body::FileAccess(f)) = &event.body.body {
+                if f.kind == Some(tacho::FileAccessKind::Search as i32) {
+                    Some("search")
+                } else {
+                    Some("read")
+                }
+            } else {
+                Some("read")
+            }
+        }
+        Kind::FileEdited => Some("edit"),
+        Kind::Wait | Kind::WaitEnded => Some("wait"),
+        Kind::Stall => Some("stall"),
+        Kind::TaskQueued | Kind::TaskState => Some("task"),
+        Kind::AgentState => Some("state"),
+        _ => None,
     }
 }

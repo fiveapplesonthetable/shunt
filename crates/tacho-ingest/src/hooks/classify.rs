@@ -137,7 +137,18 @@ pub fn classify_tool(tool_name: &str, tool_input: &serde_json::Value) -> ToolInp
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        return ToolInput::Shell { argv, cwd };
+        let git_tree = tool_input
+            .get("git_tree")
+            .or_else(|| tool_input.get("gitTree"))
+            .or_else(|| tool_input.get("tree"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        return ToolInput::Shell {
+            argv,
+            cwd,
+            git_tree,
+        };
     }
 
     // 2. FileRead

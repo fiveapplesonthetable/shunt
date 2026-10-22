@@ -45,6 +45,14 @@ pub struct AgentLiveState {
     pub flags: Vec<String>,
     pub recent_commands: Vec<RecentCommand>,
     pub timeline: Vec<TimelineItem>,
+    #[serde(default)]
+    pub last_edit_ts_ns: Option<u64>,
+    #[serde(default)]
+    pub last_passing_test_ts_ns: Option<u64>,
+    #[serde(default)]
+    pub commits_succeeded: u32,
+    #[serde(default)]
+    pub pushes_succeeded: u32,
 }
 
 impl AgentLiveState {
@@ -73,6 +81,10 @@ impl AgentLiveState {
             flags: Vec::new(),
             recent_commands: Vec::new(),
             timeline: Vec::new(),
+            last_edit_ts_ns: None,
+            last_passing_test_ts_ns: None,
+            commits_succeeded: 0,
+            pushes_succeeded: 0,
         }
     }
 }

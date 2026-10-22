@@ -15,10 +15,12 @@ One lightweight daemon records what every coding agent does into a single SQLite
 ## Key Highlights
 
 - **Single Source of Truth:** Everything is stored in `$TACHO_HOME/events.sqlite` with WAL mode. Snapshots are streamed directly from SQLite rows through a zero-allocation O(1) memory encoder.
-- **Resilient Fallback:** If the daemon process crashes or hangs, `tacho trace` opens the SQLite WAL file directly in read-only mode and writes a valid `.perfetto-trace` file.
+- **Resilient Fallback & Graceful Degradation:** If the daemon process crashes, `tacho trace` opens the SQLite WAL file directly in read-only mode. If SQLite encounters a read-only or full disk, in-memory `LiveState` continues updating so agent hooks never block. Dead/zombie worker processes (`ESRCH` / `'Z'`) are automatically reaped, closing open slices with `abandoned = true`.
 - **High-Throughput Ingestion:** Sustains **511,195 inputs/sec** on `api.sock` and over **51,800 inputs/sec** during concurrent 10-million-row snapshot exports.
 - **Fast Streaming Snapshots:** Exports 100,000 rows in **96.3 ms** (1.04M rows/s), 1,000,000 rows in **790.6 ms** (1.26M rows/s), and 10,000,000 rows (641 MB) in **7.87 s** (1.27M rows/s) with only a **+4.0 MB RSS delta** from 1M to 10M rows.
-- **Supervisor Control Loop:** Turns 97 MB of messy worker transcripts into ~180 tokens for orchestrators via `tacho watch --until stalled`, `tacho status`, and `tacho report`.
+- **Supervisor Control Loop & 7 Detectors:** Turns 97 MB of messy worker transcripts into ~180 tokens. Detects `LOOP`, `SPIN`, `BURN`, `FAILING`, `OFF_BRIEF`, CPU-aware `SILENT` (which checks `/proc` CPU counters so long compiles never false-positive), and `CLAIM` (flags runs exiting 0 after edits without passing tests).
+- **Claim Verification (`--diff-claims`):** `tacho report <agent> --diff-claims` cross-references recorded edits, tests, commits, and worktree clean status against agent claims.
+- **Git Tree Verification:** Every build, test, and run records `git_tree` hash (`git rev-parse HEAD^{tree}`), queryable via `tacho query verified-trees` for CI reuse and merge trains.
 - **Properly Nested Lanes:** Parallel tool calls and concurrent subagents are routed into deterministic virtual tracks (`turns`, `lane:1`, `lane:2`), avoiding Perfetto slice stack collisions.
 - **Host Corroboration:** Integrates with Perfetto `traced` to overlay kernel scheduler slices, CPU frequency, and per-process memory alongside agent turns.
 - **Zero Leaks:** Strict privacy firewall scrubs secrets, tokens, API keys, credentials, and userinfo before persistence or display.
@@ -70,12 +72,17 @@ worker-2   Stalled   6m     2    31    Read src/lib.rs (x4)        88k         L
 worker-3   Waiting   40s    1    3     Wait on message             2k
 ```
 
-### Inspecting an Agent Timeline
+### Inspecting an Agent Timeline & Claim Verification
 
 ```bash
+# Detailed timeline report of turns, commands, and stall evidence
 tacho report worker-2 --since 30m
+
+# Verify agent claims against actual ground truth (edits, tests, commits, pushes, clean worktree)
+tacho report worker-2 --diff-claims
 ```
 
+Example timeline output:
 ```text
 Turn 28: Read src/lib.rs (820 lines) [ok]
 Turn 29: Read src/lib.rs (820 lines) [ok]
@@ -83,6 +90,29 @@ Turn 30: Read src/lib.rs (820 lines) [ok]
 Turn 31: Read src/lib.rs (820 lines) [ok]
 STALL DETECTED: LOOP (identical input digest 4x in a row)
 ```
+
+Example `--diff-claims` output when an agent claims all tests pass without running them:
+```text
+=== Claim Verification: worker-2 ===
+Claimed:  "Task complete, all tests passing"
+Actual:   CLAIM STALL DETECTED (STALL_CLAIM)
+  - FileEdits: 4 files modified (src/auth.rs, src/token.rs, ...)
+  - Last Test: None after last FileEdited! (exit code 0 required)
+  - Worktree:  Dirty (uncommitted changes remain)
+Result:   REJECTED — Agent exited without running tests after modifying code.
+```
+
+### Seven Anomaly Detectors
+
+| Detector | Trigger Threshold | Diagnostic Meaning |
+|---|---|---|
+| `SILENT` | 300s no event while not in Wait | Wedged/hung agent. **CPU-aware**: suppresses if child process tree is consuming CPU (e.g. 25-minute `cargo clippy`). |
+| `LOOP` | Same tool input digest 4x consecutively | Agent trapped in an automated retry or tool failure loop. |
+| `SPIN` | 8 turns without `FileEdited` or `BUILD/TEST/COMMIT` | Agent wandering across read/search calls without making code progress. |
+| `BURN` | Output tokens exceed 200k in 10m (or per-task budget) | Runaway generation or prompt inflation exhausting token/cost limits. |
+| `FAILING` | Same build/test command failed 3x in a row | Agent repeatedly running failing commands without fixing the defect. |
+| `OFF_BRIEF` | `FileEdited` outside task's declared `--paths` | Agent hallucinating edits to out-of-scope files. |
+| `CLAIM` | Run exits 0 after edits without passing `TEST` | Agent prematurely claiming task completion without verifying tests. |
 
 ---
 
@@ -162,17 +192,25 @@ tacho daemon --otlp 127.0.0.1:4318
 
 ### 4. Custom Spans & CLI Events
 
-Orchestrator scripts can emit custom events, tasks, and state transitions:
+Orchestrator scripts can emit custom events, tasks, budgets, and state transitions:
 
 ```bash
-# Declare a task
-tacho emit task refactor-auth --paths src/auth.rs --brief-file brief.md
+# Declare a task with declared paths, bound agent, base commit, and budgets
+tacho emit task refactor-auth \
+  --paths src/auth.rs,src/token.rs \
+  --agent worker-1 \
+  --base-commit abc1234 \
+  --token-budget 100000 \
+  --cost-budget 500000 \
+  --brief-file brief.md
 
 # Emit spans
 tacho emit span begin custom:pipeline "codegen" --arg schema=v2
 tacho emit instant custom:pipeline "checkpoint" --arg status=ok
 tacho emit span end custom:pipeline
 ```
+
+Tasks bound with `tacho emit task` enforce `--paths` scope on `OFF_BRIEF`, enforce per-task token/cost budgets on `BURN`, and link restarted runs of the same task with a Perfetto flow arrow (`task_run_flow:<slug>`).
 
 ---
 
@@ -189,6 +227,7 @@ Execute pre-packaged analytics queries directly using `tacho query <name>`:
 | `edits-by-file` | Modifed files, agent counts, and lines added/removed |
 | `tokens-by-agent` | Input, output, and cached token consumption |
 | `stalls` | Recorded anomaly detector firings with evidence |
+| `verified-trees` | Git tree hashes (`git_tree`) with passing builds/tests/lints for CI reuse |
 | `system-during-builds` | CPU time and peak RSS intersected with build slices |
 | `contention` | Intervals with concurrent build/test runs and host load |
 

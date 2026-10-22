@@ -6,14 +6,14 @@
 //! Persistent file handles are reused across ticks with `pread` into stack buffers to avoid
 //! file open/close syscalls and heap reallocations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tacho_core::Input;
+use tacho_core::{Input, SessionKey};
 
 use crate::appender::AppenderHandle;
 use crate::config::SamplerConfig;
@@ -60,6 +60,7 @@ pub struct ProcSampler {
     page_size: u64,
     tree_pids_scratch: Vec<u32>,
     queue_scratch: Vec<u32>,
+    reaped_sessions: HashSet<SessionKey>,
 }
 
 impl ProcSampler {
@@ -81,6 +82,7 @@ impl ProcSampler {
             page_size: get_page_size(),
             tree_pids_scratch: Vec::with_capacity(32),
             queue_scratch: Vec::with_capacity(32),
+            reaped_sessions: HashSet::new(),
         }
     }
 
@@ -241,9 +243,39 @@ impl ProcSampler {
             }
         }
 
-        // 5. Per-run process tree sampling
+        // 5. Per-run process tree sampling and dead/killed worker reaping
         let active_runs = appender.active_runs();
+
+        // Prune reaped_sessions for runs that are no longer active
+        self.reaped_sessions
+            .retain(|s| active_runs.iter().any(|r| &r.session == s));
+
         for run in active_runs.iter() {
+            if run.pid > 0 {
+                let is_dead = unsafe {
+                    libc::kill(run.pid as i32, 0) != 0 && *libc::__errno_location() == libc::ESRCH
+                };
+                let is_zombie = if !is_dead {
+                    is_process_zombie(run.pid)
+                } else {
+                    true
+                };
+
+                if (is_dead || is_zombie) && !self.reaped_sessions.contains(&run.session) {
+                    self.reaped_sessions.insert(run.session.clone());
+                    let _ = appender.send_input(
+                        Input::RunEnd {
+                            source_ts_ns: Some(now_ns),
+                            session: run.session.clone(),
+                            exit_code: Some(137),
+                            reason: Some("worker process died unexpectedly".to_string()),
+                        },
+                        now_ns,
+                    );
+                    continue;
+                }
+            }
+
             if let Some((cpu_us, rss_bytes)) = self.sample_tree(run.pid) {
                 run_track_buf.clear();
                 run_track_buf.push_str(&run.run_track);
@@ -468,6 +500,28 @@ pub fn sample_mount_statvfs(c_path: &CString) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// Checks if a process PID is in zombie state ('Z') in `/proc/<pid>/stat`.
+#[inline]
+pub fn is_process_zombie(pid: u32) -> bool {
+    let path = format!("/proc/{}/stat", pid);
+    if let Ok(file) = File::open(&path) {
+        let mut buf = [0u8; 256];
+        if let Ok(n) = file.read_at(&mut buf, 0) {
+            let slice = &buf[..n];
+            if let Some(rparen) = slice.iter().rposition(|&b| b == b')') {
+                let rest = &slice[rparen + 1..];
+                if let Some(state_tok) = rest
+                    .split(|&b| b == b' ' || b == b'\t')
+                    .find(|s| !s.is_empty())
+                {
+                    return state_tok == b"Z";
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Reads utime + stime (in clock ticks), RSS (in bytes), and PPID for a process from `/proc/<pid>/stat`.
@@ -752,5 +806,62 @@ mod tests {
             "Sampling tick must be sub-millisecond, got {:.2} µs",
             us_per_tick
         );
+    }
+
+    #[test]
+    fn test_dead_worker_pid_reaping() {
+        use crate::appender::spawn_appender;
+        use crate::log::EventLog;
+        use tacho_core::{Input, Recorder, SessionKey};
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("reap_test.sqlite");
+        let log = EventLog::open(&db_path).unwrap();
+        let recorder = Recorder::new();
+
+        let (appender, _thread) = spawn_appender(recorder, log, 128);
+
+        // Spawn a short-lived process and wait for it to exit
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let child_pid = child.id();
+        let _ = child.wait().unwrap();
+
+        // Register active run with this dead PID
+        let _sess = SessionKey::new("test", "sess-dead-worker");
+        appender
+            .send_input(
+                Input::RunStart {
+                    source_ts_ns: Some(1_000_000),
+                    provider: "test".to_string(),
+                    session_id: "sess-dead-worker".to_string(),
+                    agent: Some("dead-worker".to_string()),
+                    task: None,
+                    pid: Some(child_pid),
+                    cwd: None,
+                    model: None,
+                    parent_session: None,
+                    git_tree: None,
+                },
+                1_000_000,
+            )
+            .unwrap();
+        appender.flush();
+
+        // Verify it was in active_runs
+        assert_eq!(appender.active_runs().len(), 1);
+
+        // Run sampler tick
+        let mut proc_sampler = ProcSampler::new(&[]);
+        let mut run_track_buf = String::new();
+        proc_sampler.sample_tick(&appender, 2_000_000, &mut run_track_buf);
+        appender.flush();
+
+        // Verify active_runs is now 0 (reaped!)
+        assert_eq!(appender.active_runs().len(), 0);
+
+        // Verify live state shows agent state Exited
+        let live = appender.live_state();
+        let agent = live.agents.get("dead-worker").expect("agent exists");
+        assert_eq!(agent.state, "Exited");
     }
 }

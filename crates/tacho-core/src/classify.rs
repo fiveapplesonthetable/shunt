@@ -279,12 +279,37 @@ fn classify_simple_segment<'a>(mut words: &'a [&'a str]) -> CommandClass {
 
         // Git / VCS
         "git" => {
-            let sub = find_first_non_flag(&words[1..]).unwrap_or("");
+            let rem = peel_git_options(&words[1..]);
+            let sub = find_first_non_flag(rem).unwrap_or("");
             match sub {
                 "push" => CommandClass::Push,
                 "commit" => CommandClass::Commit,
-                "rebase" | "merge" | "cherry-pick" | "revert" => CommandClass::Rebase,
+                "rebase" | "merge" | "cherry-pick" | "revert" | "absorb" => CommandClass::Rebase,
                 "fetch" | "pull" => CommandClass::Fetch,
+                _ => CommandClass::Command,
+            }
+        }
+        "gh" => {
+            let non_flags = collect_non_flags(&words[1..]);
+            let sub1 = non_flags.first().copied().unwrap_or("");
+            let sub2 = non_flags.get(1).copied().unwrap_or("");
+            match (sub1, sub2) {
+                ("pr", "create" | "merge" | "edit" | "ready") | ("stack", "submit" | "push") => {
+                    CommandClass::Push
+                }
+                ("pr", "sync") | ("stack", "sync") => CommandClass::Rebase,
+                ("pr", "checks") | ("run", "watch" | "view") => CommandClass::Test,
+                ("pr", "checkout" | "view" | "list" | "status") | ("repo", "clone" | "sync") => {
+                    CommandClass::Fetch
+                }
+                _ => CommandClass::Command,
+            }
+        }
+        "gt" => {
+            let sub = find_first_non_flag(&words[1..]).unwrap_or("");
+            match sub {
+                "submit" => CommandClass::Push,
+                "restack" | "sync" => CommandClass::Rebase,
                 _ => CommandClass::Command,
             }
         }
@@ -594,6 +619,34 @@ fn classify_simple_segment<'a>(mut words: &'a [&'a str]) -> CommandClass {
 #[inline]
 fn program_name(raw: &str) -> &str {
     raw.rsplit('/').next().unwrap_or(raw)
+}
+
+/// Peels git top-level options (-C <dir>, -c <k=v>, --git-dir <dir>, etc.).
+fn peel_git_options<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
+    while !words.is_empty() {
+        let w = words[0];
+        if (w == "-C" || w == "-c" || w == "--git-dir" || w == "--work-tree" || w == "--namespace")
+            && words.len() >= 2
+        {
+            words = &words[2..];
+        } else if w.starts_with("-C")
+            || w.starts_with("-c")
+            || w.starts_with("--git-dir=")
+            || w.starts_with("--work-tree=")
+            || w.starts_with("--namespace=")
+            || w.starts_with("--exec-path")
+            || w == "--bare"
+            || w == "--no-pager"
+            || w == "-p"
+            || w == "--literal-pathspecs"
+            || w == "--no-replace-objects"
+        {
+            words = &words[1..];
+        } else {
+            break;
+        }
+    }
+    words
 }
 
 /// Peels flags from `sudo`.
@@ -969,6 +1022,38 @@ mod tests {
             ("hg commit -m 'wip'", CommandClass::Commit),
             ("hg rebase", CommandClass::Rebase),
             ("hg pull -u", CommandClass::Fetch),
+            ("git -C /tmp/repo rebase origin/main", CommandClass::Rebase),
+            (
+                "git -c user.name=Bot commit -m 'bot commit'",
+                CommandClass::Commit,
+            ),
+            ("git --git-dir=/repo/.git push", CommandClass::Push),
+            (
+                "git -C /path/to/repo cherry-pick abc1234",
+                CommandClass::Rebase,
+            ),
+            ("git -C /path/to/repo fetch", CommandClass::Fetch),
+            ("git absorb", CommandClass::Rebase),
+            ("gh pr create --fill", CommandClass::Push),
+            ("gh pr merge --auto", CommandClass::Push),
+            ("gh pr edit --title 'new title'", CommandClass::Push),
+            ("gh pr ready", CommandClass::Push),
+            ("gh stack submit", CommandClass::Push),
+            ("gh stack push", CommandClass::Push),
+            ("gt submit", CommandClass::Push),
+            ("gh pr sync", CommandClass::Rebase),
+            ("gh stack sync", CommandClass::Rebase),
+            ("gt restack", CommandClass::Rebase),
+            ("gt sync", CommandClass::Rebase),
+            ("gh pr checks", CommandClass::Test),
+            ("gh run watch", CommandClass::Test),
+            ("gh run view", CommandClass::Test),
+            ("gh pr checkout 123", CommandClass::Fetch),
+            ("gh pr view", CommandClass::Fetch),
+            ("gh pr list", CommandClass::Fetch),
+            ("gh pr status", CommandClass::Fetch),
+            ("gh repo clone owner/repo", CommandClass::Fetch),
+            ("gh repo sync", CommandClass::Fetch),
             // 3. Node / JavaScript / TypeScript (25 commands)
             ("npm test", CommandClass::Test),
             ("npm t", CommandClass::Test),

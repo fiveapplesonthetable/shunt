@@ -382,9 +382,11 @@ fn process_ndjson_line(
                     .unwrap_or_default()
                     .as_nanos() as u64;
                 let text = render_report(&state, agent, since, now_ns);
+                let agent_state = state.agents.get(agent);
                 let resp = serde_json::json!({
                     "status": "ok",
                     "output": text,
+                    "agent_state": agent_state,
                 });
                 Some(serde_json::to_vec(&resp).unwrap_or_default())
             }
@@ -420,11 +422,13 @@ fn process_ndjson_line(
                     }
 
                     if let Some(target) = until {
-                        if state
-                            .agents
-                            .values()
-                            .any(|a| a.state.eq_ignore_ascii_case(target))
-                        {
+                        let is_match = state.agents.values().any(|a| {
+                            a.state.eq_ignore_ascii_case(target)
+                                || (target.eq_ignore_ascii_case("stalled")
+                                    && (!a.flags.is_empty()
+                                        || a.state.eq_ignore_ascii_case("stalled")))
+                        });
+                        if is_match {
                             let match_line = serde_json::json!({"matched": target});
                             let _ = stream
                                 .write_all(&serde_json::to_vec(&match_line).unwrap_or_default());

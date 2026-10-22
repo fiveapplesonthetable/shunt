@@ -33,6 +33,7 @@ enum StallKind {
   BURN = 4;
   FAILING = 5;
   OFF_BRIEF = 6;
+  STALL_CLAIM = 7;
 }
 
 // Closed set of file access operations.
@@ -120,6 +121,7 @@ message Run {
   optional string task = 6;            // <= 128
   optional uint64 parent_run_seq = 7;
   optional bool resume = 8;
+  optional string git_tree = 9;        // <= 64
 }
 
 message RunEnded {
@@ -164,6 +166,7 @@ message Command {
   optional bool via_wrap = 5;
   optional string program = 6;         // <= 64
   optional string tool_use_id = 7;     // <= 128
+  optional string git_tree = 8;        // <= 64
 }
 
 message CommandEnded {

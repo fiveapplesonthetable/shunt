@@ -418,13 +418,14 @@
     <tr><td><code>seq</code></td><td>4000</td><td><code>uint64</code></td><td>Global monotonically increasing event sequence number</td></tr>
     <tr><td><code>cause_seq</code></td><td>4001</td><td><code>uint64</code></td><td>Sequence number of the causal antecedent event</td></tr>
     <tr><td><code>agent</code></td><td>4002</td><td><code>string</code></td><td>Agent identifier, enabling SQL filters without track joins</td></tr>
-    <tr><td><code>command</code></td><td>4003</td><td><code>Command</code></td><td>Argv, command class, exit code, working directory</td></tr>
+    <tr><td><code>command</code></td><td>4003</td><td><code>Command</code></td><td>Argv, command class, exit code, working directory, <code>git_tree</code> (SHA)</td></tr>
     <tr><td><code>tool_call</code></td><td>4004</td><td><code>ToolCall</code></td><td>Tool name, input digest (Blake3), call ID</td></tr>
     <tr><td><code>turn_ended</code></td><td>4005</td><td><code>TurnEnded</code></td><td>Turn duration, tokens in, tokens out, tokens cached</td></tr>
     <tr><td><code>file_access</code></td><td>4006</td><td><code>FileAccess</code></td><td>Path relative to cwd, access kind (Read, Search, List)</td></tr>
     <tr><td><code>file_edited</code></td><td>4007</td><td><code>FileEdited</code></td><td>Path, lines added, lines removed, patch digest</td></tr>
     <tr><td><code>wait</code></td><td>4008</td><td><code>Wait</code></td><td>Wait reason, timeout, target sender ID</td></tr>
-    <tr><td><code>stall</code></td><td>4009</td><td><code>Stall</code></td><td>Detector kind (LOOP, SPIN, SILENT, BURN), evidence</td></tr>
+    <tr><td><code>stall</code></td><td>4009</td><td><code>Stall</code></td><td>Detector kind (LOOP, SPIN, SILENT, BURN, FAILING, OFF_BRIEF, CLAIM), evidence</td></tr>
+    <tr><td><code>task_meta</code></td><td>4010</td><td><code>TaskMeta</code></td><td>Slug, paths, bound agent, base commit, token budget, cost budget</td></tr>
   </tbody>
 </table>
 
@@ -448,6 +449,11 @@
   </thead>
   <tbody>
     <tr>
+      <td><b>SILENT</b></td>
+      <td>300 seconds without an event while not in a <code>Wait</code></td>
+      <td>Agent wedged or unresponsive. <b>CPU-aware:</b> checks <code>agent:&lt;id&gt;/run:&lt;n&gt;/cpu</code> deltas; suppresses while process tree burns CPU (e.g. 25-minute <code>cargo clippy</code> or test suite).</td>
+    </tr>
+    <tr>
       <td><b>LOOP</b></td>
       <td>Same tool input digest repeated 4 times consecutively</td>
       <td>Agent is stuck in an automated retry loop or failing tool call</td>
@@ -458,14 +464,9 @@
       <td>Agent is wandering across read/list commands without making progress</td>
     </tr>
     <tr>
-      <td><b>SILENT</b></td>
-      <td>300 seconds without an event while not in a <code>Wait</code></td>
-      <td>Agent process wedged, network hang, or dead without exit hook</td>
-    </tr>
-    <tr>
       <td><b>BURN</b></td>
-      <td>&gt; 200,000 output tokens consumed in a 10-minute window</td>
-      <td>Runaway generation loop or prompt regression consuming budget</td>
+      <td>&gt; 200,000 output tokens consumed in 10 minutes (or per-task budget)</td>
+      <td>Runaway generation loop, prompt inflation, or task budget exhaustion</td>
     </tr>
     <tr>
       <td><b>FAILING</b></td>
@@ -475,10 +476,36 @@
     <tr>
       <td><b>OFF_BRIEF</b></td>
       <td><code>FileEdited</code> occurs on path outside task's declared scope</td>
-      <td>Agent hallucinated modifications to unrelated files in workspace</td>
+      <td>Agent hallucinated modifications to files outside declared <code>--paths</code></td>
+    </tr>
+    <tr>
+      <td><b>CLAIM</b></td>
+      <td>Run completes (exit 0) after edits without a passing test</td>
+      <td>Agent prematurely claims task completion without verifying that tests pass</td>
     </tr>
   </tbody>
 </table>
+
+<h3>Ground-truth claim verification: <code>tacho report &lt;agent&gt; --diff-claims</code></h3>
+<p>Coding agents often declare success in conversation while leaving broken code or failing tests. The <code>--diff-claims</code> flag cross-references the agent's assertions against ground truth recorded in the SQLite event log and git worktree:</p>
+
+<ul>
+  <li><b>File edits:</b> Verifies whether any <code>FileEdited</code> events were recorded during the run.</li>
+  <li><b>Test verification:</b> Asserts that at least one command classified as <code>TEST</code> completed with exit code 0 <i>after</i> the final file edit.</li>
+  <li><b>Commit &amp; push tracking:</b> Checks whether commits or pushes were executed and whether the working tree is clean.</li>
+</ul>
+
+<pre><code><span class="c"># Compare agent claims against verifiable execution events</span>
+tacho report worker-2 --diff-claims
+
+<span class="c"># Example output when an agent claims completion without testing:</span>
+<span class="hl">=== Claim Verification: worker-2 ===</span>
+<span class="hl">Claimed:  "Task complete, all tests passing"</span>
+<span class="hl">Actual:   CLAIM STALL DETECTED (STALL_CLAIM)</span>
+<span class="hl">  - FileEdits: 4 files modified (src/auth.rs, src/token.rs, ...)</span>
+<span class="hl">  - Last Test: None after last FileEdited! (exit code 0 required)</span>
+<span class="hl">  - Worktree:  Dirty (uncommitted changes remain)</span>
+<span class="hl">Result:   REJECTED — Agent exited without running tests after modifying code.</span></code></pre>
 
 <!-- ───────────── Section 6 ───────────── -->
 <div class="part">Part 6 &mdash; Integration</div>
@@ -503,13 +530,21 @@ tacho run -- codex exec --json "implement feature x"</code></pre>
 <p>Accepts standard OTLP/HTTP protobuf or JSON on <code>127.0.0.1:4318</code> for agents instrumented with OpenTelemetry.</p>
 
 <h3>4. Shell scripting: <code>tacho emit</code></h3>
-<pre><code><span class="c"># Declare a supervisor task with bounded paths</span>
-tacho emit task auth-refactor --paths crates/core/src/auth.rs --brief-file brief.md
+<pre><code><span class="c"># Declare a supervisor task with declared paths, assigned agent, base commit, and budgets</span>
+tacho emit task auth-refactor \
+  --paths crates/core/src/auth.rs,crates/core/src/token.rs \
+  --agent worker-1 \
+  --base-commit 7c3b2f1 \
+  --token-budget 100000 \
+  --cost-budget 500000 \
+  --brief-file brief.md
 
 <span class="c"># Emit custom spans and progress instants</span>
 tacho emit span begin custom:migration "phase-1" --arg schema=v2
 tacho emit instant custom:migration "checkpoint" --arg status=ok
 tacho emit span end custom:migration</code></pre>
+
+<p>Declared task paths bound the scope for the <code>OFF_BRIEF</code> detector. Per-task token and cost budgets set thresholds for the <code>BURN</code> detector. Subsequent runs assigned to the same task are automatically connected with Perfetto flow arrows (<code>task_run_flow:&lt;slug&gt;</code>) to preserve execution lineage across retries.</p>
 
 <!-- ───────────── Section 7 ───────────── -->
 <div class="part">Part 7 &mdash; Host Corroboration</div>
@@ -566,16 +601,40 @@ tacho emit span end custom:migration</code></pre>
 <figcaption>Figure 4: Perfetto UI visualization. The agent's <code>Build</code> slice aligns directly with <code>rustc</code> scheduler slices on CPU 3 and RSS growth captured by <code>traced</code>.</figcaption>
 </figure>
 
+<h3>Fault-tolerant process reaping and storage degradation</h3>
+<p>In production agent fleets, workers may crash, get killed by OOM killers, or exhaust host storage. tachograph handles these conditions automatically:</p>
+
+<ul>
+  <li><b>Dead worker reaping:</b> During each <code>/proc</code> sampling cycle, the daemon inspects the PID tree of active runs. If a tracked PID terminates or enters a zombie state (<code>ESRCH</code> or process state <code>'Z'</code>), the daemon automatically marks the run complete and closes all open child tool slices with <code>abandoned = true</code>.</li>
+  <li><b>Graceful storage degradation:</b> If the host disk runs out of space (<code>ENOSPC</code>) or the filesystem becomes read-only, SQLite WAL writes degrade safely. The appender continues updating in-memory <code>LiveState</code> and draining the channel so agent hook callers never block or fail.</li>
+</ul>
+
 <!-- ───────────── Section 8 ───────────── -->
 <div class="part">Part 8 &mdash; Analytics</div>
 <h2 id="queries"><span class="n">8</span>PerfettoSQL queries</h2>
 
-<p>tachograph ships 9 production queries in <code>queries/</code>. Every query is implemented in standard SQL and PerfettoSQL pipe syntax with 100% row equivalence.</p>
+<p>tachograph ships 10 production queries in <code>queries/</code>. Every query is implemented in standard SQL and PerfettoSQL pipe syntax with 100% row equivalence.</p>
 
 <pre><code><span class="c">-- Execute shipped query against running daemon</span>
 tacho query agents-now
 tacho query contention
-tacho query system-during-builds</code></pre>
+tacho query system-during-builds
+tacho query verified-trees</code></pre>
+
+<h3>Git tree verification: <code>verified-trees</code></h3>
+<p>Every command of class <code>BUILD</code>, <code>TEST</code>, <code>LINT</code>, <code>COMMIT</code>, <code>PUSH</code>, or <code>REBASE</code> captures the underlying Git tree hash (<code>git rev-parse HEAD^{tree}</code>). The <code>verified-trees</code> query tracks which trees have passing builds and tests for CI reuse and merge trains:</p>
+
+<pre><code><span class="c">-- queries/verified-trees.sql</span>
+<span class="k">SELECT</span>
+  c.git_tree,
+  COUNT(<span class="k">DISTINCT</span> c.agent) <span class="k">AS</span> verifying_agents,
+  MIN(c.ts_ns) <span class="k">AS</span> first_verified_ts,
+  MAX(c.ts_ns) <span class="k">AS</span> last_verified_ts
+<span class="k">FROM</span> command_slices c
+<span class="k">WHERE</span> c.command_class <span class="k">IN</span> (<span class="k">'BUILD'</span>, <span class="k">'TEST'</span>)
+  <span class="k">AND</span> c.exit_code = 0
+  <span class="k">AND</span> c.git_tree <span class="k">IS NOT NULL</span>
+<span class="k">GROUP BY</span> c.git_tree;</code></pre>
 
 <h3>Interval intersection of agent builds and system RSS</h3>
 <p>Here is <code>queries/system-during-builds.pipe.sql</code> using PerfettoSQL's native interval intersection:</p>

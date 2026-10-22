@@ -7,6 +7,7 @@ use crate::live::AgentLiveState;
 use crate::scrub::{relativize_cwd, truncate_utf8};
 use tacho_proto::tacho;
 
+use super::slices::make_abandoned_body;
 use super::{Recorder, RunState};
 
 impl Recorder {
@@ -41,6 +42,7 @@ impl Recorder {
             None,
             None,
             None,
+            None,
             now_ns,
             out,
         );
@@ -61,6 +63,7 @@ impl Recorder {
         cwd: Option<String>,
         model: Option<String>,
         parent_session: Option<String>,
+        git_tree: Option<String>,
         ts: u64,
         out: &mut Vec<Event>,
     ) {
@@ -85,9 +88,26 @@ impl Recorder {
         run_state.lane_allocator.allocate_begin(slice_id, Kind::Run);
 
         let mut terminating_flows = Vec::new();
+        let mut flow_ids = Vec::new();
         if let Some(ref parent) = parent_session {
             if let Some(flow_id) = self.subagent_flows.remove(parent) {
                 terminating_flows.push(flow_id);
+            }
+        }
+        if let Some(ref slug) = task {
+            if let Some(tmeta) = self.task_meta.get_mut(slug) {
+                let det = self.detectors.entry(agent_id.to_string()).or_default();
+                det.set_declared_paths(tmeta.paths.clone());
+                det.task_token_budget = tmeta.token_budget;
+                det.task_cost_budget_micros = tmeta.cost_budget_micros;
+                let flow_id =
+                    xxhash_rust::xxh3::xxh3_64(format!("task_run_flow:{}", slug).as_bytes())
+                        & 0x7FFF_FFFF_FFFF_FFFF;
+                if tmeta.last_run_seq.is_some() {
+                    terminating_flows.push(flow_id);
+                }
+                tmeta.last_run_seq = Some(slice_id);
+                flow_ids.push(flow_id);
             }
         }
 
@@ -110,7 +130,7 @@ impl Recorder {
             cause_seq: None,
             agent: Some(agent_id.to_string()),
             custom_name: None,
-            flow_ids: Vec::new(),
+            flow_ids,
             terminating_flow_ids: terminating_flows,
             counter_value: None,
             body: tacho::Event {
@@ -123,6 +143,7 @@ impl Recorder {
                     parent_run_seq: None,
                     resume: Some(false),
                     pid,
+                    git_tree: git_tree.as_deref().map(|g| truncate_utf8(g, 64)),
                 })),
             },
         });
@@ -139,7 +160,8 @@ impl Recorder {
         live_agent.task = scrubbed_task;
 
         self.runs.insert(key, run_state);
-        self.detectors.entry(agent_id.to_string()).or_default();
+        let det = self.detectors.entry(agent_id.to_string()).or_default();
+        det.touch_event(ts);
 
         // Derive initial Idle state
         self.transition_state(
@@ -164,6 +186,7 @@ impl Recorder {
         cwd: Option<String>,
         model: Option<String>,
         parent_session: Option<String>,
+        git_tree: Option<String>,
         ts: u64,
         out: &mut Vec<Event>,
     ) {
@@ -188,6 +211,7 @@ impl Recorder {
             cwd,
             model,
             parent_session,
+            git_tree,
             ts,
             out,
         );
@@ -206,7 +230,7 @@ impl Recorder {
         let run_key = (agent_id.clone(), run_n);
 
         // Drain abandoned open slices before closing the run
-        let (abandoned, turn_n, tool_calls_count, files_edited_count) =
+        let (abandoned, turn_n, tool_calls_count, files_edited_count, abandoned_tools) =
             if let Some(run) = self.runs.get_mut(&run_key) {
                 let abandoned: Vec<_> = run
                     .lane_allocator
@@ -217,72 +241,29 @@ impl Recorder {
                 run.is_exited = true;
                 run.turn_open = false;
                 run.turn_begin_seq = None;
+                let tools: Vec<_> = run.open_tools.values().cloned().collect();
                 run.open_tools.clear();
                 (
                     abandoned,
                     run.current_turn_n,
                     run.tool_calls_count,
                     run.files_edited_count,
+                    tools,
                 )
             } else {
-                (Vec::new(), 0, 0, 0)
+                (Vec::new(), 0, 0, 0, Vec::new())
             };
+
+        for tool in abandoned_tools {
+            self.update_active_cmd_counter(tool.command_class, -1, ts, out);
+        }
 
         for ab in abandoned {
             let ab_ts = self.clamp_ts(&ab.track_key, ts);
             let ab_seq = self.alloc_seq();
             let ab_kind = ab.kind.pairing().unwrap_or(ab.kind);
 
-            let ab_body = match ab_kind {
-                Kind::CommandEnded => tacho::event::Body::CommandEnded(tacho::CommandEnded {
-                    exit: None,
-                    timed_out: Some(false),
-                    stdout_bytes: None,
-                    stderr_bytes: None,
-                    tests_run: None,
-                    tests_failed: None,
-                    abandoned: Some(true),
-                }),
-                Kind::ToolCallEnded => tacho::event::Body::ToolCallEnded(tacho::ToolCallEnded {
-                    error: Some(true),
-                    result_bytes: None,
-                    abandoned: Some(true),
-                }),
-                Kind::FileAccessEnded => {
-                    tacho::event::Body::FileAccessEnded(tacho::FileAccessEnded {
-                        bytes_read: None,
-                        items_found: None,
-                        error: Some(true),
-                        abandoned: Some(true),
-                    })
-                }
-                Kind::TurnEnded => tacho::event::Body::TurnEnded(tacho::TurnEnded {
-                    input_tokens: None,
-                    output_tokens: None,
-                    cached_tokens: None,
-                    text_bytes: None,
-                    cost_usd_micros: None,
-                }),
-                Kind::WaitEnded => tacho::event::Body::WaitEnded(tacho::WaitEnded {
-                    timed_out: Some(false),
-                    abandoned: Some(true),
-                }),
-                Kind::ReviewEnded => tacho::event::Body::ReviewEnded(tacho::ReviewEnded {
-                    findings_count: None,
-                    approved: None,
-                    abandoned: Some(true),
-                }),
-                Kind::CustomEnded => tacho::event::Body::CustomEnded(tacho::CustomEnded {
-                    id: None,
-                    args: Vec::new(),
-                    abandoned: Some(true),
-                }),
-                _ => tacho::event::Body::ToolCallEnded(tacho::ToolCallEnded {
-                    error: Some(true),
-                    result_bytes: None,
-                    abandoned: Some(true),
-                }),
-            };
+            let ab_body = make_abandoned_body(ab_kind);
 
             out.push(Event {
                 seq: ab_seq,
@@ -330,6 +311,17 @@ impl Recorder {
             },
         });
 
+        if exit_code.unwrap_or(0) == 0 {
+            let firing = if let Some(det) = self.detectors.get_mut(&agent_id) {
+                det.check_claim()
+            } else {
+                None
+            };
+            if let Some(f) = firing {
+                self.handle_detector_firings(&agent_id, vec![f], None, ts, out);
+            }
+        }
+
         self.transition_state(
             &agent_id,
             "Exited",
@@ -338,74 +330,6 @@ impl Recorder {
             ts,
             out,
         );
-    }
-
-    /// Restores agent and run state from persisted `Run` or `RunEnded` events.
-    pub(crate) fn restore_run_event(&mut self, event: &Event) {
-        let segs: Vec<&str> = event.track_key.split('/').collect();
-        let agent_id = segs[0].strip_prefix("agent:").unwrap_or(segs[0]);
-        let run_n = segs
-            .get(1)
-            .and_then(|s| s.strip_prefix("run:"))
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1);
-
-        match event.kind {
-            Kind::Run => {
-                if let Some(tacho::event::Body::Run(r)) = &event.body.body {
-                    let provider = r.provider.clone().unwrap_or_else(|| "unknown".to_string());
-                    let session_id = r
-                        .session_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let sess_key = SessionKey::new(&provider, &session_id);
-
-                    let cur = self.agent_runs.entry(agent_id.to_string()).or_insert(0);
-                    *cur = (*cur).max(run_n);
-                    if self.sessions.get(&sess_key).is_none_or(|p| run_n >= p.1) {
-                        self.sessions
-                            .insert(sess_key, (agent_id.to_string(), run_n));
-                    }
-
-                    let mut run_state = RunState::new(
-                        agent_id.to_string(),
-                        run_n,
-                        provider.clone(),
-                        session_id.clone(),
-                        r.cwd.clone(),
-                    );
-                    run_state
-                        .lane_allocator
-                        .allocate_begin(event.seq, Kind::Run);
-
-                    let live_agent = self
-                        .live
-                        .agents
-                        .entry(agent_id.to_string())
-                        .or_insert_with(|| AgentLiveState::new(agent_id, provider, session_id));
-                    live_agent.run_n = run_n;
-                    live_agent.model = r.model.clone();
-                    live_agent.cwd = r.cwd.clone();
-                    live_agent.task = r.task.clone();
-
-                    self.runs.insert((agent_id.to_string(), run_n), run_state);
-                    self.detectors.entry(agent_id.to_string()).or_default();
-                }
-            }
-            Kind::RunEnded => {
-                if let Some(run) = self.runs.get_mut(&(agent_id.to_string(), run_n)) {
-                    run.is_exited = true;
-                    run.turn_open = false;
-                    run.turn_begin_seq = None;
-                    run.open_tools.clear();
-                }
-                if let Some(agent) = self.live.agents.get_mut(agent_id) {
-                    agent.state = "Exited".to_string();
-                    agent.state_since_ns = event.ts_ns;
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Handles `Input::Wait`.

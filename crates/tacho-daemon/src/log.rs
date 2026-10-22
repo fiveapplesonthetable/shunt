@@ -44,15 +44,15 @@ impl EventLog {
             [],
         )?;
 
-        conn.execute(
+        let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts_ns);",
             [],
-        )?;
+        );
 
-        conn.execute(
+        let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_kind_seq ON events(kind, seq);",
             [],
-        )?;
+        );
 
         // Optional columns for exact round-trip preservation of flow and counter fields
         let _ = conn.execute("ALTER TABLE events ADD COLUMN flow_ids TEXT;", []);
@@ -89,15 +89,15 @@ impl EventLog {
             [],
         )?;
 
-        conn.execute(
+        let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts_ns);",
             [],
-        )?;
+        );
 
-        conn.execute(
+        let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_kind_seq ON events(kind, seq);",
             [],
-        )?;
+        );
 
         Ok(Self { conn })
     }

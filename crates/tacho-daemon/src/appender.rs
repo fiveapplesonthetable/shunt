@@ -6,7 +6,7 @@
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tacho_core::{Event, Input, LiveState, Recorder, SessionKey, TrackRegistry};
@@ -48,6 +48,7 @@ pub struct AppenderHandle {
     published_registry: Arc<ArcSwap<TrackRegistry>>,
     active_runs: Arc<ArcSwap<Vec<ActiveRun>>>,
     hooks: Arc<AppenderHooks>,
+    write_errors: Arc<AtomicUsize>,
 }
 
 impl AppenderHandle {
@@ -106,6 +107,11 @@ impl AppenderHandle {
     pub fn hooks(&self) -> &Arc<AppenderHooks> {
         &self.hooks
     }
+
+    /// Returns the cumulative number of SQLite WAL write errors encountered.
+    pub fn write_errors(&self) -> usize {
+        self.write_errors.load(Ordering::Relaxed)
+    }
 }
 
 /// Spawns the dedicated appender thread and returns its handle.
@@ -123,6 +129,7 @@ pub fn spawn_appender(
     let live_state = Arc::new(ArcSwap::new(initial_state));
     let published_registry = Arc::new(ArcSwap::new(initial_reg));
     let hooks = Arc::new(AppenderHooks::default());
+    let write_errors = Arc::new(AtomicUsize::new(0));
 
     let handle = AppenderHandle {
         sender,
@@ -130,6 +137,7 @@ pub fn spawn_appender(
         published_registry: published_registry.clone(),
         active_runs: active_runs.clone(),
         hooks: hooks.clone(),
+        write_errors: write_errors.clone(),
     };
 
     let join_handle = std::thread::Builder::new()
@@ -143,6 +151,7 @@ pub fn spawn_appender(
                 published_registry,
                 active_runs,
                 hooks,
+                write_errors,
             );
         })
         .expect("failed to spawn appender thread");
@@ -151,6 +160,7 @@ pub fn spawn_appender(
 }
 
 /// Main execution loop of the sole appender thread.
+#[allow(clippy::too_many_arguments)]
 fn run_appender_loop(
     receiver: Receiver<AppenderCommand>,
     recorder: &mut Recorder,
@@ -159,12 +169,15 @@ fn run_appender_loop(
     published_registry: Arc<ArcSwap<TrackRegistry>>,
     active_runs: Arc<ArcSwap<Vec<ActiveRun>>>,
     hooks: Arc<AppenderHooks>,
+    write_errors: Arc<AtomicUsize>,
 ) {
     let mut batch_events = Vec::with_capacity(256);
     let mut flush_notifiers = Vec::new();
     let mut active_runs_map: HashMap<SessionKey, ActiveRun> = HashMap::new();
     let mut last_live_publish = Instant::now();
     let mut last_published_reg_len = recorder.registry().len();
+    let mut last_tick = Instant::now();
+    let tick_interval = Duration::from_millis(200);
 
     let commit_interval = Duration::from_millis(50);
     const MAX_BATCH_SIZE: usize = 256;
@@ -185,6 +198,7 @@ fn run_appender_loop(
                     .unwrap_or_default()
                     .as_nanos() as u64;
                 recorder.tick(now_ns, &mut batch_events);
+                last_tick = Instant::now();
                 if !batch_events.is_empty() {
                     commit_batch(
                         &mut batch_events,
@@ -195,6 +209,7 @@ fn run_appender_loop(
                         &published_registry,
                         &mut last_live_publish,
                         &mut last_published_reg_len,
+                        &write_errors,
                     );
                 }
                 continue;
@@ -236,6 +251,7 @@ fn run_appender_loop(
                             &published_registry,
                             &mut last_live_publish,
                             &mut last_published_reg_len,
+                            &write_errors,
                         );
                     }
                 }
@@ -277,6 +293,7 @@ fn run_appender_loop(
                                 &published_registry,
                                 &mut last_live_publish,
                                 &mut last_published_reg_len,
+                                &write_errors,
                             );
                         }
                     }
@@ -287,7 +304,17 @@ fn run_appender_loop(
             }
         }
 
-        // 3. Commit batch if events or flushes are pending
+        // 3. Periodic detector tick under continuous load
+        if last_tick.elapsed() >= tick_interval {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            recorder.tick(now_ns, &mut batch_events);
+            last_tick = Instant::now();
+        }
+
+        // 4. Commit batch if events or flushes are pending
         if !batch_events.is_empty() || !flush_notifiers.is_empty() {
             commit_batch(
                 &mut batch_events,
@@ -298,6 +325,7 @@ fn run_appender_loop(
                 &published_registry,
                 &mut last_live_publish,
                 &mut last_published_reg_len,
+                &write_errors,
             );
         }
     }
@@ -342,6 +370,7 @@ fn run_appender_loop(
             &published_registry,
             &mut last_live_publish,
             &mut last_published_reg_len,
+            &write_errors,
         );
     }
 }
@@ -418,12 +447,14 @@ fn commit_batch(
     published_registry: &Arc<ArcSwap<TrackRegistry>>,
     last_live_publish: &mut Instant,
     last_published_reg_len: &mut usize,
+    write_errors: &AtomicUsize,
 ) {
     if !batch_events.is_empty() {
         // SQLite write: insert all events (sampled machine/run counters logged at sample interval)
         if let Err(e) = log.insert_batch(batch_events.iter()) {
+            write_errors.fetch_add(1, Ordering::Relaxed);
             eprintln!(
-                "[tacho-daemon] failed to insert batch into SQLite WAL: {}",
+                "[tacho-daemon] failed to insert batch into SQLite WAL (graceful degradation): {}",
                 e
             );
         }

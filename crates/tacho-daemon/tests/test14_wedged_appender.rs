@@ -41,6 +41,7 @@ fn test_wedged_appender_trace_oracle() {
                 cwd: Some("/dev".to_string()),
                 model: Some("claude-3-opus".to_string()),
                 parent_session: None,
+                git_tree: None,
             },
             1_000_000_000,
         )
@@ -57,6 +58,7 @@ fn test_wedged_appender_trace_oracle() {
                 input: ToolInput::Shell {
                     argv: "ls -la".to_string(),
                     cwd: Some("/dev".to_string()),
+                    git_tree: None,
                 },
             },
             1_000_100_000,
