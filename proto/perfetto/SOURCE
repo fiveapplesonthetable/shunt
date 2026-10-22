@@ -1,0 +1,3 @@
+git_commit: 02835f6f1b7afbb89c705b39a4777586aa50a398
+sha256: c8888365343386a800b2241321c1c627452f63d878962600d8ba5116cc830186
+source_path: protos/perfetto/trace/perfetto_trace.proto

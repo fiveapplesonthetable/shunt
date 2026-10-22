@@ -1,0 +1,18 @@
+[package]
+name = "tacho-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tacho-proto = { path = "../tacho-proto" }
+prost = "0.14"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1.12"
+tempfile = "3.27"
+serde_json = "1.0"

@@ -1,0 +1,426 @@
+// Schema for tachograph (tacho) agent flight recorder extensions.
+// Package tacho extends perfetto.protos.TrackEvent in range 4000-4099.
+
+syntax = "proto2";
+
+package tacho;
+
+import "perfetto/perfetto_trace.proto";
+
+// Closed set of command classifications.
+enum CommandClass {
+  COMMAND_CLASS_UNSPECIFIED = 0;
+  COMMAND = 1;
+  BUILD = 2;
+  TEST = 3;
+  LINT = 4;
+  FORMAT = 5;
+  INSTALL = 6;
+  COMMIT = 7;
+  PUSH = 8;
+  FETCH = 9;
+  REBASE = 10;
+  PACKAGE = 11;
+  EXEC = 12;
+}
+
+// Closed set of stall detector categories.
+enum StallKind {
+  STALL_KIND_UNSPECIFIED = 0;
+  SILENT = 1;
+  LOOP = 2;
+  SPIN = 3;
+  BURN = 4;
+  FAILING = 5;
+  OFF_BRIEF = 6;
+}
+
+// Closed set of file access operations.
+enum FileAccessKind {
+  FILE_ACCESS_KIND_UNSPECIFIED = 0;
+  READ = 1;
+  SEARCH = 2;
+  LIST = 3;
+}
+
+// Closed set of file edit operations.
+enum FileEditKind {
+  FILE_EDIT_KIND_UNSPECIFIED = 0;
+  EDIT = 1;
+  CREATE = 2;
+  DELETE = 3;
+  RENAME = 4;
+}
+
+// Closed set of wait reasons.
+enum WaitOn {
+  WAIT_ON_UNSPECIFIED = 0;
+  WAIT_INPUT = 1;
+  WAIT_MESSAGE = 2;
+  WAIT_SUBAGENT = 3;
+  WAIT_RATE_LIMIT = 4;
+  WAIT_OTHER = 5;
+}
+
+// Message flow direction.
+enum MessageDirection {
+  MESSAGE_DIRECTION_UNSPECIFIED = 0;
+  SENT = 1;
+  DELIVERED = 2;
+}
+
+// Closed set of task status states.
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_QUEUED = 1;
+  TASK_IN_PROGRESS = 2;
+  TASK_REVIEW = 3;
+  TASK_DONE = 4;
+  TASK_FAILED = 5;
+  TASK_CANCELLED = 6;
+}
+
+// Closed set of agent lifecycle states.
+enum AgentStateType {
+  AGENT_STATE_UNSPECIFIED = 0;
+  IDLE = 1;
+  THINKING = 2;
+  TOOL = 3;
+  WAITING = 4;
+  STALLED = 5;
+  EXITED = 6;
+}
+
+// Closed set of review finding severities.
+enum FindingSeverity {
+  FINDING_SEVERITY_UNSPECIFIED = 0;
+  FINDING_INFO = 1;
+  FINDING_MINOR = 2;
+  FINDING_MAJOR = 3;
+  FINDING_CRITICAL = 4;
+}
+
+// Daemon lifecycle action.
+enum DaemonAction {
+  DAEMON_ACTION_UNSPECIFIED = 0;
+  DAEMON_STARTED = 1;
+  DAEMON_STOPPING = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Body messages
+// ----------------------------------------------------------------------------
+
+message Run {
+  optional uint32 pid = 1;
+  optional string provider = 2;        // <= 64
+  optional string model = 3;           // <= 64
+  optional string session_id = 4;      // <= 128
+  optional string cwd = 5;             // <= 256
+  optional string task = 6;            // <= 128
+  optional uint64 parent_run_seq = 7;
+  optional bool resume = 8;
+}
+
+message RunEnded {
+  optional string reason = 1;          // <= 64
+  optional int32 exit_code = 2;
+  optional uint32 turns = 3;
+  optional uint32 tool_calls = 4;
+  optional uint32 files_edited = 5;
+}
+
+message Turn {
+  optional uint32 turn_number = 1;
+  optional string model = 2;           // <= 64
+}
+
+message TurnEnded {
+  optional uint64 input_tokens = 1;
+  optional uint64 output_tokens = 2;
+  optional uint64 cached_tokens = 3;
+  optional uint64 text_bytes = 4;
+  optional uint64 cost_usd_micros = 5;
+}
+
+message ToolCall {
+  optional string name = 1;            // <= 128
+  optional string input_digest = 2;    // <= 64
+  optional uint64 input_bytes = 3;
+  optional string tool_use_id = 4;     // <= 128
+}
+
+message ToolCallEnded {
+  optional bool error = 1;
+  optional uint64 result_bytes = 2;
+  optional bool abandoned = 3;
+}
+
+message Command {
+  optional string argv = 1;            // <= 1024
+  optional string cwd = 2;             // <= 512
+  optional CommandClass class = 3;
+  optional string check_name = 4;      // <= 128
+  optional bool via_wrap = 5;
+  optional string program = 6;         // <= 64
+}
+
+message CommandEnded {
+  optional int32 exit = 1;
+  optional bool timed_out = 2;
+  optional uint64 stdout_bytes = 3;
+  optional uint64 stderr_bytes = 4;
+  optional uint32 tests_run = 5;
+  optional uint32 tests_failed = 6;
+  optional bool abandoned = 7;
+}
+
+message FileAccess {
+  optional string path = 1;            // <= 512
+  optional FileAccessKind kind = 2;
+  optional string query = 3;           // <= 256
+}
+
+message FileAccessEnded {
+  optional uint64 bytes_read = 1;
+  optional uint32 items_found = 2;
+  optional bool error = 3;
+  optional bool abandoned = 4;
+}
+
+message FileEdited {
+  optional string path = 1;            // <= 512
+  optional FileEditKind kind = 2;
+  optional uint32 lines_added = 3;
+  optional uint32 lines_removed = 4;
+  optional bool in_brief = 5;
+}
+
+message Wait {
+  optional string target = 1;          // <= 128
+  optional WaitOn on = 2;
+}
+
+message WaitEnded {
+  optional bool timed_out = 1;
+  optional bool abandoned = 2;
+}
+
+message Prompt {
+  optional string digest = 1;          // <= 64
+  optional uint64 bytes = 2;
+}
+
+message Message {
+  optional string from = 1;            // <= 128
+  optional string to = 2;              // <= 128
+  optional string message_id = 3;      // <= 128
+  optional uint64 bytes = 4;
+  optional MessageDirection direction = 5;
+}
+
+message Compacted {
+  optional uint64 tokens_before = 1;
+  optional uint64 tokens_after = 2;
+  optional uint64 bytes_compacted = 3;
+}
+
+message Stall {
+  optional StallKind kind = 1;
+  optional uint64 since_us = 2;
+  optional uint32 repeats = 3;
+  optional string evidence = 4;        // <= 512
+}
+
+message ProviderError {
+  optional string provider = 1;        // <= 64
+  optional string error_code = 2;      // <= 64
+  optional string message = 3;         // <= 256
+  optional bool rate_limit = 4;
+  optional uint64 retry_after_ms = 5;
+}
+
+message TaskQueued {
+  optional string slug = 1;            // <= 128
+  optional string brief_digest = 2;    // <= 64
+  optional uint64 brief_bytes = 3;
+  repeated string paths = 4;           // <= 512
+}
+
+message TaskState {
+  optional TaskStatus state = 1;
+  optional string because = 2;         // <= 256
+}
+
+message AgentState {
+  optional AgentStateType state = 1;
+  optional string because = 2;         // <= 256
+}
+
+message Milestone {
+  optional string name = 1;            // <= 128
+  optional string description = 2;     // <= 256
+}
+
+message Review {
+  optional string task = 1;            // <= 128
+  optional string reviewer = 2;        // <= 128
+}
+
+message ReviewEnded {
+  optional uint32 findings_count = 1;
+  optional bool approved = 2;
+  optional bool abandoned = 3;
+}
+
+message ReviewFinding {
+  optional string task = 1;            // <= 128
+  optional FindingSeverity severity = 2;
+  optional string path = 3;            // <= 512
+  optional uint32 line = 4;
+  optional string title = 5;           // <= 256
+}
+
+message Snapshot {
+  optional string trigger = 1;         // <= 64
+}
+
+message RingStats {
+  optional string name = 1;            // <= 32
+  optional uint64 bytes = 2;
+  optional uint64 chunks_overwritten = 3;
+  optional uint64 chunks_skipped = 4;
+}
+
+message SnapshotEnded {
+  repeated RingStats rings = 1;
+  optional uint64 duration_us = 2;
+}
+
+message Daemon {
+  optional DaemonAction action = 1;
+  optional string version = 2;         // <= 64
+  optional uint32 pid = 3;
+  optional string host = 4;            // <= 128
+}
+
+message ClockStep {
+  optional int64 delta_ns = 1;
+  optional string reason = 2;          // <= 128
+}
+
+message TrackCreated {
+  optional string key = 1;             // <= 256
+  optional uint64 uuid = 2;
+  optional uint64 parent_uuid = 3;
+  optional string name = 4;            // <= 128
+  optional bool collision = 5;
+}
+
+message TraceError {
+  optional string message = 1;         // <= 256
+  optional string track_key = 2;       // <= 256
+}
+
+message CustomArg {
+  optional string key = 1;             // <= 64
+  optional string value = 2;           // <= 512
+}
+
+message Custom {
+  optional string name = 1;            // <= 128
+  optional string id = 2;              // <= 128
+  repeated CustomArg args = 3;
+}
+
+message CustomEnded {
+  optional string id = 1;              // <= 128
+  repeated CustomArg args = 2;
+  optional bool abandoned = 3;
+}
+
+// ----------------------------------------------------------------------------
+// Unified Event oneof
+// ----------------------------------------------------------------------------
+
+message Event {
+  oneof body {
+    Run run = 1;
+    RunEnded run_ended = 2;
+    Turn turn = 3;
+    TurnEnded turn_ended = 4;
+    ToolCall tool_call = 5;
+    ToolCallEnded tool_call_ended = 6;
+    Command command = 7;
+    CommandEnded command_ended = 8;
+    FileAccess file_access = 9;
+    FileAccessEnded file_access_ended = 10;
+    FileEdited file_edited = 11;
+    Wait wait = 12;
+    WaitEnded wait_ended = 13;
+    Prompt prompt = 14;
+    Message message = 15;
+    Compacted compacted = 16;
+    Stall stall = 17;
+    ProviderError provider_error = 18;
+    TaskQueued task_queued = 19;
+    TaskState task_state = 20;
+    AgentState agent_state = 21;
+    Milestone milestone = 22;
+    Review review = 23;
+    ReviewEnded review_ended = 24;
+    ReviewFinding review_finding = 25;
+    Snapshot snapshot = 26;
+    SnapshotEnded snapshot_ended = 27;
+    Daemon daemon = 28;
+    ClockStep clock_step = 29;
+    TrackCreated track_created = 30;
+    TraceError trace_error = 31;
+    Custom custom = 32;
+    CustomEnded custom_ended = 33;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// TrackEvent extension block (4000-4099)
+// ----------------------------------------------------------------------------
+
+extend perfetto.protos.TrackEvent {
+  optional uint64 seq = 4000;
+  optional uint64 cause_seq = 4001;
+  optional string agent = 4002;        // <= 128
+
+  optional Run run = 4003;
+  optional RunEnded run_ended = 4004;
+  optional Turn turn = 4005;
+  optional TurnEnded turn_ended = 4006;
+  optional ToolCall tool_call = 4007;
+  optional ToolCallEnded tool_call_ended = 4008;
+  optional Command command = 4009;
+  optional CommandEnded command_ended = 4010;
+  optional FileAccess file_access = 4011;
+  optional FileAccessEnded file_access_ended = 4012;
+  optional FileEdited file_edited = 4013;
+  optional Wait wait = 4014;
+  optional WaitEnded wait_ended = 4015;
+  optional Prompt prompt = 4016;
+  optional Message message = 4017;
+  optional Compacted compacted = 4018;
+  optional Stall stall = 4019;
+  optional ProviderError provider_error = 4020;
+  optional TaskQueued task_queued = 4021;
+  optional TaskState task_state = 4022;
+  optional AgentState agent_state = 4023;
+  optional Milestone milestone = 4024;
+  optional Review review = 4025;
+  optional ReviewEnded review_ended = 4026;
+  optional ReviewFinding review_finding = 4027;
+  optional Snapshot snapshot = 4028;
+  optional SnapshotEnded snapshot_ended = 4029;
+  optional Daemon daemon = 4030;
+  optional ClockStep clock_step = 4031;
+  optional TrackCreated track_created = 4032;
+  optional TraceError trace_error = 4033;
+  optional Custom custom = 4034;
+  optional CustomEnded custom_ended = 4035;
+}

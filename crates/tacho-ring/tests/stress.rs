@@ -7,7 +7,7 @@ use tacho_ring::Ring;
 
 const TOTAL_PACKETS: u64 = 1_000_000;
 const PAYLOAD_LEN: usize = 32;
-const RING_BYTES: usize = 8 * 1024 * 1024; // 8 MiB = 2048 chunks
+const RING_BYTES: usize = 16 * 1024 * 1024; // 16 MiB = 4096 chunks
 
 fn compute_checksum(seq: u64, payload: &[u8]) -> u32 {
     let mut hash = 0x811c9dc5u32;
