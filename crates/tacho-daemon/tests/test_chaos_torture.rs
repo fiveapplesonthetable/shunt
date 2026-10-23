@@ -95,7 +95,7 @@ fn send_input_resilient(sock_path: &Path, input: &Input) -> bool {
                 }
             }
         }
-        thread::sleep(Duration::from_millis(10));
+        std::thread::yield_now();
     }
     false
 }
@@ -228,7 +228,7 @@ fn test_chaos_and_torture() {
                         );
 
                         ops.fetch_add(6, Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(5));
+                        std::thread::yield_now();
                     }
                 })
                 .unwrap(),
@@ -300,7 +300,7 @@ fn test_chaos_and_torture() {
                         }
 
                         ops.fetch_add(201, Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(20));
+                        std::thread::yield_now();
                     }
                 })
                 .unwrap(),
@@ -348,7 +348,7 @@ fn test_chaos_and_torture() {
                             },
                         );
                         ops.fetch_add(3, Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(2));
+                        std::thread::yield_now();
                     }
                 })
                 .unwrap(),
@@ -415,7 +415,7 @@ fn test_chaos_and_torture() {
                             }
                         }
                     }
-                    thread::sleep(Duration::from_millis(15));
+                    std::thread::yield_now();
                 }
             })
             .unwrap());
@@ -466,7 +466,7 @@ fn test_chaos_and_torture() {
                                 ops.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        thread::sleep(Duration::from_millis(100));
+                        std::thread::yield_now();
                     }
                 })
                 .unwrap(),
@@ -506,7 +506,7 @@ fn test_chaos_and_torture() {
                     }
 
                     ops.fetch_add(3, Ordering::Relaxed);
-                    thread::sleep(Duration::from_millis(20));
+                    std::thread::yield_now();
                 }
             })
             .unwrap());
@@ -627,7 +627,7 @@ fn test_chaos_and_torture() {
                         );
 
                         ops.fetch_add(104, Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(50));
+                        std::thread::yield_now();
                     }
                 })
                 .unwrap(),
@@ -710,7 +710,7 @@ fn test_chaos_and_torture() {
                         );
 
                         ops.fetch_add(4, Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(50));
+                        std::thread::yield_now();
                     }
                 })
                 .unwrap(),
@@ -723,8 +723,10 @@ fn test_chaos_and_torture() {
         "Must have exactly 16 concurrent chaos threads"
     );
 
-    println!("All 16 chaos threads running. Hammering for 2.5 seconds...");
-    thread::sleep(Duration::from_millis(2500));
+    println!("All 16 chaos threads running. Hammering until 500 ops...");
+    while total_ops.load(Ordering::Relaxed) < 500 {
+        std::thread::yield_now();
+    }
 
     // Mid-storm chaos: Simulate abrupt daemon restart while threads are actively hammering!
     println!("=== INJECTING CHAOS: Abrupt daemon restart ===");
@@ -736,12 +738,14 @@ fn test_chaos_and_torture() {
     assert!(paths.events_db().exists(), "SQLite database must exist");
 
     // Re-launch daemon on the exact same paths (restoring state from SQLite WAL)
-    thread::sleep(Duration::from_millis(50));
     daemon = Some(Daemon::start(paths.clone(), config.clone()).expect("failed to restart daemon"));
     println!("=== Daemon restarted successfully on existing DB ===");
 
-    // Hammer for another 2.5 seconds against the restarted daemon
-    thread::sleep(Duration::from_millis(2500));
+    // Hammer for another 500 ops against the restarted daemon
+    let target_ops = total_ops.load(Ordering::Relaxed) + 500;
+    while total_ops.load(Ordering::Relaxed) < target_ops {
+        std::thread::yield_now();
+    }
 
     // Stop all chaos threads
     println!("Stopping chaos threads...");

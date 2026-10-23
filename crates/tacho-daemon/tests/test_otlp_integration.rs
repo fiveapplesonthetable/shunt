@@ -11,7 +11,6 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
 use tacho_daemon::{Config, Daemon, DaemonPaths};
 
@@ -39,8 +38,13 @@ fn test_otlp_daemon_integration() {
 
     let daemon = Daemon::start(paths.clone(), config).expect("Failed to start daemon");
 
-    // Wait briefly for HTTP server accept loop to start
-    thread::sleep(Duration::from_millis(50));
+    // Wait until HTTP server accept loop is ready
+    let cap = std::time::Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+        && std::time::Instant::now() < cap
+    {
+        std::thread::yield_now();
+    }
 
     // 1. Send OTLP JSON logs request
     let json_body = serde_json::json!({

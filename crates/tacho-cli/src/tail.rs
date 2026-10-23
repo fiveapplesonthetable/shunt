@@ -195,8 +195,35 @@ pub fn execute_tail(args: TailArgs) -> Result<(), String> {
             Err(e) => {
                 eprintln!("Warning: failed to send tailed inputs to daemon: {e}; retrying...");
                 pending_retry_files.extend(file_list);
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(5));
+                let inotify_fd =
+                    unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+                if inotify_fd >= 0 {
+                    if let Some(parent) = client.api_sock().parent() {
+                        if let Ok(c_path) =
+                            std::ffi::CString::new(parent.to_str().unwrap_or_default())
+                        {
+                            let wd = unsafe {
+                                libc::inotify_add_watch(
+                                    inotify_fd,
+                                    c_path.as_ptr(),
+                                    libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB,
+                                )
+                            };
+                            let mut pfd = libc::pollfd {
+                                fd: inotify_fd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let _ = unsafe { libc::poll(&mut pfd, 1, 500) };
+                            if wd >= 0 {
+                                unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+                            }
+                        }
+                    }
+                    unsafe { libc::close(inotify_fd) };
+                } else {
+                    std::thread::yield_now();
+                }
             }
         }
     }
@@ -1006,9 +1033,10 @@ mod tests {
             .unwrap();
         }
 
-        // Point client to non-existent runtime dir where daemon is not running
-        let bad_client =
-            DaemonClient::custom(temp.path().join("bad_home"), temp.path().join("bad_run"));
+        // Point client to invalid runtime path where daemon cannot run or connect
+        let bad_run = temp.path().join("bad_run");
+        fs::write(&bad_run, b"not-a-directory").unwrap();
+        let bad_client = DaemonClient::custom(temp.path().join("bad_home"), bad_run);
         let mut offsets = BTreeMap::new();
         let mut states = HashMap::new();
 

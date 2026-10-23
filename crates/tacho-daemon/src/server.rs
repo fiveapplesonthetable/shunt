@@ -74,6 +74,7 @@ pub struct DaemonServer {
     paths: DaemonPaths,
     _lock: DaemonLock,
     shutdown_flag: Arc<AtomicBool>,
+    shutdown_tx: i32,
     api_thread: Option<std::thread::JoinHandle<()>>,
     trace_thread: Option<std::thread::JoinHandle<()>>,
     worker_threads: Vec<std::thread::JoinHandle<()>>,
@@ -133,13 +134,24 @@ impl DaemonServer {
             worker_threads.push(worker);
         }
 
-        // 5. Acceptor thread for api.sock
+        // 5. Acceptor thread for api.sock and trace.sock using kernel pipe for instant shutdown wakeup
+        let mut shutdown_pipe = [0i32; 2];
+        unsafe {
+            libc::pipe2(
+                shutdown_pipe.as_mut_ptr(),
+                libc::O_CLOEXEC | libc::O_NONBLOCK,
+            );
+        }
+        let shutdown_rx_api = shutdown_pipe[0];
+        let shutdown_tx = shutdown_pipe[1];
+        let shutdown_rx_trace = unsafe { libc::dup(shutdown_rx_api) };
+
         let stop_api = shutdown_flag.clone();
         api_listener.set_nonblocking(true)?;
         let api_thread = std::thread::Builder::new()
             .name("tacho-api-acceptor".to_string())
             .spawn(move || {
-                run_api_acceptor(api_listener, conn_tx, stop_api);
+                run_api_acceptor(api_listener, conn_tx, stop_api, shutdown_rx_api);
             })
             .expect("failed to spawn api acceptor");
 
@@ -150,7 +162,7 @@ impl DaemonServer {
         let trace_thread = std::thread::Builder::new()
             .name("tacho-trace-server".to_string())
             .spawn(move || {
-                run_trace_server(trace_listener, db_path_trace, stop_trace);
+                run_trace_server(trace_listener, db_path_trace, stop_trace, shutdown_rx_trace);
             })
             .expect("failed to spawn trace server");
 
@@ -158,6 +170,7 @@ impl DaemonServer {
             paths,
             _lock: lock,
             shutdown_flag,
+            shutdown_tx,
             api_thread: Some(api_thread),
             trace_thread: Some(trace_thread),
             worker_threads,
@@ -167,6 +180,13 @@ impl DaemonServer {
     /// Stops servers, joins threads, and removes socket files.
     pub fn stop(&mut self) {
         self.shutdown_flag.store(true, Ordering::Release);
+
+        if self.shutdown_tx >= 0 {
+            unsafe {
+                libc::close(self.shutdown_tx);
+            }
+            self.shutdown_tx = -1;
+        }
 
         if let Some(t) = self.api_thread.take() {
             let _ = t.join();
@@ -191,7 +211,12 @@ impl Drop for DaemonServer {
 }
 
 /// Acceptor loop for api.sock.
-fn run_api_acceptor(listener: UnixListener, conn_tx: Sender<UnixStream>, stop: Arc<AtomicBool>) {
+fn run_api_acceptor(
+    listener: UnixListener,
+    conn_tx: Sender<UnixStream>,
+    stop: Arc<AtomicBool>,
+    shutdown_rx: std::os::unix::io::RawFd,
+) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -199,17 +224,35 @@ fn run_api_acceptor(listener: UnixListener, conn_tx: Sender<UnixStream>, stop: A
                 let _ = conn_tx.send(stream);
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let mut pfd = libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe {
-                    let _ = libc::poll(&mut pfd, 1, 100);
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: shutdown_rx,
+                        events: libc::POLLIN | libc::POLLHUP,
+                        revents: 0,
+                    },
+                ];
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                    break;
                 }
             }
             Err(_) => break,
         }
+    }
+    if shutdown_rx >= 0 {
+        unsafe { libc::close(shutdown_rx) };
     }
 }
 
@@ -217,7 +260,12 @@ fn run_api_acceptor(listener: UnixListener, conn_tx: Sender<UnixStream>, stop: A
 ///
 /// CRITICAL: This thread streams snapshots using its own independent read-only WAL connection.
 /// It never touches the appender channel or locks, ensuring snapshots succeed even if the appender is wedged.
-fn run_trace_server(listener: UnixListener, db_path: std::path::PathBuf, stop: Arc<AtomicBool>) {
+fn run_trace_server(
+    listener: UnixListener,
+    db_path: std::path::PathBuf,
+    stop: Arc<AtomicBool>,
+    shutdown_rx: std::os::unix::io::RawFd,
+) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -226,17 +274,35 @@ fn run_trace_server(listener: UnixListener, db_path: std::path::PathBuf, stop: A
                 let _ = stream.flush();
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let mut pfd = libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe {
-                    let _ = libc::poll(&mut pfd, 1, 100);
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: shutdown_rx,
+                        events: libc::POLLIN | libc::POLLHUP,
+                        revents: 0,
+                    },
+                ];
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                    break;
                 }
             }
             Err(_) => break,
         }
+    }
+    if shutdown_rx >= 0 {
+        unsafe { libc::close(shutdown_rx) };
     }
 }
 
@@ -525,18 +591,48 @@ fn process_ndjson_line(
                             area_rules: state.area_rules.clone(),
                             refused_self_update_sha: state.refused_self_update_sha.clone(),
                             last_tick_ts: state.last_tick_ts,
+                            inbox: state.inbox.clone(),
                             last_watchdog_alert_ts: state.last_watchdog_alert_ts,
                             tidy_min_age_secs: 3_600,
                         };
                         let live_keys: std::collections::BTreeSet<String> =
                             live.agents.keys().cloned().collect();
+
+                        let prev_tick_ts = state.last_tick_ts.unwrap_or(0);
+                        let mut batch_outcomes = Vec::new();
+                        for b in &state.batches {
+                            if let Some(finished_ts) = b.finished_at {
+                                if finished_ts > prev_tick_ts
+                                    && (b.status == "passed" || b.status == "failed")
+                                {
+                                    batch_outcomes.push(tacho_core::decide::BatchOutcomeObs {
+                                        batch_id: b.id.clone(),
+                                        passed: b.status == "passed",
+                                        failed_area: b.areas.first().cloned(),
+                                        log_output: b.log.clone(),
+                                        tree_sha: b.tree.clone().unwrap_or_default(),
+                                    });
+                                }
+                            }
+                        }
+
+                        let main_sha = std::process::Command::new("git")
+                            .args(["rev-parse", "HEAD"])
+                            .current_dir(&paths.home)
+                            .output()
+                            .ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_default();
+
                         let world_obs = tacho_core::decide::WorldObservation {
                             now,
-                            main_sha: String::new(),
+                            main_sha,
                             open_prs: state.open_prs_cache.clone(),
                             merged_prs: state.merged_prs.clone(),
                             closed_prs: state.closed_prs.clone(),
                             live_keys,
+                            batch_outcomes,
                             ..Default::default()
                         };
                         let plan = tacho_core::decide::decide(&decision_state, &world_obs);
@@ -602,6 +698,7 @@ fn process_ndjson_line(
                 let _ = stream.flush();
 
                 let mut last_rendered = String::new();
+                let mut last_seq = appender.state_seq();
                 for _ in 0..500 {
                     if stop.load(Ordering::Acquire) {
                         break;
@@ -648,9 +745,12 @@ fn process_ndjson_line(
                         events: libc::POLLERR | libc::POLLHUP,
                         revents: 0,
                     };
-                    unsafe {
-                        let _ = libc::poll(&mut pfd, 1, 25);
+                    let poll_res = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    if poll_res > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
+                        break;
                     }
+
+                    last_seq = appender.wait_state_change(last_seq, Duration::from_millis(250));
                 }
                 let _ = stream.flush();
                 let _ = stream.shutdown(std::net::Shutdown::Both);

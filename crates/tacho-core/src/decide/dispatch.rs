@@ -98,6 +98,10 @@ pub struct AgentRun {
     pub session_id: Option<String>,
     #[serde(default)]
     pub compare: Option<String>,
+    #[serde(default)]
+    pub starttime: Option<u64>,
+    #[serde(default)]
+    pub cgroup: Option<String>,
 }
 
 /// An explicit hold on a task key, PR (`pr:<n>`), or area (`area:<name>`).

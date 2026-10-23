@@ -18,6 +18,18 @@ use crate::log::EventLog;
 pub struct AppenderHooks {
     /// When true, causes the appender thread to block until cleared.
     pub wedged: AtomicBool,
+    pub condvar: std::sync::Condvar,
+    pub mutex: std::sync::Mutex<()>,
+}
+
+impl AppenderHooks {
+    pub fn set_wedged(&self, wedged: bool) {
+        let _guard = self.mutex.lock().unwrap();
+        self.wedged.store(wedged, Ordering::Release);
+        if !wedged {
+            self.condvar.notify_all();
+        }
+    }
 }
 
 /// Commands accepted by the appender loop.
@@ -52,9 +64,26 @@ pub struct AppenderHandle {
     active_runs: Arc<ArcSwap<Vec<ActiveRun>>>,
     hooks: Arc<AppenderHooks>,
     write_errors: Arc<AtomicUsize>,
+    state_notify: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 }
 
 impl AppenderHandle {
+    /// Waits for `LiveState` to update beyond `last_seq` within `timeout`, returning the new sequence.
+    pub fn wait_state_change(&self, last_seq: u64, timeout: Duration) -> u64 {
+        let (lock, cvar) = &*self.state_notify;
+        let seq = lock.lock().unwrap();
+        if *seq != last_seq {
+            return *seq;
+        }
+        let (res, _) = cvar.wait_timeout(seq, timeout).unwrap();
+        *res
+    }
+
+    /// Returns current state sequence number.
+    pub fn state_seq(&self) -> u64 {
+        let (lock, _) = &*self.state_notify;
+        *lock.lock().unwrap()
+    }
     /// Sends an input event into the flight recorder pipeline with a bounded timeout
     /// so high-throughput streams get backpressure without hanging indefinitely if wedged.
     #[allow(clippy::result_large_err)]
@@ -214,13 +243,22 @@ fn run_stall_worker(
                 let _ = child.wait();
             }
         } else {
-            match child.wait() {
-                Ok(_) => {
-                    exited = true;
-                }
-                Err(e) => {
-                    eprintln!("[tacho-daemon] on_stall wait error: {}", e);
-                    exited = true;
+            // pidfd not supported: poll non-blocking with child.try_wait() up to timeout
+            let start = Instant::now();
+            while start.elapsed() < timeout {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        exited = true;
+                        break;
+                    }
+                    Ok(None) => {
+                        std::thread::yield_now();
+                    }
+                    Err(e) => {
+                        eprintln!("[tacho-daemon] on_stall wait error: {}", e);
+                        exited = true;
+                        break;
+                    }
                 }
             }
         }
@@ -304,6 +342,7 @@ pub fn spawn_appender_with_hook_timeout(
     let published_registry = Arc::new(ArcSwap::new(initial_reg));
     let hooks = Arc::new(AppenderHooks::default());
     let write_errors = Arc::new(AtomicUsize::new(0));
+    let state_notify = Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
 
     let handle = AppenderHandle {
         sender,
@@ -312,6 +351,7 @@ pub fn spawn_appender_with_hook_timeout(
         active_runs: active_runs.clone(),
         hooks: hooks.clone(),
         write_errors: write_errors.clone(),
+        state_notify: state_notify.clone(),
     };
 
     let (stall_hook_sender, stall_worker_handle) = match on_stall {
@@ -335,6 +375,7 @@ pub fn spawn_appender_with_hook_timeout(
         _ => (None, None),
     };
 
+    let state_notify_loop = state_notify.clone();
     let join_handle = std::thread::Builder::new()
         .name("tacho-appender".to_string())
         .spawn(move || {
@@ -350,6 +391,7 @@ pub fn spawn_appender_with_hook_timeout(
                 write_errors,
                 stall_hook_sender,
                 stall_worker_handle,
+                state_notify_loop,
             );
         })
         .expect("failed to spawn appender thread");
@@ -371,6 +413,7 @@ fn run_appender_loop(
     write_errors: Arc<AtomicUsize>,
     mut stall_hook_sender: Option<StallHookSender>,
     stall_worker_handle: Option<std::thread::JoinHandle<()>>,
+    state_notify: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 ) {
     let mut batch_events = Vec::with_capacity(256);
     let mut flush_notifiers = Vec::new();
@@ -385,8 +428,14 @@ fn run_appender_loop(
     'outer: loop {
         // Chaos injection hook: intentionally wedges the appender thread to simulate SQLite lock contention
         // and verify daemon degrades cleanly without blocking hook clients (test14_wedged_appender).
-        while hooks.wedged.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(10));
+        if hooks.wedged.load(Ordering::Acquire) {
+            let guard = hooks.mutex.lock().unwrap();
+            if let Ok(guard) = hooks
+                .condvar
+                .wait_while(guard, |_| hooks.wedged.load(Ordering::Acquire))
+            {
+                drop(guard);
+            }
         }
 
         // 1. Wait for the first item with timeout
@@ -412,6 +461,7 @@ fn run_appender_loop(
                         &mut last_published_reg_len,
                         &write_errors,
                         &mut stall_hook_sender,
+                        &state_notify,
                     );
                 }
                 continue;
@@ -455,6 +505,7 @@ fn run_appender_loop(
                             &mut last_published_reg_len,
                             &write_errors,
                             &mut stall_hook_sender,
+                            &state_notify,
                         );
                     }
                 }
@@ -498,6 +549,7 @@ fn run_appender_loop(
                                 &mut last_published_reg_len,
                                 &write_errors,
                                 &mut stall_hook_sender,
+                                &state_notify,
                             );
                         }
                     }
@@ -531,6 +583,7 @@ fn run_appender_loop(
                 &mut last_published_reg_len,
                 &write_errors,
                 &mut stall_hook_sender,
+                &state_notify,
             );
         }
     }
@@ -577,6 +630,7 @@ fn run_appender_loop(
             &mut last_published_reg_len,
             &write_errors,
             &mut stall_hook_sender,
+            &state_notify,
         );
     }
 
@@ -679,6 +733,7 @@ fn commit_batch(
     last_published_reg_len: &mut usize,
     write_errors: &AtomicUsize,
     stall_hook_sender: &mut Option<StallHookSender>,
+    state_notify: &Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 ) {
     if !batch_events.is_empty() {
         // SQLite write: insert all events (sampled machine/run counters logged at sample interval)
@@ -742,6 +797,12 @@ fn commit_batch(
         // Publish updated LiveState on every committed batch
         live_state.store(Arc::new(recorder.live_state().clone()));
         *last_live_publish = Instant::now();
+        {
+            let (lock, cvar) = &**state_notify;
+            let mut seq = lock.lock().unwrap();
+            *seq += 1;
+            cvar.notify_all();
+        }
 
         batch_events.clear();
     }
@@ -888,20 +949,20 @@ fi"#,
                         libc::IN_CREATE | libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO,
                     )
                 };
-                while !second_marker.exists() {
+                let cap = Instant::now() + Duration::from_secs(60);
+                while !second_marker.exists() && Instant::now() < cap {
                     let mut pfd = libc::pollfd {
                         fd: inotify_fd,
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    let rc = unsafe { libc::poll(&mut pfd, 1, 5_000) };
-                    if rc <= 0 {
-                        break;
+                    let rc = unsafe { libc::poll(&mut pfd, 1, 1_000) };
+                    if rc > 0 {
+                        let mut buf = [0u8; 1024];
+                        let _ = unsafe {
+                            libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        };
                     }
-                    let mut buf = [0u8; 1024];
-                    let _ = unsafe {
-                        libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                    };
                 }
                 if wd >= 0 {
                     unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
@@ -991,8 +1052,7 @@ fi"#,
             .unwrap();
         appender.flush();
 
-        // Sleep briefly to ensure worker had time if it were going to fire
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::yield_now();
         assert!(
             !marker.exists(),
             "historical replay stall must not fire on_stall hook"

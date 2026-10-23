@@ -8,19 +8,52 @@ use prost::Message;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tacho_core::Input;
 use tacho_ingest::otlp_server::{
-    serve_otlp, serve_otlp_with_config, OtlpServerConfig, DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+    serve_otlp_with_config, OtlpServerConfig, DEFAULT_MAX_CONCURRENT_CONNECTIONS,
 };
 
 struct TestServer {
     port: u16,
     shutdown: Arc<AtomicBool>,
-    collected: Arc<Mutex<Vec<Input>>>,
-    handle: thread::JoinHandle<()>,
+    shutdown_tx: i32,
+    collected: Arc<(Mutex<Vec<Input>>, Condvar)>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TestServer {
+    fn wait_collected(&self, min_len: usize) -> Vec<Input> {
+        let (lock, cvar) = &*self.collected;
+        let mut inputs = lock.lock().unwrap();
+        let cap = Instant::now() + Duration::from_secs(5);
+        while inputs.len() < min_len && Instant::now() < cap {
+            let (next, _) = cvar
+                .wait_timeout(inputs, Duration::from_millis(50))
+                .unwrap();
+            inputs = next;
+        }
+        inputs.clone()
+    }
+
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if self.shutdown_tx >= 0 {
+            unsafe { libc::close(self.shutdown_tx) };
+            self.shutdown_tx = -1;
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 fn start_test_server() -> TestServer {
@@ -29,30 +62,53 @@ fn start_test_server() -> TestServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
-    let collected = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let collected_clone = Arc::clone(&collected);
 
+    let mut shutdown_pipe = [0i32; 2];
+    unsafe {
+        libc::pipe2(
+            shutdown_pipe.as_mut_ptr(),
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+    }
+    let shutdown_rx = shutdown_pipe[0];
+    let shutdown_tx = shutdown_pipe[1];
+
+    let config = OtlpServerConfig {
+        shutdown_fd: Some(shutdown_rx),
+        ..Default::default()
+    };
+
     let handle = thread::spawn(move || {
-        serve_otlp(listener, shutdown_clone, move |inputs| {
-            let mut lock = collected_clone.lock().unwrap();
-            lock.extend(inputs);
-        })
-        .expect("serve_otlp");
+        let _ = serve_otlp_with_config(listener, shutdown_clone, config, move |inputs| {
+            let (lock, cvar) = &*collected_clone;
+            let mut l = lock.lock().unwrap();
+            l.extend(inputs);
+            cvar.notify_all();
+        });
+        if shutdown_rx >= 0 {
+            unsafe { libc::close(shutdown_rx) };
+        }
     });
 
-    // Small delay to ensure server loop starts
-    thread::sleep(Duration::from_millis(50));
+    let cap = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() && Instant::now() < cap {
+        thread::yield_now();
+    }
+
     TestServer {
         port,
         shutdown,
+        shutdown_tx,
         collected,
-        handle,
+        handle: Some(handle),
     }
 }
 
 #[test]
 fn test_otlp_server_json_logs() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let json_body = serde_json::json!({
         "resourceLogs": [{
@@ -88,9 +144,7 @@ fn test_otlp_server_json_logs() {
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("{}"));
 
-    // Wait briefly for inputs callback
-    thread::sleep(Duration::from_millis(50));
-    let inputs = server.collected.lock().unwrap().clone();
+    let inputs = server.wait_collected(1);
     assert_eq!(inputs.len(), 1);
     match &inputs[0] {
         Input::Prompt {
@@ -102,13 +156,12 @@ fn test_otlp_server_json_logs() {
         other => panic!("expected Prompt, got {:?}", other),
     }
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
 fn test_otlp_server_proto_logs() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let req_proto = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
@@ -175,8 +228,7 @@ fn test_otlp_server_proto_logs() {
     stream.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 200 OK"));
 
-    thread::sleep(Duration::from_millis(50));
-    let inputs = server.collected.lock().unwrap().clone();
+    let inputs = server.wait_collected(1);
     assert_eq!(inputs.len(), 1);
     match &inputs[0] {
         Input::Prompt {
@@ -188,13 +240,12 @@ fn test_otlp_server_proto_logs() {
         other => panic!("expected Prompt, got {:?}", other),
     }
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
 fn test_otlp_server_gzip() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let json_body = serde_json::json!({
         "resourceLogs": [{
@@ -232,8 +283,7 @@ fn test_otlp_server_gzip() {
     stream.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 200 OK"));
 
-    thread::sleep(Duration::from_millis(50));
-    let inputs = server.collected.lock().unwrap().clone();
+    let inputs = server.wait_collected(1);
     assert_eq!(inputs.len(), 1);
     match &inputs[0] {
         Input::Prompt { session, .. } => {
@@ -242,13 +292,12 @@ fn test_otlp_server_gzip() {
         other => panic!("expected Prompt, got {:?}", other),
     }
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
 fn test_otlp_server_chunked() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let json_body = serde_json::json!({
         "resourceLogs": [{
@@ -293,8 +342,7 @@ fn test_otlp_server_chunked() {
     stream.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 200 OK"));
 
-    thread::sleep(Duration::from_millis(50));
-    let inputs = server.collected.lock().unwrap().clone();
+    let inputs = server.wait_collected(1);
     assert_eq!(inputs.len(), 1);
     match &inputs[0] {
         Input::Prompt { session, .. } => {
@@ -303,13 +351,12 @@ fn test_otlp_server_chunked() {
         other => panic!("expected Prompt, got {:?}", other),
     }
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
 fn test_otlp_server_malformed_http() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
     stream
@@ -320,13 +367,12 @@ fn test_otlp_server_malformed_http() {
     let _ = stream.read_to_string(&mut resp);
     assert!(resp.starts_with("HTTP/1.1 400 Bad Request"));
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
 fn test_otlp_server_unknown_path() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
     stream
@@ -337,13 +383,12 @@ fn test_otlp_server_unknown_path() {
     stream.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
 fn test_otlp_server_oversized_body() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
     // 17 MiB > 16 MiB max
@@ -354,13 +399,12 @@ fn test_otlp_server_oversized_body() {
     stream.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large"));
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
 fn test_otlp_server_slow_loris_timeout() {
-    let server = start_test_server();
+    let mut server = start_test_server();
 
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
     // Send partial header and stop
@@ -368,15 +412,11 @@ fn test_otlp_server_slow_loris_timeout() {
         .write_all(b"POST /v1/logs HTTP/1.1\r\nHost: localhost\r\n")
         .unwrap();
 
-    // Wait longer than 2s timeout
-    thread::sleep(Duration::from_millis(2200));
-
     let mut resp = String::new();
     let _ = stream.read_to_string(&mut resp);
     assert!(resp.starts_with("HTTP/1.1 400 Bad Request"));
 
-    server.shutdown.store(true, Ordering::Relaxed);
-    let _ = server.handle.join();
+    server.stop();
 }
 
 #[test]
@@ -392,26 +432,47 @@ fn test_otlp_server_connection_cap_503_retry_after() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
+    let mut shutdown_pipe = [0i32; 2];
+    unsafe {
+        libc::pipe2(
+            shutdown_pipe.as_mut_ptr(),
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+    }
+    let shutdown_rx = shutdown_pipe[0];
+    let shutdown_tx = shutdown_pipe[1];
+
     let config = OtlpServerConfig {
         max_concurrent_connections: 2,
+        shutdown_fd: Some(shutdown_rx),
         ..Default::default()
     };
 
     let handle = thread::spawn(move || {
-        serve_otlp_with_config(listener, shutdown_clone, config, |_| {})
-            .expect("serve_otlp_with_config");
+        let _ = serve_otlp_with_config(listener, shutdown_clone, config, |_| {});
+        if shutdown_rx >= 0 {
+            unsafe { libc::close(shutdown_rx) };
+        }
     });
 
-    thread::sleep(Duration::from_millis(50));
+    // Connect 2 clients with HTTP keep-alive to hold both connection slots active
+    let req_keepalive = "POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}";
 
-    // Connect 2 clients and keep them active
     let mut stream1 = TcpStream::connect(("127.0.0.1", port)).expect("connect 1");
-    stream1.write_all(b"POST /v1/logs HTTP/1.1\r\n").unwrap();
+    stream1.write_all(req_keepalive.as_bytes()).unwrap();
+    let mut resp1_buf = [0u8; 128];
+    let n1 = stream1.read(&mut resp1_buf).unwrap();
+    assert!(std::str::from_utf8(&resp1_buf[..n1])
+        .unwrap()
+        .starts_with("HTTP/1.1 200 OK"));
 
     let mut stream2 = TcpStream::connect(("127.0.0.1", port)).expect("connect 2");
-    stream2.write_all(b"POST /v1/logs HTTP/1.1\r\n").unwrap();
-
-    thread::sleep(Duration::from_millis(50));
+    stream2.write_all(req_keepalive.as_bytes()).unwrap();
+    let mut resp2_buf = [0u8; 128];
+    let n2 = stream2.read(&mut resp2_buf).unwrap();
+    assert!(std::str::from_utf8(&resp2_buf[..n2])
+        .unwrap()
+        .starts_with("HTTP/1.1 200 OK"));
 
     // 3rd client exceeds capacity (max 2) -> server immediately responds 503 Retry-After: 1 and closes
     let mut stream3 = TcpStream::connect(("127.0.0.1", port)).expect("connect 3");
@@ -428,18 +489,34 @@ fn test_otlp_server_connection_cap_503_retry_after() {
 
     // Now close stream1 so active connection count drops back below 2
     drop(stream1);
-    thread::sleep(Duration::from_millis(50));
 
     // 4th client connects now that a slot is free -> should succeed
-    let mut stream4 = TcpStream::connect(("127.0.0.1", port)).expect("connect 4");
+    let cap = Instant::now() + Duration::from_secs(5);
+    let mut stream4_succeeded = false;
     let req4 = "POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
-    stream4.write_all(req4.as_bytes()).unwrap();
-
-    let mut resp4 = String::new();
-    stream4.read_to_string(&mut resp4).unwrap();
-    assert!(resp4.starts_with("HTTP/1.1 200 OK"), "got: {}", resp4);
+    while Instant::now() < cap {
+        if let Ok(mut stream4) = TcpStream::connect(("127.0.0.1", port)) {
+            if stream4.write_all(req4.as_bytes()).is_ok() {
+                let mut resp4 = String::new();
+                if stream4.read_to_string(&mut resp4).is_ok()
+                    && resp4.starts_with("HTTP/1.1 200 OK")
+                {
+                    stream4_succeeded = true;
+                    break;
+                }
+            }
+        }
+        thread::yield_now();
+    }
+    assert!(
+        stream4_succeeded,
+        "stream4 must succeed once stream1 is dropped"
+    );
 
     drop(stream2);
     shutdown.store(true, Ordering::Relaxed);
+    if shutdown_tx >= 0 {
+        unsafe { libc::close(shutdown_tx) };
+    }
     let _ = handle.join();
 }

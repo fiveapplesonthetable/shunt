@@ -4,7 +4,6 @@
 //! records positive CPU time and RSS values on agent:<agent>/run:<n>/cpu and rss tracks.
 
 use std::process::Command;
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tacho_core::{Input, SessionKey};
 use tacho_daemon::{Config, Daemon, DaemonPaths};
@@ -99,7 +98,7 @@ fn test_per_run_process_tree_sampling() {
         if sampled_cpu && sampled_rss {
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        std::thread::yield_now();
     }
 
     let _ = child.wait();

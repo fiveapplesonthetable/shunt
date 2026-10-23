@@ -12,8 +12,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tacho_core::{
     encode_snapshot_header, Encoder, FileEditKind, Input, Recorder, SessionKey, ToolInput, WaitOn,
@@ -1109,11 +1108,9 @@ fn test_system_during_builds_with_real_traced() {
     let traced_child = traced_cmd.spawn().expect("failed to start traced");
 
     // Wait for sockets
-    for _ in 0..20 {
-        if consumer_sock.exists() && producer_sock.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
+    let cap = Instant::now() + Duration::from_secs(5);
+    while (!consumer_sock.exists() || !producer_sock.exists()) && Instant::now() < cap {
+        std::thread::yield_now();
     }
 
     // 2. Start unprivileged traced_probes
@@ -1142,9 +1139,6 @@ fn test_system_during_builds_with_real_traced() {
     perfetto
         .start(tacho_system::Profile::Default)
         .expect("start session");
-
-    // Wait 250ms for initial process scan
-    thread::sleep(Duration::from_millis(300));
 
     // 4. Spawn a real busy child process whose CPU and memory will be attributed
     let (start_wall_ns, start_boot_ns) = get_paired_clocks();
@@ -1210,9 +1204,6 @@ fn test_system_during_builds_with_real_traced() {
         end_wall_ns,
         &mut events,
     );
-
-    // Sleep a moment to ensure system stats poller catches the exit/RSS
-    thread::sleep(Duration::from_millis(350));
 
     // 6. Clone system trace
     let sys_trace_path = temp_dir.path().join("system.pftrace");

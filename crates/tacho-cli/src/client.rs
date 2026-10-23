@@ -14,7 +14,6 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::paths::{ensure_dir_0700, resolve_home, resolve_runtime};
@@ -65,7 +64,7 @@ impl DaemonClient {
     }
 
     /// Connects to `api.sock`. If the daemon is not running, launches it detached
-    /// and waits with exponential backoff up to a 3-second deadline.
+    /// and waits for kernel inotify event or process exit.
     pub fn connect_api(&self) -> io::Result<UnixStream> {
         let sock = self.api_sock();
 
@@ -75,24 +74,81 @@ impl DaemonClient {
         }
 
         // 2. Daemon not responding; spawn it detached
-        self.spawn_daemon_detached()?;
+        let mut spawned_child = self.spawn_daemon_detached()?;
 
-        // 3. Retry connection with exponential backoff up to 2s
-        let deadline = Instant::now() + Duration::from_millis(2000);
-        let mut delay = Duration::from_millis(10);
+        // 3. Wait on kernel inotify event for api.sock to appear and accept connections
+        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        let mut watched = false;
+        let mut wd = -1;
+        if inotify_fd >= 0 {
+            if let Ok(path_c) =
+                std::ffi::CString::new(self.runtime_dir.to_str().unwrap_or_default())
+            {
+                wd = unsafe {
+                    libc::inotify_add_watch(
+                        inotify_fd,
+                        path_c.as_ptr(),
+                        libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB,
+                    )
+                };
+                watched = wd >= 0;
+            }
+        }
 
-        while Instant::now() < deadline {
-            thread::sleep(delay);
+        let cap = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < cap {
             if let Ok(stream) = UnixStream::connect(&sock) {
+                if watched {
+                    unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+                }
+                if inotify_fd >= 0 {
+                    unsafe { libc::close(inotify_fd) };
+                }
                 return Ok(stream);
             }
-            delay = (delay * 2).min(Duration::from_millis(150));
+
+            if let Some(ref mut child) = spawned_child {
+                if let Ok(Some(status)) = child.try_wait() {
+                    if watched {
+                        unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+                    }
+                    if inotify_fd >= 0 {
+                        unsafe { libc::close(inotify_fd) };
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("tachograph daemon process exited prematurely with {status}"),
+                    ));
+                }
+            }
+
+            if watched {
+                let mut pfd = libc::pollfd {
+                    fd: inotify_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let _ = unsafe { libc::poll(&mut pfd, 1, 250) };
+                let mut buf = [0u8; 1024];
+                let _ = unsafe {
+                    libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        if watched {
+            unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+        }
+        if inotify_fd >= 0 {
+            unsafe { libc::close(inotify_fd) };
         }
 
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "tachograph daemon failed to start and respond at {:?} within 2s",
+                "tachograph daemon failed to start and respond at {:?}",
                 sock
             ),
         ))
@@ -107,7 +163,7 @@ impl DaemonClient {
     /// Spawns `tacho daemon` in the background detached (`setsid`, stdio to `daemon.log`),
     /// returning immediately without waiting for initialization.
     /// Guarded by an O_EXCL/flock spawn lock in TACHO_RUNTIME and daemon.lock check.
-    pub fn spawn_daemon_detached(&self) -> io::Result<()> {
+    pub fn spawn_daemon_detached(&self) -> io::Result<Option<std::process::Child>> {
         ensure_dir_0700(&self.home_dir)?;
         ensure_dir_0700(&self.runtime_dir)?;
 
@@ -125,7 +181,7 @@ impl DaemonClient {
             unsafe { libc::flock(spawn_lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if lock_res != 0 {
             // Another process is already spawning the daemon
-            return Ok(());
+            return Ok(None);
         }
 
         // 2. Check if daemon is already running (holding daemon.lock)
@@ -140,7 +196,7 @@ impl DaemonClient {
                     unsafe { libc::flock(d_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if d_res != 0 {
                     // Daemon is already running (holding daemon.lock)
-                    return Ok(());
+                    return Ok(None);
                 }
                 let _ = unsafe { libc::flock(d_file.as_raw_fd(), libc::LOCK_UN) };
             }
@@ -148,7 +204,7 @@ impl DaemonClient {
 
         // 3. Check if api.sock is already responding
         if self.try_connect_api_fast().is_ok() {
-            return Ok(());
+            return Ok(None);
         }
 
         let log_file = OpenOptions::new()
@@ -159,7 +215,21 @@ impl DaemonClient {
 
         let exe = env::var_os("TACHO_BIN")
             .map(PathBuf::from)
-            .unwrap_or_else(|| env::current_exe().unwrap_or_default());
+            .unwrap_or_else(|| {
+                // If running within cargo test / cargo run, find `tacho` in target dir or PATH.
+                // Never execute the test harness binary itself!
+                if let Ok(cur) = env::current_exe() {
+                    let mut dir = cur.parent();
+                    while let Some(d) = dir {
+                        let candidate = d.join("tacho");
+                        if candidate.is_file() {
+                            return candidate;
+                        }
+                        dir = d.parent();
+                    }
+                }
+                PathBuf::from("tacho")
+            });
         let mut cmd = Command::new(exe);
         cmd.arg("daemon")
             .env("TACHO_HOME", &self.home_dir)
@@ -176,8 +246,8 @@ impl DaemonClient {
             });
         }
 
-        cmd.spawn()?;
-        Ok(())
+        let child = cmd.spawn()?;
+        Ok(Some(child))
     }
 
     /// Sends a single NDJSON request to `api.sock` and reads a single JSON response.

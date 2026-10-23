@@ -68,6 +68,8 @@ pub struct DecisionState {
     pub last_watchdog_alert_ts: Option<i64>,
     #[serde(default)]
     pub tidy_min_age_secs: i64,
+    #[serde(default)]
+    pub inbox: BTreeMap<String, Vec<String>>,
 }
 
 /// Observation of a finished batch check on the current tick.
@@ -114,6 +116,8 @@ pub struct BurnerProcess {
     pub pid: u32,
     pub comm: String,
     pub elapsed_secs: i64,
+    #[serde(default)]
+    pub starttime: Option<u64>,
 }
 
 /// Pure resolution of a completed batch run.
@@ -532,6 +536,18 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         }
     }
 
+    let mut tell_actions = Vec::new();
+    for (agent_key, msgs) in &state.inbox {
+        if obs.live_keys.contains(agent_key) {
+            for msg in msgs {
+                tell_actions.push((agent_key.clone(), msg.clone()));
+            }
+        }
+    }
+    for (k, _) in &tell_actions {
+        next.inbox.remove(k);
+    }
+
     DecisionPlan {
         reaped_agents,
         supervision_actions,
@@ -550,7 +566,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         watchdog_alert,
         next_state: next,
         burner_kills,
-        tell_actions: Vec::new(),
+        tell_actions,
     }
 }
 

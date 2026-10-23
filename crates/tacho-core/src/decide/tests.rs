@@ -339,6 +339,8 @@ fn test_pr_preflight_refusals_and_proof_validation() {
             ok: true,
             duration_ms: 42,
             output_tail: "ok".to_string(),
+            area: Some("workspace".to_string()),
+            units: vec!["all".to_string()],
         }],
         screenshots: Vec::new(),
     };

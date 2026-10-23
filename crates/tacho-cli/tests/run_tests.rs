@@ -45,7 +45,10 @@ impl Drop for TestSandbox {
                 if pid > 0 {
                     unsafe {
                         let _ = libc::kill(pid, libc::SIGTERM);
-                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        let cap = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        while libc::kill(pid, 0) == 0 && std::time::Instant::now() < cap {
+                            std::thread::yield_now();
+                        }
                         let _ = libc::kill(pid, libc::SIGKILL);
                     }
                 }

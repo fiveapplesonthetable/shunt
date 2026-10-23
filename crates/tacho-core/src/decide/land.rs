@@ -88,17 +88,15 @@ pub fn still_ready(
     if pr.head != record.sha {
         return false;
     }
-    if let Some(b) = batch {
-        if b.status != "passed" {
-            return false;
-        }
+    let Some(b) = batch else {
+        return false;
+    };
+    if b.status != "passed" {
+        return false;
     }
     if current_main == record.main_sha {
         return true;
     }
-    let Some(b) = batch else {
-        return false;
-    };
     let Some(pos) = b.prs.iter().position(|&n| n == pr.number) else {
         return false;
     };

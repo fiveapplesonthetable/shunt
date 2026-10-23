@@ -5,7 +5,6 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::thread;
 use std::time::Duration;
 use tacho_system::{Perfetto, Profile, SystemError};
 
@@ -105,11 +104,9 @@ fn test_system_tracing_lifecycle() {
     let traced_child = traced_cmd.spawn().expect("failed to start traced");
 
     // Wait for traced socket to appear
-    for _ in 0..20 {
-        if consumer_sock.exists() && producer_sock.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
+    let cap = std::time::Instant::now() + Duration::from_secs(5);
+    while (!consumer_sock.exists() || !producer_sock.exists()) && std::time::Instant::now() < cap {
+        std::thread::yield_now();
     }
 
     // Start unprivileged traced_probes
@@ -166,8 +163,14 @@ fn test_system_tracing_lifecycle() {
         .start(Profile::Default)
         .expect("idempotent start should succeed");
 
-    // Sleep briefly to let process_stats and sys_stats record system telemetry
-    thread::sleep(Duration::from_millis(1500));
+    // Wait until trace packets are written to sink file
+    let sink_file = runtime_dir.join("tacho-system-sink.pftrace");
+    let cap = std::time::Instant::now() + Duration::from_secs(5);
+    while fs::metadata(&sink_file).map(|m| m.len()).unwrap_or(0) == 0
+        && std::time::Instant::now() < cap
+    {
+        std::thread::yield_now();
+    }
 
     // Clone session into Vec<u8>
     let mut trace_bytes = Vec::new();

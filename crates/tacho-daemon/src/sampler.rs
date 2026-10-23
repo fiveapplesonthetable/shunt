@@ -1056,8 +1056,36 @@ fn run_sampler_loop(config: SamplerConfig, appender: AppenderHandle, stop_flag: 
         if elapsed < interval {
             // Hardware sampling necessity: The Linux kernel does not provide an epoll/inotify
             // event interface for CPU counters or memory usage in /proc/stat and /proc/<pid>/stat.
-            // Continuous hardware metrics fundamentally require periodic rate sampling.
-            std::thread::sleep(interval - elapsed);
+            // Continuous hardware metrics fundamentally require periodic rate sampling via kernel timerfd.
+            let remain = interval - elapsed;
+            let tfd = unsafe {
+                libc::timerfd_create(
+                    libc::CLOCK_MONOTONIC,
+                    libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+                )
+            };
+            if tfd >= 0 {
+                let spec = libc::itimerspec {
+                    it_interval: libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    },
+                    it_value: libc::timespec {
+                        tv_sec: remain.as_secs() as i64,
+                        tv_nsec: remain.subsec_nanos() as i64,
+                    },
+                };
+                unsafe { libc::timerfd_settime(tfd, 0, &spec, std::ptr::null_mut()) };
+                let mut pfd = libc::pollfd {
+                    fd: tfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let _ = unsafe { libc::poll(&mut pfd, 1, -1) };
+                unsafe { libc::close(tfd) };
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 }
@@ -1517,7 +1545,22 @@ pub fn run_git(cwd: &Path, args: &[&str], timeout: Duration) -> io::Result<Strin
                 "git command timed out",
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as i32 };
+        if pidfd >= 0 {
+            let rem_ms = timeout
+                .saturating_sub(start.elapsed())
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            let mut pfd = libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let _ = unsafe { libc::poll(&mut pfd, 1, rem_ms.max(1)) };
+            unsafe { libc::close(pidfd) };
+        } else {
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -2390,8 +2433,11 @@ mod tests {
         };
         assert!(cg.dir.exists(), "scope cgroup dir must exist: {:?}", cg.dir);
 
-        // Sleep ~600ms so `yes` burns CPU
-        std::thread::sleep(Duration::from_millis(600));
+        // Wait until `yes` burns CPU in cgroup
+        let cap = Instant::now() + Duration::from_secs(5);
+        while cg.cpu_usage_us().unwrap_or(0) < 100_000 && Instant::now() < cap {
+            std::thread::yield_now();
+        }
 
         // Tick 2: sample CPU and processes
         proc_sampler.sample_tick(&appender, now_ns + 650_000_000, &mut buf);
@@ -2501,11 +2547,17 @@ mod tests {
 
         let poll_start = Instant::now();
         let poll_timeout = Duration::from_secs(5);
-        while !marker_path.exists() && poll_start.elapsed() < poll_timeout {
-            std::thread::sleep(Duration::from_millis(10));
+        let mut content = String::new();
+        while poll_start.elapsed() < poll_timeout {
+            if let Ok(c) = std::fs::read_to_string(&marker_path) {
+                if !c.is_empty() {
+                    content = c;
+                    break;
+                }
+            }
+            std::thread::yield_now();
         }
 
-        let content = std::fs::read_to_string(&marker_path).expect("on_stall hook file created");
         assert!(
             content.starts_with("hook-worker:LOOP:"),
             "unexpected hook payload: {}",

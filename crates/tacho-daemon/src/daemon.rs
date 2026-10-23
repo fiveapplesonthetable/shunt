@@ -29,6 +29,7 @@ pub struct Daemon {
     retention_wake_tx: Option<crossbeam_channel::Sender<()>>,
     signal_handle: Option<signal_hook::iterator::Handle>,
     otlp_thread: Option<JoinHandle<()>>,
+    otlp_shutdown_fds: Option<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
     sampler_thread: Option<JoinHandle<()>>,
     retention_thread: Option<JoinHandle<()>>,
     appender_thread: Option<JoinHandle<()>>,
@@ -106,10 +107,20 @@ impl Daemon {
             spawn_signal_handler(shutdown_flag.clone(), paths.clone(), appender.clone());
 
         // 8. Optional OTLP HTTP receiver (design section 1 and 8)
-        let otlp_thread = if let Some(ref addr_str) = config.otlp_addr {
+        let (otlp_thread, otlp_shutdown_fds) = if let Some(ref addr_str) = config.otlp_addr {
             let listener = std::net::TcpListener::bind(addr_str)?;
             let shutdown_clone = shutdown_flag.clone();
             let appender_clone = appender.clone();
+            let mut fds = [0i32; 2];
+            unsafe {
+                libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK);
+            }
+            let otlp_rx = fds[0];
+            let otlp_tx = fds[1];
+            let otlp_cfg = tacho_ingest::otlp_server::OtlpServerConfig {
+                shutdown_fd: Some(otlp_rx),
+                ..Default::default()
+            };
             let handle = std::thread::Builder::new()
                 .name("tacho-otlp".to_string())
                 .spawn(move || {
@@ -122,13 +133,20 @@ impl Daemon {
                             inputs.into_iter().map(|inp| (inp, now_ns)).collect();
                         let _ = appender_clone.send_input_batch(batch);
                     };
-                    let _ =
-                        tacho_ingest::otlp_server::serve_otlp(listener, shutdown_clone, on_inputs);
+                    let _ = tacho_ingest::otlp_server::serve_otlp_with_config(
+                        listener,
+                        shutdown_clone,
+                        otlp_cfg,
+                        on_inputs,
+                    );
+                    if otlp_rx >= 0 {
+                        unsafe { libc::close(otlp_rx) };
+                    }
                 })
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            Some(handle)
+            (Some(handle), Some((otlp_rx, otlp_tx)))
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -140,6 +158,7 @@ impl Daemon {
             retention_wake_tx: Some(retention_wake_tx),
             signal_handle,
             otlp_thread,
+            otlp_shutdown_fds,
             sampler_thread: Some(sampler_thread),
             retention_thread: Some(retention_thread),
             appender_thread: Some(appender_thread),
@@ -182,6 +201,11 @@ impl Daemon {
             let _ = write_snapshot(&self.paths.events_db(), None, None, &mut f);
         }
 
+        if let Some((_rx, tx)) = self.otlp_shutdown_fds.take() {
+            if tx >= 0 {
+                unsafe { libc::close(tx) };
+            }
+        }
         if let Some(t) = self.otlp_thread.take() {
             let _ = t.join();
         }
@@ -240,6 +264,10 @@ fn spawn_retention_thread(
                     .as_nanos() as u64;
 
                 let cutoff_ns = now_ns.saturating_sub(retention_ns);
+                let cutoff_secs = (cutoff_ns / 1_000_000_000) as i64;
+                if let Ok(mut store) = crate::fleet::FleetStore::open(&paths.events_db()) {
+                    let _ = store.prune_decision_ticks_older_than(cutoff_secs);
+                }
 
                 if let Ok(mut log) = EventLog::open(&paths.events_db()) {
                     // Small-batch pruning: 1000 rows per batch, yielding between transactions

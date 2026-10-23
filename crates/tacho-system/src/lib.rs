@@ -11,7 +11,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::Duration;
 
 /// Shipped default tracing profile config (process stats and sys stats, no root required).
@@ -304,14 +303,56 @@ impl Perfetto {
             }
         }
 
-        // Wait up to 2 seconds for session to appear in traced service state.
-        // Perfetto traced protocol necessity: `traced` manages session states over Unix domain
-        // socket IPC without exposing an inotify/eventfd mechanism; query-raw sampling is required.
-        for _ in 0..20 {
-            thread::sleep(Duration::from_millis(100));
+        // Check immediately if session is already reported by traced
+        if self.status()?.is_some() {
+            return Ok(());
+        }
+
+        // Wait on inotify events in runtime_dir (watching sink_file or pid_file creation/writes)
+        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        let mut watched = false;
+        let mut wd = -1;
+        if inotify_fd >= 0 {
+            if let Ok(path_c) = std::ffi::CString::new(runtime_dir.to_str().unwrap_or_default()) {
+                wd = unsafe {
+                    libc::inotify_add_watch(
+                        inotify_fd,
+                        path_c.as_ptr(),
+                        libc::IN_CREATE | libc::IN_MODIFY | libc::IN_ATTRIB,
+                    )
+                };
+                watched = wd >= 0;
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        while start.elapsed() < timeout {
             if self.status()?.is_some() {
                 break;
             }
+            if watched {
+                let mut pfd = libc::pollfd {
+                    fd: inotify_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rem_ms = timeout.saturating_sub(start.elapsed()).as_millis().min(250) as i32;
+                let _ = unsafe { libc::poll(&mut pfd, 1, rem_ms.max(10)) };
+                let mut buf = [0u8; 1024];
+                let _ = unsafe {
+                    libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        if watched {
+            unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+        }
+        if inotify_fd >= 0 {
+            unsafe { libc::close(inotify_fd) };
         }
 
         Ok(())

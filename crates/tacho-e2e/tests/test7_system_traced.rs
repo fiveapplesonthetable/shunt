@@ -82,9 +82,6 @@ fn test_system_tracing_with_traced() {
     let start_status = start_cmd.status().expect("tacho system start failed");
     assert!(start_status.success(), "tacho system start returned error");
 
-    // Wait for traced initial probe scan
-    std::thread::sleep(Duration::from_millis(300));
-
     // 4. Record agent slices via tacho emit
     let emit_out = env
         .tacho_cmd()
@@ -100,7 +97,7 @@ fn test_system_tracing_with_traced() {
         .unwrap();
     assert!(emit_out2.status.success());
 
-    std::thread::sleep(Duration::from_millis(150));
+    env.flush();
 
     // 5. Run tacho trace --system
     let sys_trace_path = env.home_dir.join("trace/system.perfetto-trace");

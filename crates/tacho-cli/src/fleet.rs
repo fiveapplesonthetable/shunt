@@ -99,6 +99,15 @@ fn pid_alive(pid: u32) -> bool {
     true
 }
 
+pub fn proc_pid_starttime(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let content = fs::read_to_string(&stat_path).ok()?;
+    let rparen = content.rfind(')')?;
+    let rest = &content[rparen + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(19).and_then(|s| s.parse::<u64>().ok())
+}
+
 /// Verify that a PID on the system actually belongs to the agent before signalling.
 ///
 /// Prevents signalling or killing a reused PID if the agent process previously exited
@@ -113,65 +122,52 @@ pub(crate) fn verify_agent_pid(
         return false;
     }
 
-    // 1. Check starttime from /proc/<pid>/stat if recorded
-    let stat_path = format!("/proc/{pid}/stat");
-    if let Ok(content) = fs::read_to_string(&stat_path) {
-        if let Some(rparen) = content.rfind(')') {
-            let rest = &content[rparen + 2..];
-            let fields: Vec<&str> = rest.split_whitespace().collect();
-            // Field 22 is index 19 in fields (since field 3 'state' is index 0)
-            if let Some(st_str) = fields.get(19) {
-                if let Ok(st) = st_str.parse::<u64>() {
-                    if let Some(expected_st) = recorded_starttime {
-                        if st != expected_st {
-                            eprintln!(
-                                "[tacho-safety] PID {pid} starttime ({st}) does not match recorded ({expected_st}); refusing signal to reused PID"
-                            );
-                            return false;
-                        }
-                    }
-                }
-            }
+    let actual_st = proc_pid_starttime(pid);
+    if actual_st.is_none() {
+        // If /proc/<pid>/stat cannot be read, the process is unverified or dead. Refuse!
+        return false;
+    }
+
+    // 1. If starttime was recorded, it MUST match the running process's starttime!
+    if let Some(expected_st) = recorded_starttime {
+        if actual_st != Some(expected_st) {
+            eprintln!(
+                "[tacho-safety] PID {pid} starttime ({:?}) does not match recorded ({expected_st}); refusing signal to reused PID",
+                actual_st
+            );
+            return false;
         }
-    } else {
         return true;
     }
 
-    // 2. Check cgroup, cmdline, or environment for agent attribution
+    // 2. Check cgroup for agent attribution
     let cgroup_path = format!("/proc/{pid}/cgroup");
     if let Ok(cg) = fs::read_to_string(&cgroup_path) {
-        if cg.contains(agent_key) || cg.contains("tachograph") {
+        if cg.contains(agent_key) || session_id.map(|s| cg.contains(s)).unwrap_or(false) {
             return true;
         }
     }
 
-    let cmdline_path = format!("/proc/{pid}/cmdline");
-    if let Ok(cmd) = fs::read(&cmdline_path) {
-        let cmd_str = String::from_utf8_lossy(&cmd);
-        if cmd_str.contains(agent_key)
-            || session_id.map(|s| cmd_str.contains(s)).unwrap_or(false)
-            || cmd_str.contains("claude")
-            || cmd_str.contains("gemini")
-            || cmd_str.contains("codex")
-            || cmd_str.contains("tacho")
-        {
-            return true;
-        }
-    }
-
+    // 3. Check environment for agent attribution
     let env_path = format!("/proc/{pid}/environ");
     if let Ok(env_bytes) = fs::read(&env_path) {
         let env_str = String::from_utf8_lossy(&env_bytes);
-        if env_str.contains(agent_key)
+        if env_str.contains(&format!("TACHO_AGENT={agent_key}"))
+            || env_str.contains(&format!("TACHO_TASK={agent_key}"))
+            || env_str.contains(&format!("TACHO_JOB_NAME={agent_key}"))
             || session_id.map(|s| env_str.contains(s)).unwrap_or(false)
-            || env_str.contains("TACHO_AGENT")
         {
             return true;
         }
     }
 
-    if recorded_starttime.is_some() {
-        return true;
+    // 4. Check cmdline for exact agent/session attribution (do not match broad substrings)
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    if let Ok(cmd) = fs::read(&cmdline_path) {
+        let cmd_str = String::from_utf8_lossy(&cmd);
+        if cmd_str.contains(agent_key) || session_id.map(|s| cmd_str.contains(s)).unwrap_or(false) {
+            return true;
+        }
     }
 
     eprintln!(
@@ -447,6 +443,7 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
     let pid = child.id();
     let now = now_secs();
     let base_pr = item.base.as_deref().and_then(|s| s.parse::<u64>().ok());
+    let starttime = proc_pid_starttime(pid);
 
     let run = AgentRun {
         key: item.key.clone(),
@@ -469,6 +466,8 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
         effort: choice.effort.clone(),
         session_id: None,
         compare: item.compare.clone(),
+        starttime,
+        cgroup: None,
     };
 
     let because = format!(
@@ -1833,26 +1832,60 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 /// Executes `tacho replay <batch-id>`.
 pub fn execute_replay(args: ReplayArgs) -> io::Result<()> {
     let store = open_fleet_store()?;
-    // If a tick ID is supplied or no batch_id supplied, replay decision tick deterministically from logged inputs!
-    let tick_data = if let Ok(tick_id) = args.batch_id.parse::<i64>() {
-        store.load_decision_tick(tick_id).ok()
+    let state = store.load()?;
+
+    // 1. Check if args.batch_id refers to a recorded batch
+    if let Some(b) = state.batches.iter().find(|b| b.id == args.batch_id) {
+        println!(
+            "Replaying batch {} (PRs {:?} on main {})",
+            b.id, b.prs, b.main_sha
+        );
+        if !b.log.is_empty() {
+            println!("--- Recorded Log ---\n{}", b.log);
+        }
+        return execute_batch(BatchArgs {
+            prs: b.prs.clone(),
+            cmd: args.cmd,
+            mode: None,
+            timeout: None,
+            dry_run: args.dry_run,
+        });
+    }
+
+    // 2. Check if args.batch_id refers to a decision tick (e.g. "tick:<id>", numeric tick ts, or "latest" / "tick")
+    let is_tick_request =
+        args.batch_id.starts_with("tick:") || args.batch_id == "tick" || args.batch_id == "latest";
+
+    let tick_data = if is_tick_request {
+        if let Some(rest) = args.batch_id.strip_prefix("tick:") {
+            if let Ok(ts) = rest.parse::<i64>() {
+                store.load_decision_tick(ts).ok()
+            } else {
+                None
+            }
+        } else {
+            store
+                .load_latest_decision_tick()
+                .ok()
+                .flatten()
+                .map(|(_, s, o, p)| (s, o, p))
+        }
+    } else if let Ok(ts) = args.batch_id.parse::<i64>() {
+        // Numeric id that wasn't a batch: try loading as tick ts
+        store.load_decision_tick(ts).ok()
     } else {
         None
     };
 
-    if let Some((logged_state, logged_obs, logged_plan)) = tick_data.or_else(|| {
-        store
-            .load_latest_decision_tick()
-            .ok()
-            .flatten()
-            .map(|(_, s, o, p)| (s, o, p))
-    }) {
+    if let Some((logged_state, logged_obs, logged_plan)) = tick_data {
         println!("Replaying pure decision evaluation from recorded tick inputs...");
         let replayed_plan = decide(&logged_state, &logged_obs);
-        assert_eq!(
-            replayed_plan, logged_plan,
-            "Replayed decisions diverged from recorded decision plan!"
-        );
+        if replayed_plan != logged_plan {
+            return Err(io::Error::other(format!(
+                "Replayed decisions diverged from recorded decision plan!\nExpected: {:?}\nReplayed: {:?}",
+                logged_plan, replayed_plan
+            )));
+        }
         println!("Deterministic decision replay VERIFIED: exact 1:1 match with recorded plan.");
         println!(
             "Dispatched: {} tasks, Resumed: {} tasks, Reaped: {} agents, Batch resolutions: {}",
@@ -1864,27 +1897,10 @@ pub fn execute_replay(args: ReplayArgs) -> io::Result<()> {
         return Ok(());
     }
 
-    let state = store.load()?;
-    let Some(b) = state.batches.iter().find(|b| b.id == args.batch_id) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("batch or decision tick '{}' not found", args.batch_id),
-        ));
-    };
-    println!(
-        "Replaying batch {} (PRs {:?} on main {})",
-        b.id, b.prs, b.main_sha
-    );
-    if !b.log.is_empty() {
-        println!("--- Recorded Log ---\n{}", b.log);
-    }
-    execute_batch(BatchArgs {
-        prs: b.prs.clone(),
-        cmd: args.cmd,
-        mode: None,
-        timeout: None,
-        dry_run: args.dry_run,
-    })
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("batch or decision tick '{}' not found", args.batch_id),
+    ))
 }
 
 /// Executes `tacho queue`.
@@ -2042,18 +2058,49 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
             ));
         }
 
+        struct ScratchWorktreeGuard<'a> {
+            scratch_path: PathBuf,
+            cwd: &'a Path,
+            removed: bool,
+        }
+
+        impl<'a> ScratchWorktreeGuard<'a> {
+            fn new(scratch_path: PathBuf, cwd: &'a Path) -> Self {
+                Self {
+                    scratch_path,
+                    cwd,
+                    removed: false,
+                }
+            }
+
+            fn remove(&mut self) {
+                if !self.removed {
+                    self.removed = true;
+                    let _ = Command::new("git")
+                        .args([
+                            "worktree",
+                            "remove",
+                            "--force",
+                            self.scratch_path.to_str().unwrap_or(""),
+                        ])
+                        .current_dir(self.cwd)
+                        .output();
+                }
+            }
+        }
+
+        impl<'a> Drop for ScratchWorktreeGuard<'a> {
+            fn drop(&mut self) {
+                self.remove();
+            }
+        }
+
+        let mut guard = ScratchWorktreeGuard::new(scratch_path.to_path_buf(), &cwd);
+
         // Merge each PR head into scratch worktree
         for &pr_num in slice {
             let Some(pr) = state.open_prs_cache.iter().find(|p| p.number == pr_num) else {
-                let _ = Command::new("git")
-                    .args([
-                        "worktree",
-                        "remove",
-                        "--force",
-                        scratch_path.to_str().unwrap(),
-                    ])
-                    .current_dir(&cwd)
-                    .output();
+                guard.remove();
                 return Err(format!("PR #{pr_num} not found in open PR cache"));
             };
             let merge_out = Command::new("git")
@@ -2062,15 +2109,7 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
                 .output()
                 .map_err(|e| e.to_string())?;
             if !merge_out.status.success() {
-                let _ = Command::new("git")
-                    .args([
-                        "worktree",
-                        "remove",
-                        "--force",
-                        scratch_path.to_str().unwrap(),
-                    ])
-                    .current_dir(&cwd)
-                    .output();
+                guard.remove();
                 return Err(format!(
                     "Merge conflict merging PR #{pr_num} ({}) onto train: {}",
                     pr.head,
@@ -2087,15 +2126,7 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
             .output()
             .map_err(|e| e.to_string())?;
 
-        let _ = Command::new("git")
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                scratch_path.to_str().unwrap(),
-            ])
-            .current_dir(&cwd)
-            .output();
+        guard.remove();
 
         if !out.status.success() {
             let err_txt = format!(
@@ -2807,18 +2838,22 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         last_tick_ts: state.last_tick_ts,
         last_watchdog_alert_ts: state.last_watchdog_alert_ts,
         tidy_min_age_secs: 3_600,
+        inbox: state.inbox.clone(),
     };
 
     let mut batch_outcomes = Vec::new();
+    let prev_tick_ts = state.last_tick_ts.unwrap_or(0);
     for b in &state.batches {
-        if b.status == "passed" || b.status == "failed" || b.status == "flake" {
-            batch_outcomes.push(BatchOutcomeObs {
-                batch_id: b.id.clone(),
-                passed: b.status == "passed",
-                failed_area: b.areas.first().cloned(),
-                log_output: b.log.clone(),
-                tree_sha: b.tree.clone().unwrap_or_default(),
-            });
+        if let Some(finished_ts) = b.finished_at {
+            if finished_ts > prev_tick_ts && (b.status == "passed" || b.status == "failed") {
+                batch_outcomes.push(BatchOutcomeObs {
+                    batch_id: b.id.clone(),
+                    passed: b.status == "passed",
+                    failed_area: b.areas.first().cloned(),
+                    log_output: b.log.clone(),
+                    tree_sha: b.tree.clone().unwrap_or_default(),
+                });
+            }
         }
     }
 
@@ -2828,6 +2863,7 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
             pid: b.pid,
             comm: b.comm,
             elapsed_secs: b.elapsed_secs,
+            starttime: proc_pid_starttime(b.pid),
         });
     }
 
@@ -2854,7 +2890,11 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
     let plan = decide(&decision_state, &world_obs);
 
     // Record decision tick inputs and output plan for deterministic replay
-    let _ = store.record_decision_tick(now, &decision_state, &world_obs, &plan);
+    if !args.dry_run {
+        if let Err(e) = store.record_decision_tick(now, &decision_state, &world_obs, &plan) {
+            eprintln!("[tacho-fleet] failed to record decision tick: {e}");
+        }
+    }
 
     // 4. Execute side-effects prescribed by `plan`
     for b in &plan.burner_kills {
@@ -2863,37 +2903,29 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
             b.pid, b.comm, b.elapsed_secs
         );
         if !args.dry_run {
-            if verify_agent_pid(b.pid, &b.comm, None, None) || b.elapsed_secs >= 600 {
+            let actual_st = proc_pid_starttime(b.pid);
+            if actual_st.is_some() && (b.starttime.is_none() || actual_st == b.starttime) {
                 unsafe {
                     let _ = libc::kill(b.pid as i32, libc::SIGKILL);
                 }
+                let _ = store.record_decision("watch", "kill_burner", &b.pid.to_string(), &because);
+                emit_decision_event("system", "watch:kill_burner", &because);
+            } else {
+                eprintln!(
+                    "[tacho-safety] burner PID {} starttime mismatch; refusing kill",
+                    b.pid
+                );
             }
-            let _ = store.record_decision("watch", "kill_burner", &b.pid.to_string(), &because);
-            emit_decision_event("system", "watch:kill_burner", &because);
         }
         println!("{because}");
     }
 
-    for t in &plan.tidy_decisions {
-        if let TidyDecision::RemoveTree {
-            path,
-            rescue,
-            because,
-        } = t
-        {
-            if !args.dry_run {
-                if *rescue {
-                    let _ = Command::new("git").args(["-C", path, "stash"]).status();
-                }
-                let _ = Command::new("git")
-                    .args(["worktree", "remove", "--force", path])
-                    .status();
-                let _ = store.mutate(Some(("watch", "remove_worktree", path, because)), |st| {
-                    st.worktrees.retain(|_, w| &w.path != path);
-                });
-                let _ = store.record_decision("watch", "remove_worktree", path, because);
-            }
-            println!("Tidy remove worktree: {path} ({because})");
+    for (agent_key, msg) in &plan.tell_actions {
+        if !args.dry_run {
+            let _ = execute_tell(TellArgs {
+                key: agent_key.clone(),
+                message: msg.clone(),
+            });
         }
     }
 

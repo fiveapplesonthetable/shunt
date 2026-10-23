@@ -386,7 +386,7 @@ edition = "2021"
         );
     }
     // Allow initial sampler tick to record baseline process tree and worktree state
-    std::thread::sleep(Duration::from_millis(250));
+    env.flush();
 
     // Transition core tasks to InProgress now that workers have started
     for t_slug in ["auth-task", "db-task", "api-task", "rogue-task"] {
@@ -454,7 +454,6 @@ edition = "2021"
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn tacho watch");
-    std::thread::sleep(Duration::from_millis(100));
 
     // 7. worker-db runs `git rebase feat/auth-base` which fails with conflict,
     // and loops 4x with identical command + failure -> triggers LOOP and FAILING!
@@ -485,11 +484,11 @@ edition = "2021"
                 },
             }),
         );
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::yield_now();
     }
 
     // 8. supervisor watch catches worker-db's stall and terminates cleanly
-    let watch_exited = env.wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
+    let watch_exited = env.wait_until(Duration::from_secs(10), Duration::from_millis(10), || {
         watch_child.try_wait().unwrap().is_some()
     });
     assert!(
@@ -1155,7 +1154,7 @@ edition = "2021"
     );
 
     // Let sampler record worker-flaky's live process tree before SIGKILL
-    std::thread::sleep(Duration::from_millis(250));
+    env.flush();
 
     // Kill the worker-flaky process with SIGKILL (simulating process crash / OOM killer)
     let _ = flaky_proc.kill();
@@ -1165,7 +1164,7 @@ edition = "2021"
     assert!(!TestEnv::is_pid_alive(flaky_pid));
 
     // Wait for sampler / tick
-    std::thread::sleep(Duration::from_millis(350));
+    env.flush();
 
     // worker-rescue takes over the task and finishes the branch
     let rescue_proc = spawn_worker_tree("worker-rescue", "cargo-test");

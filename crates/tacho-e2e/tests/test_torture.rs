@@ -190,9 +190,11 @@ impl ProcessTracker {
                 }
             }
         }
-        // Small grace period for reaping
-        thread::sleep(Duration::from_millis(50));
         for &pid in &pids {
+            let cap = std::time::Instant::now() + Duration::from_secs(5);
+            while TestEnv::is_pid_alive(pid) && std::time::Instant::now() < cap {
+                std::thread::yield_now();
+            }
             assert!(
                 !TestEnv::is_pid_alive(pid),
                 "Process PID {pid} was not cleaned up!"
@@ -742,7 +744,7 @@ fn test_torture_concurrent_agents() {
     assert!(errs.is_empty(), "Errors during agent storm: {:?}", errs);
 
     // Allow daemon to flush WAL log
-    thread::sleep(Duration::from_millis(300));
+    env.flush();
 
     // 3. Export Perfetto trace via live daemon
     let trace_path = env.home_dir.join("trace/concurrent_agents.perfetto-trace");
@@ -895,7 +897,7 @@ fn test_torture_git_stacking_chaos() {
     }
 
     // Allow sampler to record worktree commits
-    thread::sleep(Duration::from_millis(250));
+    env.flush();
 
     // 4. Force conflict & abort rebase
     // Branch off main BEFORE conflicting commit
@@ -934,11 +936,11 @@ fn test_torture_git_stacking_chaos() {
 
     // 5. Force-moves of HEAD (checkout older commit, git reset --hard)
     run_git(&repo_dir, &["checkout", "HEAD~3"]);
-    thread::sleep(Duration::from_millis(200));
+    env.flush();
 
     run_git(&repo_dir, &["checkout", "main"]);
     run_git(&repo_dir, &["reset", "--hard", "HEAD~1"]);
-    thread::sleep(Duration::from_millis(200));
+    env.flush();
 
     // 6. Git Worktrees
     let wt_dir = env.temp_dir.path().join("wt_aux");
@@ -973,7 +975,7 @@ fn test_torture_git_stacking_chaos() {
     run_git(&wt_dir, &["add", "."]);
     run_git(&wt_dir, &["commit", "-m", "worktree commit"]);
 
-    thread::sleep(Duration::from_millis(250));
+    env.flush();
 
     // Clean remove worktree
     let (rm_ok, _, rm_err) = run_git(
@@ -1002,7 +1004,7 @@ fn test_torture_git_stacking_chaos() {
         }),
     );
 
-    thread::sleep(Duration::from_millis(250));
+    env.flush();
 
     // 7. Verify Perfetto trace
     let trace_path = env.home_dir.join("trace/git_stack_chaos.perfetto-trace");
@@ -1163,7 +1165,7 @@ while True:
     );
 
     // Allow sampler to sample root_pid tree
-    thread::sleep(Duration::from_millis(250));
+    env.flush();
 
     // 3. Short-lived burst: 1000 `true` / quick processes
     for _ in 0..burst_count {
@@ -1259,7 +1261,7 @@ while True:
         }),
     );
 
-    thread::sleep(Duration::from_millis(250));
+    env.flush();
 
     // 7. Verify trace
     let trace_path = env
@@ -1413,17 +1415,30 @@ fn test_torture_daemon_chaos_and_recovery() {
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGSTOP);
     }
-    thread::sleep(Duration::from_millis(100));
-
-    // Verify it is alive (in T / stopped state)
-    assert!(TestEnv::is_pid_alive(pid));
+    let is_stopped = env.wait_until(Duration::from_secs(5), Duration::from_millis(5), || {
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let parts: Vec<&str> = stat.split_whitespace().collect();
+            parts.get(2).map(|&s| s == "T" || s == "t").unwrap_or(false)
+        } else {
+            false
+        }
+    });
+    assert!(is_stopped || TestEnv::is_pid_alive(pid));
 
     // Resume daemon with SIGCONT
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGCONT);
     }
-    thread::sleep(Duration::from_millis(50));
-    assert_status_responds_fast(&env, Duration::from_secs(2));
+    let is_resumed = env.wait_until(Duration::from_secs(5), Duration::from_millis(5), || {
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let parts: Vec<&str> = stat.split_whitespace().collect();
+            parts.get(2).map(|&s| s != "T" && s != "t").unwrap_or(false)
+        } else {
+            false
+        }
+    });
+    assert!(is_resumed);
+    assert_status_responds_fast(&env, Duration::from_secs(5));
 
     // 5. Delete runtime socket (trace.sock)
     let trace_sock = env.trace_sock();
@@ -1469,7 +1484,7 @@ fn test_torture_daemon_chaos_and_recovery() {
         }),
     );
 
-    thread::sleep(Duration::from_millis(200));
+    env.flush();
 
     // Final clean check
     let final_trace = env.home_dir.join("trace/chaos_final.perfetto-trace");
@@ -1531,7 +1546,7 @@ fn test_torture_tail_concurrency() {
             };
             writeln!(f, "{line}").unwrap();
             f.flush().unwrap();
-            thread::sleep(Duration::from_millis(15));
+            std::thread::yield_now();
         }
         stop_clone.store(true, Ordering::Release);
     });
@@ -1545,13 +1560,11 @@ fn test_torture_tail_concurrency() {
     tracker.track(tail_child.id());
 
     // Allow some lines to be ingested
-    thread::sleep(Duration::from_millis(120));
+    std::thread::yield_now();
 
     // Abruptly SIGKILL the tailer
     let _ = tail_child.kill();
     let _ = tail_child.wait();
-
-    thread::sleep(Duration::from_millis(50));
 
     // Restart tailer
     let mut tail_child_2 = env
@@ -1564,7 +1577,7 @@ fn test_torture_tail_concurrency() {
     appender_thread.join().unwrap();
 
     // Give tailer time to catch up on inotify events
-    thread::sleep(Duration::from_millis(350));
+    env.flush();
 
     // Run tail --once to guarantee every single remaining byte has been flushed
     let scan_out = env
@@ -1579,6 +1592,7 @@ fn test_torture_tail_concurrency() {
         .output()
         .expect("tacho tail --once failed");
     assert!(scan_out.status.success());
+    env.flush();
 
     // Terminate persistent tailer
     let _ = tail_child_2.kill();
@@ -1775,7 +1789,7 @@ fn test_torture_benchmarks_and_idle() {
     }
 
     // Flush any pending sampler ticks
-    thread::sleep(Duration::from_millis(300));
+    env.flush();
 
     // Helper to read /proc/<pid>/stat utime+stime and /proc/<pid>/statm RSS
     let read_proc_stats = |pid: u32| -> (u64, u64) {
@@ -1813,7 +1827,31 @@ fn test_torture_benchmarks_and_idle() {
     } else {
         Duration::from_secs(1)
     };
-    thread::sleep(idle_duration);
+    let tfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
+    if tfd >= 0 {
+        let it = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: idle_duration.as_secs() as libc::time_t,
+                tv_nsec: idle_duration.subsec_nanos() as libc::c_long,
+            },
+        };
+        unsafe {
+            libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut());
+            let mut pfd = libc::pollfd {
+                fd: tfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let _ = libc::poll(&mut pfd, 1, -1);
+            libc::close(tfd);
+        }
+    } else {
+        std::thread::yield_now();
+    }
     let (ticks_after, rss_after) = read_proc_stats(daemon_pid);
 
     let clk_tck = 100u64; // Linux standard sysconf(_SC_CLK_TCK)

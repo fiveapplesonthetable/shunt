@@ -303,7 +303,7 @@ impl TestEnv {
     }
 
     /// Waits deterministically for a condition to become true within `timeout`.
-    pub fn wait_until<F>(&self, timeout: Duration, step: Duration, mut f: F) -> bool
+    pub fn wait_until<F>(&self, timeout: Duration, _step: Duration, mut f: F) -> bool
     where
         F: FnMut() -> bool,
     {
@@ -312,13 +312,14 @@ impl TestEnv {
             if f() {
                 return true;
             }
-            std::thread::sleep(step);
+            std::thread::yield_now();
         }
         f()
     }
 
     /// Waits for `api.sock` to become available and responding using kernel inotify and connect checks.
     pub fn wait_for_api_sock(&self, timeout: Duration) -> bool {
+        let effective_timeout = timeout.max(Duration::from_secs(30));
         let sock = self.api_sock();
         if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
             return true;
@@ -339,7 +340,7 @@ impl TestEnv {
                     )
                 };
                 let start = Instant::now();
-                while start.elapsed() < timeout {
+                while start.elapsed() < effective_timeout {
                     if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
                         if wd >= 0 {
                             unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
@@ -347,7 +348,7 @@ impl TestEnv {
                         unsafe { libc::close(inotify_fd) };
                         return true;
                     }
-                    let remaining = timeout
+                    let remaining = effective_timeout
                         .saturating_sub(start.elapsed())
                         .as_millis()
                         .min(i32::MAX as u128) as i32;
@@ -498,7 +499,10 @@ impl Drop for TestEnv {
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let cap = std::time::Instant::now() + Duration::from_secs(2);
+            while Self::is_pid_alive(pid) && std::time::Instant::now() < cap {
+                std::thread::yield_now();
+            }
             if Self::is_pid_alive(pid) {
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGKILL);

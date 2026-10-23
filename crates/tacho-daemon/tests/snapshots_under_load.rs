@@ -8,7 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tacho_core::{Input, SessionKey, ToolInput};
 use tacho_daemon::{Config, Daemon, DaemonPaths};
 
@@ -80,7 +80,7 @@ fn test_snapshots_under_load() {
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_millis(15));
+                std::thread::yield_now();
             }
         });
         reader_handles.push(handle);

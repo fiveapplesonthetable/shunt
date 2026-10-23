@@ -22,6 +22,10 @@ pub struct OtlpServerConfig {
     pub max_header_size: usize,
     /// Read/write I/O timeout (default: 2 seconds).
     pub io_timeout: Duration,
+    /// Optional shutdown file descriptor (e.g. read end of a pipe).
+    /// When provided, the accept loop blocks indefinitely on poll until a connection
+    /// arrives or shutdown_fd is signaled/closed, eliminating timed poll loops.
+    pub shutdown_fd: Option<std::os::unix::io::RawFd>,
 }
 
 impl Default for OtlpServerConfig {
@@ -31,6 +35,7 @@ impl Default for OtlpServerConfig {
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             max_header_size: DEFAULT_MAX_HEADER_SIZE,
             io_timeout: DEFAULT_IO_TIMEOUT,
+            shutdown_fd: None,
         }
     }
 }
@@ -85,13 +90,39 @@ pub fn serve_otlp_with_config(
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 use std::os::unix::io::AsRawFd;
-                let mut pfd = libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe {
-                    let _ = libc::poll(&mut pfd, 1, 100);
+                if let Some(sfd) = config.shutdown_fd {
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd: listener.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: sfd,
+                            events: libc::POLLIN | libc::POLLHUP,
+                            revents: 0,
+                        },
+                    ];
+                    let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                    if ret < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    if (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                        break;
+                    }
+                } else {
+                    let mut pfd = libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe {
+                        let _ = libc::poll(&mut pfd, 1, 100);
+                    }
                 }
             }
             Err(e) => return Err(e),

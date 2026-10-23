@@ -181,6 +181,10 @@ pub struct ProofCheck {
     pub cmd: String,
     pub ok: bool,
     #[serde(default)]
+    pub area: Option<String>,
+    #[serde(default)]
+    pub units: Vec<String>,
+    #[serde(default)]
     pub duration_ms: u64,
     #[serde(default)]
     pub output_tail: String,
@@ -451,7 +455,7 @@ pub fn reusable_batch<'a>(
     needed_areas: &[String],
 ) -> Option<&'a BatchRun> {
     for b in history.iter().rev() {
-        if b.status != "passed" {
+        if b.status != "passed" || !b.flakes.is_empty() {
             continue;
         }
         if b.main_sha != main_sha || b.prs != prs || &b.shas != shas {

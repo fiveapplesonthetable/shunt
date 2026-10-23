@@ -521,6 +521,8 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
             ok,
             duration_ms,
             output_tail,
+            area: None,
+            units: Vec::new(),
         });
         if !ok && !args.keep_going {
             break;
@@ -698,7 +700,8 @@ pub fn execute_job(args: JobArgs) -> io::Result<()> {
 
     let child = command.spawn()?;
     let pid = child.id();
-    fs::write(&pid_file, format!("{pid}\n"))?;
+    let st = crate::fleet::proc_pid_starttime(pid).unwrap_or(0);
+    fs::write(&pid_file, format!("{pid} {st}\n"))?;
     println!(
         "Started job '{}' (pid {pid}) -> {}",
         args.name,
@@ -723,16 +726,18 @@ pub fn execute_wait(args: WaitArgs) -> io::Result<i32> {
     let log_file = dir.join(format!("{}.log", args.name));
     let exit_file = dir.join(format!("{}.exit", args.name));
 
-    let pid: u32 = fs::read_to_string(&pid_file)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no job '{}' found in {}", args.name, dir.display()),
-            )
-        })?
-        .trim()
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid pid file"))?;
+    let pid_str = fs::read_to_string(&pid_file).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no job '{}' found in {}", args.name, dir.display()),
+        )
+    })?;
+    let mut parts = pid_str.split_whitespace();
+    let pid: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid pid file"))?;
+    let _starttime: Option<u64> = parts.next().and_then(|s| s.parse().ok());
 
     let max_wait = args.timeout.unwrap_or(MAX_WAIT_SECS).min(MAX_WAIT_SECS);
     let start = Instant::now();
@@ -896,16 +901,18 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
     let pid_file = dir.join(format!("{}.pid", args.name));
     let cwd_file = dir.join(format!("{}.cwd", args.name));
 
-    let pid: u32 = fs::read_to_string(&pid_file)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no job '{}' found in {}", args.name, dir.display()),
-            )
-        })?
-        .trim()
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid pid file"))?;
+    let pid_str = fs::read_to_string(&pid_file).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no job '{}' found in {}", args.name, dir.display()),
+        )
+    })?;
+    let mut parts = pid_str.split_whitespace();
+    let pid: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid pid file"))?;
+    let starttime: Option<u64> = parts.next().and_then(|s| s.parse().ok());
 
     if let Ok(recorded_cwd) = fs::read_to_string(&cwd_file) {
         let job_path = Path::new(recorded_cwd.trim());
@@ -934,7 +941,7 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
             format!("refusing to kill pid {pid}: process group leader is {pgid} (expected {pid})"),
         ));
     }
-    if !crate::fleet::verify_agent_pid(pid, &args.name, None, None) {
+    if !crate::fleet::verify_agent_pid(pid, &args.name, None, starttime) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("refusing to kill pid {pid}: process does not belong to agent {} (possible PID reuse)", args.name),

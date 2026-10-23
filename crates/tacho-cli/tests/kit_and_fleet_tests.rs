@@ -561,8 +561,21 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .unwrap();
     assert!(tick1.status.success());
 
-    // Wait briefly for the fast mock command to exit, then run tick #2 to reap & attribute PR #42
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Wait for the mock agent process to exit before running tick #2 to reap & attribute PR #42
+    if let Ok(store) = FleetStore::open(&tacho_home.join("events.sqlite")) {
+        if let Ok(st) = store.load() {
+            if let Some(agent) = st.agents.get("auto-task") {
+                if let Some(pid) = agent.pid {
+                    let cap = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+                        && std::time::Instant::now() < cap
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+    }
     let tick2 = Command::new(tacho_bin())
         .args(["tick"])
         .current_dir(&repo_dir)

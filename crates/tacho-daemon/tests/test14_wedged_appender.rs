@@ -7,7 +7,6 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
-use std::sync::atomic::Ordering;
 use tacho_core::{Input, SessionKey, ToolInput};
 use tacho_daemon::{Config, Daemon, DaemonPaths};
 
@@ -69,11 +68,7 @@ fn test_wedged_appender_trace_oracle() {
     daemon.appender.flush();
 
     // 1. Block the appender thread via test hook
-    daemon
-        .appender
-        .hooks()
-        .wedged
-        .store(true, Ordering::Release);
+    daemon.appender.hooks().set_wedged(true);
 
     // 2. Connect to trace.sock while appender is completely blocked
     let mut stream = UnixStream::connect(paths.trace_sock())
@@ -90,11 +85,7 @@ fn test_wedged_appender_trace_oracle() {
     );
 
     // 3. Un-wedge appender thread
-    daemon
-        .appender
-        .hooks()
-        .wedged
-        .store(false, Ordering::Release);
+    daemon.appender.hooks().set_wedged(false);
 
     // 4. Validate captured trace in the oracle (trace_processor_shell)
     let trace_file = temp.path().join("wedged.pftrace");

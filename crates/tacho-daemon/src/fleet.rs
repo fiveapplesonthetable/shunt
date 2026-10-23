@@ -604,6 +604,15 @@ impl FleetStore {
             ))
         }
     }
+
+    /// Prunes decision ticks older than `cutoff_secs`.
+    pub fn prune_decision_ticks_older_than(&mut self, cutoff_secs: i64) -> io::Result<usize> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM decision_ticks WHERE ts < ?1", [cutoff_secs])
+            .map_err(sql_err)?;
+        Ok(deleted)
+    }
 }
 
 fn now_secs() -> i64 {
