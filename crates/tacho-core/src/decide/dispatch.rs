@@ -1518,6 +1518,7 @@ pub trait Provider {
     ) -> ProviderCommand;
 
     /// Plan how to deliver `message` to a worker (`is_live` indicates whether the worker process is currently running).
+    #[allow(clippy::too_many_arguments)]
     fn tell(
         &self,
         key: &str,
@@ -1557,7 +1558,7 @@ pub trait Provider {
 /// - `{key}`: the worker key
 /// - `{model}`: the resolved model name
 /// - `{effort}`: the resolved effort level
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProviderSpec {
     pub name: String,
     pub binary: String,
@@ -1580,116 +1581,99 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub tell_args: Vec<String>,
     #[serde(default)]
+    pub supports_hook_inbox: bool,
+    #[serde(default)]
     pub stop_program: Option<String>,
     #[serde(default)]
     pub stop_args: Vec<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    #[serde(default)]
+    pub model_aliases: BTreeMap<String, String>,
 }
 
+const DEFAULT_PROVIDERS_JSON: &str = include_str!("default_providers.json");
+
 impl ProviderSpec {
-    /// Built-in specification for Claude Code (`claude`).
+    /// Load `claude` specification from default provider config.
     pub fn claude() -> Self {
-        Self {
-            name: "claude".to_string(),
-            binary: "claude".to_string(),
-            default_model: Some("opus".to_string()),
-            default_effort: None,
-            start_args: vec![
-                "--dangerously-skip-permissions".to_string(),
-                "-p".to_string(),
-                "{prompt}".to_string(),
-            ],
-            resume_args: vec![
-                "--dangerously-skip-permissions".to_string(),
-                "--resume".to_string(),
-                "{session}".to_string(),
-                "-p".to_string(),
-                "{message}".to_string(),
-            ],
-            resume_without_session_args: vec![
-                "--dangerously-skip-permissions".to_string(),
-                "--continue".to_string(),
-                "-p".to_string(),
-                "{message}".to_string(),
-            ],
-            model_flag: Some("--model".to_string()),
-            effort_flag: Some("--effort".to_string()),
-            tell_program: None,
-            tell_args: Vec::new(),
-            stop_program: None,
-            stop_args: Vec::new(),
-            env: Vec::new(),
-        }
+        builtin_providers()
+            .remove("claude")
+            .unwrap_or_else(|| Self {
+                name: "claude".to_string(),
+                binary: "claude".to_string(),
+                supports_hook_inbox: true,
+                ..Default::default()
+            })
     }
 
-    /// Built-in specification for Codex CLI (`codex`).
+    /// Load `codex` specification from default provider config.
     pub fn codex() -> Self {
-        Self {
+        builtin_providers().remove("codex").unwrap_or_else(|| Self {
             name: "codex".to_string(),
             binary: "codex".to_string(),
-            default_model: Some("gpt-5.4".to_string()),
-            default_effort: None,
-            start_args: vec![
-                "exec".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "{prompt}".to_string(),
-            ],
-            resume_args: vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                "{session}".to_string(),
-                "{message}".to_string(),
-            ],
-            resume_without_session_args: vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                "--last".to_string(),
-                "{message}".to_string(),
-            ],
-            model_flag: Some("-m".to_string()),
-            effort_flag: None,
-            tell_program: None,
-            tell_args: Vec::new(),
-            stop_program: None,
-            stop_args: Vec::new(),
-            env: Vec::new(),
-        }
+            ..Default::default()
+        })
     }
 
-    /// Built-in specification for Gemini CLI (`gemini`).
+    /// Load `gemini` specification from default provider config.
     pub fn gemini() -> Self {
-        Self {
-            name: "gemini".to_string(),
-            binary: "gemini".to_string(),
-            default_model: Some("gemini-3.1-pro-preview".to_string()),
-            default_effort: None,
-            start_args: vec![
-                "--yolo".to_string(),
-                "-p".to_string(),
-                "{prompt}".to_string(),
-            ],
-            resume_args: vec![
-                "--yolo".to_string(),
-                "--resume".to_string(),
-                "{session}".to_string(),
-                "-p".to_string(),
-                "{message}".to_string(),
-            ],
-            resume_without_session_args: vec![
-                "--yolo".to_string(),
-                "--resume".to_string(),
-                "latest".to_string(),
-                "-p".to_string(),
-                "{message}".to_string(),
-            ],
-            model_flag: Some("-m".to_string()),
-            effort_flag: None,
-            tell_program: None,
-            tell_args: Vec::new(),
-            stop_program: None,
-            stop_args: Vec::new(),
-            env: Vec::new(),
+        builtin_providers()
+            .remove("gemini")
+            .unwrap_or_else(|| Self {
+                name: "gemini".to_string(),
+                binary: "gemini".to_string(),
+                ..Default::default()
+            })
+    }
+
+    /// Plan how to deliver `message` to a session taking into account whether the process is
+    /// running (`is_live`) and whether the session is currently idle between turns (`is_idle`).
+    ///
+    /// - If `is_live` and the provider defines `tell_program`/`tell_args`, runs `LiveCommand`.
+    /// - If `is_live`, `!is_idle`, and `supports_hook_inbox`, queues `LiveInbox` for the active hook turn.
+    /// - Otherwise (stopped session, idle session, or provider with no `tell_args` and no hook inbox),
+    ///   returns `ResumeWithMessage` so the session is resumed immediately with `message`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tell_session(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        is_live: bool,
+        is_idle: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> TellPlan {
+        if is_live {
+            if let Some(ref prog) = self.tell_program {
+                let args = Self::expand_template(
+                    &self.tell_args,
+                    key,
+                    worktree,
+                    session_id,
+                    message,
+                    model,
+                    effort,
+                );
+                return TellPlan::LiveCommand {
+                    program: prog.clone(),
+                    args,
+                };
+            }
+            if self.supports_hook_inbox && !is_idle {
+                return TellPlan::LiveInbox {
+                    key: key.to_string(),
+                    session_id: session_id.map(str::to_string),
+                    message: message.to_string(),
+                };
+            }
+        }
+        TellPlan::ResumeWithMessage {
+            key: key.to_string(),
+            session_id: session_id.map(str::to_string),
+            command: self.resume(key, worktree, session_id, message, model, effort),
         }
     }
 
@@ -1716,6 +1700,7 @@ impl ProviderSpec {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_command(
         &self,
         template: &[String],
@@ -1807,6 +1792,7 @@ impl Provider for ProviderSpec {
         self.build_command(template, key, worktree, session_id, message, model, effort)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tell(
         &self,
         key: &str,
@@ -1817,33 +1803,9 @@ impl Provider for ProviderSpec {
         model: Option<&str>,
         effort: Option<&str>,
     ) -> TellPlan {
-        if is_live {
-            if let Some(ref prog) = self.tell_program {
-                let args = Self::expand_template(
-                    &self.tell_args,
-                    key,
-                    worktree,
-                    session_id,
-                    message,
-                    model,
-                    effort,
-                );
-                return TellPlan::LiveCommand {
-                    program: prog.clone(),
-                    args,
-                };
-            }
-            return TellPlan::LiveInbox {
-                key: key.to_string(),
-                session_id: session_id.map(str::to_string),
-                message: message.to_string(),
-            };
-        }
-        TellPlan::ResumeWithMessage {
-            key: key.to_string(),
-            session_id: session_id.map(str::to_string),
-            command: self.resume(key, worktree, session_id, message, model, effort),
-        }
+        self.tell_session(
+            key, worktree, session_id, message, is_live, false, model, effort,
+        )
     }
 
     fn alive(&self, pid: Option<u32>, live_pids: &BTreeSet<u32>) -> bool {
@@ -1909,16 +1871,13 @@ impl Provider for ProviderSpec {
     }
 }
 
-/// Return the default built-in provider registry (`claude`, `codex`, `gemini`).
+/// Return the default provider registry loaded from `default_providers.json`.
 pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
-    let mut map = BTreeMap::new();
-    map.insert("claude".to_string(), ProviderSpec::claude());
-    map.insert("codex".to_string(), ProviderSpec::codex());
-    map.insert("gemini".to_string(), ProviderSpec::gemini());
-    map
+    serde_json::from_str::<BTreeMap<String, ProviderSpec>>(DEFAULT_PROVIDERS_JSON)
+        .unwrap_or_default()
 }
 
-/// Resolve `(provider, model, effort)` against a custom provider map (falling back to built-in providers).
+/// Resolve `(provider, model, effort)` against a configured provider map (falling back to default config).
 pub fn resolve_with_providers(
     provider: Option<&str>,
     model: Option<&str>,
@@ -1928,34 +1887,79 @@ pub fn resolve_with_providers(
     default_effort: Option<&str>,
     custom_providers: &BTreeMap<String, ProviderSpec>,
 ) -> Result<Choice, String> {
-    if let Some(p) = provider.map(str::trim).filter(|s| !s.is_empty()) {
-        if custom_providers.contains_key(p) && !PROVIDERS.contains(&p) {
-            let spec = &custom_providers[p];
-            return Ok(Choice {
-                provider: p.to_string(),
-                model: model
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| spec.default_model.clone())
-                    .or_else(|| default_model.map(str::to_string)),
-                effort: effort
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| spec.default_effort.clone())
-                    .or_else(|| default_effort.map(str::to_string)),
-            });
+    let mut merged = builtin_providers();
+    for (k, v) in custom_providers {
+        merged.insert(k.clone(), v.clone());
+    }
+
+    let raw_model = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| default_model.map(str::trim).filter(|s| !s.is_empty()));
+
+    let mut alias_provider: Option<String> = None;
+    let mut canonical_model: Option<String> = raw_model.map(str::to_string);
+    if let Some(m) = raw_model {
+        let lower = m.to_ascii_lowercase();
+        for (prov_name, spec) in &merged {
+            if let Some(canon) = spec.model_aliases.get(&lower) {
+                alias_provider = Some(prov_name.clone());
+                canonical_model = Some(canon.clone());
+                break;
+            }
+        }
+        if alias_provider.is_none() {
+            if let Some(inf) = provider_of(Some(m)) {
+                alias_provider = Some(inf.to_string());
+            }
         }
     }
-    resolve(
-        provider,
-        model,
-        effort,
-        default_provider,
-        default_model,
-        default_effort,
-    )
+
+    let prov = match provider.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            if !merged.contains_key(p) {
+                let valid: Vec<&str> = merged.keys().map(String::as_str).collect();
+                return Err(format!(
+                    "unknown provider '{p}' (expected one of {valid:?})"
+                ));
+            }
+            if let Some(ref inf) = alias_provider {
+                if inf != p
+                    && merged.get(p).is_none_or(|s| {
+                        !s.model_aliases
+                            .contains_key(&raw_model.unwrap_or_default().to_ascii_lowercase())
+                    })
+                {
+                    return Err(format!(
+                        "model '{}' belongs to provider '{inf}', not '{p}'",
+                        raw_model.unwrap_or_default()
+                    ));
+                }
+            }
+            p.to_string()
+        }
+        None => alias_provider.unwrap_or_else(|| default_provider.to_string()),
+    };
+
+    let spec = merged.get(&prov);
+    let final_model = canonical_model.or_else(|| spec.and_then(|s| s.default_model.clone()));
+    let final_effort = effort
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| spec.and_then(|s| s.default_effort.clone()))
+        .or_else(|| {
+            default_effort
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+
+    Ok(Choice {
+        provider: prov,
+        model: final_model,
+        effort: final_effort,
+    })
 }
 
 /// Order open PRs `(pr_number, migration_numbers)` by their lowest numbered schema migration

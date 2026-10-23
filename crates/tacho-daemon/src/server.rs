@@ -180,6 +180,7 @@ impl DaemonServer {
 
         let _ = fs::remove_file(self.paths.api_sock());
         let _ = fs::remove_file(self.paths.trace_sock());
+        self._lock._files.clear();
     }
 }
 
@@ -521,7 +522,7 @@ fn process_ndjson_line(
                 let _ = stream.flush();
 
                 let mut last_rendered = String::new();
-                for _ in 0..100 {
+                for _ in 0..500 {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -549,7 +550,8 @@ fn process_ndjson_line(
                             a.state.eq_ignore_ascii_case(target)
                                 || (target.eq_ignore_ascii_case("stalled")
                                     && (!a.flags.is_empty()
-                                        || a.state.eq_ignore_ascii_case("stalled")))
+                                        || a.state.eq_ignore_ascii_case("stalled")
+                                        || a.timeline.iter().any(|t| t.kind == "Stall")))
                         });
                         if is_match {
                             let match_line = serde_json::json!({"matched": target});
@@ -561,8 +563,10 @@ fn process_ndjson_line(
                         }
                     }
 
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 None
             }
 

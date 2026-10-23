@@ -1,0 +1,113 @@
+{
+  "claude": {
+    "name": "claude",
+    "binary": "claude",
+    "default_model": "opus",
+    "default_effort": null,
+    "start_args": [
+      "--dangerously-skip-permissions",
+      "-p",
+      "{prompt}"
+    ],
+    "resume_args": [
+      "--dangerously-skip-permissions",
+      "--resume",
+      "{session}",
+      "-p",
+      "{message}"
+    ],
+    "resume_without_session_args": [
+      "--dangerously-skip-permissions",
+      "--continue",
+      "-p",
+      "{message}"
+    ],
+    "model_flag": "--model",
+    "effort_flag": "--effort",
+    "tell_program": null,
+    "tell_args": [],
+    "supports_hook_inbox": true,
+    "stop_program": null,
+    "stop_args": [],
+    "env": [],
+    "model_aliases": {
+      "opus": "opus",
+      "sonnet": "sonnet",
+      "haiku": "haiku"
+    }
+  },
+  "codex": {
+    "name": "codex",
+    "binary": "codex",
+    "default_model": "gpt-5.4",
+    "default_effort": null,
+    "start_args": [
+      "exec",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "{prompt}"
+    ],
+    "resume_args": [
+      "exec",
+      "resume",
+      "{session}",
+      "{message}"
+    ],
+    "resume_without_session_args": [
+      "exec",
+      "resume",
+      "--last",
+      "{message}"
+    ],
+    "model_flag": "-m",
+    "effort_flag": null,
+    "tell_program": null,
+    "tell_args": [],
+    "supports_hook_inbox": false,
+    "stop_program": null,
+    "stop_args": [],
+    "env": [],
+    "model_aliases": {
+      "codex": "gpt-5.4",
+      "gpt-5.4": "gpt-5.4",
+      "gpt-5.4-mini": "gpt-5.4-mini"
+    }
+  },
+  "gemini": {
+    "name": "gemini",
+    "binary": "gemini",
+    "default_model": "gemini-3.1-pro-preview",
+    "default_effort": null,
+    "start_args": [
+      "--yolo",
+      "-p",
+      "{prompt}"
+    ],
+    "resume_args": [
+      "--yolo",
+      "--resume",
+      "{session}",
+      "-p",
+      "{message}"
+    ],
+    "resume_without_session_args": [
+      "--yolo",
+      "--resume",
+      "latest",
+      "-p",
+      "{message}"
+    ],
+    "model_flag": "-m",
+    "effort_flag": null,
+    "tell_program": null,
+    "tell_args": [],
+    "supports_hook_inbox": false,
+    "stop_program": null,
+    "stop_args": [],
+    "env": [],
+    "model_aliases": {
+      "gemini": "gemini-3.1-pro-preview",
+      "gemini-pro": "gemini-3.1-pro-preview",
+      "gemini-flash": "gemini-3-flash-preview"
+    }
+  }
+}

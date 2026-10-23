@@ -87,6 +87,8 @@ pub struct FleetState {
     pub notified_failures: BTreeSet<String>,
     pub notified_deploys: BTreeSet<u64>,
     pub self_update_paths: Vec<String>,
+    pub refused_self_update_sha: Option<String>,
+    pub batch_timeout_secs: Option<u64>,
 }
 
 impl Default for FleetState {
@@ -130,6 +132,8 @@ impl Default for FleetState {
             notified_failures: BTreeSet::new(),
             notified_deploys: BTreeSet::new(),
             self_update_paths: vec!["crates/".to_string(), "scripts/".to_string()],
+            refused_self_update_sha: None,
+            batch_timeout_secs: None,
         }
     }
 }

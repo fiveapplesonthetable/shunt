@@ -150,6 +150,9 @@ pub fn execute_tail(args: TailArgs) -> Result<(), String> {
         };
 
         let mut files_to_process = std::mem::take(&mut pending_retry_files);
+        if watcher.is_polling_fallback() {
+            files_to_process.extend(collect_jsonl_files(&target_path));
+        }
 
         for (mask, path) in events {
             if (mask & libc::IN_CREATE) != 0 && path.is_dir() {
@@ -510,17 +513,12 @@ struct InotifyWatcher {
 }
 
 impl InotifyWatcher {
-    /// Initializes non-blocking inotify instance with `FD_CLOEXEC`.
+    /// Initializes non-blocking inotify instance with `FD_CLOEXEC`, falling back to
+    /// poll-driven directory scans if the user or system inotify limit is exhausted.
     fn new() -> Result<Self, String> {
         // SAFETY: libc::inotify_init1 takes valid flags. IN_NONBLOCK ensures poll-driven non-blocking I/O,
         // and IN_CLOEXEC prevents file descriptor leaks across process execution.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if fd < 0 {
-            return Err(format!(
-                "inotify_init1 failed: {}",
-                io::Error::last_os_error()
-            ));
-        }
         Ok(Self {
             fd,
             wd_to_dir: HashMap::new(),
@@ -528,8 +526,15 @@ impl InotifyWatcher {
         })
     }
 
+    fn is_polling_fallback(&self) -> bool {
+        self.fd < 0
+    }
+
     /// Adds a directory watch descriptor for transcript modifications and directory creation.
     fn add_dir(&mut self, dir: &Path) -> bool {
+        if self.fd < 0 {
+            return false;
+        }
         if self.dir_to_wd.contains_key(dir) {
             return true;
         }
@@ -554,6 +559,13 @@ impl InotifyWatcher {
 
     /// Polls for inotify events with `timeout_ms` and returns parsed events.
     fn read_events(&mut self, timeout_ms: i32) -> Result<Vec<(u32, PathBuf)>, String> {
+        if self.fd < 0 {
+            // Poll-based fallback when inotify instances are exhausted
+            unsafe {
+                let _ = libc::poll(std::ptr::null_mut(), 0, timeout_ms.min(100));
+            }
+            return Ok(Vec::new());
+        }
         let mut pfd = libc::pollfd {
             fd: self.fd,
             events: libc::POLLIN,

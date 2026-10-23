@@ -843,6 +843,8 @@ fn test_provider_interface_start_resume_tell_alive_stop_cost() {
             stop_program: None,
             stop_args: Vec::new(),
             env: Vec::new(),
+            supports_hook_inbox: false,
+            model_aliases: BTreeMap::new(),
         },
     );
     let choice = resolve_with_providers(
@@ -871,7 +873,34 @@ fn test_provider_interface_start_resume_tell_alive_stop_cost() {
         }
     );
 
-    // 7. migration_order
+    // 7. Provider with no tell_args and no hook inbox (or idle session) resumes with message
+    let codex = providers.get("codex").unwrap();
+    let codex_tell = codex.tell(
+        "w3",
+        "/tmp/wt3",
+        Some("codex-s1"),
+        "rebase now",
+        true,
+        None,
+        None,
+    );
+    assert!(matches!(codex_tell, TellPlan::ResumeWithMessage { .. }));
+    let idle_claude_tell = claude.tell_session(
+        "w1",
+        "/tmp/wt1",
+        Some("sess-abc"),
+        "wake up",
+        true,
+        true,
+        Some("opus"),
+        None,
+    );
+    assert!(matches!(
+        idle_claude_tell,
+        TellPlan::ResumeWithMessage { .. }
+    ));
+
+    // 8. migration_order
     let mig_prs = vec![(105, vec![14, 15]), (102, vec![12]), (109, vec![])];
     assert_eq!(migration_order(&mig_prs), vec![102, 105, 109]);
 }
@@ -879,40 +908,45 @@ fn test_provider_interface_start_resume_tell_alive_stop_cost() {
 #[test]
 fn test_workflow_job_parser_and_batch_helpers() {
     use super::verify::{
-        affected_units, area_hang_report, batch_heads_moved, env_file_with_vars, job_argv, job_for,
-        service_argv,
+        affected_units, area_hang_report, batch_heads_moved, batch_refs_moved, env_file_with_vars,
+        job_argv, job_for, job_for_yaml, parse_workflow_yaml, service_argv,
     };
 
-    let wf: serde_json::Value = serde_json::json!({
-        "jobs": {
-            "backend": {
-                "container": { "image": "ghcr.io/org/ci:${{ env.CI_TAG }}" },
-                "env": { "RUST_BACKTRACE": "1" },
-                "services": {
-                    "postgres": {
-                        "image": "postgres:16",
-                        "env": { "POSTGRES_PASSWORD": "postgres" },
-                        "ports": ["5432:5432"],
-                        "options": "--health-cmd pg_isready"
-                    }
-                },
-                "steps": [
-                    { "uses": "actions/checkout@v4" },
-                    { "uses": "Swatinem/rust-cache@v2" },
-                    {
-                        "name": "Run backend tests",
-                        "working-directory": "crates/backend",
-                        "env": { "DATABASE_URL": "postgres://postgres:postgres@127.0.0.1:5432/test" },
-                        "run": "cargo test --locked"
-                    }
-                ]
-            }
-        }
-    });
+    let wf_yaml = r#"
+# Real GitHub Actions YAML workflow
+name: CI
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/org/ci:${{ env.CI_TAG }}
+    env:
+      RUST_BACKTRACE: "1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - "5432:5432"
+        options: --health-cmd pg_isready
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run backend tests
+        working-directory: crates/backend
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/test
+        run: |
+          cargo fmt --check
+          cargo test --locked
+"#;
 
     let mut exprs = BTreeMap::new();
     exprs.insert("env.CI_TAG".to_string(), "v1.2.3".to_string());
 
+    let wf = parse_workflow_yaml(wf_yaml).unwrap();
     let job = job_for(&wf, "backend", "backend", &exprs).unwrap();
     assert_eq!(job.image.as_deref(), Some("ghcr.io/org/ci:v1.2.3"));
     assert_eq!(job.steps.len(), 1);
@@ -921,8 +955,21 @@ fn test_workflow_job_parser_and_batch_helpers() {
         job.steps[0].working_directory.as_deref(),
         Some("crates/backend")
     );
+    assert_eq!(job.steps[0].run, "cargo fmt --check\ncargo test --locked");
     let svc = job.service.as_ref().unwrap();
     assert_eq!(svc.image, "postgres:16");
+
+    // Malformed YAML or unknown expression is strictly refused
+    assert!(parse_workflow_yaml("jobs:\n  bad_line_without_colon\n").is_err());
+    assert!(job_for_yaml(wf_yaml, "backend", "backend", &BTreeMap::new()).is_err());
+
+    // batch_refs_moved catches moved main SHA as well as moved PR heads
+    let mut expected_prs = BTreeMap::new();
+    expected_prs.insert(11, "aaaa1111".to_string());
+    assert!(batch_refs_moved("main0001", "main0001", &expected_prs, &expected_prs).is_none());
+    let main_moved =
+        batch_refs_moved("main0001", "main0002", &expected_prs, &expected_prs).unwrap();
+    assert!(main_moved.contains("main moved from main0001 to main0002"));
 
     let svc_cmd = service_argv(svc, "tacho-svc-b1");
     assert!(svc_cmd.contains(&"postgres:16".to_string()));

@@ -851,9 +851,15 @@ pub struct FlakesArgs {
 pub struct BatchArgs {
     /// PR numbers to verify in this batch (omit to auto-plan from open PRs).
     pub prs: Vec<u64>,
-    /// Custom verification command (defaults to `cargo test --workspace`).
+    /// Custom verification command.
     #[arg(long)]
     pub cmd: Option<String>,
+    /// Verification depth: `presubmit` (default) or `postsubmit`.
+    #[arg(long)]
+    pub mode: Option<String>,
+    /// Per-area check timeout in seconds (reports an `area_hang_report` if exceeded).
+    #[arg(long)]
+    pub timeout: Option<u64>,
     /// Print batch plan without running checks.
     #[arg(long)]
     pub dry_run: bool,

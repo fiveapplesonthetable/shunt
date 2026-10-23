@@ -31,14 +31,15 @@ use dispatch::{
 };
 use land::{queue, ReadyItem};
 use verify::{
-    batch_heads_moved, batches, classify, counterexample, failed_tests, flake_tasks, record_flakes,
-    summary_line, AreaRule, BatchPlan, BatchRun, FailedRecord, FlakeEntry, PassedRecord,
-    MAX_BATCH_SIZE,
+    batch_refs_moved, batches, classify, counterexample, decide_fixes, failed_tests, flake_tasks,
+    record_flakes, summary_line, AreaRule, BatchPlan, BatchRun, FailedRecord, FixDecisions,
+    FlakeEntry, PassedRecord, MAX_BATCH_SIZE,
 };
 use watch::{
-    decide_owner_notifications, decide_self_update, down_alert, down_reason, needs_you,
-    supervise_step, take_sample, verdict, AttentionItem, BehindCommit, DeployRunObs,
-    OwnerNotification, ProgressSample, SelfUpdateDecision, SuperviseAction,
+    decide_owner_notifications, decide_self_update, decide_tidy, down_alert, down_reason,
+    needs_you, supervise_step, take_sample, verdict, AttentionItem, BehindCommit, DeployRunObs,
+    OwnerNotification, ProgressSample, SelfUpdateDecision, SuperviseAction, TidyDecision,
+    TidySnapshot,
 };
 
 /// Complete pure fleet state input to [`decide`].
@@ -58,11 +59,15 @@ pub struct DecisionState {
     pub samples: BTreeMap<String, Vec<ProgressSample>>,
     pub nudged: BTreeSet<String>,
     pub rebase_attempts: HashMap<u64, String>,
+    #[serde(default)]
+    pub fix_notified: HashMap<u64, String>,
     pub notified_keys: BTreeSet<String>,
     pub area_rules: Vec<AreaRule>,
     pub refused_self_update_sha: Option<String>,
     pub last_tick_ts: Option<i64>,
     pub last_watchdog_alert_ts: Option<i64>,
+    #[serde(default)]
+    pub tidy_min_age_secs: i64,
 }
 
 /// Observation of a finished batch check on the current tick.
@@ -78,7 +83,7 @@ pub struct BatchOutcomeObs {
 /// Snapshot of the external world passed into [`decide`].
 ///
 /// Captures all side-effecting reads (clock, GitHub PRs, process liveness/CPU, batch logs,
-/// deploy runs, git upstream commits) as plain data so any tick can be replayed deterministically.
+/// deploy runs, git upstream commits, tidy snapshot) as plain data so any tick can be replayed deterministically.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct WorldObservation {
     pub now: i64,
@@ -93,6 +98,12 @@ pub struct WorldObservation {
     pub deploy_runs: Vec<DeployRunObs>,
     pub behind_commits: Vec<BehindCommit>,
     pub detached_checkout: bool,
+    #[serde(default)]
+    pub failed_main_jobs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ready_trains: Vec<(String, Vec<u64>, BTreeMap<u64, String>)>,
+    #[serde(default)]
+    pub tidy_snapshot: TidySnapshot,
 }
 
 /// Pure resolution of a completed batch run.
@@ -100,7 +111,7 @@ pub struct WorldObservation {
 pub enum BatchResolution {
     /// All PRs in the batch passed at their expected heads.
     Passed { batch_id: String, prs: Vec<u64> },
-    /// One or more PRs moved their head SHA while the batch was running; results are discarded.
+    /// One or more PRs (or `main`) moved their head SHA while the batch was running; results are discarded.
     HeadMoved { batch_id: String, reason: String },
     /// Infrastructure/flake failure; retry the batch without blaming the PRs.
     InfraRetry { batch_id: String, reason: String },
@@ -127,9 +138,11 @@ pub struct DecisionPlan {
     pub dispatched_tasks: Vec<TodoItem>,
     pub rebase_handoffs: Vec<(u64, String)>,
     pub barred_rebases: Vec<(u64, String)>,
+    pub fix_decisions: FixDecisions,
     pub batch_resolutions: Vec<BatchResolution>,
     pub batch_plans: Vec<BatchPlan>,
     pub ready_prs: Vec<ReadyItem>,
+    pub tidy_decisions: Vec<TidyDecision>,
     pub attention_items: Vec<AttentionItem>,
     pub owner_notifications: Vec<OwnerNotification>,
     pub self_update: SelfUpdateDecision,
@@ -228,8 +241,10 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         let batch_areas = next.batches[b_idx].areas.clone();
         let batch_main = next.batches[b_idx].main_sha.clone();
 
-        if let Some(moved_reason) = batch_heads_moved(&expected_shas, &current_pr_shas) {
-            next.batches[b_idx].status = "failed".to_string();
+        if let Some(moved_reason) =
+            batch_refs_moved(&batch_main, &obs.main_sha, &expected_shas, &current_pr_shas)
+        {
+            next.batches[b_idx].status = "head-moved".to_string();
             next.batches[b_idx].finished_at = Some(obs.now);
             next.batches[b_idx].log = moved_reason.clone();
             batch_resolutions.push(BatchResolution::HeadMoved {
@@ -374,7 +389,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     );
     next.todo = remaining_todo;
 
-    // 6. Conflicting PR rebase handoffs (`next_hands`).
+    // 6. Conflicting PR rebase handoffs (`next_hands`) and single-retry red PR fixes (`decide_fixes`).
     let remaining_slots = free_slots.saturating_sub(dispatched_tasks.len());
     let (to_rebase, barred) = next_hands(
         &obs.open_prs,
@@ -396,7 +411,23 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         .map(|(p, reason)| (p.number, reason))
         .collect();
 
-    // 7. Speculative verification batches (`batches`) and ready queue (`queue`).
+    let fix_slots = remaining_slots.saturating_sub(rebase_handoffs.len());
+    let fix_decisions = decide_fixes(
+        &next.failed,
+        &obs.open_prs,
+        &next.agents,
+        &next.holds,
+        &obs.live_keys,
+        &next.fix_notified,
+        fix_slots,
+    );
+    for (pr_num, _) in &fix_decisions.notify {
+        if let Some(rec) = next.failed.get(pr_num) {
+            next.fix_notified.insert(*pr_num, rec.sha.clone());
+        }
+    }
+
+    // 7. Speculative verification batches (`batches`), ready queue (`queue`), and janitor (`decide_tidy`).
     let batch_plans = batches(
         &obs.open_prs,
         &next.holds,
@@ -414,9 +445,15 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         &obs.main_sha,
         &HashMap::new(),
     );
+    let tidy_min_age = if next.tidy_min_age_secs > 0 {
+        next.tidy_min_age_secs
+    } else {
+        3_600
+    };
+    let tidy_decisions = decide_tidy(&obs.tidy_snapshot, tidy_min_age);
 
     // 8. Human attention items (`needs_you`), tell-once owner notifications, self-update, and watchdog.
-    let attention_items = needs_you(
+    let mut attention_items = needs_you(
         &next.agents,
         &next.todo,
         &next.retired,
@@ -427,24 +464,44 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         &next.failed,
         obs.now,
     );
-    let owner_notifications = decide_owner_notifications(
-        &attention_items,
-        &next.batches,
-        &[],
-        &BTreeMap::new(),
-        &obs.deploy_runs,
-        &next.notified_keys,
-    );
-    for n in &owner_notifications {
-        next.notified_keys.insert(n.key.clone());
+    for (pr_num, reason) in &barred_rebases {
+        attention_items.push(AttentionItem {
+            kind: "rebase-conflict".to_string(),
+            target: format!("pr:{pr_num}"),
+            summary: reason.clone(),
+            command_hint: format!("tacho hand {pr_num}"),
+        });
     }
-
     let self_update = decide_self_update(
         obs.detached_checkout,
         &obs.behind_commits,
         next.refused_self_update_sha.as_deref(),
         obs.now,
     );
+    if let Some(ref att) = self_update.attention {
+        attention_items.push(att.clone());
+    }
+
+    let mut failed_main_jobs = obs.failed_main_jobs.clone();
+    for b in &next.batches {
+        if b.status == "main-broken" {
+            failed_main_jobs
+                .entry(format!("batch-{}", b.id))
+                .or_insert_with(|| b.log.lines().next().unwrap_or("main broken").to_string());
+        }
+    }
+
+    let owner_notifications = decide_owner_notifications(
+        &attention_items,
+        &next.batches,
+        &obs.ready_trains,
+        &failed_main_jobs,
+        &obs.deploy_runs,
+        &next.notified_keys,
+    );
+    for n in &owner_notifications {
+        next.notified_keys.insert(n.key.clone());
+    }
 
     let has_active_work = !obs.live_keys.is_empty() || !next.todo.is_empty();
     let down = down_reason(next.last_tick_ts, obs.now, 600, has_active_work);
@@ -461,9 +518,11 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         dispatched_tasks,
         rebase_handoffs,
         barred_rebases,
+        fix_decisions,
         batch_resolutions,
         batch_plans,
         ready_prs,
+        tidy_decisions,
         attention_items,
         owner_notifications,
         self_update,

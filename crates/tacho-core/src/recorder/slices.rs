@@ -123,6 +123,16 @@ impl Recorder {
                 ev.flow_ids.push(flow_ord::make(slice_id, flow_ord::STALL));
             }
             self.handle_detector_firings(&agent_id, vec![f], Some(slice_id), ts, out);
+        } else if self
+            .detectors
+            .get(&agent_id)
+            .is_some_and(|det| det.active_stalls.contains(&(tacho::StallKind::Loop as i32)))
+        {
+            if let Some(agent) = self.live.agents.get_mut(&agent_id) {
+                if !agent.flags.iter().any(|f| f == "LOOP") {
+                    agent.flags.push("LOOP".to_string());
+                }
+            }
         }
         if let Some(run) = self.runs.get_mut(&run_key) {
             run.open_tools.insert(
@@ -171,7 +181,7 @@ impl Recorder {
             _ => format!("FileEdited: {}", truncate_utf8(&scrubbed_path, 48)),
         };
         let fe_body = tacho::event::Body::FileEdited(tacho::FileEdited {
-            path: Some(scrubbed_path),
+            path: Some(scrubbed_path.clone()),
             kind: proto_k.map(|k| k as i32),
             lines_added: added,
             lines_removed: removed,
@@ -197,7 +207,7 @@ impl Recorder {
         self.touch_agent_event(agent_id, ts);
         let cfg = self.detector_cfg.clone();
         let firing = if let Some(det) = self.detectors.get_mut(agent_id) {
-            det.on_file_edited(&path, ts, &cfg)
+            det.on_file_edited(&scrubbed_path, ts, &cfg)
         } else {
             None
         };

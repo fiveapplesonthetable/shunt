@@ -298,9 +298,9 @@ impl Recorder {
                         tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
                         git_tree: git_tree.as_deref().map(|g| truncate_utf8(g, 64)),
                     }),
-                    argv: Some(s_argv),
+                    argv: Some(s_argv.clone()),
                     command_class: Some(class),
-                    digest: blake3_digest_8(&argv),
+                    digest: blake3_digest_8(&s_argv),
                     ..Default::default()
                 }
             }
@@ -316,12 +316,12 @@ impl Recorder {
                     kind: Kind::FileAccess,
                     custom_name: Some(slice_label),
                     body: tacho::event::Body::FileAccess(tacho::FileAccess {
-                        path: Some(s_path),
+                        path: Some(s_path.clone()),
                         kind: Some(tacho::FileAccessKind::Read as i32),
                         query: None,
                         tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
                     }),
-                    digest: blake3_digest_8(&path),
+                    digest: blake3_digest_8(&s_path),
                     file_path: Some(rel),
                     ..Default::default()
                 }
@@ -339,6 +339,7 @@ impl Recorder {
                 } else {
                     format!("Search: {}", truncate_utf8(&s_query, 48))
                 };
+                let digest = blake3_digest_8(&format!("{}:{:?}", s_query, s_path));
                 ToolDetails {
                     kind: Kind::FileAccess,
                     custom_name: Some(slice_label),
@@ -348,7 +349,7 @@ impl Recorder {
                         query: Some(s_query),
                         tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
                     }),
-                    digest: blake3_digest_8(&format!("{}:{:?}", pattern, path)),
+                    digest,
                     file_path: rel,
                     ..Default::default()
                 }

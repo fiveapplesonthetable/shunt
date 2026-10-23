@@ -123,35 +123,29 @@ pub fn execute_hook(provider: Provider) {
         return;
     }
 
-    // Check remaining time before connecting
-    let elapsed = start_time.elapsed();
-    if elapsed >= Duration::from_millis(HARD_BUDGET_MS - 10) {
-        record_hook_drop(&home);
-        return;
-    }
-
     // 4. Try fast connection to api.sock
     let stream = match client.try_connect_api_fast() {
         Ok(s) => s,
         Err(_) => {
             // Daemon is absent: spawn detached without waiting, drop event, record drop
-            let _ = client.spawn_daemon_detached();
+            if std::env::var("TACHO_NO_AUTOSPAWN").ok().as_deref() != Some("1") {
+                let _ = client.spawn_daemon_detached();
+            }
             record_hook_drop(&home);
             return;
         }
     };
 
-    // Enrich git_tree only when daemon is present so absent-daemon drops stay <1ms
-    enrich_git_trees(&mut inputs, &val);
-
-    // 5. Stream inputs with remaining wall budget as write timeout
-    let remaining_ms = HARD_BUDGET_MS.saturating_sub(start_time.elapsed().as_millis() as u64);
-    if remaining_ms <= 5 {
-        record_hook_drop(&home);
-        return;
+    // Enrich git_tree only when daemon is present and within budget
+    if start_time.elapsed() < Duration::from_millis(HARD_BUDGET_MS / 2) {
+        enrich_git_trees(&mut inputs, &val);
     }
 
-    let _ = send_inputs_with_timeout(stream, &inputs, Duration::from_millis(remaining_ms));
+    // 5. Stream inputs with bounded socket read/write timeout
+    let timeout_ms = HARD_BUDGET_MS
+        .saturating_sub(start_time.elapsed().as_millis() as u64)
+        .max(50);
+    let _ = send_inputs_with_timeout(stream, &inputs, Duration::from_millis(timeout_ms));
 }
 
 /// Atomically increments the drop counter in `$TACHO_HOME/hook-drops` under `flock(LOCK_EX)`.
@@ -183,7 +177,10 @@ pub fn record_hook_drop(home_dir: &Path) {
 }
 
 fn resolve_git_tree(cwd: Option<&Path>) -> Option<String> {
-    let dir = cwd.unwrap_or_else(|| Path::new("."));
+    let dir = cwd?;
+    if !dir.is_dir() {
+        return None;
+    }
     let out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD^{tree}"])
         .current_dir(dir)

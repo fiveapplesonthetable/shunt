@@ -13,27 +13,27 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tacho_core::decide::dispatch::{
-    area_report, base_key, builtin_providers, compare_items, find_pr, hold_problem, may_start,
-    needs_resume, next_hands, next_work, release_problem, resolve_with_providers, resume_task,
-    retire, retire_problem, with_hold, without_hold, AgentRun, Provider, ProviderSpec, TellPlan,
-    TodoItem,
+    area_report, base_key, builtin_providers, compare_items, hold_problem, may_start, next_work,
+    release_problem, resolve_with_providers, resume_task, retire, retire_problem, with_hold,
+    without_hold, AgentRun, Provider, ProviderSpec, TellPlan, TodoItem,
 };
 use tacho_core::decide::land::{
     drop_breakers, eligible, finished, make_train, mismatch, open_for, order_train_prs, queue,
     settle, train_refusal, waiting_for, with_train, TrainPrState,
 };
 use tacho_core::decide::verify::{
-    batch_heads_moved, batches, classify, counterexample, decide_fixes, failed_tests, flake_rows,
-    flake_tasks, job_argv, job_for, new_batch_id, next_probe, parents, record_flakes,
-    reruns_on_red, reusable_batch, service_argv, slug_problem, summary_line, BatchRun, Bisect,
-    FailedRecord, PassedRecord, ProbeStep,
+    area_hang_report, batch_refs_moved, batches, checks_for_files, classify, counterexample,
+    failed_tests, flake_rows, flake_tasks, job_argv, job_for, new_batch_id, next_probe, parents,
+    parse_workflow_yaml, record_flakes, reruns_on_red, reusable_batch, service_argv, slug_problem,
+    summary_line, BatchMode, BatchRun, Bisect, FailedRecord, PassedRecord, ProbeStep,
 };
 use tacho_core::decide::watch::{
-    agent_row, burners, chain_rows, decide_owner_notifications, decide_tidy, down_alert,
-    down_reason, duplicate_batches, idle_chains, needs_you, stale_runs, supervise_step,
-    take_sample, verdict, zombie_lines, ProcEntry, ProgressSample, SuperviseAction, TidyDecision,
-    TidySnapshot, WorktreeCandidate,
+    agent_row, burners, chain_rows, decide_tidy, down_alert, down_reason, duplicate_batches,
+    idle_chains, needs_you, stale_runs, verdict, zombie_lines, BehindCommit, DeployRunObs,
+    ProcEntry, ProgressSample, SuperviseAction, TidyDecision, TidySnapshot, Verdict,
+    WorktreeCandidate,
 };
+use tacho_core::decide::{decide, DecisionState, WorldObservation};
 use tacho_core::{Scrubber, TaskStatus};
 use tacho_daemon::{FleetState, FleetStore};
 
@@ -692,6 +692,24 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
 
     let live_keys = live_agent_keys(&state);
     let is_live = live_keys.contains(&last.key);
+    let now = now_secs();
+    let is_idle = if is_live {
+        state
+            .samples
+            .get(&last.key)
+            .map(|s| {
+                if s.len() >= 2 {
+                    let (v, _) = verdict(s, now);
+                    matches!(v, Verdict::Stalled | Verdict::Hung)
+                        || s[s.len() - 1].cpu_ticks == s[s.len() - 2].cpu_ticks
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
+    } else {
+        true
+    };
     let builtins = builtin_providers();
     let provider_spec = state
         .providers
@@ -699,17 +717,17 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
         .or_else(|| builtins.get(&last.provider))
         .cloned()
         .unwrap_or_else(ProviderSpec::claude);
-    let tell_plan = provider_spec.tell(
+    let tell_plan = provider_spec.tell_session(
         &last.key,
         &last.worktree,
         last.session_id.as_deref(),
         &args.message,
         is_live,
+        is_idle,
         last.model.as_deref(),
         last.effort.as_deref(),
     );
 
-    let now = now_secs();
     match tell_plan {
         TellPlan::LiveCommand {
             program,
@@ -761,18 +779,55 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
                 key
             );
         }
-        TellPlan::ResumeWithMessage { key, .. } => {
-            let because = format!("nudge stopped session {key}: {}", args.message);
+        TellPlan::ResumeWithMessage { key, command, .. } => {
+            if is_live {
+                if let Some(pid) = last.pid {
+                    unsafe {
+                        let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+                    }
+                }
+            }
+            let mut resumed_pid = None;
+            if !last.worktree.is_empty() && Path::new(&last.worktree).is_dir() {
+                if let Ok(log_file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&last.log)
+                {
+                    if let Ok(log_err) = log_file.try_clone() {
+                        let mut cmd = Command::new(&command.program);
+                        cmd.args(&command.args)
+                            .current_dir(&last.worktree)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::from(log_file))
+                            .stderr(Stdio::from(log_err))
+                            .process_group(0);
+                        for (ek, ev) in &command.env {
+                            cmd.env(ek, ev);
+                        }
+                        if let Ok(child) = cmd.spawn() {
+                            resumed_pid = Some(child.id());
+                        }
+                    }
+                }
+            }
+            let because = format!("resumed session {key} with message: {}", args.message);
             store.mutate(Some(("watch", "tell", &key, &because)), |st| {
                 st.nudged.insert(key.clone());
                 if let Some(a) = st.agents.get_mut(&key) {
-                    a.resume_at = Some(now);
+                    if let Some(new_pid) = resumed_pid {
+                        a.pid = Some(new_pid);
+                        a.finished_at = None;
+                        a.exit_code = None;
+                    } else {
+                        a.resume_at = Some(now);
+                    }
                     a.status_note = format!("nudged: {}", args.message);
                     a.brief = format!("{}\n\nGuidance from operator:\n{}", a.brief, args.message);
                 }
             })?;
             emit_decision_event(&format!("agent:{key}"), "watch:tell", &because);
-            println!("Sent message to {} (scheduled immediate resume)", key);
+            println!("Sent message to {} (resumed session with message)", key);
         }
     }
     Ok(())
@@ -986,19 +1041,100 @@ pub fn execute_flakes(args: FlakesArgs) -> io::Result<()> {
     Ok(())
 }
 
+fn resolve_live_main_sha(cwd: &Path) -> String {
+    if let Ok(out) = Command::new("git")
+        .args(["ls-remote", "origin", "refs/heads/main"])
+        .current_dir(cwd)
+        .output()
+    {
+        if out.status.success() {
+            if let Some(sha) = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().next())
+                .filter(|s| !s.is_empty())
+            {
+                return sha.to_string();
+            }
+        }
+    }
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+fn resolve_live_pr_heads(
+    cwd: &Path,
+    pr_nums: &[u64],
+    expected_shas: &BTreeMap<u64, String>,
+    latest_state: &FleetState,
+) -> BTreeMap<u64, String> {
+    let mut current_shas = expected_shas.clone();
+    let mut remote_refs: BTreeMap<String, String> = BTreeMap::new();
+    if let Ok(out) = Command::new("git")
+        .args(["ls-remote", "origin"])
+        .current_dir(cwd)
+        .output()
+    {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut parts = line.split_whitespace();
+                if let (Some(sha), Some(rname)) = (parts.next(), parts.next()) {
+                    remote_refs.insert(rname.to_string(), sha.to_string());
+                }
+            }
+        }
+    }
+    for &n in pr_nums {
+        if latest_state.closed_prs.contains(&n) {
+            current_shas.remove(&n);
+            continue;
+        }
+        if let Some(sha) = remote_refs.get(&format!("refs/pull/{n}/head")) {
+            current_shas.insert(n, sha.clone());
+            continue;
+        }
+        if let Some(p) = latest_state.open_prs_cache.iter().find(|p| p.number == n) {
+            if !p.branch.is_empty() {
+                if let Some(sha) = remote_refs.get(&format!("refs/heads/{}", p.branch)) {
+                    current_shas.insert(n, sha.clone());
+                    continue;
+                }
+            }
+            current_shas.insert(n, p.head.clone());
+        }
+    }
+    current_shas
+}
+
 /// Executes `tacho batch [<pr...>]` — runs speculative batch verification + automatic binary bisection on failure.
 pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
     let mut store = open_fleet_store()?;
     let state = store.load()?;
     let cwd = std::env::current_dir()?;
 
-    let main_sha = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&cwd)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "HEAD".to_string());
+    let batch_mode = match args.mode.as_deref().unwrap_or("presubmit") {
+        "presubmit" => BatchMode::Presubmit,
+        "postsubmit" => BatchMode::Postsubmit,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --mode '{other}' (expected 'presubmit' or 'postsubmit')"),
+            ))
+        }
+    };
+    let timeout_secs = args
+        .timeout
+        .or(state.batch_timeout_secs)
+        .unwrap_or(600)
+        .max(1);
+
+    let main_sha = resolve_live_main_sha(&cwd);
 
     let pr_nums: Vec<u64> = if !args.prs.is_empty() {
         args.prs.clone()
@@ -1022,9 +1158,11 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 
     let mut shas = BTreeMap::new();
     let mut areas = BTreeSet::new();
+    let mut all_files = Vec::new();
     for &n in &pr_nums {
         if let Some(p) = state.open_prs_cache.iter().find(|p| p.number == n) {
             shas.insert(n, p.head.clone());
+            all_files.extend(p.files.iter().cloned());
             for a in tacho_core::decide::verify::areas_for_files(&p.files, &state.area_rules) {
                 areas.insert(a);
             }
@@ -1034,6 +1172,7 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
         }
     }
     let area_list: Vec<String> = areas.into_iter().collect();
+    let checks = checks_for_files(&all_files, &state.area_rules);
 
     if let Some(reused) = reusable_batch(&state.batches, &pr_nums, &shas, &main_sha, &area_list) {
         println!(
@@ -1050,76 +1189,133 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 
     if args.dry_run {
         println!("Batch ID: {batch_id}");
+        println!("Mode:     {batch_mode:?}");
         println!("PRs:      {:?}", pr_nums);
         println!("Main SHA: {main_sha}");
         println!("Areas:    {:?}", area_list);
+        println!("Checks:   {:?}", checks);
         return Ok(());
     }
 
     let now = now_secs();
     let batch_start_ns = now_ns();
-    let check_cmd = args.cmd.clone().unwrap_or_else(|| {
-        // If workflow_path & workflow_jobs are configured for the batch's area, parse the CI workflow job
-        if let Some(ref wf_path) = state.workflow_path {
-            if let Ok(raw_wf) = fs::read_to_string(cwd.join(wf_path)) {
-                if let Ok(wf_val) = serde_json::from_str::<serde_json::Value>(&raw_wf) {
-                    let mut job_cmds = Vec::new();
-                    for area in &area_list {
-                        let job_name = state
-                            .workflow_jobs
-                            .get(area)
-                            .map(String::as_str)
-                            .unwrap_or(area.as_str());
-                        if let Ok(ci_job) =
-                            job_for(&wf_val, area, job_name, &state.workflow_expressions)
-                        {
-                            let svc_name = ci_job
-                                .service
-                                .as_ref()
-                                .map(|s| format!("tacho-svc-{batch_id}-{}", s.name));
-                            if let (Some(svc), Some(sname)) = (&ci_job.service, &svc_name) {
-                                let s_argv = service_argv(svc, sname);
-                                job_cmds.push(s_argv.join(" "));
-                            }
-                            let j_argv = job_argv(
-                                &ci_job,
-                                cwd.to_str().unwrap_or("."),
-                                svc_name.as_deref(),
-                                &[],
-                            );
-                            job_cmds.push(
-                                j_argv
-                                    .iter()
-                                    .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
-                                    .collect::<Vec<_>>()
-                                    .join(" "),
-                            );
-                            if let Some(sname) = svc_name {
-                                job_cmds
-                                    .push(format!("docker rm -f {sname} >/dev/null 2>&1 || true"));
-                            }
-                        }
-                    }
-                    if !job_cmds.is_empty() {
-                        return job_cmds.join(" && ");
+    let check_cmd = if let Some(ref custom_cmd) = args.cmd {
+        custom_cmd.clone()
+    } else {
+        let candidate_wf = state.workflow_path.clone().or_else(|| {
+            for rel in [".github/workflows/ci.yml", ".github/workflows/ci.yaml"] {
+                if cwd.join(rel).is_file() {
+                    return Some(rel.to_string());
+                }
+            }
+            None
+        });
+        if let Some(wf_path) = candidate_wf {
+            let raw_wf = fs::read_to_string(cwd.join(&wf_path)).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to read workflow '{wf_path}': {e}"),
+                )
+            })?;
+            let wf_val = parse_workflow_yaml(&raw_wf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut job_cmds = Vec::new();
+            for chk in &checks {
+                let area = &chk.area;
+                let job_name = state
+                    .workflow_jobs
+                    .get(area)
+                    .map(String::as_str)
+                    .unwrap_or(area.as_str());
+                let mut exprs = state.workflow_expressions.clone();
+                exprs
+                    .entry("tacho.mode".to_string())
+                    .or_insert_with(|| format!("{batch_mode:?}").to_ascii_lowercase());
+                exprs
+                    .entry("tacho.units".to_string())
+                    .or_insert_with(|| chk.units.join(","));
+                let ci_job = job_for(&wf_val, area, job_name, &exprs)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let svc_name = ci_job
+                    .service
+                    .as_ref()
+                    .map(|s| format!("tacho-svc-{batch_id}-{}", s.name));
+                if let (Some(svc), Some(sname)) = (&ci_job.service, &svc_name) {
+                    let s_argv = service_argv(svc, sname);
+                    job_cmds.push(s_argv.join(" "));
+                }
+                let j_argv = job_argv(
+                    &ci_job,
+                    cwd.to_str().unwrap_or("."),
+                    svc_name.as_deref(),
+                    &[],
+                );
+                job_cmds.push(
+                    j_argv
+                        .iter()
+                        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                if let Some(sname) = svc_name {
+                    job_cmds.push(format!("docker rm -f {sname} >/dev/null 2>&1 || true"));
+                }
+            }
+            if job_cmds.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("workflow '{wf_path}' produced no jobs for areas {area_list:?}"),
+                ));
+            }
+            job_cmds.join(" && ")
+        } else {
+            let mut rule_cmds = Vec::new();
+            for chk in &checks {
+                if let Some(rule) = state.area_rules.iter().find(|r| r.area == chk.area) {
+                    for (_, c) in &rule.checks {
+                        rule_cmds.push(c.clone());
                     }
                 }
             }
+            if rule_cmds.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "no workflow file or --cmd configured for batch verification of areas {:?}",
+                        area_list
+                    ),
+                ));
+            }
+            rule_cmds.join(" && ")
         }
-        "cargo test --workspace".to_string()
-    });
+    };
     println!(
-        "Running batch {batch_id} on PRs {:?}: `{check_cmd}`",
+        "Running batch {batch_id} ({batch_mode:?}) on PRs {:?}: `{check_cmd}`",
         pr_nums
     );
 
-    let run_probe = |k: usize, label: &str| -> io::Result<(bool, String, u64, u64)> {
+    let run_probe = |k: usize, label: &str| -> io::Result<(bool, bool, String, u64, u64)> {
         let p_start = now_ns();
         let prefix_prs: Vec<String> = pr_nums.iter().take(k).map(|n| n.to_string()).collect();
-        let out = Command::new("bash")
-            .args(["-c", &check_cmd])
+        let units_csv: Vec<String> = checks
+            .iter()
+            .flat_map(|c| c.units.iter().cloned())
+            .collect();
+        let out = Command::new("timeout")
+            .args([
+                "--signal=KILL",
+                &format!("{timeout_secs}s"),
+                "bash",
+                "-c",
+                &check_cmd,
+            ])
             .current_dir(&cwd)
             .env("TACHO_BATCH_ID", &batch_id)
+            .env(
+                "TACHO_BATCH_MODE",
+                format!("{batch_mode:?}").to_ascii_lowercase(),
+            )
+            .env("TACHO_BATCH_UNITS", units_csv.join(","))
             .env("TACHO_BATCH_PROBE_K", k.to_string())
             .env("TACHO_BATCH_PROBE_PRS", prefix_prs.join(","))
             .env("TACHO_BATCH_LABEL", label)
@@ -1131,10 +1327,11 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             String::from_utf8_lossy(&out.stderr)
         );
         let txt = Scrubber::new().scrub(&raw_txt);
-        Ok((out.status.success(), txt, p_start, p_end))
+        let timed_out = out.status.code() == Some(124) || out.status.code() == Some(137);
+        Ok((out.status.success(), timed_out, txt, p_start, p_end))
     };
 
-    let (mut ok, mut log_text, p0_start, p0_end) = run_probe(pr_nums.len(), "r0")?;
+    let (ok, timed_out, mut log_text, p0_start, p0_end) = run_probe(pr_nums.len(), "r0")?;
     let _ = store.emit_duration_slice(
         &format!("batch:{batch_id}"),
         &format!("check PRs {:?}", pr_nums),
@@ -1142,12 +1339,48 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
         p0_end,
         &check_cmd,
     );
+
+    if timed_out {
+        let area_name = area_list.first().map(String::as_str).unwrap_or("workspace");
+        let hang = area_hang_report(&batch_id, area_name, timeout_secs, &log_text);
+        let finished = now_secs();
+        let b_run = BatchRun {
+            id: batch_id.clone(),
+            group: area_name.to_string(),
+            prs: pr_nums.clone(),
+            shas: shas.clone(),
+            main_sha: main_sha.clone(),
+            areas: area_list.clone(),
+            checks: checks.clone(),
+            mode: batch_mode,
+            status: "hang".to_string(),
+            started_at: now,
+            finished_at: Some(finished),
+            tree: Some(tree_sha),
+            pid: None,
+            log: format!("{}\n{}", hang.summary, hang.log_tail),
+            culprit: None,
+            skipped: Vec::new(),
+            flakes: Vec::new(),
+        };
+        store.mutate(
+            Some(("verify", "batch_hang", &batch_id, &hang.summary)),
+            |st| {
+                st.batches.push(b_run);
+            },
+        )?;
+        eprintln!("Batch {batch_id} HUNG: {}", hang.summary);
+        return Err(io::Error::new(io::ErrorKind::TimedOut, hang.summary));
+    }
+
+    let mut flaked_on_retry = false;
     let mut recorded_flake_names = Vec::new();
 
     // If the check failed without a deterministic counterexample, retry once (`r0-again`) to detect flakes.
     if !ok && counterexample(&log_text).is_none() {
         let f_tests_initial = failed_tests(&log_text);
-        let (retry_ok, retry_log, r_start, r_end) = run_probe(pr_nums.len(), "r0-again")?;
+        let (retry_ok, _retry_to, retry_log, r_start, r_end) =
+            run_probe(pr_nums.len(), "r0-again")?;
         let _ = store.emit_duration_slice(
             &format!("batch:{batch_id}"),
             "retry r0-again",
@@ -1156,7 +1389,7 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             "flake retry on failure without counterexample",
         );
         if retry_ok {
-            ok = true;
+            flaked_on_retry = true;
             recorded_flake_names = if f_tests_initial.is_empty() {
                 vec![summary_line(&log_text)]
             } else {
@@ -1169,17 +1402,11 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 
     let finished = now_secs();
 
-    // Head-movement refusal: re-read current open PR heads from FleetStore before marking passed!
+    // Ref-movement refusal: re-read live `main` and open PR heads from the remote before recording results!
     let latest_state = store.load()?;
-    let mut current_shas = shas.clone();
-    for &n in &pr_nums {
-        if let Some(p) = latest_state.open_prs_cache.iter().find(|p| p.number == n) {
-            current_shas.insert(n, p.head.clone());
-        } else if latest_state.closed_prs.contains(&n) {
-            current_shas.remove(&n);
-        }
-    }
-    if let Some(moved_reason) = batch_heads_moved(&shas, &current_shas) {
+    let current_main = resolve_live_main_sha(&cwd);
+    let current_shas = resolve_live_pr_heads(&cwd, &pr_nums, &shas, &latest_state);
+    if let Some(moved_reason) = batch_refs_moved(&main_sha, &current_main, &shas, &current_shas) {
         let b_run = BatchRun {
             id: batch_id.clone(),
             group: area_list
@@ -1190,6 +1417,8 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             shas: shas.clone(),
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
+            checks: checks.clone(),
+            mode: batch_mode,
             status: "head-moved".to_string(),
             started_at: now,
             finished_at: Some(finished),
@@ -1210,6 +1439,57 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
         return Err(io::Error::other(moved_reason));
     }
 
+    if flaked_on_retry {
+        let b_run = BatchRun {
+            id: batch_id.clone(),
+            group: area_list
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "default".to_string()),
+            prs: pr_nums.clone(),
+            shas: shas.clone(),
+            main_sha: main_sha.clone(),
+            areas: area_list.clone(),
+            checks: checks.clone(),
+            mode: batch_mode,
+            status: "flake".to_string(),
+            started_at: now,
+            finished_at: Some(finished),
+            tree: Some(tree_sha.clone()),
+            pid: None,
+            log: log_text.clone(),
+            culprit: None,
+            skipped: Vec::new(),
+            flakes: recorded_flake_names.clone(),
+        };
+        let because = format!(
+            "batch {batch_id} recorded as flake for PRs {:?}: {:?}",
+            pr_nums, recorded_flake_names
+        );
+        store.mutate(Some(("verify", "batch_flake", &batch_id, &because)), |st| {
+            let area_hint = area_list.first().map(String::as_str).unwrap_or("");
+            let updated = record_flakes(
+                &st.flakes,
+                &recorded_flake_names,
+                area_hint,
+                &batch_id,
+                &log_text,
+                finished,
+            );
+            let (with_tasks, new_items) =
+                flake_tasks(&updated, &st.todo, &st.agents, &st.retired, finished);
+            st.flakes = with_tasks;
+            st.todo.extend(new_items);
+            st.batches.push(b_run);
+        })?;
+        emit_decision_event(&format!("batch:{batch_id}"), "verify:flake", &because);
+        println!(
+            "Batch {batch_id} FLAKE recorded: {:?}",
+            recorded_flake_names
+        );
+        return Ok(());
+    }
+
     if ok {
         let b_run = BatchRun {
             id: batch_id.clone(),
@@ -1221,6 +1501,8 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             shas: shas.clone(),
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
+            checks: checks.clone(),
+            mode: batch_mode,
             status: "passed".to_string(),
             started_at: now,
             finished_at: Some(finished),
@@ -1229,25 +1511,10 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             log: String::new(),
             culprit: None,
             skipped: Vec::new(),
-            flakes: recorded_flake_names.clone(),
+            flakes: Vec::new(),
         };
         let because = format!("batch {batch_id} passed for PRs {:?}", pr_nums);
         store.mutate(Some(("verify", "batch_pass", &batch_id, &because)), |st| {
-            if !recorded_flake_names.is_empty() {
-                let area_hint = area_list.first().map(String::as_str).unwrap_or("");
-                let updated = record_flakes(
-                    &st.flakes,
-                    &recorded_flake_names,
-                    &batch_id,
-                    area_hint,
-                    &log_text,
-                    finished,
-                );
-                let (with_tasks, new_items) =
-                    flake_tasks(&updated, &st.todo, &st.agents, &st.retired, finished);
-                st.flakes = with_tasks;
-                st.todo.extend(new_items);
-            }
             for &pr in &pr_nums {
                 let sha = shas.get(&pr).cloned().unwrap_or_else(|| main_sha.clone());
                 st.failed.remove(&pr);
@@ -1299,7 +1566,7 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             results: BTreeMap::from([(pr_nums.len(), false)]),
         };
         while let ProbeStep::Probe(k) = next_probe(&bisect) {
-            let (probe_ok, probe_log, ps, pe) = run_probe(k, &format!("bisect-k{k}"))?;
+            let (probe_ok, _probe_to, probe_log, ps, pe) = run_probe(k, &format!("bisect-k{k}"))?;
             let _ = store.emit_duration_slice(
                 &format!("batch:{batch_id}"),
                 &format!("bisect k={k}"),
@@ -1329,6 +1596,8 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
                 shas: shas.clone(),
                 main_sha: main_sha.clone(),
                 areas: area_list.clone(),
+                checks: checks.clone(),
+                mode: batch_mode,
                 status: "main-broken".to_string(),
                 started_at: now,
                 finished_at: Some(finished),
@@ -1369,6 +1638,8 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             shas: shas.clone(),
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
+            checks: checks.clone(),
+            mode: batch_mode,
             status: "failed".to_string(),
             started_at: now,
             finished_at: Some(finished),
@@ -1420,6 +1691,8 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
                 let _ = execute_batch(BatchArgs {
                     prs: reruns,
                     cmd: args.cmd,
+                    mode: args.mode,
+                    timeout: args.timeout,
                     dry_run: false,
                 });
             }
@@ -1451,6 +1724,8 @@ pub fn execute_replay(args: ReplayArgs) -> io::Result<()> {
     execute_batch(BatchArgs {
         prs: b.prs.clone(),
         cmd: args.cmd,
+        mode: None,
+        timeout: None,
         dry_run: args.dry_run,
     })
 }
@@ -1574,23 +1849,32 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
     let compile_cmd = std::env::var("TACHO_COMPILE_CMD")
         .ok()
         .or_else(|| state.train_compile_cmd.clone())
-        .filter(|s| !s.trim().is_empty());
+        .unwrap_or_else(|| "cargo check --workspace".to_string());
+    if compile_cmd.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "merged-tree compile command cannot be empty before release-train",
+        ));
+    }
     let (surviving, dropped) = drop_breakers(&ordered_nums, &parent_map, |slice| {
-        if let Some(ref cmd) = compile_cmd {
-            let prs_str = slice
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let out = Command::new("bash")
-                .args(["-c", cmd])
-                .current_dir(&cwd)
-                .env("TACHO_TRAIN_SLICE_PRS", &prs_str)
-                .output()
-                .map_err(|e| e.to_string())?;
-            if !out.status.success() {
-                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-            }
+        let prs_str = slice
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let out = Command::new("bash")
+            .args(["-c", &compile_cmd])
+            .current_dir(&cwd)
+            .env("TACHO_TRAIN_SLICE_PRS", &prs_str)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let err_txt = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(err_txt.trim().to_string());
         }
         Ok(())
     });
@@ -1844,38 +2128,7 @@ fn scan_procs() -> Vec<ProcEntry> {
     out
 }
 
-/// Executes `tacho tidy [--dry-run] [--min-age 3600]`.
-pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
-    let mut store = open_fleet_store()?;
-    let state = store.load()?;
-    let procs = scan_procs();
-    let live_pids: BTreeSet<u32> = procs.iter().map(|p| p.pid).collect();
-
-    // Reap stale runs whose PID exited
-    let stale = stale_runs(&state.agents, &live_pids);
-    let now = now_secs();
-    if !stale.is_empty() && !args.dry_run {
-        store.mutate(
-            Some((
-                "watch",
-                "reap_stale",
-                "agents",
-                &format!("marked {:?} finished", stale),
-            )),
-            |st| {
-                for k in &stale {
-                    if let Some(a) = st.agents.get_mut(k) {
-                        a.finished_at = Some(now);
-                        if a.exit_code.is_none() {
-                            a.exit_code = Some(1);
-                        }
-                    }
-                }
-            },
-        )?;
-    }
-
-    let live_keys = live_agent_keys(&state);
+fn build_tidy_snapshot(state: &FleetState, live_keys: &BTreeSet<String>, now: i64) -> TidySnapshot {
     let mut live_wt = BTreeSet::new();
     let mut held_ports = BTreeSet::new();
     for a in state.agents.values() {
@@ -1920,17 +2173,22 @@ pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
                     .ok()
             })
             .unwrap_or(0);
+        let pr_merged_or_closed = state
+            .agents
+            .get(&wt.slug)
+            .and_then(|a| a.pr)
+            .is_some_and(|pr| state.merged_prs.contains(&pr) || state.closed_prs.contains(&pr));
         wt_candidates.push(WorktreeCandidate {
             path: wt.path.clone(),
             branch: wt.branch.clone(),
             age_secs: (now - wt.created_at).max(0),
             dirty,
             unpushed_commits: unpushed,
-            pr_merged_or_closed: false,
+            pr_merged_or_closed,
         });
     }
 
-    let snap = TidySnapshot {
+    TidySnapshot {
         now,
         worktrees: wt_candidates,
         checkouts: Vec::new(),
@@ -1940,20 +2198,16 @@ pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
         live_batch_worktrees: BTreeSet::new(),
         held_paths: BTreeSet::new(),
         held_ports,
-    };
-
-    let decisions = decide_tidy(&snap, args.min_age.unwrap_or(3_600));
-    let zombies = zombie_lines(&procs);
-
-    if decisions.is_empty() && stale.is_empty() && zombies.is_empty() {
-        println!("Machine is tidy (nothing to clean up).");
-        return Ok(());
     }
+}
 
-    for z in &zombies {
-        println!("Zombie warning: {z}");
-    }
-    for d in &decisions {
+fn apply_tidy_decisions(
+    store: &mut FleetStore,
+    decisions: &[TidyDecision],
+    now: i64,
+    dry_run: bool,
+) {
+    for d in decisions {
         match d {
             TidyDecision::RemoveTree {
                 path,
@@ -1962,12 +2216,12 @@ pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
             } => {
                 println!(
                     "{}RemoveTree {} (rescue={}): {}",
-                    if args.dry_run { "[dry-run] " } else { "" },
+                    if dry_run { "[dry-run] " } else { "" },
                     path,
                     rescue,
                     because
                 );
-                if !args.dry_run {
+                if !dry_run {
                     if *rescue {
                         let wt_p = Path::new(path);
                         let slug = wt_p
@@ -2033,18 +2287,122 @@ pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
                 }
             }
             other => {
-                println!(
-                    "{}{:?}",
-                    if args.dry_run { "[dry-run] " } else { "" },
-                    other
-                );
+                println!("{}{:?}", if dry_run { "[dry-run] " } else { "" }, other);
             }
         }
     }
+}
+
+fn observe_git_and_deploys(
+    cwd: &Path,
+    now: i64,
+) -> (
+    String,
+    bool,
+    Vec<BehindCommit>,
+    BTreeMap<String, String>,
+    Vec<DeployRunObs>,
+) {
+    let main_sha = resolve_live_main_sha(cwd);
+    let detached = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false);
+
+    let mut behind_commits = Vec::new();
+    if let Ok(out) = Command::new("git")
+        .args(["log", "--format=%H:%ct", "HEAD..origin/main"])
+        .current_dir(cwd)
+        .output()
+    {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some((sha, ts_str)) = line.trim().split_once(':') {
+                    let ts = ts_str.parse::<i64>().unwrap_or(now);
+                    behind_commits.push(BehindCommit {
+                        sha: sha.to_string(),
+                        ts,
+                        ci_green: true,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut failed_main_jobs = BTreeMap::new();
+    if let Ok(raw) = std::env::var("TACHO_MAIN_FAILED_JOBS_JSON") {
+        if let Ok(parsed) = serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+            failed_main_jobs.extend(parsed);
+        }
+    }
+
+    let mut deploy_runs = Vec::new();
+    if let Ok(raw) = std::env::var("TACHO_DEPLOY_RUNS_JSON") {
+        if let Ok(parsed) = serde_json::from_str::<Vec<DeployRunObs>>(&raw) {
+            deploy_runs.extend(parsed);
+        }
+    }
+
+    (
+        main_sha,
+        detached,
+        behind_commits,
+        failed_main_jobs,
+        deploy_runs,
+    )
+}
+
+/// Executes `tacho tidy [--dry-run] [--min-age 3600]`.
+pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
+    let mut store = open_fleet_store()?;
+    let state = store.load()?;
+    let procs = scan_procs();
+    let live_pids: BTreeSet<u32> = procs.iter().map(|p| p.pid).collect();
+
+    // Reap stale runs whose PID exited
+    let stale = stale_runs(&state.agents, &live_pids);
+    let now = now_secs();
+    if !stale.is_empty() && !args.dry_run {
+        store.mutate(
+            Some((
+                "watch",
+                "reap_stale",
+                "agents",
+                &format!("marked {:?} finished", stale),
+            )),
+            |st| {
+                for k in &stale {
+                    if let Some(a) = st.agents.get_mut(k) {
+                        a.finished_at = Some(now);
+                        if a.exit_code.is_none() {
+                            a.exit_code = Some(1);
+                        }
+                    }
+                }
+            },
+        )?;
+    }
+
+    let live_keys = live_agent_keys(&state);
+    let snap = build_tidy_snapshot(&state, &live_keys, now);
+    let decisions = decide_tidy(&snap, args.min_age.unwrap_or(3_600));
+    let zombies = zombie_lines(&procs);
+
+    if decisions.is_empty() && stale.is_empty() && zombies.is_empty() {
+        println!("Machine is tidy (nothing to clean up).");
+        return Ok(());
+    }
+
+    for z in &zombies {
+        println!("Zombie warning: {z}");
+    }
+    apply_tidy_decisions(&mut store, &decisions, now, args.dry_run);
     Ok(())
 }
 
-/// Executes a single orchestrator & supervisor pass (`tacho tick`).
+/// Executes a single orchestrator & supervisor pass (`tacho tick`) driven entirely by `tacho_core::decide::decide`.
 pub fn execute_tick(args: TickArgs) -> io::Result<()> {
     let mut store = open_fleet_store()?;
     let state = store.load()?;
@@ -2052,80 +2410,7 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
     let tick_start_ns = now_ns();
     let procs = scan_procs();
     let live = live_agent_keys(&state);
-
-    // 0. Reap exited agents and attribute PRs (`find_pr`) + clear idle chains
-    let mut reaped = Vec::new();
-    for (k, a) in &state.agents {
-        if a.finished_at.is_none() && !live.contains(k) {
-            let log_tail = fs::read_to_string(&a.log)
-                .map(|s| {
-                    let lines: Vec<&str> = s.lines().rev().take(50).collect();
-                    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
-                })
-                .unwrap_or_default();
-            let (found_pr, found_src) = find_pr(k, a.started_at, &state.open_prs_cache, &log_tail);
-            let is_none = found_src.as_deref() == Some("none");
-            reaped.push((k.clone(), found_pr, is_none, found_src));
-        }
-    }
-    if !reaped.is_empty() && !args.dry_run {
-        store.mutate(
-            Some((
-                "dispatch",
-                "reap_agents",
-                "agents",
-                "reaped exited agents and attributed PRs",
-            )),
-            |st| {
-                for (k, found_pr, is_none, found_src) in &reaped {
-                    if let Some(a) = st.agents.get_mut(k) {
-                        a.finished_at = Some(now);
-                        if a.exit_code.is_none() {
-                            a.exit_code = Some(if found_pr.is_some() || *is_none { 0 } else { 1 });
-                        }
-                        if found_pr.is_some() {
-                            a.pr = *found_pr;
-                            a.pr_source = found_src.clone();
-                        } else if *is_none {
-                            a.pr_none = true;
-                            a.pr_source = Some("none".to_string());
-                        }
-                    }
-                }
-                let wt_clean_map = HashMap::new();
-                let idle = idle_chains(&st.agents, &st.retired, &live, &wt_clean_map);
-                for root in idle {
-                    if let Some(a) = st.agents.get_mut(&root) {
-                        a.pr_none = true;
-                    }
-                }
-            },
-        )?;
-        for (k, found_pr, is_none, _) in &reaped {
-            let (label, status, because) = if let Some(p) = found_pr {
-                ("Review", TaskStatus::Review, format!("{k} opened PR #{p}"))
-            } else if *is_none {
-                (
-                    "Done",
-                    TaskStatus::Done,
-                    format!("{k} completed with PR: none"),
-                )
-            } else {
-                (
-                    "Failed",
-                    TaskStatus::Failed,
-                    format!("{k} exited without PR"),
-                )
-            };
-            let _ = store.emit_state_band(
-                &format!("task:{}/state", base_key(k)),
-                label,
-                status,
-                &because,
-                now_ns(),
-            );
-        }
-    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // 1. Check for unguarded runaway CPU burners (`yes`, `stress`, `stress-ng` >= 10m) and duplicate batches
     for b in burners(&procs) {
@@ -2168,8 +2453,22 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         }
     }
 
-    // 2. Sample progress and supervise live agents
+    // 2. Gather WorldObservation (agent log tails, progress samples, git/main/deploy state, tidy snapshot)
     let state = store.load()?;
+    let mut agent_log_tails = BTreeMap::new();
+    for (k, a) in &state.agents {
+        if a.finished_at.is_none() && !live.contains(k) {
+            let log_tail = fs::read_to_string(&a.log)
+                .map(|s| {
+                    let lines: Vec<&str> = s.lines().rev().take(50).collect();
+                    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+                })
+                .unwrap_or_default();
+            agent_log_tails.insert(k.clone(), log_tail);
+        }
+    }
+
+    let mut agent_samples = BTreeMap::new();
     for key in &live {
         if let Some(a) = state.agents.get(key) {
             let log_bytes = fs::metadata(&a.log).map(|m| m.len()).unwrap_or(0);
@@ -2202,190 +2501,33 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
             } else {
                 0
             };
-            let sample = ProgressSample {
-                ts: now,
-                log_bytes,
-                head_sha,
-                dirty_files: dirty_files as u32,
-                cpu_ticks: cpu,
-            };
-            let existing = state.samples.get(key).map(Vec::as_slice).unwrap_or(&[]);
-            let updated_samples = take_sample(existing, sample, 60);
-            let (v, idle) = verdict(&updated_samples, now);
-            let step = supervise_step(key, v, idle, state.nudged.contains(key));
-            if !args.dry_run {
-                store.mutate(None, |st| {
-                    st.samples.insert(key.clone(), updated_samples);
-                })?;
-            }
-            match step {
-                SuperviseAction::Ok => {}
-                SuperviseAction::Resume { key, because } => {
-                    println!("Supervise: {because}");
-                    if !args.dry_run {
-                        if let Some(pid) = a.pid {
-                            unsafe {
-                                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-                            }
-                        }
-                        let resumed = resume_task(a, &because, "", now);
-                        store.mutate(
-                            Some(("watch", "supervise_resume", &key, &because)),
-                            |st| {
-                                if let Some(ag) = st.agents.get_mut(&key) {
-                                    ag.finished_at = Some(now);
-                                    ag.exit_code = Some(143);
-                                }
-                                st.todo.push(resumed);
-                            },
-                        )?;
-                        emit_decision_event(&format!("agent:{key}"), "watch:supervise", &because);
-                    }
-                }
-                SuperviseAction::Nudge { key, because } => {
-                    println!("Supervise: {because}");
-                    if !args.dry_run {
-                        store.mutate(Some(("watch", "supervise_nudge", &key, &because)), |st| {
-                            st.nudged.insert(key.clone());
-                        })?;
-                        emit_decision_event(&format!("agent:{key}"), "watch:supervise", &because);
-                    }
-                }
-                SuperviseAction::Escalate { key, because } => {
-                    println!("Supervise: {because}");
-                    if !args.dry_run {
-                        let _ = store.record_decision("watch", "supervise", &key, &because);
-                        emit_decision_event(&format!("agent:{key}"), "watch:supervise", &because);
-                    }
-                }
-            }
+            agent_samples.insert(
+                key.clone(),
+                ProgressSample {
+                    ts: now,
+                    log_bytes,
+                    head_sha,
+                    dirty_files: dirty_files as u32,
+                    cpu_ticks: cpu,
+                },
+            );
         }
     }
 
-    // 3. Check for due automatic resumes (`needs_resume`), red-PR fixes (`decide_fixes`), and rebases (`next_hands`)
-    let state = store.load()?;
-    for root in tacho_core::decide::dispatch::base_keys(&state.agents, &state.retired) {
-        if needs_resume(
-            &state.agents,
-            &state.todo,
-            &state.retired,
-            &state.holds,
-            &live,
-            &root,
-            now,
-        ) {
-            if let Some(last) =
-                tacho_core::decide::dispatch::latest(&state.agents, &state.retired, &root).cloned()
-            {
-                let item = resume_task(&last, "", "", now);
-                let item_key = item.key.clone();
-                let because = format!("auto-queued resume {item_key} after backoff");
-                println!("{because}");
-                if !args.dry_run {
-                    store.mutate(
-                        Some(("dispatch", "auto_resume", &item_key, &because)),
-                        |st| {
-                            st.todo.push(item);
-                        },
-                    )?;
-                }
+    let (main_sha, detached_checkout, behind_commits, failed_main_jobs, deploy_runs) =
+        observe_git_and_deploys(&cwd, now);
+    let tidy_snapshot = build_tidy_snapshot(&state, &live, now);
+    let mut ready_trains = Vec::new();
+    if let Some(open) = open_for(&state.trains) {
+        let mut heads = BTreeMap::new();
+        for &pr in &open.prs {
+            if let Some(p) = state.open_prs_cache.iter().find(|p| p.number == pr) {
+                heads.insert(pr, p.head.clone());
             }
         }
+        ready_trains.push((open.id.clone(), open.prs.clone(), heads));
     }
 
-    let state = store.load()?;
-    let free_for_aux = state.max_workers.saturating_sub(live.len());
-    let fix_decisions = decide_fixes(
-        &state.failed,
-        &state.open_prs_cache,
-        &state.agents,
-        &state.holds,
-        &live,
-        &state.fix_notified,
-        free_for_aux,
-    );
-    if (!fix_decisions.dispatch.is_empty() || !fix_decisions.notify.is_empty()) && !args.dry_run {
-        store.mutate(
-            Some((
-                "verify",
-                "decide_fixes",
-                "failed_prs",
-                "processed red PR fix actions",
-            )),
-            |st| {
-                for (pr, _msg) in &fix_decisions.notify {
-                    if let Some(rec) = st.failed.get(pr) {
-                        st.fix_notified.insert(*pr, rec.sha.clone());
-                    }
-                }
-                for (pr, rec) in fix_decisions.dispatch {
-                    let fix_key = format!("fix-pr{pr}");
-                    if !st.todo.iter().any(|t| t.key == fix_key) {
-                        st.todo.push(TodoItem {
-                            key: fix_key,
-                            brief: format!(
-                                "Fix red PR #{pr} at {} ({}):\n{}",
-                                rec.sha, rec.summary, rec.log
-                            ),
-                            area: String::new(),
-                            base: Some(pr.to_string()),
-                            after: Vec::new(),
-                            priority: 1,
-                            created_at: now,
-                            ..Default::default()
-                        });
-                    }
-                }
-            },
-        )?;
-    }
-
-    let state = store.load()?;
-    let (to_rebase, _barred) = next_hands(
-        &state.open_prs_cache,
-        &state.agents,
-        &state.holds,
-        &live,
-        &state.rebase_attempts,
-        free_for_aux,
-    );
-    let rebase_prs: Vec<(u64, String)> = to_rebase
-        .into_iter()
-        .map(|p| (p.number, p.head.clone()))
-        .collect();
-    if !rebase_prs.is_empty() && !args.dry_run {
-        store.mutate(
-            Some((
-                "dispatch",
-                "next_hands",
-                "open_prs",
-                "processed conflict rebase actions",
-            )),
-            |st| {
-                for (pr_num, head_sha) in rebase_prs {
-                    st.rebase_attempts.insert(pr_num, head_sha.clone());
-                    let reb_key = format!("rebase-pr{pr_num}");
-                    if !st.todo.iter().any(|t| t.key == reb_key) {
-                        st.todo.push(TodoItem {
-                            key: reb_key,
-                            brief: format!(
-                                "Rebase conflicting PR #{pr_num} at {head_sha} onto main"
-                            ),
-                            area: String::new(),
-                            base: Some(pr_num.to_string()),
-                            after: Vec::new(),
-                            priority: 1,
-                            created_at: now,
-                            ..Default::default()
-                        });
-                    }
-                }
-            },
-        )?;
-    }
-
-    // 4. Auto-queue flake fix tasks if any test crossed FLAKE_TASK_THRESHOLD
-    let state = store.load()?;
     let (updated_flakes, new_flake_tasks) = flake_tasks(
         &state.flakes,
         &state.todo,
@@ -2393,35 +2535,225 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         &state.retired,
         now,
     );
-    if !new_flake_tasks.is_empty() && !args.dry_run {
-        store.mutate(
-            Some(("verify", "flake_tasks", "flakes", "queued flake fix tasks")),
-            |st| {
-                st.flakes = updated_flakes;
-                st.todo.extend(new_flake_tasks);
-            },
-        )?;
+    let mut initial_todo = state.todo.clone();
+    for item in new_flake_tasks {
+        if !initial_todo.iter().any(|t| t.key == item.key) {
+            initial_todo.push(item);
+        }
     }
 
-    // 5. Dispatch ready tasks up to free worker slots
-    let state = store.load()?;
-    let free_slots = state.max_workers.saturating_sub(live.len());
-    let passed_prs: BTreeSet<u64> = state.passed.keys().copied().collect();
-    let failed_prs: BTreeSet<u64> = state.failed.keys().copied().collect();
-    let (chosen, _) = next_work(
-        &state.todo,
-        &state.agents,
-        &state.retired,
-        &state.holds,
-        &live,
-        &passed_prs,
-        &failed_prs,
-        &state.merged_prs,
-        &state.closed_prs,
-        free_slots,
-    );
+    let decision_state = DecisionState {
+        max_parallel: state.max_workers,
+        todo: initial_todo,
+        agents: state.agents.clone(),
+        retired: state.retired.clone(),
+        holds: state.holds.clone(),
+        passed: state.passed.clone(),
+        failed: state.failed.clone(),
+        merged_prs: state.merged_prs.clone(),
+        closed_prs: state.closed_prs.clone(),
+        batches: state.batches.clone(),
+        flakes: updated_flakes,
+        samples: state.samples.clone(),
+        nudged: state.nudged.clone(),
+        rebase_attempts: state.rebase_attempts.clone(),
+        fix_notified: state.fix_notified.clone(),
+        notified_keys: state.notified_failures.clone(),
+        area_rules: state.area_rules.clone(),
+        refused_self_update_sha: state.refused_self_update_sha.clone(),
+        last_tick_ts: state.last_tick_ts,
+        last_watchdog_alert_ts: state.last_watchdog_alert_ts,
+        tidy_min_age_secs: 3_600,
+    };
 
-    for item in &chosen {
+    let world_obs = WorldObservation {
+        now,
+        main_sha,
+        open_prs: state.open_prs_cache.clone(),
+        merged_prs: state.merged_prs.clone(),
+        closed_prs: state.closed_prs.clone(),
+        live_keys: live.clone(),
+        agent_samples,
+        agent_log_tails,
+        batch_outcomes: Vec::new(),
+        deploy_runs,
+        behind_commits,
+        detached_checkout,
+        failed_main_jobs,
+        ready_trains,
+        tidy_snapshot,
+    };
+
+    // 3. Call the pure decision engine (`decide`) — nothing else decides!
+    let plan = decide(&decision_state, &world_obs);
+
+    // 4. Execute side-effects prescribed by `plan`
+    if !plan.reaped_agents.is_empty() && !args.dry_run {
+        store.mutate(
+            Some((
+                "dispatch",
+                "reap_agents",
+                "agents",
+                "reaped exited agents and attributed PRs",
+            )),
+            |st| {
+                st.agents = plan.next_state.agents.clone();
+                let wt_clean_map = HashMap::new();
+                let idle = idle_chains(&st.agents, &st.retired, &live, &wt_clean_map);
+                for root in idle {
+                    if let Some(a) = st.agents.get_mut(&root) {
+                        a.pr_none = true;
+                    }
+                }
+            },
+        )?;
+        for (k, found_pr, is_none) in &plan.reaped_agents {
+            let (label, status, because) = if let Some(p) = found_pr {
+                ("Review", TaskStatus::Review, format!("{k} opened PR #{p}"))
+            } else if *is_none {
+                (
+                    "Done",
+                    TaskStatus::Done,
+                    format!("{k} completed with PR: none"),
+                )
+            } else {
+                (
+                    "Failed",
+                    TaskStatus::Failed,
+                    format!("{k} exited without PR"),
+                )
+            };
+            let _ = store.emit_state_band(
+                &format!("task:{}/state", base_key(k)),
+                label,
+                status,
+                &because,
+                now_ns(),
+            );
+        }
+    }
+
+    for step in &plan.supervision_actions {
+        match step {
+            SuperviseAction::Ok => {}
+            SuperviseAction::Resume { key, because } => {
+                println!("Supervise: {because}");
+                if !args.dry_run {
+                    if let Some(a) = state.agents.get(key) {
+                        if let Some(pid) = a.pid {
+                            unsafe {
+                                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+                            }
+                        }
+                        let resumed = resume_task(a, because, "", now);
+                        store.mutate(Some(("watch", "supervise_resume", key, because)), |st| {
+                            if let Some(ag) = st.agents.get_mut(key) {
+                                ag.finished_at = Some(now);
+                                ag.exit_code = Some(143);
+                            }
+                            st.todo.push(resumed);
+                        })?;
+                    }
+                    emit_decision_event(&format!("agent:{key}"), "watch:supervise", because);
+                }
+            }
+            SuperviseAction::Nudge { key, because } => {
+                println!("Supervise: {because}");
+                if !args.dry_run {
+                    store.mutate(Some(("watch", "supervise_nudge", key, because)), |st| {
+                        st.nudged.insert(key.clone());
+                    })?;
+                    emit_decision_event(&format!("agent:{key}"), "watch:supervise", because);
+                }
+            }
+            SuperviseAction::Escalate { key, because } => {
+                println!("Supervise: {because}");
+                if !args.dry_run {
+                    let _ = store.record_decision("watch", "supervise", key, because);
+                    emit_decision_event(&format!("agent:{key}"), "watch:supervise", because);
+                }
+            }
+        }
+    }
+
+    for item in &plan.resumed_tasks {
+        let because = format!("auto-queued resume {} after backoff", item.key);
+        println!("{because}");
+        if !args.dry_run {
+            let _ = store.record_decision("dispatch", "auto_resume", &item.key, &because);
+        }
+    }
+
+    if !args.dry_run {
+        let mut next_todo = plan.next_state.todo.clone();
+        for (pr, rec) in &plan.fix_decisions.dispatch {
+            let fix_key = format!("fix-pr{pr}");
+            if !next_todo.iter().any(|t| t.key == fix_key) {
+                next_todo.push(TodoItem {
+                    key: fix_key,
+                    brief: format!(
+                        "Fix red PR #{pr} at {} ({}):\n{}",
+                        rec.sha, rec.summary, rec.log
+                    ),
+                    area: String::new(),
+                    base: Some(pr.to_string()),
+                    after: Vec::new(),
+                    priority: 1,
+                    created_at: now,
+                    ..Default::default()
+                });
+            }
+        }
+        for (pr_num, head_sha) in &plan.rebase_handoffs {
+            let reb_key = format!("rebase-pr{pr_num}");
+            if !next_todo.iter().any(|t| t.key == reb_key) {
+                next_todo.push(TodoItem {
+                    key: reb_key,
+                    brief: format!("Rebase conflicting PR #{pr_num} at {head_sha} onto main"),
+                    area: String::new(),
+                    base: Some(pr_num.to_string()),
+                    after: Vec::new(),
+                    priority: 1,
+                    created_at: now,
+                    ..Default::default()
+                });
+            }
+        }
+
+        if !plan.fix_decisions.dispatch.is_empty() || !plan.fix_decisions.notify.is_empty() {
+            let _ = store.record_decision(
+                "verify",
+                "decide_fixes",
+                "failed_prs",
+                "processed red PR fix actions",
+            );
+        }
+        if !plan.rebase_handoffs.is_empty() {
+            let _ = store.record_decision(
+                "dispatch",
+                "next_hands",
+                "open_prs",
+                "processed conflict rebase actions",
+            );
+        }
+
+        // Persist updated state from `decide` (keeping `dispatched_tasks` in `st.todo` until `spawn_worker_for_item` pops them)
+        let mut todo_with_dispatched = plan.dispatched_tasks.clone();
+        todo_with_dispatched.extend(next_todo);
+        store.mutate(None, |st| {
+            st.todo = todo_with_dispatched;
+            st.samples = plan.next_state.samples.clone();
+            st.nudged = plan.next_state.nudged.clone();
+            st.flakes = plan.next_state.flakes.clone();
+            st.rebase_attempts = plan.next_state.rebase_attempts.clone();
+            st.fix_notified = plan.next_state.fix_notified.clone();
+            st.notified_failures = plan.next_state.notified_keys.clone();
+            st.last_tick_ts = plan.next_state.last_tick_ts;
+            st.last_watchdog_alert_ts = plan.next_state.last_watchdog_alert_ts;
+        })?;
+    }
+
+    for item in &plan.dispatched_tasks {
         if args.dry_run {
             println!("[dry-run] Would dispatch {}", item.key);
         } else {
@@ -2430,43 +2762,40 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         }
     }
 
+    // 5. Run automatic janitor (`tidy_decisions`), self-update, and owner notifications from `decide`
+    if !plan.tidy_decisions.is_empty() {
+        apply_tidy_decisions(&mut store, &plan.tidy_decisions, now, args.dry_run);
+    }
+
+    if let Some(ref target_sha) = plan.self_update.target_sha {
+        println!("Self-update: {}", plan.self_update.because);
+        if !args.dry_run {
+            let _ = store.record_decision(
+                "watch",
+                "self_update",
+                target_sha,
+                &plan.self_update.because,
+            );
+        }
+    }
+
+    if !args.dry_run {
+        for n in &plan.owner_notifications {
+            let _ = store.record_decision("watch", "notify_owner", &n.key, &n.because);
+        }
+        if let Some(ref alert) = plan.watchdog_alert {
+            let _ = store.record_decision("watch", "watchdog_alert", "tick", alert);
+        }
+    }
+
     let tick_summary = format!(
         "active={}, dispatched={}, reaped={}",
         live.len(),
-        chosen.len(),
-        reaped.len()
+        plan.dispatched_tasks.len(),
+        plan.reaped_agents.len()
     );
 
     if !args.dry_run {
-        let st_before = store.load()?;
-        let attention = needs_you(
-            &st_before.agents,
-            &st_before.todo,
-            &st_before.retired,
-            &st_before.holds,
-            &live,
-            &st_before.open_prs_cache,
-            &st_before.passed,
-            &st_before.failed,
-            now,
-        );
-        let notifications = decide_owner_notifications(
-            &attention,
-            &st_before.batches,
-            &[],
-            &BTreeMap::new(),
-            &[],
-            &st_before.notified_failures,
-        );
-        store.mutate(None, |st| {
-            st.last_tick_ts = Some(now);
-            for n in &notifications {
-                st.notified_failures.insert(n.key.clone());
-            }
-        })?;
-        for n in &notifications {
-            let _ = store.record_decision("watch", "notify_owner", &n.key, &n.because);
-        }
         let _ = store.emit_duration_slice(
             "fleet/ticks",
             "tick",

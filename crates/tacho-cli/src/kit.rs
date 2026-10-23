@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tacho_core::decide::verify::{
@@ -751,6 +751,8 @@ pub fn execute_wait(args: WaitArgs) -> io::Result<i32> {
         }
     };
 
+    let event_watcher = FdEventWatcher::new_for_dir_and_pid(Some(&dir), pid);
+
     loop {
         drain_log(&mut offset);
 
@@ -779,7 +781,105 @@ pub fn execute_wait(args: WaitArgs) -> io::Result<i32> {
             return Ok(3);
         }
 
-        thread::sleep(Duration::from_millis(100));
+        let rem_ms = Duration::from_secs(max_wait)
+            .saturating_sub(start.elapsed())
+            .as_millis()
+            .min(100) as i32;
+        event_watcher.wait_ms(rem_ms);
+    }
+}
+
+/// Event-driven waiter backed by Linux `inotify` and `pidfd_open` + `poll(2)`.
+struct FdEventWatcher {
+    inotify_fd: i32,
+    pid_fd: i32,
+}
+
+impl FdEventWatcher {
+    fn new_for_dir_and_pid(dir: Option<&Path>, pid: u32) -> Self {
+        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if inotify_fd >= 0 {
+            if let Some(d) = dir {
+                if let Ok(c_path) = std::ffi::CString::new(d.as_os_str().as_bytes()) {
+                    let mask = libc::IN_MODIFY
+                        | libc::IN_CLOSE_WRITE
+                        | libc::IN_CREATE
+                        | libc::IN_MOVED_TO;
+                    unsafe {
+                        let _ = libc::inotify_add_watch(inotify_fd, c_path.as_ptr(), mask);
+                    }
+                }
+            }
+        }
+        let pid_fd = if pid > 0 {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) as i32 };
+            if fd >= 0 {
+                fd
+            } else {
+                -1
+            }
+        } else {
+            -1
+        };
+        Self { inotify_fd, pid_fd }
+    }
+
+    fn wait_ms(&self, timeout_ms: i32) {
+        let mut pfds = [
+            libc::pollfd {
+                fd: -1,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: -1,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut nfds = 0usize;
+        if self.inotify_fd >= 0 {
+            pfds[nfds].fd = self.inotify_fd;
+            nfds += 1;
+        }
+        if self.pid_fd >= 0 {
+            pfds[nfds].fd = self.pid_fd;
+            nfds += 1;
+        }
+        unsafe {
+            let ptr = if nfds > 0 {
+                pfds.as_mut_ptr()
+            } else {
+                std::ptr::null_mut()
+            };
+            let _ = libc::poll(ptr, nfds as libc::nfds_t, timeout_ms.max(1));
+        }
+        if self.inotify_fd >= 0 {
+            let mut buf = [0u8; 1024];
+            unsafe {
+                while libc::read(
+                    self.inotify_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                ) > 0
+                {}
+            }
+        }
+    }
+}
+
+impl Drop for FdEventWatcher {
+    fn drop(&mut self) {
+        if self.inotify_fd >= 0 {
+            unsafe {
+                let _ = libc::close(self.inotify_fd);
+            }
+        }
+        if self.pid_fd >= 0 {
+            unsafe {
+                let _ = libc::close(self.pid_fd);
+            }
+        }
     }
 }
 
@@ -836,6 +936,8 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
     }
     let target = -(pid as i32);
 
+    let pid_watcher = FdEventWatcher::new_for_dir_and_pid(Some(&dir), pid);
+
     if args.now {
         unsafe {
             let _ = libc::kill(target, libc::SIGKILL);
@@ -849,7 +951,7 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
             if !pid_alive(pid) && !group_alive(pid) {
                 break;
             }
-            thread::sleep(Duration::from_millis(50));
+            pid_watcher.wait_ms(50);
         }
         if pid_alive(pid) || group_alive(pid) {
             unsafe {
@@ -861,7 +963,7 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
     // Reap/wait up to 2s for process group to clear
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline && (pid_alive(pid) || group_alive(pid)) {
-        thread::sleep(Duration::from_millis(50));
+        pid_watcher.wait_ms(50);
     }
 
     println!("Stopped job '{}' (pid {pid})", args.name);
@@ -1094,7 +1196,7 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
         .iter()
         .any(|b| b.status == "running" || b.status == "bisecting");
 
-    let total_cpus = thread::available_parallelism()
+    let total_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     let plan = plan_starve(
@@ -1163,6 +1265,8 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
     let start = Instant::now();
     let timeout = Duration::from_secs(plan.timeout_secs);
     let exit_code: i32;
+    let home_dir = crate::paths::resolve_home();
+    let starve_watcher = FdEventWatcher::new_for_dir_and_pid(Some(&home_dir), child.id());
 
     loop {
         match child.try_wait()? {
@@ -1199,7 +1303,8 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
                         break;
                     }
                 }
-                thread::sleep(Duration::from_millis(50));
+                let rem_ms = timeout.saturating_sub(start.elapsed()).as_millis().min(50) as i32;
+                starve_watcher.wait_ms(rem_ms);
             }
         }
     }

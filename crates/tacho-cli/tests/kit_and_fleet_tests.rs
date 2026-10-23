@@ -54,6 +54,7 @@ fn test_kit_start_prove_and_pr_preflight() {
             st.area_rules.push(AreaRule {
                 area: "docs".to_string(),
                 prefixes: vec!["docs/".to_string(), "README.md".to_string()],
+                unit_prefixes: std::collections::BTreeMap::new(),
                 checks: vec![("docs-check".to_string(), "test -f README.md".to_string())],
                 isolate_batch: false,
                 needs_screenshot: false,
@@ -400,7 +401,11 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
         String::from_utf8_lossy(&batch_flake.stderr)
     );
     let st_after_flake = store.load().unwrap();
-    assert!(st_after_flake.passed.contains_key(&10));
+    assert!(
+        !st_after_flake.passed.contains_key(&10),
+        "flake retry must not be treated as passed"
+    );
+    assert_eq!(st_after_flake.batches.last().unwrap().status, "flake");
     assert!(!st_after_flake.flakes.is_empty());
 
     // 4. Test binary bisection blaming culprit PR #11 (`k >= 2` fails, `k < 2` passes) and auto-rerunning PR #10

@@ -24,6 +24,14 @@ pub const PORT_RANGE_END: u16 = 32_000;
 /// Number of ports reserved per worktree block.
 pub const PORT_BLOCK_SIZE: u16 = 20;
 
+/// A check modelled as an area name plus its affected units (packages/targets/crates).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AreaCheck {
+    pub area: String,
+    #[serde(default)]
+    pub units: Vec<String>,
+}
+
 /// A planned verification batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BatchPlan {
@@ -32,6 +40,10 @@ pub struct BatchPlan {
     pub prs: Vec<u64>,
     pub shas: BTreeMap<u64, String>,
     pub areas: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<AreaCheck>,
+    #[serde(default)]
+    pub mode: BatchMode,
     #[serde(default)]
     pub because: String,
 }
@@ -48,7 +60,11 @@ pub struct BatchRun {
     pub main_sha: String,
     #[serde(default)]
     pub areas: Vec<String>,
-    /// `"running"`, `"passed"`, `"failed"`, `"bisecting"`
+    #[serde(default)]
+    pub checks: Vec<AreaCheck>,
+    #[serde(default)]
+    pub mode: BatchMode,
+    /// `"running"`, `"passed"`, `"failed"`, `"flake"`, `"bisecting"`, `"head-moved"`, `"main-broken"`, `"hang"`
     #[serde(default)]
     pub status: String,
     #[serde(default)]
@@ -187,11 +203,13 @@ pub struct ProofSummary {
 }
 
 /// Configurable rule mapping file path prefixes or regexes to area names and check commands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AreaRule {
     pub area: String,
     #[serde(default)]
     pub prefixes: Vec<String>,
+    #[serde(default)]
+    pub unit_prefixes: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub checks: Vec<(String, String)>,
     #[serde(default)]
@@ -339,6 +357,41 @@ pub fn areas_for_files(files: &[String], rules: &[AreaRule]) -> Vec<String> {
         }
     }
     out.into_iter().collect()
+}
+
+/// Compute structured `(area, affected_units)` checks for a set of changed files.
+pub fn checks_for_files(files: &[String], rules: &[AreaRule]) -> Vec<AreaCheck> {
+    let areas = areas_for_files(files, rules);
+    let mut out = Vec::with_capacity(areas.len());
+    for area in areas {
+        let mut units_set = BTreeSet::new();
+        if let Some(rule) = rules.iter().find(|r| r.area == area) {
+            if !rule.unit_prefixes.is_empty() {
+                for u in affected_units(files, &rule.unit_prefixes) {
+                    units_set.insert(u);
+                }
+            }
+        }
+        if units_set.is_empty() {
+            for f in files {
+                if let Some(rest) = f.strip_prefix("crates/") {
+                    if let Some(krate) = rest.split('/').next() {
+                        if area == krate || area == "workspace" {
+                            units_set.insert(krate.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if units_set.is_empty() {
+            units_set.insert("all".to_string());
+        }
+        out.push(AreaCheck {
+            area,
+            units: units_set.into_iter().collect(),
+        });
+    }
+    out
 }
 
 /// Check whether a PR touches `ci` or any area configured with `isolate_batch: true`.
@@ -519,9 +572,11 @@ pub fn batches(
         }
         let mut shas = BTreeMap::new();
         let mut area_set = BTreeSet::new();
+        let mut all_files = Vec::new();
         for &n in &capped {
             if let Some(p) = by_num.get(&n) {
                 shas.insert(n, p.head.clone());
+                all_files.extend(p.files.iter().cloned());
                 for a in areas_for_files(&p.files, rules) {
                     area_set.insert(a);
                 }
@@ -530,12 +585,15 @@ pub fn batches(
         next_num += 1;
         let id = format!("b{next_num:03}");
         let areas: Vec<String> = area_set.into_iter().collect();
+        let checks = checks_for_files(&all_files, rules);
         plans.push(BatchPlan {
             id,
             group: group.clone(),
             prs: capped.clone(),
             shas,
             areas,
+            checks,
+            mode: BatchMode::Presubmit,
             because: format!("verify {:?} in group {}", capped, group),
         });
     }
@@ -1519,15 +1577,21 @@ pub enum BatchMode {
     Postsubmit,
 }
 
-/// Check whether any PR in a running batch moved its head SHA while verification was running.
-///
-/// Returns `Some(reason)` when any PR's live head SHA differs from the SHA recorded when the
-/// batch started (or if the PR disappeared / closed), refusing to mark the stale batch as passed.
-pub fn batch_heads_moved(
+/// Check whether `main` or any PR in a running batch moved its head SHA while verification was running.
+pub fn batch_refs_moved(
+    expected_main: &str,
+    current_main: &str,
     expected_shas: &BTreeMap<u64, String>,
     current_shas: &BTreeMap<u64, String>,
 ) -> Option<String> {
     let mut moved = Vec::new();
+    if !expected_main.is_empty() && !current_main.is_empty() && expected_main != current_main {
+        moved.push(format!(
+            "main moved from {} to {}",
+            &expected_main[..expected_main.len().min(8)],
+            &current_main[..current_main.len().min(8)]
+        ));
+    }
     for (pr, expected) in expected_shas {
         match current_shas.get(pr) {
             Some(actual) if actual == expected => {}
@@ -1550,10 +1614,22 @@ pub fn batch_heads_moved(
         None
     } else {
         Some(format!(
-            "batch invalidated because PR heads moved during verification: {}",
+            "batch invalidated because refs moved during verification: {}",
             moved.join(", ")
         ))
     }
+}
+
+/// Check whether any PR in a running batch moved its head SHA while verification was running.
+///
+/// Returns `Some(reason)` when any PR's live head SHA differs from the SHA recorded when the
+/// batch started (or if the PR disappeared / closed), refusing to mark the stale batch as passed.
+pub fn batch_heads_moved(
+    expected_shas: &BTreeMap<u64, String>,
+    current_shas: &BTreeMap<u64, String>,
+) -> Option<String> {
+    batch_refs_moved("", "", expected_shas, current_shas)
+        .map(|s| s.replace("refs moved", "PR heads moved"))
 }
 
 fn path_under(path: &str, prefix: &str) -> bool {
@@ -1647,24 +1723,500 @@ fn expand_workflow_expr(
     expressions: &BTreeMap<String, String>,
     context: &str,
 ) -> Result<String, String> {
-    static EXPR_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\$\{\{\s*(.*?)\s*\}\}").unwrap());
     let mut out = String::with_capacity(raw.len());
-    let mut last = 0;
-    for cap in EXPR_RE.captures_iter(raw) {
-        let m = cap.get(0).unwrap();
-        let key = cap.get(1).unwrap().as_str().trim();
+    let mut rest = raw;
+    while let Some(open_idx) = rest.find("${{") {
+        out.push_str(&rest[..open_idx]);
+        let after_open = &rest[open_idx + 3..];
+        let Some(close_idx) = after_open.find("}}") else {
+            return Err(format!(
+                "{context}: unclosed workflow expression in '{raw}'"
+            ));
+        };
+        let key = after_open[..close_idx].trim();
         let Some(val) = expressions.get(key) else {
             return Err(format!(
                 "{context}: unsupported workflow expression '${{{{ {key} }}}}'"
             ));
         };
-        out.push_str(&raw[last..m.start()]);
         out.push_str(val);
-        last = m.end();
+        rest = &after_open[close_idx + 2..];
     }
-    out.push_str(&raw[last..]);
+    out.push_str(rest);
     Ok(out)
+}
+
+fn strip_yaml_comment(line: &str) -> Result<&str, String> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_double {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if ch == '#' && !in_single && !in_double && (idx == 0 || line[..idx].ends_with([' ', '\t']))
+        {
+            return Ok(line[..idx].trim_end());
+        }
+    }
+    if in_single || in_double {
+        return Err(format!("unclosed quote in YAML line: {line}"));
+    }
+    Ok(line.trim_end())
+}
+
+fn split_yaml_key_val(text: &str) -> Option<(&str, &str)> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut depth_brace = 0usize;
+    let mut depth_bracket = 0usize;
+    let bytes = text.as_bytes();
+    for (idx, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_double {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_single && !in_double {
+            match ch {
+                '{' => depth_brace += 1,
+                '}' => depth_brace = depth_brace.saturating_sub(1),
+                '[' => depth_bracket += 1,
+                ']' => depth_bracket = depth_bracket.saturating_sub(1),
+                ':' if depth_brace == 0 && depth_bracket == 0 => {
+                    let next_byte = bytes.get(idx + 1).copied();
+                    if next_byte.is_none() || next_byte == Some(b' ') || next_byte == Some(b'\t') {
+                        let key = text[..idx].trim();
+                        if !key.is_empty() {
+                            let val = text[idx + 1..].trim();
+                            return Some((key, val));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn split_flow_items(inner: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut depth_brace = 0usize;
+    let mut depth_bracket = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_double {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_single && !in_double {
+            match ch {
+                '{' => depth_brace += 1,
+                '}' => depth_brace = depth_brace.saturating_sub(1),
+                '[' => depth_bracket += 1,
+                ']' => depth_bracket = depth_bracket.saturating_sub(1),
+                ',' if depth_brace == 0 && depth_bracket == 0 => {
+                    let seg = inner[start..idx].trim();
+                    if !seg.is_empty() {
+                        items.push(seg);
+                    }
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        items.push(tail);
+    }
+    items
+}
+
+fn unquote_yaml_str(raw: &str) -> Result<String, String> {
+    let s = raw.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('t') => out.push('\t'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => return Err(format!("trailing backslash in string {raw}")),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    } else if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        Ok(s[1..s.len() - 1].replace("''", "'"))
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+fn parse_yaml_scalar_or_flow(raw: &str, line_no: usize) -> Result<serde_json::Value, String> {
+    let s = raw.trim();
+    if s.is_empty() || s == "null" || s == "~" {
+        return Ok(serde_json::Value::Null);
+    }
+    if s == "true" {
+        return Ok(serde_json::Value::Bool(true));
+    }
+    if s == "false" {
+        return Ok(serde_json::Value::Bool(false));
+    }
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        return Ok(serde_json::Value::String(unquote_yaml_str(s)?));
+    }
+    if s.starts_with('[') {
+        if !s.ends_with(']') {
+            return Err(format!("line {line_no}: unclosed flow sequence '{s}'"));
+        }
+        let inner = &s[1..s.len() - 1];
+        let mut arr = Vec::new();
+        for item in split_flow_items(inner) {
+            arr.push(parse_yaml_scalar_or_flow(item, line_no)?);
+        }
+        return Ok(serde_json::Value::Array(arr));
+    }
+    if s.starts_with('{') {
+        if !s.ends_with('}') {
+            return Err(format!("line {line_no}: unclosed flow mapping '{s}'"));
+        }
+        let inner = &s[1..s.len() - 1];
+        let mut map = serde_json::Map::new();
+        for pair in split_flow_items(inner) {
+            let Some((k, v)) = split_yaml_key_val(pair) else {
+                return Err(format!(
+                    "line {line_no}: invalid flow mapping entry '{pair}'"
+                ));
+            };
+            let key = unquote_yaml_str(k)?;
+            map.insert(key, parse_yaml_scalar_or_flow(v, line_no)?);
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Ok(serde_json::Value::Number(i.into()));
+    }
+    Ok(serde_json::Value::String(s.to_string()))
+}
+
+#[derive(Debug, Clone)]
+struct YamlLine {
+    line_no: usize,
+    indent: usize,
+    raw_content: String,
+    stripped: String,
+}
+
+fn collect_block_scalar(
+    lines: &[YamlLine],
+    idx: &mut usize,
+    parent_indent: usize,
+    folded: bool,
+) -> String {
+    let mut block_lines: Vec<(usize, &str)> = Vec::new();
+    let mut min_indent: Option<usize> = None;
+    while *idx < lines.len() {
+        let l = &lines[*idx];
+        if l.raw_content.trim().is_empty() {
+            block_lines.push((0, ""));
+            *idx += 1;
+            continue;
+        }
+        if l.indent <= parent_indent {
+            break;
+        }
+        if min_indent.is_none() {
+            min_indent = Some(l.indent);
+        }
+        block_lines.push((l.indent, l.raw_content.as_str()));
+        *idx += 1;
+    }
+    while block_lines.last().is_some_and(|(_, s)| s.is_empty()) {
+        block_lines.pop();
+    }
+    let base = min_indent.unwrap_or(parent_indent + 2);
+    let mut rendered = Vec::with_capacity(block_lines.len());
+    for (ind, text) in block_lines {
+        if text.is_empty() {
+            rendered.push(String::new());
+        } else {
+            let extra = ind.saturating_sub(base);
+            rendered.push(format!("{}{}", " ".repeat(extra), text));
+        }
+    }
+    if folded {
+        rendered.join(" ")
+    } else {
+        rendered.join("\n")
+    }
+}
+
+fn next_non_empty(lines: &[YamlLine], mut idx: usize) -> Option<&YamlLine> {
+    while idx < lines.len() {
+        if !lines[idx].stripped.is_empty() {
+            return Some(&lines[idx]);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn parse_yaml_block(
+    lines: &[YamlLine],
+    idx: &mut usize,
+    min_indent: usize,
+) -> Result<serde_json::Value, String> {
+    while *idx < lines.len() && lines[*idx].stripped.is_empty() {
+        *idx += 1;
+    }
+    let Some(first) = lines.get(*idx) else {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    };
+    if first.indent < min_indent {
+        return Ok(serde_json::Value::Null);
+    }
+    let block_indent = first.indent;
+    if first.stripped == "-" || first.stripped.starts_with("- ") {
+        let mut arr = Vec::new();
+        while *idx < lines.len() {
+            if lines[*idx].stripped.is_empty() {
+                *idx += 1;
+                continue;
+            }
+            if lines[*idx].indent < block_indent {
+                break;
+            }
+            if lines[*idx].indent > block_indent {
+                return Err(format!(
+                    "line {}: unexpected indentation in sequence",
+                    lines[*idx].line_no
+                ));
+            }
+            let cur = &lines[*idx];
+            if cur.stripped != "-" && !cur.stripped.starts_with("- ") {
+                break;
+            }
+            let rest = cur
+                .stripped
+                .strip_prefix("- ")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let line_no = cur.line_no;
+            let item_indent = cur.indent;
+            *idx += 1;
+            if rest.is_empty() {
+                let val = parse_yaml_block(lines, idx, item_indent + 1)?;
+                arr.push(val);
+            } else if let Some((k, v)) = split_yaml_key_val(&rest) {
+                let mut map = serde_json::Map::new();
+                let key = unquote_yaml_str(k)?;
+                let val = parse_yaml_rhs(v, line_no, lines, idx, item_indent + 2)?;
+                map.insert(key, val);
+                parse_yaml_map_entries(&mut map, lines, idx, item_indent + 2)?;
+                arr.push(serde_json::Value::Object(map));
+            } else {
+                arr.push(parse_yaml_scalar_or_flow(&rest, line_no)?);
+            }
+        }
+        Ok(serde_json::Value::Array(arr))
+    } else {
+        let mut map = serde_json::Map::new();
+        parse_yaml_map_entries(&mut map, lines, idx, block_indent)?;
+        Ok(serde_json::Value::Object(map))
+    }
+}
+
+fn parse_yaml_rhs(
+    v: &str,
+    line_no: usize,
+    lines: &[YamlLine],
+    idx: &mut usize,
+    key_indent: usize,
+) -> Result<serde_json::Value, String> {
+    if v == "|" || v == "|-" || v == "|+" {
+        Ok(serde_json::Value::String(collect_block_scalar(
+            lines, idx, key_indent, false,
+        )))
+    } else if v == ">" || v == ">-" || v == ">+" {
+        Ok(serde_json::Value::String(collect_block_scalar(
+            lines, idx, key_indent, true,
+        )))
+    } else if v.is_empty() {
+        if let Some(next_line) = next_non_empty(lines, *idx) {
+            if next_line.indent > key_indent
+                || (next_line.indent == key_indent
+                    && (next_line.stripped == "-" || next_line.stripped.starts_with("- ")))
+            {
+                let child_min = next_line.indent;
+                return parse_yaml_block(lines, idx, child_min);
+            }
+        }
+        Ok(serde_json::Value::Null)
+    } else {
+        parse_yaml_scalar_or_flow(v, line_no)
+    }
+}
+
+fn parse_yaml_map_entries(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    lines: &[YamlLine],
+    idx: &mut usize,
+    map_indent: usize,
+) -> Result<(), String> {
+    while *idx < lines.len() {
+        if lines[*idx].stripped.is_empty() {
+            *idx += 1;
+            continue;
+        }
+        let cur_indent = lines[*idx].indent;
+        if cur_indent < map_indent {
+            break;
+        }
+        if cur_indent > map_indent {
+            return Err(format!(
+                "line {}: unexpected indentation (expected {}, got {})",
+                lines[*idx].line_no, map_indent, cur_indent
+            ));
+        }
+        let line_no = lines[*idx].line_no;
+        let stripped = lines[*idx].stripped.clone();
+        if stripped == "-" || stripped.starts_with("- ") {
+            break;
+        }
+        let Some((k, v)) = split_yaml_key_val(&stripped) else {
+            return Err(format!(
+                "line {line_no}: expected 'key: value' mapping entry, found '{stripped}'"
+            ));
+        };
+        let key = unquote_yaml_str(k)?;
+        *idx += 1;
+        let val = parse_yaml_rhs(v, line_no, lines, idx, cur_indent)?;
+        map.insert(key, val);
+    }
+    Ok(())
+}
+
+/// Parse a GitHub Actions workflow file (YAML or JSON) into a `serde_json::Value`.
+///
+/// Fails with a descriptive error if the workflow has invalid syntax, unclosed quotes,
+/// tab indentation, or malformed mappings.
+pub fn parse_workflow_yaml(text: &str) -> Result<serde_json::Value, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("workflow file is empty".to_string());
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON workflow: {e}"));
+    }
+
+    let mut lines = Vec::new();
+    for (i, raw_line) in text.lines().enumerate() {
+        let line_no = i + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let leading: String = line
+            .chars()
+            .take_while(|&c| c == ' ' || c == '\t')
+            .collect();
+        if leading.contains('\t') {
+            return Err(format!(
+                "line {line_no}: tabs are not allowed for YAML indentation"
+            ));
+        }
+        let indent = leading.len();
+        let raw_content = line[indent..].to_string();
+        let stripped = strip_yaml_comment(&raw_content)
+            .map_err(|e| format!("line {line_no}: {e}"))?
+            .to_string();
+        if indent == 0 && (stripped == "---" || stripped == "...") {
+            continue;
+        }
+        lines.push(YamlLine {
+            line_no,
+            indent,
+            raw_content,
+            stripped,
+        });
+    }
+
+    let mut idx = 0;
+    let val = parse_yaml_block(&lines, &mut idx, 0)?;
+    while idx < lines.len() {
+        if !lines[idx].stripped.is_empty() {
+            return Err(format!(
+                "line {}: unexpected trailing content '{}'",
+                lines[idx].line_no, lines[idx].stripped
+            ));
+        }
+        idx += 1;
+    }
+    Ok(val)
+}
+
+/// Parse a YAML or JSON workflow text and extract the `CiJob` for `(area, job_name)`.
+pub fn job_for_yaml(
+    workflow_text: &str,
+    area: &str,
+    job_name: &str,
+    expressions: &BTreeMap<String, String>,
+) -> Result<CiJob, String> {
+    let wf = parse_workflow_yaml(workflow_text)?;
+    job_for(&wf, area, job_name, expressions)
 }
 
 fn parse_env_map(

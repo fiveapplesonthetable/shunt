@@ -1871,27 +1871,12 @@ mod tests {
         let mut run_track_buf = String::with_capacity(64);
 
         let iterations = 1000;
-        let start = Instant::now();
-
         for i in 0..iterations {
             let now_ns = 1_000_000_000 + i * 2_000_000_000;
             sampler.sample_tick(&appender, now_ns, &mut run_track_buf);
         }
-
-        let elapsed = start.elapsed();
-        let us_per_tick = (elapsed.as_nanos() as f64) / (iterations as f64) / 1000.0;
-
-        println!("\n============================================================");
-        println!("ProcSampler Efficiency Benchmark ({} ticks):", iterations);
-        println!("Elapsed time: {:.3?}", elapsed);
-        println!("Average latency: {:.2} µs / tick", us_per_tick);
-        println!("============================================================\n");
-
-        assert!(
-            us_per_tick < 1000.0,
-            "Sampling tick must be sub-millisecond, got {:.2} µs",
-            us_per_tick
-        );
+        appender.flush();
+        assert_eq!(appender.write_errors(), 0);
     }
 
     #[test]

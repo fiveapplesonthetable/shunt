@@ -26,11 +26,12 @@ pub struct Daemon {
     pub appender: AppenderHandle,
     pub server: DaemonServer,
     pub shutdown_flag: Arc<AtomicBool>,
+    retention_wake_tx: Option<crossbeam_channel::Sender<()>>,
+    signal_handle: Option<signal_hook::iterator::Handle>,
     otlp_thread: Option<JoinHandle<()>>,
     sampler_thread: Option<JoinHandle<()>>,
     retention_thread: Option<JoinHandle<()>>,
     appender_thread: Option<JoinHandle<()>>,
-    #[allow(dead_code)]
     signal_thread: Option<JoinHandle<()>>,
 }
 
@@ -42,6 +43,10 @@ impl Daemon {
         // 0. Acquire single-instance advisory locks on both $TACHO_RUNTIME/daemon.lock and
         // $TACHO_HOME/daemon.lock BEFORE opening SQLite WAL or spawning background threads.
         let lock = DaemonLock::acquire_paths(&paths)?;
+        let _ = fs::write(
+            paths.runtime.join("daemon.pid"),
+            std::process::id().to_string(),
+        );
 
         // 1. Open SQLite WAL event log
         let log =
@@ -88,11 +93,16 @@ impl Daemon {
         )?;
 
         // 6. Spawn retention maintenance thread (hourly small-batch prune)
-        let retention_thread =
-            spawn_retention_thread(config.retention_days, paths.clone(), shutdown_flag.clone());
+        let (retention_wake_tx, retention_wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let retention_thread = spawn_retention_thread(
+            config.retention_days,
+            paths.clone(),
+            shutdown_flag.clone(),
+            retention_wake_rx,
+        );
 
         // 7. Register SIGINT / SIGTERM signal handler
-        let signal_thread =
+        let (signal_handle, signal_thread) =
             spawn_signal_handler(shutdown_flag.clone(), paths.clone(), appender.clone());
 
         // 8. Optional OTLP HTTP receiver (design section 1 and 8)
@@ -127,11 +137,13 @@ impl Daemon {
             appender,
             server,
             shutdown_flag,
+            retention_wake_tx: Some(retention_wake_tx),
+            signal_handle,
             otlp_thread,
             sampler_thread: Some(sampler_thread),
             retention_thread: Some(retention_thread),
             appender_thread: Some(appender_thread),
-            signal_thread: Some(signal_thread),
+            signal_thread,
         })
     }
 
@@ -153,6 +165,10 @@ impl Daemon {
     /// Cleanly stops all daemon threads and writes final snapshot.
     pub fn stop(&mut self) {
         self.shutdown_flag.store(true, Ordering::Release);
+        drop(self.retention_wake_tx.take());
+        if let Some(h) = self.signal_handle.take() {
+            h.close();
+        }
 
         // Flush and shutdown appender
         self.appender.flush();
@@ -178,6 +194,9 @@ impl Daemon {
         if let Some(t) = self.appender_thread.take() {
             let _ = t.join();
         }
+        if let Some(t) = self.signal_thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -190,11 +209,12 @@ impl Drop for Daemon {
 /// Spawns the retention pruning background thread.
 ///
 /// Runs hourly, deleting rows older than `retention_days` in small batches of 1,000
-/// with a 50 ms yield between batches to guarantee zero blocking of the appender.
+/// while listening on `wake_rx` for immediate shutdown notification.
 fn spawn_retention_thread(
     retention_days: u32,
     paths: DaemonPaths,
     stop_flag: Arc<AtomicBool>,
+    wake_rx: crossbeam_channel::Receiver<()>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("tacho-retention".to_string())
@@ -206,12 +226,12 @@ fn spawn_retention_thread(
             let retention_ns = (retention_days as u64) * 86_400 * 1_000_000_000;
 
             while !stop_flag.load(Ordering::Acquire) {
-                // Sleep in short intervals up to 1 hour (3600 seconds)
-                for _ in 0..3600 {
-                    if stop_flag.load(Ordering::Acquire) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_secs(1));
+                match wake_rx.recv_timeout(Duration::from_secs(3600)) {
+                    Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                }
+                if stop_flag.load(Ordering::Acquire) {
+                    return;
                 }
 
                 let now_ns = SystemTime::now()
@@ -230,9 +250,12 @@ fn spawn_retention_thread(
                         }
                         match log.prune_older_than(cutoff_ns, BATCH_SIZE) {
                             Ok(0) => break, // Done
-                            Ok(_) => {
-                                std::thread::sleep(Duration::from_millis(50));
-                            }
+                            Ok(_) => match wake_rx.recv_timeout(Duration::from_millis(50)) {
+                                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                    return;
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            },
                             Err(e) => {
                                 eprintln!("[tacho-daemon] retention prune error: {}", e);
                                 break;
@@ -250,18 +273,21 @@ fn spawn_signal_handler(
     shutdown_flag: Arc<AtomicBool>,
     paths: DaemonPaths,
     appender: AppenderHandle,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
+) -> (
+    Option<signal_hook::iterator::Handle>,
+    Option<JoinHandle<()>>,
+) {
+    let mut signals = match signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ]) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let handle = signals.handle();
+    let thread = std::thread::Builder::new()
         .name("tacho-signals".to_string())
         .spawn(move || {
-            let mut signals = match signal_hook::iterator::Signals::new([
-                signal_hook::consts::SIGINT,
-                signal_hook::consts::SIGTERM,
-            ]) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-
             if let Some(_sig) = signals.forever().next() {
                 shutdown_flag.store(true, Ordering::Release);
                 appender.flush();
@@ -275,5 +301,6 @@ fn spawn_signal_handler(
                 let _ = fs::remove_file(paths.trace_sock());
             }
         })
-        .expect("failed to spawn signal thread")
+        .expect("failed to spawn signal thread");
+    (Some(handle), Some(thread))
 }

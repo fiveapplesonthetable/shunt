@@ -1,6 +1,7 @@
 //! Deterministic restore of flight recorder state machine from logged events.
 
 use crate::classify::CommandClass;
+use crate::detect::blake3_digest_8;
 use crate::event::Event;
 use crate::input::{AgentRole, SessionKey};
 use crate::kind::Kind;
@@ -124,10 +125,8 @@ impl Recorder {
 
                     let cur = self.agent_runs.entry(agent_id.to_string()).or_insert(0);
                     *cur = (*cur).max(run_n);
-                    if self.sessions.get(&sess_key).is_none_or(|p| run_n >= p.1) {
-                        self.sessions
-                            .insert(sess_key, (agent_id.to_string(), run_n));
-                    }
+                    self.sessions
+                        .insert(sess_key, (agent_id.to_string(), run_n));
 
                     let mut run_state = RunState::new(
                         agent_id.to_string(),
@@ -178,6 +177,15 @@ impl Recorder {
                     run.turn_begin_seq = None;
                     run.open_tools.clear();
                 }
+                let exit_code = match &event.body.body {
+                    Some(tacho::event::Body::RunEnded(re)) => re.exit_code,
+                    _ => None,
+                };
+                if exit_code.unwrap_or(0) == 0 {
+                    if let Some(det) = self.detectors.get_mut(agent_id) {
+                        det.on_run_end();
+                    }
+                }
                 let procs_prefix = format!("agent:{}/run:{}/procs", agent_id, run_n);
                 self.open_custom_slices
                     .retain(|k, _| !k.starts_with(&procs_prefix));
@@ -200,7 +208,6 @@ impl Recorder {
             .unwrap_or(1);
 
         let det = self.detectors.entry(agent_id.to_string()).or_default();
-        det.touch_event(event.ts_ns);
 
         let Some(run) = self.runs.get_mut(&(agent_id.to_string(), run_n)) else {
             return;
@@ -208,6 +215,7 @@ impl Recorder {
 
         match event.kind {
             Kind::Turn => {
+                det.touch_event(event.ts_ns);
                 run.lane_allocator.allocate_begin(event.seq, Kind::Turn);
                 run.turn_open = true;
                 run.turn_begin_seq = Some(event.seq);
@@ -217,6 +225,7 @@ impl Recorder {
                 }
             }
             Kind::TurnEnded => {
+                det.touch_event(event.ts_ns);
                 let _ = run
                     .lane_allocator
                     .allocate_end(event.cause_seq.unwrap_or(0), Kind::Turn);
@@ -228,18 +237,35 @@ impl Recorder {
                 }
             }
             Kind::Command | Kind::ToolCall | Kind::FileAccess => {
+                det.touch_event(event.ts_ns);
                 run.lane_allocator.allocate_begin(event.seq, event.kind);
                 run.tool_calls_count += 1;
+                let cfg = self.detector_cfg.clone();
+                let mut triggered_stall = false;
                 let (tid_opt, argv, cmd_class, file_path, file_edit) = match &event.body.body {
                     Some(tacho::event::Body::Command(c)) => {
                         let class = c.class.and_then(from_proto_cmd_class);
                         if let Some(ref a) = c.argv {
-                            let cfg = self.detector_cfg.clone();
-                            det.on_tool_begin(&format!("argv:{}", a), &cfg);
+                            let dig = blake3_digest_8(a);
+                            if det.on_tool_begin(&dig, &cfg).is_some() {
+                                triggered_stall = true;
+                            }
                         }
                         (c.tool_use_id.clone(), c.argv.clone(), class, None, None)
                     }
                     Some(tacho::event::Body::FileAccess(f)) => {
+                        let dig = if f.kind == Some(tacho::FileAccessKind::Search as i32) {
+                            blake3_digest_8(&format!(
+                                "{}:{:?}",
+                                f.query.as_deref().unwrap_or(""),
+                                f.path
+                            ))
+                        } else {
+                            blake3_digest_8(f.path.as_deref().unwrap_or(""))
+                        };
+                        if det.on_tool_begin(&dig, &cfg).is_some() {
+                            triggered_stall = true;
+                        }
                         (f.tool_use_id.clone(), None, None, f.path.clone(), None)
                     }
                     Some(tacho::event::Body::ToolCall(t)) => {
@@ -249,13 +275,22 @@ impl Recorder {
                             }
                         }
                         if let Some(ref dig) = t.input_digest {
-                            let cfg = self.detector_cfg.clone();
-                            det.on_tool_begin(&dig.to_string(), &cfg);
+                            if det.on_tool_begin(dig, &cfg).is_some() {
+                                triggered_stall = true;
+                            }
                         }
                         (t.tool_use_id.clone(), None, None, None, None)
                     }
                     _ => (None, None, None, None, None),
                 };
+                if det.active_stalls.contains(&(tacho::StallKind::Loop as i32)) && !triggered_stall
+                {
+                    if let Some(agent) = self.live.agents.get_mut(agent_id) {
+                        if !agent.flags.iter().any(|f| f == "LOOP") {
+                            agent.flags.push("LOOP".to_string());
+                        }
+                    }
+                }
                 if let Some(tid) = tid_opt {
                     run.open_tools.insert(
                         tid.clone(),
@@ -269,7 +304,7 @@ impl Recorder {
                             command_class: cmd_class,
                             file_path,
                             file_edit,
-                            triggered_stall: false,
+                            triggered_stall,
                         },
                     );
                 }
@@ -285,28 +320,47 @@ impl Recorder {
                         .map(|(k, v)| (k.clone(), v.clone()));
                     if let Some((k, slice)) = matched_slice {
                         run.open_tools.remove(&k);
-                        if event.kind == Kind::CommandEnded {
-                            let exit_code = match &event.body.body {
-                                Some(tacho::event::Body::CommandEnded(ce)) => ce.exit,
-                                _ => None,
-                            };
-                            let argv = slice.argv.unwrap_or_default();
-                            let class = slice.command_class.unwrap_or(CommandClass::Command);
-                            let cfg = self.detector_cfg.clone();
-                            det.on_command_ended(&argv, class, exit_code, event.ts_ns, &cfg);
-                            if let Some(agent) = self.live.agents.get_mut(agent_id) {
-                                agent.push_recent_command(RecentCommand {
-                                    argv,
-                                    class: command_class_name(class).to_string(),
-                                    exit_code,
-                                    ts_ns: event.ts_ns,
-                                });
-                                if class == CommandClass::Test && exit_code == Some(0) {
-                                    agent.last_passing_test_ts_ns = Some(event.ts_ns);
-                                } else if class == CommandClass::Commit && exit_code == Some(0) {
-                                    agent.commits_succeeded += 1;
-                                } else if class == CommandClass::Push && exit_code == Some(0) {
-                                    agent.pushes_succeeded += 1;
+                        let (exit_code, error, abandoned) = match &event.body.body {
+                            Some(tacho::event::Body::CommandEnded(ce)) => {
+                                (ce.exit, false, ce.abandoned.unwrap_or(false))
+                            }
+                            Some(tacho::event::Body::ToolCallEnded(te)) => (
+                                None,
+                                te.error.unwrap_or(false),
+                                te.abandoned.unwrap_or(false),
+                            ),
+                            Some(tacho::event::Body::FileAccessEnded(fe)) => (
+                                None,
+                                fe.error.unwrap_or(false),
+                                fe.abandoned.unwrap_or(false),
+                            ),
+                            _ => (None, false, false),
+                        };
+                        if !abandoned {
+                            if !error && exit_code.unwrap_or(0) == 0 {
+                                det.clear_stall(tacho::StallKind::Silent);
+                            }
+                            if event.kind == Kind::CommandEnded {
+                                let argv = slice.argv.unwrap_or_default();
+                                let class = slice.command_class.unwrap_or(CommandClass::Command);
+                                let cfg = self.detector_cfg.clone();
+                                det.touch_event(event.ts_ns);
+                                det.on_command_ended(&argv, class, exit_code, event.ts_ns, &cfg);
+                                if let Some(agent) = self.live.agents.get_mut(agent_id) {
+                                    agent.push_recent_command(RecentCommand {
+                                        argv,
+                                        class: command_class_name(class).to_string(),
+                                        exit_code,
+                                        ts_ns: event.ts_ns,
+                                    });
+                                    if class == CommandClass::Test && exit_code == Some(0) {
+                                        agent.last_passing_test_ts_ns = Some(event.ts_ns);
+                                    } else if class == CommandClass::Commit && exit_code == Some(0)
+                                    {
+                                        agent.commits_succeeded += 1;
+                                    } else if class == CommandClass::Push && exit_code == Some(0) {
+                                        agent.pushes_succeeded += 1;
+                                    }
                                 }
                             }
                         }
@@ -324,13 +378,22 @@ impl Recorder {
                 }
             }
             Kind::FileEdited => {
+                det.touch_event(event.ts_ns);
                 run.files_edited_count += 1;
                 let path = match &event.body.body {
                     Some(tacho::event::Body::FileEdited(fe)) => fe.path.as_deref().unwrap_or(""),
                     _ => "",
                 };
                 let cfg = self.detector_cfg.clone();
-                det.on_file_edited(path, event.ts_ns, &cfg);
+                if det.on_file_edited(path, event.ts_ns, &cfg).is_some() {
+                    if let Some(cause) = event.cause_seq {
+                        for slice in run.open_tools.values_mut() {
+                            if slice.slice_id == cause {
+                                slice.triggered_stall = true;
+                            }
+                        }
+                    }
+                }
                 if let Some(agent) = self.live.agents.get_mut(agent_id) {
                     agent.last_edit_ts_ns = Some(event.ts_ns);
                 }
@@ -350,14 +413,6 @@ impl Recorder {
                         agent.state_since_ns = event.ts_ns;
                         if name != "Stalled" && name != "Exited" {
                             agent.flags.clear();
-                        }
-                    }
-                }
-                if let Some(ref name) = event.custom_name {
-                    if name != "Stalled" && name != "Exited" {
-                        if let Some(det) = self.detectors.get_mut(agent_id) {
-                            det.active_stalls.clear();
-                            det.is_stalled = false;
                         }
                     }
                 }

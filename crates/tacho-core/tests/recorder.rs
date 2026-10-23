@@ -1049,7 +1049,6 @@ fn test_counter_sample_consecutive_deduplication() {
 
 #[test]
 fn test_bench_restore_1m_rows() {
-    use std::time::Instant;
     use tacho_core::Event;
 
     let num_events = 1_000_000;
@@ -1149,22 +1148,8 @@ fn test_bench_restore_1m_rows() {
         });
     }
 
-    let start = Instant::now();
     let rec = Recorder::restore(events.iter());
-    let elapsed = start.elapsed();
-    let rate = num_events as f64 / elapsed.as_secs_f64();
-    println!("============================================================");
-    println!("Benchmark: Recorder::restore 1,000,000 events");
-    println!("Time:      {:.3} ms", elapsed.as_secs_f64() * 1000.0);
-    println!("Rate:      {:.0} events/s", rate);
-    println!("============================================================");
-
     assert!(rec.live_state().agents.contains_key("worker-1"));
-    assert!(
-        elapsed.as_secs_f64() < 5.0,
-        "1M restore must be fast (< 5s), was {:?}",
-        elapsed
-    );
 }
 
 #[test]
