@@ -211,7 +211,7 @@ static PATTERNS: LazyLock<ScrubberPatterns> = LazyLock::new(|| {
 
 /// Privacy scrubber that replaces credentials and secret shapes with `<redacted>` when enabled.
 ///
-/// Opt-in by default (`enabled = false` unless `TACHO_SCRUB=1` or `scrub = true` in `config.toml`).
+/// Enabled by default (`enabled = true` unless `TACHO_SCRUB=0`/`false`/`no` or `scrub = false` in `config.toml`).
 #[derive(Debug, Clone, Copy)]
 pub struct Scrubber {
     enabled: bool,
@@ -224,11 +224,16 @@ impl Default for Scrubber {
 }
 
 impl Scrubber {
-    /// Creates a new scrubber (opt-in: disabled by default unless `TACHO_SCRUB=1`/`true` is set).
+    /// Creates a new scrubber (enabled by default unless `TACHO_SCRUB=0`/`false`/`no` is set).
     pub fn new() -> Self {
         let enabled = std::env::var("TACHO_SCRUB")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(true);
         Self::with_enabled(enabled)
     }
 

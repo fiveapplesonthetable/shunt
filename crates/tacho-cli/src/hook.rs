@@ -58,6 +58,19 @@ pub fn execute_hook(provider: Provider) {
     // Optional worker guardrail enforcement when opted in via TACHO_GUARDRAILS=1 or TACHO_MANAGED_WORKER=1
     let guardrails_enabled = std::env::var("TACHO_GUARDRAILS").ok().as_deref() == Some("1")
         || std::env::var("TACHO_MANAGED_WORKER").ok().as_deref() == Some("1");
+    if let Ok(agent_key) = std::env::var("TACHO_AGENT") {
+        if !agent_key.is_empty() {
+            let inbox_file = home.join("inbox").join(format!("{agent_key}.txt"));
+            if inbox_file.is_file() {
+                if let Ok(msg) = std::fs::read_to_string(&inbox_file) {
+                    let _ = std::fs::remove_file(&inbox_file);
+                    if !msg.trim().is_empty() {
+                        eprintln!("[FLEET MESSAGE for {agent_key}]: {}", msg.trim());
+                    }
+                }
+            }
+        }
+    }
     if guardrails_enabled {
         let event_name = val
             .get("hook_event_name")

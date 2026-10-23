@@ -576,3 +576,188 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
     assert_eq!(run.pr_source.as_deref(), Some("stated"));
     assert!(tacho_home.join("snapshot.json").is_file());
 }
+
+#[test]
+fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tacho_home = tmp.path().join("tacho-home");
+    let repo_dir = tmp.path().join("repo");
+    let wt_root = tmp.path().join("worktrees");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let main_sha = init_git_repo(&repo_dir);
+
+    // 1. `tacho start` strictly refuses an unresolvable PR number or revision without falling back to HEAD
+    let bad_pr_start = Command::new(tacho_bin())
+        .args([
+            "start",
+            "bad-pr-wt",
+            "--base",
+            "pr:999999",
+            "--dir",
+            wt_root.to_str().unwrap(),
+        ])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(
+        !bad_pr_start.status.success(),
+        "tacho start with non-existent PR base must fail rather than falling back to HEAD"
+    );
+
+    let bad_rev_start = Command::new(tacho_bin())
+        .args([
+            "start",
+            "bad-rev-wt",
+            "--base",
+            "nonexistent-branch-xyz",
+            "--dir",
+            wt_root.to_str().unwrap(),
+        ])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(!bad_rev_start.status.success());
+
+    // 2. `tacho start` runs per-agent database setup plugin (`TACHO_DB_UP_CMD`) and writes DATABASE_URL into `.tachoenv`
+    let db_start = Command::new(tacho_bin())
+        .args([
+            "start",
+            "db-wt",
+            "--base",
+            &main_sha,
+            "--dir",
+            wt_root.to_str().unwrap(),
+        ])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .env(
+            "TACHO_DB_UP_CMD",
+            "echo \"DATABASE_URL=postgres://postgres:postgres@127.0.0.1:${DB_PORT}/test_${SLUG}\"",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        db_start.status.success(),
+        "tacho start with TACHO_DB_UP_CMD failed: {}",
+        String::from_utf8_lossy(&db_start.stderr)
+    );
+    let env_txt = fs::read_to_string(wt_root.join("db-wt").join(".tachoenv")).unwrap();
+    let parsed_env = tacho_core::decide::verify::parse_env(&env_txt);
+    let db_url = parsed_env
+        .get("DATABASE_URL")
+        .expect("DATABASE_URL should be present in .tachoenv");
+    assert!(db_url.starts_with("postgres://postgres:postgres@127.0.0.1:"));
+    assert!(db_url.ends_with("/test_db-wt"));
+
+    // 3. Live `tacho tell` delivers to a running worker's inbox without killing/restarting it,
+    // and the next `tacho hook claude` drains and injects the message.
+    let mut store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
+    let my_pid = std::process::id(); // Guaranteed alive PID
+    store
+        .mutate(None, |st| {
+            st.agents.insert(
+                "live-worker".to_string(),
+                tacho_core::decide::dispatch::AgentRun {
+                    key: "live-worker".to_string(),
+                    pid: Some(my_pid),
+                    provider: "claude".to_string(),
+                    worktree: wt_root.join("db-wt").to_string_lossy().to_string(),
+                    started_at: 1000,
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+    let tell_out = Command::new(tacho_bin())
+        .args(["tell", "live-worker", "Please also add a migration test"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(tell_out.status.success());
+    let inbox_file = tacho_home.join("inbox").join("live-worker.txt");
+    assert!(
+        inbox_file.is_file(),
+        "inbox file should exist for live worker"
+    );
+
+    let hook_payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": { "file_path": "README.md" }
+    })
+    .to_string();
+    let mut hook_child = Command::new(tacho_bin())
+        .args(["hook", "claude"])
+        .env("TACHO_HOME", &tacho_home)
+        .env("TACHO_AGENT", "live-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(hook_payload.as_bytes())
+        .unwrap();
+    let hook_out = hook_child.wait_with_output().unwrap();
+    assert_eq!(hook_out.status.code(), Some(0));
+    let hook_stderr = String::from_utf8_lossy(&hook_out.stderr);
+    assert!(
+        hook_stderr.contains("Please also add a migration test"),
+        "expected live tell message in hook stderr, got: {hook_stderr}"
+    );
+    assert!(
+        !inbox_file.exists(),
+        "inbox file should be drained after hook delivery"
+    );
+
+    // 4. `tacho batch` refuses to mark a batch as passed if a PR's head SHA moves while the batch is running
+    store
+        .mutate(None, |st| {
+            st.open_prs_cache = vec![PullFacts {
+                number: 77,
+                branch: "feat-77".to_string(),
+                head: main_sha.clone(),
+                base: "main".to_string(),
+                state: "OPEN".to_string(),
+                mergeable: "MERGEABLE".to_string(),
+                files: vec!["src/lib.rs".to_string()],
+                title: "Feature 77".to_string(),
+                ..Default::default()
+            }];
+        })
+        .unwrap();
+
+    // While the batch command runs, mutate PR #77's head SHA in SQLite to simulate a force-push mid-batch
+    let db_path = tacho_home.join("events.sqlite");
+    let move_head_cmd = format!(
+        "sqlite3 '{}' \"UPDATE fleet_state SET state_json = replace(state_json, '\\\"head\\\":\\\"{}\\\"', '\\\"head\\\":\\\"deadbeef9999\\\"') WHERE id = 1;\"",
+        db_path.display(),
+        main_sha
+    );
+    let batch_moved = Command::new(tacho_bin())
+        .args(["batch", "77", "--cmd", &move_head_cmd])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(
+        !batch_moved.status.success(),
+        "batch should refuse to pass when PR head moves mid-batch"
+    );
+    let st_after_move = store.load().unwrap();
+    assert!(
+        !st_after_move.passed.contains_key(&77),
+        "PR #77 must NOT be marked passed when its head moved during batch"
+    );
+    assert!(st_after_move
+        .batches
+        .iter()
+        .any(|b| b.prs == vec![77] && b.status == "head-moved"));
+}

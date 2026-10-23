@@ -11,11 +11,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tacho_core::decide::dispatch::{AgentRun, Hold, PullFacts, TodoItem};
+use tacho_core::decide::dispatch::{
+    builtin_providers, AgentRun, Hold, ProviderSpec, PullFacts, TodoItem,
+};
 use tacho_core::decide::land::{TrainPrState, TrainRecord};
 use tacho_core::decide::verify::{AreaRule, BatchRun, FailedRecord, FlakeEntry, PassedRecord};
 use tacho_core::decide::watch::{CostRecord, PhaseNote, ProgressSample};
-use tacho_core::{Kind, TaskStatus};
+use tacho_core::{Kind, Scrubber, TaskStatus};
 use tacho_proto::tacho;
 
 /// A recorded worktree allocation in fleet state.
@@ -75,6 +77,16 @@ pub struct FleetState {
     pub closed_prs: BTreeSet<u64>,
     pub last_tick_ts: Option<i64>,
     pub last_watchdog_alert_ts: Option<i64>,
+    pub providers: BTreeMap<String, ProviderSpec>,
+    pub inbox: BTreeMap<String, Vec<String>>,
+    pub db_up_cmd: Option<String>,
+    pub workflow_path: Option<String>,
+    pub workflow_jobs: BTreeMap<String, String>,
+    pub workflow_expressions: BTreeMap<String, String>,
+    pub train_compile_cmd: Option<String>,
+    pub notified_failures: BTreeSet<String>,
+    pub notified_deploys: BTreeSet<u64>,
+    pub self_update_paths: Vec<String>,
 }
 
 impl Default for FleetState {
@@ -108,6 +120,16 @@ impl Default for FleetState {
             closed_prs: BTreeSet::new(),
             last_tick_ts: None,
             last_watchdog_alert_ts: None,
+            providers: builtin_providers(),
+            inbox: BTreeMap::new(),
+            db_up_cmd: None,
+            workflow_path: None,
+            workflow_jobs: BTreeMap::new(),
+            workflow_expressions: BTreeMap::new(),
+            train_compile_cmd: None,
+            notified_failures: BTreeSet::new(),
+            notified_deploys: BTreeSet::new(),
+            self_update_paths: vec!["crates/".to_string(), "scripts/".to_string()],
         }
     }
 }
@@ -266,10 +288,13 @@ impl FleetStore {
         )
         .map_err(sql_err)?;
         if let Some((category, action, target, because)) = decision {
+            let scrubber = Scrubber::new();
+            let clean_target = scrubber.scrub(target);
+            let clean_because = scrubber.scrub(because);
             tx.execute(
                 "INSERT INTO decisions (ts, category, action, target, because)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![now, category, action, target, because],
+                params![now, category, action, clean_target, clean_because],
             )
             .map_err(sql_err)?;
         }
@@ -286,11 +311,14 @@ impl FleetStore {
         because: &str,
     ) -> io::Result<()> {
         let now = now_secs();
+        let scrubber = Scrubber::new();
+        let clean_target = scrubber.scrub(target);
+        let clean_because = scrubber.scrub(because);
         self.conn
             .execute(
                 "INSERT INTO decisions (ts, category, action, target, because)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![now, category, action, target, because],
+                params![now, category, action, clean_target, clean_because],
             )
             .map_err(sql_err)?;
         Ok(())

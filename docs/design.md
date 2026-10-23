@@ -34,12 +34,20 @@ Goals:
    the system session and writes one file with both: agent slices beside
    scheduling, CPU frequency and per-process memory.
 7. Nothing secret leaves the machine unintentionally. Prose, tool output, file
-   content, diffs and prompts never enter the trace. Opt-in regex/shape
-   scrubbing (`scrub = true` in `config.toml` or `TACHO_SCRUB=1`) redacts
-   credentials and tokens from command lines and titles.
+   content, diffs and prompts never enter the trace. Default-on regex/shape
+   scrubbing (`scrub = true` by default; opt-out via `scrub = false` in
+   `config.toml` or `TACHO_SCRUB=0`) redacts credentials and tokens from
+   command lines, titles, status pages, issues, owner emails and log tails.
+8. Pure, replayable fleet orchestration and worker kit. `tacho` provides the
+   worker kit (`start`, `prove`, `pr`, `job`, `note`), guardrail hooks, a
+   configurable provider interface (`start`, `resume`, `tell`, `alive`, `stop`,
+   `cost`), speculative verification batches that run CI's own workflow jobs and
+   bisect failures, verified merge trains, and an event-driven orchestrator loop
+   (`decide`) whose every action carries its `because` reason into the SQLite
+   WAL log.
 
-Non-goals: controlling agents (kill, resume, schedule), hosted dashboards, MCP.
-A supervisor with a shell calls the CLI; that is the integration surface.
+Non-goals: hosted cloud SaaS dashboards, MCP servers.
+Operators and agents interact through the `tacho` CLI and the SQLite WAL log.
 
 ## 1. Shape
 

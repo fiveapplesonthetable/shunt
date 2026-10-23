@@ -22,5 +22,455 @@ pub mod land;
 pub mod verify;
 pub mod watch;
 
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use dispatch::{
+    base_keys, find_pr, latest, needs_resume, next_hands, next_work, resume_task, AgentRun, Hold,
+    PullFacts, TodoItem,
+};
+use land::{queue, ReadyItem};
+use verify::{
+    batch_heads_moved, batches, classify, counterexample, failed_tests, flake_tasks, record_flakes,
+    summary_line, AreaRule, BatchPlan, BatchRun, FailedRecord, FlakeEntry, PassedRecord,
+    MAX_BATCH_SIZE,
+};
+use watch::{
+    decide_owner_notifications, decide_self_update, down_alert, down_reason, needs_you,
+    supervise_step, take_sample, verdict, AttentionItem, BehindCommit, DeployRunObs,
+    OwnerNotification, ProgressSample, SelfUpdateDecision, SuperviseAction,
+};
+
+/// Complete pure fleet state input to [`decide`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DecisionState {
+    pub max_parallel: usize,
+    pub todo: Vec<TodoItem>,
+    pub agents: BTreeMap<String, AgentRun>,
+    pub retired: BTreeSet<String>,
+    pub holds: BTreeMap<String, Hold>,
+    pub passed: BTreeMap<u64, PassedRecord>,
+    pub failed: BTreeMap<u64, FailedRecord>,
+    pub merged_prs: BTreeSet<u64>,
+    pub closed_prs: BTreeSet<u64>,
+    pub batches: Vec<BatchRun>,
+    pub flakes: BTreeMap<String, FlakeEntry>,
+    pub samples: BTreeMap<String, Vec<ProgressSample>>,
+    pub nudged: BTreeSet<String>,
+    pub rebase_attempts: HashMap<u64, String>,
+    pub notified_keys: BTreeSet<String>,
+    pub area_rules: Vec<AreaRule>,
+    pub refused_self_update_sha: Option<String>,
+    pub last_tick_ts: Option<i64>,
+    pub last_watchdog_alert_ts: Option<i64>,
+}
+
+/// Observation of a finished batch check on the current tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchOutcomeObs {
+    pub batch_id: String,
+    pub passed: bool,
+    pub failed_area: Option<String>,
+    pub log_output: String,
+    pub tree_sha: String,
+}
+
+/// Snapshot of the external world passed into [`decide`].
+///
+/// Captures all side-effecting reads (clock, GitHub PRs, process liveness/CPU, batch logs,
+/// deploy runs, git upstream commits) as plain data so any tick can be replayed deterministically.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct WorldObservation {
+    pub now: i64,
+    pub main_sha: String,
+    pub open_prs: Vec<PullFacts>,
+    pub merged_prs: BTreeSet<u64>,
+    pub closed_prs: BTreeSet<u64>,
+    pub live_keys: BTreeSet<String>,
+    pub agent_samples: BTreeMap<String, ProgressSample>,
+    pub agent_log_tails: BTreeMap<String, String>,
+    pub batch_outcomes: Vec<BatchOutcomeObs>,
+    pub deploy_runs: Vec<DeployRunObs>,
+    pub behind_commits: Vec<BehindCommit>,
+    pub detached_checkout: bool,
+}
+
+/// Pure resolution of a completed batch run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchResolution {
+    /// All PRs in the batch passed at their expected heads.
+    Passed { batch_id: String, prs: Vec<u64> },
+    /// One or more PRs moved their head SHA while the batch was running; results are discarded.
+    HeadMoved { batch_id: String, reason: String },
+    /// Infrastructure/flake failure; retry the batch without blaming the PRs.
+    InfraRetry { batch_id: String, reason: String },
+    /// Multi-PR code failure; bisect the batch.
+    Bisect {
+        batch_id: String,
+        left_prs: Vec<u64>,
+        right_prs: Vec<u64>,
+    },
+    /// Single-PR code failure; mark the PR as failed.
+    FailedSingle {
+        batch_id: String,
+        pr: u64,
+        reason: String,
+    },
+}
+
+/// Complete deterministic plan produced by a single [`decide`] tick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionPlan {
+    pub reaped_agents: Vec<(String, Option<u64>, bool)>,
+    pub supervision_actions: Vec<SuperviseAction>,
+    pub resumed_tasks: Vec<TodoItem>,
+    pub dispatched_tasks: Vec<TodoItem>,
+    pub rebase_handoffs: Vec<(u64, String)>,
+    pub barred_rebases: Vec<(u64, String)>,
+    pub batch_resolutions: Vec<BatchResolution>,
+    pub batch_plans: Vec<BatchPlan>,
+    pub ready_prs: Vec<ReadyItem>,
+    pub attention_items: Vec<AttentionItem>,
+    pub owner_notifications: Vec<OwnerNotification>,
+    pub self_update: SelfUpdateDecision,
+    pub watchdog_alert: Option<String>,
+    pub next_state: DecisionState,
+}
+
+/// Replayable pure decision function `(DecisionState, WorldObservation) -> DecisionPlan`.
+///
+/// Given the current fleet state and a world observation snapshot, computes every orchestration,
+/// supervision, batch verification, landing, notification, and self-update decision without IO.
+pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
+    let mut next = state.clone();
+    if next.max_parallel == 0 {
+        next.max_parallel = 4;
+    }
+
+    // 1. Update merged and closed PR sets from world observation.
+    for &m in &obs.merged_prs {
+        next.merged_prs.insert(m);
+        next.closed_prs.remove(&m);
+    }
+    for &c in &obs.closed_prs {
+        if !next.merged_prs.contains(&c) {
+            next.closed_prs.insert(c);
+        }
+    }
+
+    let mut current_pr_shas = BTreeMap::new();
+    for pr in &obs.open_prs {
+        if !pr.head.is_empty() {
+            current_pr_shas.insert(pr.number, pr.head.clone());
+        }
+    }
+
+    // 2. Reap exited agents and attribute PRs (`find_pr`).
+    let mut reaped_agents = Vec::new();
+    let agent_keys: Vec<String> = next.agents.keys().cloned().collect();
+    for k in agent_keys {
+        let should_reap = next
+            .agents
+            .get(&k)
+            .is_some_and(|a| a.finished_at.is_none() && !obs.live_keys.contains(&k));
+        if should_reap {
+            let started_at = next.agents[&k].started_at;
+            let tail = obs
+                .agent_log_tails
+                .get(&k)
+                .map(String::as_str)
+                .unwrap_or("");
+            let (found_pr, found_src) = find_pr(&k, started_at, &obs.open_prs, tail);
+            let is_none = found_src.as_deref() == Some("none");
+            if let Some(a) = next.agents.get_mut(&k) {
+                a.finished_at = Some(obs.now);
+                if a.exit_code.is_none() {
+                    a.exit_code = Some(if found_pr.is_some() || is_none { 0 } else { 1 });
+                }
+                if found_pr.is_some() {
+                    a.pr = found_pr;
+                    a.pr_source = found_src;
+                } else if is_none {
+                    a.pr_none = true;
+                    a.pr_source = Some("none".to_string());
+                }
+            }
+            reaped_agents.push((k, found_pr, is_none));
+        }
+    }
+
+    // 3. Sample progress and supervise live agents (`MOVING`, `STALLED`, `HUNG`).
+    let mut supervision_actions = Vec::new();
+    for key in &obs.live_keys {
+        if let Some(sample) = obs.agent_samples.get(key) {
+            let existing = next.samples.get(key).map(Vec::as_slice).unwrap_or(&[]);
+            let updated = take_sample(existing, sample.clone(), 60);
+            let (v, idle) = verdict(&updated, obs.now);
+            let step = supervise_step(key, v, idle, next.nudged.contains(key));
+            next.samples.insert(key.clone(), updated);
+            if matches!(step, SuperviseAction::Nudge { .. }) {
+                next.nudged.insert(key.clone());
+            }
+            if !matches!(step, SuperviseAction::Ok) {
+                supervision_actions.push(step);
+            }
+        }
+    }
+
+    // 4. Resolve completed batch outcomes (including head-movement refusal and bisection).
+    let mut batch_resolutions = Vec::new();
+    for outcome in &obs.batch_outcomes {
+        let Some(b_idx) = next.batches.iter().position(|b| b.id == outcome.batch_id) else {
+            continue;
+        };
+        let batch_prs = next.batches[b_idx].prs.clone();
+        let expected_shas = next.batches[b_idx].shas.clone();
+        let batch_areas = next.batches[b_idx].areas.clone();
+        let batch_main = next.batches[b_idx].main_sha.clone();
+
+        if let Some(moved_reason) = batch_heads_moved(&expected_shas, &current_pr_shas) {
+            next.batches[b_idx].status = "failed".to_string();
+            next.batches[b_idx].finished_at = Some(obs.now);
+            next.batches[b_idx].log = moved_reason.clone();
+            batch_resolutions.push(BatchResolution::HeadMoved {
+                batch_id: outcome.batch_id.clone(),
+                reason: moved_reason,
+            });
+            continue;
+        }
+
+        if outcome.passed {
+            next.batches[b_idx].status = "passed".to_string();
+            next.batches[b_idx].finished_at = Some(obs.now);
+            next.batches[b_idx].tree = Some(outcome.tree_sha.clone());
+            for &pr in &batch_prs {
+                let sha = expected_shas
+                    .get(&pr)
+                    .cloned()
+                    .unwrap_or_else(|| batch_main.clone());
+                next.failed.remove(&pr);
+                next.passed.insert(
+                    pr,
+                    PassedRecord {
+                        pr,
+                        sha,
+                        main_sha: batch_main.clone(),
+                        batch_id: outcome.batch_id.clone(),
+                        passed_at: obs.now,
+                        tree: outcome.tree_sha.clone(),
+                        areas: batch_areas.clone(),
+                    },
+                );
+            }
+            batch_resolutions.push(BatchResolution::Passed {
+                batch_id: outcome.batch_id.clone(),
+                prs: batch_prs,
+            });
+        } else {
+            let kind = classify(&outcome.log_output).to_string();
+            let sum = summary_line(&outcome.log_output);
+            let f_tests = failed_tests(&outcome.log_output);
+            let ce = counterexample(&outcome.log_output);
+            next.batches[b_idx].status = "failed".to_string();
+            next.batches[b_idx].finished_at = Some(obs.now);
+            next.batches[b_idx].log = outcome.log_output.clone();
+
+            if kind == "infra" {
+                let area_hint = outcome
+                    .failed_area
+                    .as_deref()
+                    .or_else(|| batch_areas.first().map(String::as_str))
+                    .unwrap_or("");
+                let flake_names = if f_tests.is_empty() {
+                    vec![sum.clone()]
+                } else {
+                    f_tests
+                };
+                let updated = record_flakes(
+                    &next.flakes,
+                    &flake_names,
+                    &outcome.batch_id,
+                    area_hint,
+                    &outcome.log_output,
+                    obs.now,
+                );
+                let (with_tasks, new_items) =
+                    flake_tasks(&updated, &next.todo, &next.agents, &next.retired, obs.now);
+                next.flakes = with_tasks;
+                next.todo.extend(new_items);
+                batch_resolutions.push(BatchResolution::InfraRetry {
+                    batch_id: outcome.batch_id.clone(),
+                    reason: sum,
+                });
+            } else if batch_prs.len() > 1 {
+                let mid = batch_prs.len() / 2;
+                batch_resolutions.push(BatchResolution::Bisect {
+                    batch_id: outcome.batch_id.clone(),
+                    left_prs: batch_prs[..mid].to_vec(),
+                    right_prs: batch_prs[mid..].to_vec(),
+                });
+            } else if let Some(&single_pr) = batch_prs.first() {
+                let sha = expected_shas.get(&single_pr).cloned().unwrap_or_default();
+                next.passed.remove(&single_pr);
+                next.failed.insert(
+                    single_pr,
+                    FailedRecord {
+                        pr: single_pr,
+                        sha,
+                        batch_id: outcome.batch_id.clone(),
+                        failed_at: obs.now,
+                        kind,
+                        summary: sum.clone(),
+                        failed_tests: f_tests,
+                        counterexample: ce,
+                        log: outcome.log_output.clone(),
+                    },
+                );
+                batch_resolutions.push(BatchResolution::FailedSingle {
+                    batch_id: outcome.batch_id.clone(),
+                    pr: single_pr,
+                    reason: sum,
+                });
+            }
+        }
+    }
+
+    // 5. Queue automatic resume candidates (after backoff) and select next work up to free slots.
+    let mut resumed_tasks = Vec::new();
+    for root in base_keys(&next.agents, &next.retired) {
+        if needs_resume(
+            &next.agents,
+            &next.todo,
+            &next.retired,
+            &next.holds,
+            &obs.live_keys,
+            &root,
+            obs.now,
+        ) {
+            if let Some(last) = latest(&next.agents, &next.retired, &root).cloned() {
+                let item = resume_task(&last, "", "", obs.now);
+                if !next.todo.iter().any(|t| t.key == item.key) {
+                    next.todo.push(item.clone());
+                }
+                resumed_tasks.push(item);
+            }
+        }
+    }
+
+    let passed_prs: BTreeSet<u64> = next.passed.keys().copied().collect();
+    let failed_prs: BTreeSet<u64> = next.failed.keys().copied().collect();
+    let free_slots = next.max_parallel.saturating_sub(obs.live_keys.len());
+    let (dispatched_tasks, remaining_todo) = next_work(
+        &next.todo,
+        &next.agents,
+        &next.retired,
+        &next.holds,
+        &obs.live_keys,
+        &passed_prs,
+        &failed_prs,
+        &next.merged_prs,
+        &next.closed_prs,
+        free_slots,
+    );
+    next.todo = remaining_todo;
+
+    // 6. Conflicting PR rebase handoffs (`next_hands`).
+    let remaining_slots = free_slots.saturating_sub(dispatched_tasks.len());
+    let (to_rebase, barred) = next_hands(
+        &obs.open_prs,
+        &next.agents,
+        &next.holds,
+        &obs.live_keys,
+        &next.rebase_attempts,
+        remaining_slots,
+    );
+    let rebase_handoffs: Vec<(u64, String)> = to_rebase
+        .into_iter()
+        .map(|p| {
+            next.rebase_attempts.insert(p.number, p.head.clone());
+            (p.number, p.head.clone())
+        })
+        .collect();
+    let barred_rebases: Vec<(u64, String)> = barred
+        .into_iter()
+        .map(|(p, reason)| (p.number, reason))
+        .collect();
+
+    // 7. Speculative verification batches (`batches`) and ready queue (`queue`).
+    let batch_plans = batches(
+        &obs.open_prs,
+        &next.holds,
+        &next.passed,
+        &next.failed,
+        &next.batches,
+        &next.area_rules,
+        MAX_BATCH_SIZE,
+    );
+    let ready_prs = queue(
+        &obs.open_prs,
+        &next.passed,
+        &next.batches,
+        &next.holds,
+        &obs.main_sha,
+        &HashMap::new(),
+    );
+
+    // 8. Human attention items (`needs_you`), tell-once owner notifications, self-update, and watchdog.
+    let attention_items = needs_you(
+        &next.agents,
+        &next.todo,
+        &next.retired,
+        &next.holds,
+        &obs.live_keys,
+        &obs.open_prs,
+        &next.passed,
+        &next.failed,
+        obs.now,
+    );
+    let owner_notifications = decide_owner_notifications(
+        &attention_items,
+        &next.batches,
+        &[],
+        &BTreeMap::new(),
+        &obs.deploy_runs,
+        &next.notified_keys,
+    );
+    for n in &owner_notifications {
+        next.notified_keys.insert(n.key.clone());
+    }
+
+    let self_update = decide_self_update(
+        obs.detached_checkout,
+        &obs.behind_commits,
+        next.refused_self_update_sha.as_deref(),
+        obs.now,
+    );
+
+    let has_active_work = !obs.live_keys.is_empty() || !next.todo.is_empty();
+    let down = down_reason(next.last_tick_ts, obs.now, 600, has_active_work);
+    let watchdog_alert = down_alert(down.as_deref(), next.last_watchdog_alert_ts, obs.now, 3_600);
+    next.last_tick_ts = Some(obs.now);
+    if watchdog_alert.is_some() {
+        next.last_watchdog_alert_ts = Some(obs.now);
+    }
+
+    DecisionPlan {
+        reaped_agents,
+        supervision_actions,
+        resumed_tasks,
+        dispatched_tasks,
+        rebase_handoffs,
+        barred_rebases,
+        batch_resolutions,
+        batch_plans,
+        ready_prs,
+        attention_items,
+        owner_notifications,
+        self_update,
+        watchdog_alert,
+        next_state: next,
+    }
+}
+
 #[cfg(test)]
 mod tests;

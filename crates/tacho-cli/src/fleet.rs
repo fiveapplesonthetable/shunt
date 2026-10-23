@@ -10,29 +10,31 @@ use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tacho_core::decide::dispatch::{
-    area_report, base_key, compare_items, find_pr, hold_problem, may_start, needs_resume,
-    next_hands, next_work, release_problem, resolve, resume_task, retire, retire_problem,
-    with_hold, without_hold, AgentRun, TodoItem,
+    area_report, base_key, builtin_providers, compare_items, find_pr, hold_problem, may_start,
+    needs_resume, next_hands, next_work, release_problem, resolve_with_providers, resume_task,
+    retire, retire_problem, with_hold, without_hold, AgentRun, Provider, ProviderSpec, TellPlan,
+    TodoItem,
 };
 use tacho_core::decide::land::{
     drop_breakers, eligible, finished, make_train, mismatch, open_for, order_train_prs, queue,
     settle, train_refusal, waiting_for, with_train, TrainPrState,
 };
 use tacho_core::decide::verify::{
-    batches, classify, counterexample, decide_fixes, failed_tests, flake_rows, flake_tasks,
-    new_batch_id, next_probe, parents, record_flakes, reruns_on_red, reusable_batch, slug_problem,
-    summary_line, BatchRun, Bisect, FailedRecord, PassedRecord, ProbeStep,
+    batch_heads_moved, batches, classify, counterexample, decide_fixes, failed_tests, flake_rows,
+    flake_tasks, job_argv, job_for, new_batch_id, next_probe, parents, record_flakes,
+    reruns_on_red, reusable_batch, service_argv, slug_problem, summary_line, BatchRun, Bisect,
+    FailedRecord, PassedRecord, ProbeStep,
 };
 use tacho_core::decide::watch::{
-    agent_row, burners, chain_rows, decide_tidy, down_alert, down_reason, duplicate_batches,
-    idle_chains, needs_you, stale_runs, supervise_step, take_sample, verdict, zombie_lines,
-    ProcEntry, ProgressSample, SuperviseAction, TidyDecision, TidySnapshot, WorktreeCandidate,
+    agent_row, burners, chain_rows, decide_owner_notifications, decide_tidy, down_alert,
+    down_reason, duplicate_batches, idle_chains, needs_you, stale_runs, supervise_step,
+    take_sample, verdict, zombie_lines, ProcEntry, ProgressSample, SuperviseAction, TidyDecision,
+    TidySnapshot, WorktreeCandidate,
 };
-use tacho_core::TaskStatus;
+use tacho_core::{Scrubber, TaskStatus};
 use tacho_daemon::{FleetState, FleetStore};
 
 use crate::cli::{
@@ -210,13 +212,14 @@ pub fn execute_todo(args: TodoArgs) -> io::Result<()> {
 
     // Validate provider/model/compare before queueing
     if args.compare.is_none() {
-        resolve(
+        resolve_with_providers(
             args.provider.as_deref(),
             args.model.as_deref(),
             args.effort.as_deref(),
             &state.default_provider,
             state.default_model.as_deref(),
             state.default_effort.as_deref(),
+            &state.providers,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     }
@@ -267,13 +270,14 @@ pub fn execute_todo(args: TodoArgs) -> io::Result<()> {
 /// Spawns a provider agent process for a `TodoItem` in its worktree.
 pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Result<u32> {
     let state = store.load()?;
-    let choice = resolve(
+    let choice = resolve_with_providers(
         item.provider.as_deref(),
         item.model.as_deref(),
         item.effort.as_deref(),
         &state.default_provider,
         state.default_model.as_deref(),
         state.default_effort.as_deref(),
+        &state.providers,
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
@@ -302,28 +306,49 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
         item.brief
     );
 
-    let cmd_str = if let Ok(custom) = std::env::var("TACHO_AGENT_CMD") {
-        custom
+    let prior_session =
+        tacho_core::decide::dispatch::latest(&state.agents, &state.retired, root_key)
+            .and_then(|a| a.session_id.as_deref());
+    let builtins = builtin_providers();
+    let provider_spec = state
+        .providers
+        .get(&choice.provider)
+        .or_else(|| builtins.get(&choice.provider))
+        .cloned()
+        .unwrap_or_else(ProviderSpec::claude);
+    let wt_str = wt_path.to_string_lossy();
+    let planned_cmd = if prior_session.is_some() {
+        provider_spec.resume(
+            &item.key,
+            &wt_str,
+            prior_session,
+            &prompt,
+            choice.model.as_deref(),
+            choice.effort.as_deref(),
+        )
     } else {
-        match choice.provider.as_str() {
-            "codex" => {
-                let m = choice.model.as_deref().unwrap_or("gpt-5.4");
-                format!("codex exec --model {m} --full-auto")
-            }
-            "gemini" => {
-                let m = choice.model.as_deref().unwrap_or("gemini-3.1-pro-preview");
-                format!("gemini --model {m} --yolo")
-            }
-            _ => {
-                let m = choice.model.as_deref().unwrap_or("sonnet");
-                format!("claude -p --model {m} --dangerously-skip-permissions")
-            }
-        }
+        provider_spec.start(
+            &item.key,
+            &wt_str,
+            &prompt,
+            choice.model.as_deref(),
+            choice.effort.as_deref(),
+        )
     };
 
-    let mut command = Command::new("bash");
+    let mut command = if let Ok(custom) = std::env::var("TACHO_AGENT_CMD") {
+        let mut c = Command::new("bash");
+        c.args(["-c", &custom]);
+        c
+    } else {
+        let mut c = Command::new(&planned_cmd.program);
+        c.args(&planned_cmd.args);
+        for (ek, ev) in &planned_cmd.env {
+            c.env(ek, ev);
+        }
+        c
+    };
     command
-        .args(["-c", &cmd_str])
         .current_dir(&wt_path)
         .env("TACHO_AGENT", &item.key)
         .env("TACHO_TASK", &item.key)
@@ -598,16 +623,27 @@ pub fn execute_stop(args: StopArgs) -> io::Result<()> {
             format!("unknown agent '{}'", args.key),
         ));
     };
-    if let Some(pid) = agent.pid {
+    let builtins = builtin_providers();
+    let provider_spec = state
+        .providers
+        .get(&agent.provider)
+        .or_else(|| builtins.get(&agent.provider))
+        .cloned()
+        .unwrap_or_else(ProviderSpec::claude);
+    let stop_plan = provider_spec.stop(
+        &agent.key,
+        &agent.worktree,
+        agent.session_id.as_deref(),
+        agent.pid,
+    );
+    if let Some((prog, stop_args)) = stop_plan.custom_cmd {
+        let _ = Command::new(prog).args(stop_args).status();
+    }
+    if let Some(pid) = stop_plan.pid {
         if pid_alive(pid) {
             unsafe {
                 let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-            }
-            thread::sleep(Duration::from_millis(200));
-            if pid_alive(pid) {
-                unsafe {
-                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-                }
+                let _ = libc::kill(pid as i32, libc::SIGTERM);
             }
         }
     }
@@ -654,21 +690,91 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
         ));
     };
 
-    let now = now_secs();
-    let because = format!("nudge {}: {}", args.key, args.message);
-    store.mutate(Some(("watch", "tell", &args.key, &because)), |st| {
-        st.nudged.insert(args.key.clone());
-        if let Some(a) = st.agents.get_mut(&last.key) {
-            a.resume_at = Some(now);
-            a.status_note = format!("nudged: {}", args.message);
-            a.brief = format!("{}\n\nGuidance from operator:\n{}", a.brief, args.message);
-        }
-    })?;
-    emit_decision_event(&format!("agent:{}", args.key), "watch:tell", &because);
-    println!(
-        "Sent message to {} (scheduled immediate resume if stopped)",
-        args.key
+    let live_keys = live_agent_keys(&state);
+    let is_live = live_keys.contains(&last.key);
+    let builtins = builtin_providers();
+    let provider_spec = state
+        .providers
+        .get(&last.provider)
+        .or_else(|| builtins.get(&last.provider))
+        .cloned()
+        .unwrap_or_else(ProviderSpec::claude);
+    let tell_plan = provider_spec.tell(
+        &last.key,
+        &last.worktree,
+        last.session_id.as_deref(),
+        &args.message,
+        is_live,
+        last.model.as_deref(),
+        last.effort.as_deref(),
     );
+
+    let now = now_secs();
+    match tell_plan {
+        TellPlan::LiveCommand {
+            program,
+            args: cmd_args,
+        } => {
+            let status = Command::new(&program).args(&cmd_args).status()?;
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "live tell command '{program}' exited with {status}"
+                )));
+            }
+            let because = format!("live-command tell {}: {}", last.key, args.message);
+            store.mutate(Some(("watch", "tell", &last.key, &because)), |st| {
+                st.nudged.insert(last.key.clone());
+                if let Some(a) = st.agents.get_mut(&last.key) {
+                    a.status_note = format!("nudged (live): {}", args.message);
+                }
+            })?;
+            emit_decision_event(&format!("agent:{}", last.key), "watch:tell", &because);
+            println!("Delivered live message to running session {}", last.key);
+        }
+        TellPlan::LiveInbox { key, message, .. } => {
+            let home = crate::paths::resolve_home();
+            let inbox_dir = home.join("inbox");
+            fs::create_dir_all(&inbox_dir)?;
+            let inbox_file = inbox_dir.join(format!("{key}.txt"));
+            let mut existing = fs::read_to_string(&inbox_file).unwrap_or_default();
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(&message);
+            existing.push('\n');
+            fs::write(&inbox_file, existing)?;
+
+            let because = format!("queued live inbox message for running session {key}: {message}");
+            store.mutate(Some(("watch", "tell", &key, &because)), |st| {
+                st.nudged.insert(key.clone());
+                st.inbox
+                    .entry(key.clone())
+                    .or_default()
+                    .push(message.clone());
+                if let Some(a) = st.agents.get_mut(&key) {
+                    a.status_note = format!("nudged (live inbox): {}", args.message);
+                }
+            })?;
+            emit_decision_event(&format!("agent:{key}"), "watch:tell", &because);
+            println!(
+                "Delivered live message to running worker {} (injected on next hook turn without restart)",
+                key
+            );
+        }
+        TellPlan::ResumeWithMessage { key, .. } => {
+            let because = format!("nudge stopped session {key}: {}", args.message);
+            store.mutate(Some(("watch", "tell", &key, &because)), |st| {
+                st.nudged.insert(key.clone());
+                if let Some(a) = st.agents.get_mut(&key) {
+                    a.resume_at = Some(now);
+                    a.status_note = format!("nudged: {}", args.message);
+                    a.brief = format!("{}\n\nGuidance from operator:\n{}", a.brief, args.message);
+                }
+            })?;
+            emit_decision_event(&format!("agent:{key}"), "watch:tell", &because);
+            println!("Sent message to {} (scheduled immediate resume)", key);
+        }
+    }
     Ok(())
 }
 
@@ -952,10 +1058,56 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 
     let now = now_secs();
     let batch_start_ns = now_ns();
-    let check_cmd = args
-        .cmd
-        .clone()
-        .unwrap_or_else(|| "cargo test --workspace".to_string());
+    let check_cmd = args.cmd.clone().unwrap_or_else(|| {
+        // If workflow_path & workflow_jobs are configured for the batch's area, parse the CI workflow job
+        if let Some(ref wf_path) = state.workflow_path {
+            if let Ok(raw_wf) = fs::read_to_string(cwd.join(wf_path)) {
+                if let Ok(wf_val) = serde_json::from_str::<serde_json::Value>(&raw_wf) {
+                    let mut job_cmds = Vec::new();
+                    for area in &area_list {
+                        let job_name = state
+                            .workflow_jobs
+                            .get(area)
+                            .map(String::as_str)
+                            .unwrap_or(area.as_str());
+                        if let Ok(ci_job) =
+                            job_for(&wf_val, area, job_name, &state.workflow_expressions)
+                        {
+                            let svc_name = ci_job
+                                .service
+                                .as_ref()
+                                .map(|s| format!("tacho-svc-{batch_id}-{}", s.name));
+                            if let (Some(svc), Some(sname)) = (&ci_job.service, &svc_name) {
+                                let s_argv = service_argv(svc, sname);
+                                job_cmds.push(s_argv.join(" "));
+                            }
+                            let j_argv = job_argv(
+                                &ci_job,
+                                cwd.to_str().unwrap_or("."),
+                                svc_name.as_deref(),
+                                &[],
+                            );
+                            job_cmds.push(
+                                j_argv
+                                    .iter()
+                                    .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                            );
+                            if let Some(sname) = svc_name {
+                                job_cmds
+                                    .push(format!("docker rm -f {sname} >/dev/null 2>&1 || true"));
+                            }
+                        }
+                    }
+                    if !job_cmds.is_empty() {
+                        return job_cmds.join(" && ");
+                    }
+                }
+            }
+        }
+        "cargo test --workspace".to_string()
+    });
     println!(
         "Running batch {batch_id} on PRs {:?}: `{check_cmd}`",
         pr_nums
@@ -973,11 +1125,12 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             .env("TACHO_BATCH_LABEL", label)
             .output()?;
         let p_end = now_ns();
-        let txt = format!(
+        let raw_txt = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        let txt = Scrubber::new().scrub(&raw_txt);
         Ok((out.status.success(), txt, p_start, p_end))
     };
 
@@ -1015,6 +1168,47 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
     }
 
     let finished = now_secs();
+
+    // Head-movement refusal: re-read current open PR heads from FleetStore before marking passed!
+    let latest_state = store.load()?;
+    let mut current_shas = shas.clone();
+    for &n in &pr_nums {
+        if let Some(p) = latest_state.open_prs_cache.iter().find(|p| p.number == n) {
+            current_shas.insert(n, p.head.clone());
+        } else if latest_state.closed_prs.contains(&n) {
+            current_shas.remove(&n);
+        }
+    }
+    if let Some(moved_reason) = batch_heads_moved(&shas, &current_shas) {
+        let b_run = BatchRun {
+            id: batch_id.clone(),
+            group: area_list
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "default".to_string()),
+            prs: pr_nums.clone(),
+            shas: shas.clone(),
+            main_sha: main_sha.clone(),
+            areas: area_list.clone(),
+            status: "head-moved".to_string(),
+            started_at: now,
+            finished_at: Some(finished),
+            tree: Some(tree_sha),
+            pid: None,
+            log: moved_reason.clone(),
+            culprit: None,
+            skipped: Vec::new(),
+            flakes: Vec::new(),
+        };
+        store.mutate(
+            Some(("verify", "batch_head_moved", &batch_id, &moved_reason)),
+            |st| {
+                st.batches.push(b_run);
+            },
+        )?;
+        eprintln!("Batch {batch_id} REFUSED: {moved_reason}");
+        return Err(io::Error::other(moved_reason));
+    }
 
     if ok {
         let b_run = BatchRun {
@@ -1377,7 +1571,10 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
     let ordered_nums = order_train_prs(&elig, &state.open_prs_cache);
     let parent_map = parents(&state.open_prs_cache);
     let cwd = std::env::current_dir()?;
-    let compile_cmd = std::env::var("TACHO_COMPILE_CMD").ok();
+    let compile_cmd = std::env::var("TACHO_COMPILE_CMD")
+        .ok()
+        .or_else(|| state.train_compile_cmd.clone())
+        .filter(|s| !s.trim().is_empty());
     let (surviving, dropped) = drop_breakers(&ordered_nums, &parent_map, |slice| {
         if let Some(ref cmd) = compile_cmd {
             let prs_str = slice
@@ -2241,9 +2438,35 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
     );
 
     if !args.dry_run {
+        let st_before = store.load()?;
+        let attention = needs_you(
+            &st_before.agents,
+            &st_before.todo,
+            &st_before.retired,
+            &st_before.holds,
+            &live,
+            &st_before.open_prs_cache,
+            &st_before.passed,
+            &st_before.failed,
+            now,
+        );
+        let notifications = decide_owner_notifications(
+            &attention,
+            &st_before.batches,
+            &[],
+            &BTreeMap::new(),
+            &[],
+            &st_before.notified_failures,
+        );
         store.mutate(None, |st| {
             st.last_tick_ts = Some(now);
+            for n in &notifications {
+                st.notified_failures.insert(n.key.clone());
+            }
         })?;
+        for n in &notifications {
+            let _ = store.record_decision("watch", "notify_owner", &n.key, &n.because);
+        }
         let _ = store.emit_duration_slice(
             "fleet/ticks",
             "tick",

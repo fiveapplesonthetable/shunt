@@ -1437,3 +1437,534 @@ pub fn next_hands<'a>(
     }
     (to_rebase, barred)
 }
+
+// =============================================================================
+// Provider Interface & Configuration
+// =============================================================================
+
+/// Planned command invocation for a provider lifecycle step (`start` or `resume`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCommand {
+    /// Binary or script to execute.
+    pub program: String,
+    /// Arguments passed to `program`.
+    pub args: Vec<String>,
+    /// Environment variables `(key, value)` to set for the child process.
+    pub env: Vec<(String, String)>,
+}
+
+/// Planned delivery for `tacho tell`: either live delivery into a running worker
+/// (via an inbox / live command) or queued for the next turn/resume without killing
+/// the running session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TellPlan {
+    /// Deliver to a live running session via a custom provider tell command (`{session}`, `{message}`, `{worktree}`).
+    LiveCommand { program: String, args: Vec<String> },
+    /// Deliver to a live running session via the managed hook inbox so the next PreToolUse/UserPromptSubmit
+    /// hook injects the message into the running turn without restarting the worker.
+    LiveInbox {
+        key: String,
+        session_id: Option<String>,
+        message: String,
+    },
+    /// Worker is not currently live; resume the session with the message.
+    ResumeWithMessage {
+        key: String,
+        session_id: Option<String>,
+        command: ProviderCommand,
+    },
+}
+
+/// Planned stop action for a provider worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopPlan {
+    pub key: String,
+    pub pid: Option<u32>,
+    pub custom_cmd: Option<(String, Vec<String>)>,
+}
+
+/// Trait representing an agent provider (Claude, Codex, Gemini, or custom configured provider).
+///
+/// Every method is a pure planner or parser over plain data structures:
+/// - `start`: plan the command to start a new worker session with a prompt in a worktree.
+/// - `resume`: plan the command to resume an existing session (by `session_id` or in-place worktree) with a prompt.
+/// - `tell`: plan how to deliver a message to a live or stopped worker without cold-restarting a live session.
+/// - `alive`: check whether a worker is alive given its PID and observed live process table.
+/// - `stop`: plan how to stop a worker session cleanly.
+/// - `cost`: parse or compute the USD cost of a provider run from its transcript/usage observation.
+pub trait Provider {
+    /// Provider identifier (e.g. `"claude"`, `"codex"`, `"gemini"`).
+    fn name(&self) -> &str;
+
+    /// Plan the command to launch a fresh worker session.
+    fn start(
+        &self,
+        key: &str,
+        worktree: &str,
+        prompt: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> ProviderCommand;
+
+    /// Plan the command to resume a prior worker session (`session_id` if available) with `message`.
+    fn resume(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> ProviderCommand;
+
+    /// Plan how to deliver `message` to a worker (`is_live` indicates whether the worker process is currently running).
+    fn tell(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        is_live: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> TellPlan;
+
+    /// Return whether the worker is currently alive given its recorded `pid` and the set of live PIDs on the host.
+    fn alive(&self, pid: Option<u32>, live_pids: &BTreeSet<u32>) -> bool;
+
+    /// Plan how to stop the worker.
+    fn stop(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+    ) -> StopPlan;
+
+    /// Compute or extract USD cost from a provider transcript (`jsonl_lines`) or fallback token counts.
+    fn cost(&self, jsonl_lines: &[&str], model: Option<&str>) -> f64;
+}
+
+/// Configurable specification for an agent provider.
+///
+/// Allows projects to configure custom providers or override flags/binaries for built-in providers
+/// (`claude`, `codex`, `gemini`) in fleet config without modifying Rust code.
+///
+/// Template placeholders supported in `start_args`, `resume_args`, `tell_args`, and `stop_args`:
+/// - `{prompt}` / `{message}`: the task brief or follow-up message
+/// - `{session}`: the provider session ID
+/// - `{worktree}`: the worker worktree path
+/// - `{key}`: the worker key
+/// - `{model}`: the resolved model name
+/// - `{effort}`: the resolved effort level
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSpec {
+    pub name: String,
+    pub binary: String,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    #[serde(default)]
+    pub start_args: Vec<String>,
+    #[serde(default)]
+    pub resume_args: Vec<String>,
+    #[serde(default)]
+    pub resume_without_session_args: Vec<String>,
+    #[serde(default)]
+    pub model_flag: Option<String>,
+    #[serde(default)]
+    pub effort_flag: Option<String>,
+    #[serde(default)]
+    pub tell_program: Option<String>,
+    #[serde(default)]
+    pub tell_args: Vec<String>,
+    #[serde(default)]
+    pub stop_program: Option<String>,
+    #[serde(default)]
+    pub stop_args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
+impl ProviderSpec {
+    /// Built-in specification for Claude Code (`claude`).
+    pub fn claude() -> Self {
+        Self {
+            name: "claude".to_string(),
+            binary: "claude".to_string(),
+            default_model: Some("opus".to_string()),
+            default_effort: None,
+            start_args: vec![
+                "--dangerously-skip-permissions".to_string(),
+                "-p".to_string(),
+                "{prompt}".to_string(),
+            ],
+            resume_args: vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                "{session}".to_string(),
+                "-p".to_string(),
+                "{message}".to_string(),
+            ],
+            resume_without_session_args: vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--continue".to_string(),
+                "-p".to_string(),
+                "{message}".to_string(),
+            ],
+            model_flag: Some("--model".to_string()),
+            effort_flag: Some("--effort".to_string()),
+            tell_program: None,
+            tell_args: Vec::new(),
+            stop_program: None,
+            stop_args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Built-in specification for Codex CLI (`codex`).
+    pub fn codex() -> Self {
+        Self {
+            name: "codex".to_string(),
+            binary: "codex".to_string(),
+            default_model: Some("gpt-5.4".to_string()),
+            default_effort: None,
+            start_args: vec![
+                "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "{prompt}".to_string(),
+            ],
+            resume_args: vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "{session}".to_string(),
+                "{message}".to_string(),
+            ],
+            resume_without_session_args: vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+                "{message}".to_string(),
+            ],
+            model_flag: Some("-m".to_string()),
+            effort_flag: None,
+            tell_program: None,
+            tell_args: Vec::new(),
+            stop_program: None,
+            stop_args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Built-in specification for Gemini CLI (`gemini`).
+    pub fn gemini() -> Self {
+        Self {
+            name: "gemini".to_string(),
+            binary: "gemini".to_string(),
+            default_model: Some("gemini-3.1-pro-preview".to_string()),
+            default_effort: None,
+            start_args: vec![
+                "--yolo".to_string(),
+                "-p".to_string(),
+                "{prompt}".to_string(),
+            ],
+            resume_args: vec![
+                "--yolo".to_string(),
+                "--resume".to_string(),
+                "{session}".to_string(),
+                "-p".to_string(),
+                "{message}".to_string(),
+            ],
+            resume_without_session_args: vec![
+                "--yolo".to_string(),
+                "--resume".to_string(),
+                "latest".to_string(),
+                "-p".to_string(),
+                "{message}".to_string(),
+            ],
+            model_flag: Some("-m".to_string()),
+            effort_flag: None,
+            tell_program: None,
+            tell_args: Vec::new(),
+            stop_program: None,
+            stop_args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    fn expand_template(
+        template: &[String],
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        prompt_or_msg: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Vec<String> {
+        template
+            .iter()
+            .map(|arg| {
+                arg.replace("{key}", key)
+                    .replace("{worktree}", worktree)
+                    .replace("{session}", session_id.unwrap_or(""))
+                    .replace("{prompt}", prompt_or_msg)
+                    .replace("{message}", prompt_or_msg)
+                    .replace("{model}", model.unwrap_or(""))
+                    .replace("{effort}", effort.unwrap_or(""))
+            })
+            .collect()
+    }
+
+    fn build_command(
+        &self,
+        template: &[String],
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        prompt_or_msg: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> ProviderCommand {
+        let eff_model = model
+            .filter(|s| !s.trim().is_empty())
+            .or(self.default_model.as_deref());
+        let eff_effort = effort
+            .filter(|s| !s.trim().is_empty())
+            .or(self.default_effort.as_deref());
+
+        let mut args = Vec::new();
+        let template_uses_model = template.iter().any(|a| a.contains("{model}"));
+        let template_uses_effort = template.iter().any(|a| a.contains("{effort}"));
+
+        if !template_uses_model {
+            if let (Some(flag), Some(m)) = (&self.model_flag, eff_model) {
+                args.push(flag.clone());
+                args.push(m.to_string());
+            }
+        }
+        if !template_uses_effort {
+            if let (Some(flag), Some(e)) = (&self.effort_flag, eff_effort) {
+                args.push(flag.clone());
+                args.push(e.to_string());
+            }
+        }
+
+        args.extend(Self::expand_template(
+            template,
+            key,
+            worktree,
+            session_id,
+            prompt_or_msg,
+            eff_model,
+            eff_effort,
+        ));
+
+        let mut env = self.env.clone();
+        env.push(("TACHO_AGENT".to_string(), key.to_string()));
+        env.push(("TACHO_WORKTREE".to_string(), worktree.to_string()));
+
+        ProviderCommand {
+            program: self.binary.clone(),
+            args,
+            env,
+        }
+    }
+}
+
+impl Provider for ProviderSpec {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn start(
+        &self,
+        key: &str,
+        worktree: &str,
+        prompt: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> ProviderCommand {
+        self.build_command(&self.start_args, key, worktree, None, prompt, model, effort)
+    }
+
+    fn resume(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> ProviderCommand {
+        let template = if session_id.filter(|s| !s.trim().is_empty()).is_some() {
+            &self.resume_args
+        } else if !self.resume_without_session_args.is_empty() {
+            &self.resume_without_session_args
+        } else {
+            &self.start_args
+        };
+        self.build_command(template, key, worktree, session_id, message, model, effort)
+    }
+
+    fn tell(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        is_live: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> TellPlan {
+        if is_live {
+            if let Some(ref prog) = self.tell_program {
+                let args = Self::expand_template(
+                    &self.tell_args,
+                    key,
+                    worktree,
+                    session_id,
+                    message,
+                    model,
+                    effort,
+                );
+                return TellPlan::LiveCommand {
+                    program: prog.clone(),
+                    args,
+                };
+            }
+            return TellPlan::LiveInbox {
+                key: key.to_string(),
+                session_id: session_id.map(str::to_string),
+                message: message.to_string(),
+            };
+        }
+        TellPlan::ResumeWithMessage {
+            key: key.to_string(),
+            session_id: session_id.map(str::to_string),
+            command: self.resume(key, worktree, session_id, message, model, effort),
+        }
+    }
+
+    fn alive(&self, pid: Option<u32>, live_pids: &BTreeSet<u32>) -> bool {
+        pid.is_some_and(|p| p > 0 && live_pids.contains(&p))
+    }
+
+    fn stop(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+    ) -> StopPlan {
+        let custom_cmd = self.stop_program.as_ref().map(|prog| {
+            (
+                prog.clone(),
+                Self::expand_template(&self.stop_args, key, worktree, session_id, "", None, None),
+            )
+        });
+        StopPlan {
+            key: key.to_string(),
+            pid,
+            custom_cmd,
+        }
+    }
+
+    fn cost(&self, jsonl_lines: &[&str], model: Option<&str>) -> f64 {
+        let eff_model = model
+            .or(self.default_model.as_deref())
+            .unwrap_or(&self.name);
+        let mut explicit_usd = 0.0;
+        let mut in_tok = 0u64;
+        let mut out_tok = 0u64;
+        let mut cache_read = 0u64;
+        let mut cache_write = 0u64;
+        for line in jsonl_lines {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(c) = v.get("total_cost_usd").and_then(|x| x.as_f64()) {
+                if c > explicit_usd {
+                    explicit_usd = c;
+                }
+            }
+            if let Some(u) = v.get("usage") {
+                in_tok += u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                out_tok += u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                cache_read += u
+                    .get("cache_read_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                cache_write += u
+                    .get("cache_creation_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+            }
+        }
+        if explicit_usd > 0.0 {
+            explicit_usd
+        } else {
+            crate::decide::watch::price(eff_model, in_tok, out_tok, cache_read, cache_write)
+        }
+    }
+}
+
+/// Return the default built-in provider registry (`claude`, `codex`, `gemini`).
+pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
+    let mut map = BTreeMap::new();
+    map.insert("claude".to_string(), ProviderSpec::claude());
+    map.insert("codex".to_string(), ProviderSpec::codex());
+    map.insert("gemini".to_string(), ProviderSpec::gemini());
+    map
+}
+
+/// Resolve `(provider, model, effort)` against a custom provider map (falling back to built-in providers).
+pub fn resolve_with_providers(
+    provider: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    default_provider: &str,
+    default_model: Option<&str>,
+    default_effort: Option<&str>,
+    custom_providers: &BTreeMap<String, ProviderSpec>,
+) -> Result<Choice, String> {
+    if let Some(p) = provider.map(str::trim).filter(|s| !s.is_empty()) {
+        if custom_providers.contains_key(p) && !PROVIDERS.contains(&p) {
+            let spec = &custom_providers[p];
+            return Ok(Choice {
+                provider: p.to_string(),
+                model: model
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| spec.default_model.clone())
+                    .or_else(|| default_model.map(str::to_string)),
+                effort: effort
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| spec.default_effort.clone())
+                    .or_else(|| default_effort.map(str::to_string)),
+            });
+        }
+    }
+    resolve(
+        provider,
+        model,
+        effort,
+        default_provider,
+        default_model,
+        default_effort,
+    )
+}
+
+/// Order open PRs `(pr_number, migration_numbers)` by their lowest numbered schema migration
+/// so PRs with earlier database migrations land first.
+pub fn migration_order(prs: &[(u64, Vec<u32>)]) -> Vec<u64> {
+    let mut keyed: Vec<(u32, u64)> = prs
+        .iter()
+        .map(|(pr, migs)| (migs.iter().copied().min().unwrap_or(u32::MAX), *pr))
+        .collect();
+    keyed.sort_by_key(|&(lowest_mig, pr)| (lowest_mig, pr));
+    keyed.into_iter().map(|(_, pr)| pr).collect()
+}

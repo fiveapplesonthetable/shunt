@@ -679,3 +679,412 @@ NumbersFlowTest > a_number_is_registered FAILED
     assert!(queue_grew(&[10, 11], &[10, 11, 12]));
     assert!(!queue_grew(&[10, 11], &[10]));
 }
+
+#[test]
+fn test_child_cpu_counts_toward_stalled_verdict() {
+    // Agent log/head/dirty_files have been unchanged for 48m (> 45m STALLED_SECS),
+    // BUT child processes in the process tree are burning CPU (`>= IDLE_CPU_TICKS_PER_SEC` = 5 ticks/s).
+    // Must be Verdict::Moving, not Verdict::Stalled!
+    let samples_busy_child = vec![
+        ProgressSample {
+            ts: 1000,
+            log_bytes: 500,
+            head_sha: "abc".to_string(),
+            dirty_files: 1,
+            cpu_ticks: 100,
+        },
+        ProgressSample {
+            ts: 1000 + 2800,
+            log_bytes: 500,
+            head_sha: "abc".to_string(),
+            dirty_files: 1,
+            // 2800s * 10 ticks/s = 28_000 ticks (>= 5 ticks/s)
+            cpu_ticks: 100 + 28_000,
+        },
+    ];
+    let (v, _idle) = verdict(&samples_busy_child, 1000 + 2900);
+    assert_eq!(v, Verdict::Moving);
+
+    // Conversely, if CPU rate is only 1 tick over 2800s (< 5 ticks/s), it is alive (not Hung),
+    // but process tree is idle for >= 45m, so it IS Verdict::Stalled.
+    let samples_idle_child = vec![
+        ProgressSample {
+            ts: 1000,
+            log_bytes: 500,
+            head_sha: "abc".to_string(),
+            dirty_files: 1,
+            cpu_ticks: 100,
+        },
+        ProgressSample {
+            ts: 1000 + 2800,
+            log_bytes: 500,
+            head_sha: "abc".to_string(),
+            dirty_files: 1,
+            cpu_ticks: 101,
+        },
+    ];
+    let (v_idle, _) = verdict(&samples_idle_child, 1000 + 2900);
+    assert_eq!(v_idle, Verdict::Stalled);
+}
+
+#[test]
+fn test_provider_interface_start_resume_tell_alive_stop_cost() {
+    use super::dispatch::{
+        builtin_providers, migration_order, resolve_with_providers, Provider, ProviderSpec,
+        TellPlan,
+    };
+
+    let providers = builtin_providers();
+    let claude = providers.get("claude").unwrap();
+
+    // 1. start
+    let start_cmd = claude.start(
+        "w1",
+        "/tmp/wt1",
+        "Fix the bug",
+        Some("sonnet"),
+        Some("high"),
+    );
+    assert_eq!(start_cmd.program, "claude");
+    assert!(start_cmd.args.contains(&"--model".to_string()));
+    assert!(start_cmd.args.contains(&"sonnet".to_string()));
+    assert!(start_cmd.args.contains(&"--effort".to_string()));
+    assert!(start_cmd.args.contains(&"high".to_string()));
+    assert!(start_cmd.args.contains(&"Fix the bug".to_string()));
+
+    // 2. resume with session_id
+    let resume_cmd = claude.resume(
+        "w1",
+        "/tmp/wt1",
+        Some("sess-abc"),
+        "Address review comments",
+        Some("opus"),
+        None,
+    );
+    assert!(resume_cmd.args.contains(&"--resume".to_string()));
+    assert!(resume_cmd.args.contains(&"sess-abc".to_string()));
+    assert!(resume_cmd
+        .args
+        .contains(&"Address review comments".to_string()));
+
+    // 3. tell on a LIVE worker -> LiveInbox (no cold restart!)
+    let live_tell = claude.tell(
+        "w1",
+        "/tmp/wt1",
+        Some("sess-abc"),
+        "New instruction while running",
+        true,
+        Some("opus"),
+        None,
+    );
+    assert_eq!(
+        live_tell,
+        TellPlan::LiveInbox {
+            key: "w1".to_string(),
+            session_id: Some("sess-abc".to_string()),
+            message: "New instruction while running".to_string(),
+        }
+    );
+
+    // 4. tell on a STOPPED worker -> ResumeWithMessage
+    let stopped_tell = claude.tell(
+        "w1",
+        "/tmp/wt1",
+        Some("sess-abc"),
+        "Wake up and rebase",
+        false,
+        Some("opus"),
+        None,
+    );
+    assert!(matches!(stopped_tell, TellPlan::ResumeWithMessage { .. }));
+
+    // 5. alive & stop & cost
+    let mut live_pids = BTreeSet::new();
+    live_pids.insert(4242);
+    assert!(claude.alive(Some(4242), &live_pids));
+    assert!(!claude.alive(Some(9999), &live_pids));
+    let stop_plan = claude.stop("w1", "/tmp/wt1", Some("sess-abc"), Some(4242));
+    assert_eq!(stop_plan.pid, Some(4242));
+    let cost = claude.cost(
+        &[r#"{"type":"result","total_cost_usd":0.25,"usage":{"input_tokens":1000,"output_tokens":500}}"#],
+        Some("opus"),
+    );
+    assert!((cost - 0.25).abs() < 1e-6);
+
+    // 6. Custom configured provider with custom tell_program
+    let mut custom_map = builtin_providers();
+    custom_map.insert(
+        "custom-agent".to_string(),
+        ProviderSpec {
+            name: "custom-agent".to_string(),
+            binary: "/usr/local/bin/custom-agent".to_string(),
+            default_model: Some("custom-v1".to_string()),
+            default_effort: None,
+            start_args: vec![
+                "run".to_string(),
+                "--prompt".to_string(),
+                "{prompt}".to_string(),
+            ],
+            resume_args: vec![
+                "resume".to_string(),
+                "--session".to_string(),
+                "{session}".to_string(),
+                "{message}".to_string(),
+            ],
+            resume_without_session_args: Vec::new(),
+            model_flag: Some("--model".to_string()),
+            effort_flag: None,
+            tell_program: Some("/usr/local/bin/custom-tell".to_string()),
+            tell_args: vec![
+                "--session".to_string(),
+                "{session}".to_string(),
+                "{message}".to_string(),
+            ],
+            stop_program: None,
+            stop_args: Vec::new(),
+            env: Vec::new(),
+        },
+    );
+    let choice = resolve_with_providers(
+        Some("custom-agent"),
+        None,
+        None,
+        "claude",
+        None,
+        None,
+        &custom_map,
+    )
+    .unwrap();
+    assert_eq!(choice.provider, "custom-agent");
+    assert_eq!(choice.model.as_deref(), Some("custom-v1"));
+    let custom_live_tell =
+        custom_map["custom-agent"].tell("w2", "/tmp/wt2", Some("s-99"), "ping", true, None, None);
+    assert_eq!(
+        custom_live_tell,
+        TellPlan::LiveCommand {
+            program: "/usr/local/bin/custom-tell".to_string(),
+            args: vec![
+                "--session".to_string(),
+                "s-99".to_string(),
+                "ping".to_string()
+            ],
+        }
+    );
+
+    // 7. migration_order
+    let mig_prs = vec![(105, vec![14, 15]), (102, vec![12]), (109, vec![])];
+    assert_eq!(migration_order(&mig_prs), vec![102, 105, 109]);
+}
+
+#[test]
+fn test_workflow_job_parser_and_batch_helpers() {
+    use super::verify::{
+        affected_units, area_hang_report, batch_heads_moved, env_file_with_vars, job_argv, job_for,
+        service_argv,
+    };
+
+    let wf: serde_json::Value = serde_json::json!({
+        "jobs": {
+            "backend": {
+                "container": { "image": "ghcr.io/org/ci:${{ env.CI_TAG }}" },
+                "env": { "RUST_BACKTRACE": "1" },
+                "services": {
+                    "postgres": {
+                        "image": "postgres:16",
+                        "env": { "POSTGRES_PASSWORD": "postgres" },
+                        "ports": ["5432:5432"],
+                        "options": "--health-cmd pg_isready"
+                    }
+                },
+                "steps": [
+                    { "uses": "actions/checkout@v4" },
+                    { "uses": "Swatinem/rust-cache@v2" },
+                    {
+                        "name": "Run backend tests",
+                        "working-directory": "crates/backend",
+                        "env": { "DATABASE_URL": "postgres://postgres:postgres@127.0.0.1:5432/test" },
+                        "run": "cargo test --locked"
+                    }
+                ]
+            }
+        }
+    });
+
+    let mut exprs = BTreeMap::new();
+    exprs.insert("env.CI_TAG".to_string(), "v1.2.3".to_string());
+
+    let job = job_for(&wf, "backend", "backend", &exprs).unwrap();
+    assert_eq!(job.image.as_deref(), Some("ghcr.io/org/ci:v1.2.3"));
+    assert_eq!(job.steps.len(), 1);
+    assert_eq!(job.steps[0].name, "Run backend tests");
+    assert_eq!(
+        job.steps[0].working_directory.as_deref(),
+        Some("crates/backend")
+    );
+    let svc = job.service.as_ref().unwrap();
+    assert_eq!(svc.image, "postgres:16");
+
+    let svc_cmd = service_argv(svc, "tacho-svc-b1");
+    assert!(svc_cmd.contains(&"postgres:16".to_string()));
+    let run_cmd = job_argv(
+        &job,
+        "/tmp/batch-wt",
+        Some("tacho-svc-b1"),
+        &[("/tmp/cargo-cache".to_string(), "/root/.cargo".to_string())],
+    );
+    assert!(run_cmd.contains(&"container:tacho-svc-b1".to_string()));
+    assert!(run_cmd.contains(&"ghcr.io/org/ci:v1.2.3".to_string()));
+
+    // Unknown expression is strictly refused
+    let empty_exprs = BTreeMap::new();
+    assert!(job_for(&wf, "backend", "backend", &empty_exprs).is_err());
+
+    // Head movement refusal during batch verification
+    let mut expected = BTreeMap::new();
+    expected.insert(11, "aaaa1111".to_string());
+    expected.insert(12, "bbbb2222".to_string());
+    let mut current = expected.clone();
+    assert!(batch_heads_moved(&expected, &current).is_none());
+    current.insert(12, "cccc3333".to_string());
+    let moved = batch_heads_moved(&expected, &current).unwrap();
+    assert!(
+        moved.contains("PR #12 moved from aaaa1111")
+            || moved.contains("PR #12 moved from bbbb2222")
+    );
+
+    // Affected units
+    let mut unit_prefixes = BTreeMap::new();
+    unit_prefixes.insert("api".to_string(), vec!["crates/api/".to_string()]);
+    unit_prefixes.insert("db".to_string(), vec!["crates/db/".to_string()]);
+    assert_eq!(
+        affected_units(&["crates/api/src/lib.rs".to_string()], &unit_prefixes),
+        vec!["api".to_string()]
+    );
+    assert_eq!(
+        affected_units(&["Cargo.lock".to_string()], &unit_prefixes),
+        vec!["all".to_string()]
+    );
+
+    // Area timeout hang report
+    let log = "=== step: Build ===\nok\n=== step: Integration Suite ===\nrunning test_slow...\n";
+    let hang = area_hang_report("batch-7", "backend", 600, log);
+    assert_eq!(hang.active_step.as_deref(), Some("Integration Suite"));
+    assert!(hang
+        .summary
+        .contains("timed out after 600s in step 'Integration Suite'"));
+
+    // env_file_with_vars
+    let env_txt = env_file_with_vars(
+        "w1",
+        "deadbeef",
+        None,
+        20000,
+        20019,
+        None,
+        &[("DATABASE_URL", "postgres://postgres@127.0.0.1:20001/w1")],
+    );
+    let parsed = parse_env(&env_txt);
+    assert_eq!(
+        parsed.get("DATABASE_URL").map(String::as_str),
+        Some("postgres://postgres@127.0.0.1:20001/w1")
+    );
+}
+
+#[test]
+fn test_unified_replayable_decide_function() {
+    use super::watch::{BehindCommit, DeployRunObs};
+    use super::{decide, BatchOutcomeObs, BatchResolution, DecisionState, WorldObservation};
+
+    let mut state = DecisionState {
+        max_parallel: 2,
+        todo: vec![TodoItem {
+            key: "feat-a".to_string(),
+            brief: "Implement feature A".to_string(),
+            area: "core".to_string(),
+            priority: 5,
+            created_at: 100,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    state.batches.push(super::verify::BatchRun {
+        id: "b-1".to_string(),
+        group: "default".to_string(),
+        prs: vec![50],
+        shas: BTreeMap::from([(50, "sha50".to_string())]),
+        main_sha: "main-sha-1".to_string(),
+        status: "running".to_string(),
+        started_at: 900,
+        ..Default::default()
+    });
+
+    let obs = WorldObservation {
+        now: 1000,
+        main_sha: "main-sha-1".to_string(),
+        open_prs: vec![PullFacts {
+            number: 50,
+            title: "Add feature 50".to_string(),
+            branch: "agent/prior".to_string(),
+            head: "sha50".to_string(),
+            base: "main".to_string(),
+            state: "OPEN".to_string(),
+            mergeable: "MERGEABLE".to_string(),
+            files: vec!["crates/tacho-core/src/lib.rs".to_string()],
+            additions: 10,
+            deletions: 2,
+            ..Default::default()
+        }],
+        batch_outcomes: vec![BatchOutcomeObs {
+            batch_id: "b-1".to_string(),
+            passed: true,
+            failed_area: None,
+            log_output: "all green".to_string(),
+            tree_sha: "tree-50".to_string(),
+        }],
+        deploy_runs: vec![DeployRunObs {
+            run_id: 9001,
+            head_sha: "main-sha-1".to_string(),
+            status: "in_progress".to_string(),
+            gate_conclusion: Some("success".to_string()),
+            on_main: true,
+        }],
+        behind_commits: vec![BehindCommit {
+            sha: "112233445566".to_string(),
+            ts: 950,
+            ci_green: true,
+        }],
+        detached_checkout: true,
+        ..Default::default()
+    };
+
+    let plan1 = decide(&state, &obs);
+    let plan2 = decide(&state, &obs);
+    // Replayable determinism: identical inputs produce identical plans.
+    assert_eq!(plan1, plan2);
+    assert_eq!(plan1.dispatched_tasks.len(), 1);
+    assert_eq!(plan1.dispatched_tasks[0].key, "feat-a");
+    assert_eq!(
+        plan1.batch_resolutions,
+        vec![BatchResolution::Passed {
+            batch_id: "b-1".to_string(),
+            prs: vec![50],
+        }]
+    );
+    assert!(plan1.next_state.passed.contains_key(&50));
+    assert_eq!(plan1.ready_prs.len(), 1);
+    assert_eq!(plan1.ready_prs[0].pr, 50);
+    assert_eq!(
+        plan1.self_update.target_sha.as_deref(),
+        Some("112233445566")
+    );
+    assert!(plan1
+        .owner_notifications
+        .iter()
+        .any(|n| n.key == "deploy:9001"));
+    // Second tick with plan1.next_state does NOT re-send the tell-once deploy notification!
+    let plan_second_tick = decide(&plan1.next_state, &obs);
+    assert!(!plan_second_tick
+        .owner_notifications
+        .iter()
+        .any(|n| n.key == "deploy:9001"));
+}

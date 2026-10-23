@@ -7,7 +7,7 @@ PINNED_VERSION="v58.3"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/tacho"
 TARGET_BIN="${CACHE_ROOT}/trace_processor_shell"
 
-if [[ -x "${TARGET_BIN}" ]]; then
+if [[ -x "${TARGET_BIN}" ]] && "${TARGET_BIN}" --version 2>&1 | grep -qE "v5[789]\.|v[6-9][0-9]\."; then
     echo "${TARGET_BIN}"
     exit 0
 fi

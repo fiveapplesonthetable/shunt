@@ -14,10 +14,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tacho_core::decide::verify::{
-    allocate_ports, build_body, env_file, job_name_problem, owns, parse_env, pr_refusals,
+    allocate_ports, build_body, env_file_with_vars, job_name_problem, owns, parse_env, pr_refusals,
     proof_plan, slug_problem, ProofCheck, ProofSummary,
 };
 use tacho_core::decide::watch::{parse_note, plan_starve, with_note};
+use tacho_core::Scrubber;
 use tacho_daemon::{FleetStore, WorktreeEntry};
 
 use crate::cli::{JobArgs, KillArgs, NoteArgs, PrArgs, ProveArgs, StartArgs, StarveArgs, WaitArgs};
@@ -174,30 +175,89 @@ pub fn execute_start(args: StartArgs) -> io::Result<()> {
     let cwd = std::env::current_dir()?;
     let root = repo_root(&cwd)?;
 
-    // Resolve base to an exact commit SHA
+    // Strictly resolve base to an exact commit SHA without silent fallback to stale FETCH_HEAD or HEAD.
     let base_arg = args.base.as_deref().unwrap_or("HEAD");
     let mut base_pr: Option<u64> = None;
     let base_sha = if let Ok(pr_num) = base_arg.trim_start_matches("pr:").parse::<u64>() {
         base_pr = Some(pr_num);
-        // Try fetching pull/<n>/head or resolving via gh
+        let pr_ref = format!("refs/tacho/pr/{pr_num}");
+        let fetch_ok = Command::new("git")
+            .args([
+                "fetch",
+                "--no-tags",
+                "origin",
+                &format!("+pull/{pr_num}/head:{pr_ref}"),
+            ])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if fetch_ok {
+            git_output(&root, &["rev-parse", &format!("{pr_ref}^{{commit}}")])?
+        } else {
+            // Try gh pr view for local/mocked gh setups, otherwise refuse explicitly
+            let gh_sha = Command::new("gh")
+                .args([
+                    "pr",
+                    "view",
+                    &pr_num.to_string(),
+                    "--json",
+                    "headRefOid",
+                    "-q",
+                    ".headRefOid",
+                ])
+                .current_dir(&root)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            match gh_sha {
+                Some(sha) => git_output(&root, &["rev-parse", &format!("{sha}^{{commit}}")]).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("base PR #{pr_num} head SHA '{sha}' is not present in local git object store"),
+                    )
+                })?,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("failed to resolve base PR #{pr_num}: could not fetch origin pull/{pr_num}/head"),
+                    ));
+                }
+            }
+        }
+    } else if base_arg == "origin/main" {
         let _ = Command::new("git")
-            .args(["fetch", "origin", &format!("pull/{pr_num}/head")])
+            .args(["fetch", "origin", "main"])
             .current_dir(&root)
             .output();
-        git_output(&root, &["rev-parse", "FETCH_HEAD"])
-            .or_else(|_| git_output(&root, &["rev-parse", "HEAD"]))?
+        git_output(&root, &["rev-parse", "origin/main^{commit}"]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to resolve base 'origin/main'",
+            )
+        })?
+    } else if base_arg == "main" {
+        let _ = Command::new("git")
+            .args(["fetch", "origin", "main"])
+            .current_dir(&root)
+            .output();
+        git_output(&root, &["rev-parse", "origin/main^{commit}"])
+            .or_else(|_| git_output(&root, &["rev-parse", "main^{commit}"]))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "failed to resolve base 'main' (neither origin/main nor main exists)",
+                )
+            })?
     } else {
-        if base_arg == "main" || base_arg == "origin/main" {
-            let _ = Command::new("git")
-                .args(["fetch", "origin", "main"])
-                .current_dir(&root)
-                .output();
-            git_output(&root, &["rev-parse", "origin/main"])
-                .or_else(|_| git_output(&root, &["rev-parse", "main"]))
-                .or_else(|_| git_output(&root, &["rev-parse", "HEAD"]))?
-        } else {
-            git_output(&root, &["rev-parse", &format!("{base_arg}^{{commit}}")])?
-        }
+        git_output(&root, &["rev-parse", &format!("{base_arg}^{{commit}}")]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to resolve base revision '{base_arg}'"),
+            )
+        })?
     };
 
     let mut store = open_fleet_store()?;
@@ -289,7 +349,65 @@ pub fn execute_start(args: StartArgs) -> io::Result<()> {
 
     let target_dir = root.join("target");
     let target_str = target_dir.to_str();
-    let env_contents = env_file(&args.slug, &base_sha, base_pr, port, port_last, target_str);
+
+    // Optional per-agent database project plugin (`db_up_cmd` in FleetState or `TACHO_DB_UP_CMD` env var).
+    let mut extra_vars: Vec<(String, String)> = Vec::new();
+    let db_cmd = std::env::var("TACHO_DB_UP_CMD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| state.db_up_cmd.clone().filter(|s| !s.trim().is_empty()));
+    if let Some(cmd_str) = db_cmd {
+        let db_port = port.saturating_add(1);
+        let out = Command::new("bash")
+            .args(["-c", &cmd_str])
+            .current_dir(&wt_path)
+            .env("SLUG", &args.slug)
+            .env("PORT", port.to_string())
+            .env("PORT_LAST", port_last.to_string())
+            .env("DB_PORT", db_port.to_string())
+            .env("WORKTREE", wt_path.to_str().unwrap_or_default())
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(format!(
+                "per-agent database setup plugin failed: {}",
+                stderr.trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut db_url = None;
+        for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if let Some(rest) = line
+                .strip_prefix("export DATABASE_URL=")
+                .or_else(|| line.strip_prefix("DATABASE_URL="))
+            {
+                db_url = Some(rest.trim_matches('\'').trim_matches('"').to_string());
+            } else if line.contains("://") {
+                db_url = Some(line.to_string());
+            }
+        }
+        let resolved_url = db_url.unwrap_or_else(|| {
+            format!(
+                "postgres://postgres:postgres@127.0.0.1:{db_port}/{}",
+                args.slug.replace('-', "_")
+            )
+        });
+        extra_vars.push(("DATABASE_URL".to_string(), resolved_url));
+    }
+
+    let extra_refs: Vec<(&str, &str)> = extra_vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let env_contents = env_file_with_vars(
+        &args.slug,
+        &base_sha,
+        base_pr,
+        port,
+        port_last,
+        target_str,
+        &extra_refs,
+    );
     fs::write(wt_path.join(".tachoenv"), &env_contents)?;
     add_git_excludes(&wt_path);
 
@@ -389,7 +507,8 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
             String::from_utf8_lossy(&out.stderr)
         );
         let tail: Vec<&str> = combined.lines().rev().take(25).collect();
-        let output_tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        let raw_tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+        let output_tail = Scrubber::new().scrub(&raw_tail);
         if !ok {
             all_ok = false;
             eprintln!("FAIL [{name}] ({duration_ms}ms):\n{output_tail}");

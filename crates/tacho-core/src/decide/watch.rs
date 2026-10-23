@@ -248,19 +248,32 @@ pub fn take_sample(
     out
 }
 
+/// Minimum process-tree CPU tick rate (`CLK_TCK = 100` -> 5 ticks/s = `0.05` CPU-s/s)
+/// above which a worker's process tree (including child builds/tests) is considered busy.
+pub const IDLE_CPU_TICKS_PER_SEC: u64 = 5;
+
+/// Staleness threshold (30 minutes) before lagging self-update commits raise an attention item.
+pub const SELF_UPDATE_STALE_SECS: i64 = 30 * 60;
+
 /// Compute the progress [`Verdict`] (`MOVING`, `STALLED`, or `HUNG`) from an agent's samples.
 ///
 /// Rules:
 /// - Work occurs whenever `log_bytes` grows by `>= 64` bytes, `head_sha` changes, or `dirty_files` changes.
-/// - If work occurred within `HUNG_SECS` (30m), verdict is `MOVING`.
-/// - If no work occurred for `>= HUNG_SECS` (30m) AND `cpu_ticks` did not increase over that window, verdict is `HUNG`.
-/// - If no work occurred for `>= STALLED_SECS` (45m), verdict is `STALLED`.
-/// - Otherwise verdict is `MOVING`.
+/// - Process-tree CPU liveness (`last_alive_ts`) advances whenever `cpu_ticks` increases by `>= 1` tick.
+/// - Process-tree CPU busy activity (`last_busy_ts`) advances whenever `cpu_ticks` (which includes all
+///   child processes in the agent's process tree/cgroup) grows at `>= IDLE_CPU_TICKS_PER_SEC` (`0.05` CPU-s/s).
+/// - If no work occurred for `>= HUNG_SECS` (30m) AND `now - last_alive_ts >= HUNG_SECS` (zero CPU ticks), verdict is `HUNG`.
+/// - If no work occurred for `>= STALLED_SECS` (45m) AND `now - last_busy_ts >= STALLED_SECS` (process tree CPU idle), verdict is `STALLED`.
+/// - Otherwise (including when child processes are actively burning CPU on a long check), verdict is `MOVING`.
 pub fn verdict(samples: &[ProgressSample], now: i64) -> (Verdict, i64) {
-    let Some(last) = samples.last() else {
+    let Some(_last) = samples.last() else {
         return (Verdict::Moving, 0);
     };
-    let mut last_work_ts = samples.first().map(|s| s.ts).unwrap_or(now);
+    let start_ts = samples.first().map(|s| s.ts).unwrap_or(now);
+    let mut last_work_ts = start_ts;
+    let mut last_alive_ts = start_ts;
+    let mut last_busy_ts = start_ts;
+
     for pair in samples.windows(2) {
         let a = &pair[0];
         let b = &pair[1];
@@ -270,28 +283,27 @@ pub fn verdict(samples: &[ProgressSample], now: i64) -> (Verdict, i64) {
         {
             last_work_ts = b.ts;
         }
-    }
-    let idle_secs = (now - last_work_ts).max(0);
-    if idle_secs < HUNG_SECS {
-        return (Verdict::Moving, idle_secs);
+        let cpu_grew = b.cpu_ticks.saturating_sub(a.cpu_ticks);
+        if cpu_grew > 0 {
+            last_alive_ts = b.ts;
+        }
+        let elapsed = (b.ts - a.ts).max(1) as u64;
+        if cpu_grew >= elapsed.saturating_mul(IDLE_CPU_TICKS_PER_SEC) {
+            last_busy_ts = b.ts;
+        }
     }
 
-    // Check CPU delta across the idle window (the latest sample at or before `now - HUNG_SECS`,
-    // falling back to the earliest sample).
-    let cutoff = now - HUNG_SECS;
-    let baseline = samples
-        .iter()
-        .rev()
-        .find(|s| s.ts <= cutoff)
-        .unwrap_or_else(|| samples.first().unwrap());
-    let cpu_delta = last.cpu_ticks.saturating_sub(baseline.cpu_ticks);
-    if cpu_delta == 0 && idle_secs >= HUNG_SECS {
+    let idle_secs = (now - last_work_ts).max(0);
+    let cpu_silent_secs = (now - last_alive_ts).max(0);
+    let cpu_idle_secs = (now - last_busy_ts).max(0);
+
+    if idle_secs >= HUNG_SECS && cpu_silent_secs >= HUNG_SECS {
         return (Verdict::Hung, idle_secs);
     }
-    if idle_secs >= STALLED_SECS {
+    if idle_secs >= STALLED_SECS && cpu_idle_secs >= STALLED_SECS {
         return (Verdict::Stalled, idle_secs);
     }
-    (Verdict::Moving, idle_secs)
+    (Verdict::Moving, idle_secs.min(cpu_idle_secs))
 }
 
 /// Parse a `"<phase>: <summary>"` note string, validating that `<phase>` is one of [`VALID_PHASES`].
@@ -1052,4 +1064,270 @@ pub fn needs_you(
     }
 
     items
+}
+
+/// A commit on `main` ahead of the currently running orchestrator binary/checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehindCommit {
+    pub sha: String,
+    pub ts: i64,
+    pub ci_green: bool,
+}
+
+/// Pure decision for whether the running orchestrator should self-update to a newer green `main` commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfUpdateDecision {
+    pub target_sha: Option<String>,
+    pub stale: bool,
+    pub distance_summary: String,
+    pub attention: Option<AttentionItem>,
+    pub because: String,
+}
+
+/// Observed CI / deploy run on `main`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployRunObs {
+    pub run_id: u64,
+    pub head_sha: String,
+    pub status: String,
+    pub gate_conclusion: Option<String>,
+    pub on_main: bool,
+}
+
+/// Tell-once owner notification item (email / attention line).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerNotification {
+    pub key: String,
+    pub kind: String,
+    pub subject: String,
+    pub body: String,
+    pub command_hint: String,
+    pub because: String,
+}
+
+/// Decide whether the running orchestrator should advance to a newer `main` commit.
+///
+/// Rules (`SHUNT.md:26`):
+/// - Only moves when `detached` is true and a candidate commit in `behind` (newest first, up to 5) has `ci_green == true`.
+/// - Never moves to `refused_sha` (a commit whose self-test previously failed).
+/// - Raises an attention item when behind `main` for `> SELF_UPDATE_STALE_SECS` (30m).
+pub fn decide_self_update(
+    detached: bool,
+    behind: &[BehindCommit],
+    refused_sha: Option<&str>,
+    now: i64,
+) -> SelfUpdateDecision {
+    if behind.is_empty() {
+        return SelfUpdateDecision {
+            target_sha: None,
+            stale: false,
+            distance_summary: "up to date with main".to_string(),
+            attention: None,
+            because: "up to date with main".to_string(),
+        };
+    }
+
+    let oldest_ts = behind.iter().map(|c| c.ts).min().unwrap_or(now);
+    let oldest_min = ((now - oldest_ts).max(0)) / 60;
+    let plural = if behind.len() == 1 { "" } else { "s" };
+    let distance_summary = format!(
+        "behind main by {} commit{plural}, the oldest {oldest_min} min old",
+        behind.len()
+    );
+    let stale = (now - oldest_ts) > SELF_UPDATE_STALE_SECS;
+    let attention = if stale {
+        Some(AttentionItem {
+            kind: "self-update".to_string(),
+            target: "tacho".to_string(),
+            summary: format!(
+                "orchestrator code is {distance_summary} (over {} min)",
+                SELF_UPDATE_STALE_SECS / 60
+            ),
+            command_hint: "tacho tick".to_string(),
+        })
+    } else {
+        None
+    };
+
+    if !detached {
+        return SelfUpdateDecision {
+            target_sha: None,
+            stale,
+            distance_summary,
+            attention,
+            because: "checkout is not detached; skipping self-update".to_string(),
+        };
+    }
+
+    let candidate = behind
+        .iter()
+        .take(5)
+        .find(|c| c.ci_green)
+        .map(|c| c.sha.clone());
+
+    match candidate {
+        Some(ref sha) if refused_sha == Some(sha.as_str()) => SelfUpdateDecision {
+            target_sha: None,
+            stale,
+            distance_summary,
+            attention,
+            because: format!(
+                "refusing self-update to {}: self-test previously failed on that commit",
+                &sha[..sha.len().min(8)]
+            ),
+        },
+        Some(sha) => {
+            let short = &sha[..sha.len().min(8)];
+            SelfUpdateDecision {
+                because: format!("moving orchestrator to green main commit {short}"),
+                target_sha: Some(sha),
+                stale,
+                distance_summary,
+                attention,
+            }
+        }
+        None => SelfUpdateDecision {
+            target_sha: None,
+            stale,
+            distance_summary,
+            attention,
+            because: "waiting for main CI to turn green before self-updating".to_string(),
+        },
+    }
+}
+
+/// Compute new tell-once owner notifications (`SHUNT.md:25`: "The owner is told once.
+/// attention.py gives one line per item with the command that fixes it, said once rather than every tick.").
+#[allow(clippy::too_many_arguments)]
+pub fn decide_owner_notifications(
+    attention_items: &[AttentionItem],
+    batches: &[BatchRun],
+    ready_trains: &[(String, Vec<u64>, BTreeMap<u64, String>)],
+    failed_main_jobs: &BTreeMap<String, String>,
+    deploy_runs: &[DeployRunObs],
+    already_notified: &BTreeSet<String>,
+) -> Vec<OwnerNotification> {
+    let mut out = Vec::new();
+
+    // 1. Attention / NEEDS YOU items (one line per item with the command that fixes it, said once)
+    for item in attention_items {
+        let key = format!("attention:{}:{}:{}", item.kind, item.target, item.summary);
+        if already_notified.contains(&key) {
+            continue;
+        }
+        out.push(OwnerNotification {
+            key,
+            kind: item.kind.clone(),
+            subject: format!("[tacho] {} needs attention ({})", item.target, item.kind),
+            body: format!("{}\nFix: {}", item.summary, item.command_hint),
+            command_hint: item.command_hint.clone(),
+            because: format!(
+                "{} needs attention: {} (run `{}`)",
+                item.target, item.summary, item.command_hint
+            ),
+        });
+    }
+
+    // 2. Ready merge trains (once per train + member head set)
+    for (train_id, order, heads) in ready_trains {
+        if train_id.is_empty() || order.is_empty() {
+            continue;
+        }
+        let mut head_parts = Vec::new();
+        for pr in order {
+            let sha = heads.get(pr).map(String::as_str).unwrap_or("");
+            head_parts.push(format!("{pr}:{}", &sha[..sha.len().min(8)]));
+        }
+        let key = format!("ready:{train_id}:{}", head_parts.join(","));
+        if already_notified.contains(&key) {
+            continue;
+        }
+        let pr_list = order
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cmd = format!("tacho land --train {train_id}");
+        out.push(OwnerNotification {
+            key,
+            kind: "ready-train".to_string(),
+            subject: format!("[tacho] train {train_id} ready to merge ({pr_list})"),
+            body: format!("Verified train {train_id} ({pr_list}) is ready.\nMerge: {cmd}"),
+            command_hint: cmd.clone(),
+            because: format!("train {train_id} ({pr_list}) is ready to merge (run `{cmd}`)"),
+        });
+    }
+
+    // 3. Red batches (reported once when finished red)
+    for b in batches {
+        if b.status != "failed" && b.status != "red" && b.status != "red-once" {
+            continue;
+        }
+        let key = format!("batch-red:{}", b.id);
+        if already_notified.contains(&key) {
+            continue;
+        }
+        let cmd = format!("tacho replay {}", b.id);
+        let culprit_str = b
+            .culprit
+            .map(|c| format!(" (blamed PR #{c})"))
+            .unwrap_or_default();
+        out.push(OwnerNotification {
+            key,
+            kind: "red-batch".to_string(),
+            subject: format!("[tacho] batch {} failed{}", b.id, culprit_str),
+            body: format!(
+                "Batch {} on PRs {:?} ended red{}.\nInspect: {}",
+                b.id, b.prs, culprit_str, cmd
+            ),
+            command_hint: cmd.clone(),
+            because: format!("batch {} ended red{} (run `{cmd}`)", b.id, culprit_str),
+        });
+    }
+
+    // 4. Failed main CI jobs (reported once per job failure key)
+    for (job_key, line) in failed_main_jobs {
+        let key = format!("main-job:{job_key}");
+        if already_notified.contains(&key) {
+            continue;
+        }
+        let cmd = "tacho status".to_string();
+        out.push(OwnerNotification {
+            key,
+            kind: "main-red".to_string(),
+            subject: format!("[tacho] main job failed: {job_key}"),
+            body: format!("Main CI job {job_key} failed: {line}\nCheck: {cmd}"),
+            command_hint: cmd,
+            because: format!("main CI job {job_key} failed: {line}"),
+        });
+    }
+
+    // 5. Deploys started on main (reported once per deploy run_id)
+    for d in deploy_runs {
+        if !d.on_main || !matches!(d.status.as_str(), "in_progress" | "queued" | "waiting") {
+            continue;
+        }
+        if matches!(
+            d.gate_conclusion.as_deref(),
+            Some("skipped" | "failure" | "cancelled")
+        ) {
+            continue;
+        }
+        let key = format!("deploy:{}", d.run_id);
+        if already_notified.contains(&key) {
+            continue;
+        }
+        let short = &d.head_sha[..d.head_sha.len().min(8)];
+        let cmd = "tacho top".to_string();
+        out.push(OwnerNotification {
+            key,
+            kind: "deploy-started".to_string(),
+            subject: format!("[tacho] deploy of {short} started (run #{})", d.run_id),
+            body: format!("Deploy of main commit {short} started (run #{})", d.run_id),
+            command_hint: cmd,
+            because: format!("deploy of {short} started (run #{})", d.run_id),
+        });
+    }
+
+    out
 }

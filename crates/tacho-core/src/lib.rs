@@ -40,12 +40,28 @@ pub use track::{compute_uuid, TrackEntry, TrackKind, TrackRegistry};
 /// Resolves the `trace_processor_shell` oracle binary path in a single canonical place:
 /// 1. `$TACHO_TP`
 /// 2. `$TACHO_TRACE_PROCESSOR`
-/// 3. `${XDG_CACHE_HOME:-$HOME/.cache}/tacho/trace_processor_shell`
-/// 4. `PATH` lookup for `trace_processor_shell`
-/// 5. Runs `scripts/oracle.sh` if present in the workspace to populate `$XDG_CACHE_HOME/tacho/trace_processor_shell`.
+/// 3. `${XDG_CACHE_HOME:-$HOME/.cache}/tacho/trace_processor_shell` (if >= v57, supporting state tracks)
+/// 4. Runs `scripts/oracle.sh` if present in the workspace to populate `$XDG_CACHE_HOME/tacho/trace_processor_shell`.
+/// 5. `PATH` lookup for `trace_processor_shell` (preferring >= v57).
 pub fn find_trace_processor() -> Option<std::path::PathBuf> {
     use std::env;
     use std::path::PathBuf;
+
+    let supports_state_tracks = |bin: &PathBuf| -> bool {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .output()
+            .ok()
+            .map(|out| {
+                let s = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                s.contains("v57.") || s.contains("v58.") || s.contains("v59.") || s.contains("v6")
+            })
+            .unwrap_or(false)
+    };
 
     for var in ["TACHO_TP", "TACHO_TRACE_PROCESSOR"] {
         if let Ok(val) = env::var(var) {
@@ -68,21 +84,13 @@ pub fn find_trace_processor() -> Option<std::path::PathBuf> {
 
     if let Some(ref root) = cache_root {
         let cached = root.join("tacho/trace_processor_shell");
-        if cached.is_file() {
+        if cached.is_file() && supports_state_tracks(&cached) {
             return Some(cached);
         }
     }
 
-    if let Ok(path_var) = env::var("PATH") {
-        for dir in env::split_paths(&path_var) {
-            let candidate = dir.join("trace_processor_shell");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // Attempt to invoke workspace scripts/oracle.sh if available
+    // Attempt to invoke workspace scripts/oracle.sh before falling back to PATH so an older
+    // system trace_processor_shell without TYPE_STATE = 5 does not shadow the pinned v58.3 binary.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if let Some(ws_root) = manifest_dir.parent().and_then(|p| p.parent()) {
         let script = ws_root.join("scripts/oracle.sh");
@@ -96,6 +104,24 @@ pub fn find_trace_processor() -> Option<std::path::PathBuf> {
                     }
                 }
             }
+        }
+    }
+
+    if let Ok(path_var) = env::var("PATH") {
+        let mut fallback = None;
+        for dir in env::split_paths(&path_var) {
+            let candidate = dir.join("trace_processor_shell");
+            if candidate.is_file() {
+                if supports_state_tracks(&candidate) {
+                    return Some(candidate);
+                }
+                if fallback.is_none() {
+                    fallback = Some(candidate);
+                }
+            }
+        }
+        if fallback.is_some() {
+            return fallback;
         }
     }
 
