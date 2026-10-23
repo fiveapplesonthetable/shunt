@@ -196,6 +196,11 @@ impl Recorder {
         self.detector_cfg = cfg;
     }
 
+    /// Enables or disables the opt-in privacy scrubber.
+    pub fn set_scrub(&mut self, enabled: bool) {
+        self.scrubber = Scrubber::with_enabled(enabled);
+    }
+
     /// Applies an input event into the state machine, appending generated `Event` items to `out`.
     pub fn apply(&mut self, input: Input, now_ns: u64, out: &mut Vec<Event>) {
         self.last_ingest_now_ns = now_ns;

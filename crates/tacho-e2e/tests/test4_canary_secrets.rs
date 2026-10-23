@@ -31,6 +31,7 @@ fn assert_no_leaks(target_name: &str, data: &[u8]) {
 #[test]
 fn test_canary_secrets_zero_leak() {
     let env = TestEnv::new().unwrap();
+    fs::write(env.home_dir.join("config.toml"), "scrub = true\n").unwrap();
 
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();

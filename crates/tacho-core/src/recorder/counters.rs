@@ -425,11 +425,12 @@ impl Recorder {
         let proto_args: Vec<tacho::CustomArg> = args
             .into_iter()
             .map(|(k, v)| {
-                let scrubbed_val = if crate::scrub::is_sensitive_name(&k) {
-                    "<redacted>".to_string()
-                } else {
-                    self.scrubber.scrub(&v)
-                };
+                let scrubbed_val =
+                    if self.scrubber.is_enabled() && crate::scrub::is_sensitive_name(&k) {
+                        "<redacted>".to_string()
+                    } else {
+                        self.scrubber.scrub(&v)
+                    };
                 tacho::CustomArg {
                     key: Some(truncate_utf8(&self.scrubber.scrub(&k), 64)),
                     value: Some(truncate_utf8(&scrubbed_val, 512)),
@@ -868,7 +869,34 @@ mod tests {
 
     #[test]
     fn test_handle_custom_name_is_scrubbed() {
+        // Default: opt-in scrubber is disabled, so raw name is preserved
+        let mut rec_default = Recorder::new();
+        rec_default.set_scrub(false);
+        let mut out_default = Vec::new();
+        rec_default.apply(
+            Input::Custom {
+                source_ts_ns: Some(1_000_000),
+                track: "custom_track".to_string(),
+                op: CustomOp::Begin,
+                name: Some("password: secretpassword123".to_string()),
+                id: Some("id1".to_string()),
+                args: BTreeMap::new(),
+                value: None,
+                flow_out: None,
+                flow_in: None,
+            },
+            1_000_000,
+            &mut out_default,
+        );
+        let ev_default = out_default.iter().find(|e| e.kind == Kind::Custom).unwrap();
+        assert_eq!(
+            ev_default.custom_name.as_deref(),
+            Some("password: secretpassword123")
+        );
+
+        // Opt-in: when enabled, secrets are redacted
         let mut rec = Recorder::new();
+        rec.set_scrub(true);
         let mut out = Vec::new();
         let track = "custom_track".to_string();
 

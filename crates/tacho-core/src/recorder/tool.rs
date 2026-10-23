@@ -123,6 +123,9 @@ fn make_simple_tool_call(
         input_bytes: bytes,
         tool_use_id: Some(truncate_utf8(id, 128)),
         path: None,
+        edit_kind: None,
+        lines_added: None,
+        lines_removed: None,
     })
 }
 
@@ -366,6 +369,7 @@ impl Recorder {
                     _ if !s_rel.is_empty() => format!("Edit: {}", truncate_utf8(&s_rel, 48)),
                     _ => "Edit".to_string(),
                 };
+                let proto_edit_kind = kind.map(super::tracks::to_proto_edit_kind);
                 ToolDetails {
                     custom_name: Some(slice_label),
                     body: tacho::event::Body::ToolCall(tacho::ToolCall {
@@ -374,6 +378,9 @@ impl Recorder {
                         input_bytes: None,
                         tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
                         path: Some(s_rel),
+                        edit_kind: proto_edit_kind.map(|k| k as i32),
+                        lines_added,
+                        lines_removed,
                     }),
                     file_path: Some(rel),
                     file_edit: Some((kind, lines_added, lines_removed)),

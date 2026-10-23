@@ -209,9 +209,13 @@ static PATTERNS: LazyLock<ScrubberPatterns> = LazyLock::new(|| {
 }
 });
 
-/// Privacy scrubber that replaces credentials and secret shapes with `<redacted>`.
+/// Privacy scrubber that replaces credentials and secret shapes with `<redacted>` when enabled.
+///
+/// Opt-in by default (`enabled = false` unless `TACHO_SCRUB=1` or `scrub = true` in `config.toml`).
 #[derive(Debug, Clone, Copy)]
-pub struct Scrubber;
+pub struct Scrubber {
+    enabled: bool,
+}
 
 impl Default for Scrubber {
     fn default() -> Self {
@@ -220,14 +224,37 @@ impl Default for Scrubber {
 }
 
 impl Scrubber {
-    /// Creates a new scrubber referencing the compiled static secret patterns.
+    /// Creates a new scrubber (opt-in: disabled by default unless `TACHO_SCRUB=1`/`true` is set).
     pub fn new() -> Self {
-        let _ = &*PATTERNS;
-        Self
+        let enabled = std::env::var("TACHO_SCRUB")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        Self::with_enabled(enabled)
     }
 
-    /// Scrubs secrets from text, replacing sensitive tokens with `<redacted>`.
+    /// Creates a scrubber with secret redaction explicitly enabled.
+    pub fn enabled() -> Self {
+        Self::with_enabled(true)
+    }
+
+    /// Creates a scrubber with the specified `enabled` state.
+    pub fn with_enabled(enabled: bool) -> Self {
+        if enabled {
+            let _ = &*PATTERNS;
+        }
+        Self { enabled }
+    }
+
+    /// Returns whether secret redaction is active.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Scrubs secrets from text, replacing sensitive tokens with `<redacted>` when enabled.
     pub fn scrub(&self, input: &str) -> String {
+        if !self.enabled {
+            return input.to_string();
+        }
         let p = &*PATTERNS;
         // Normalise shell line continuations (\ + newline + leading spaces -> one space) before tokenising
         let mut s = p.line_continuation.replace_all(input, " ").into_owned();
@@ -1770,8 +1797,16 @@ mod tests {
         ];
 
     #[test]
+    fn test_scrubber_opt_in_default_disabled() {
+        let scrubber = Scrubber::with_enabled(false);
+        assert!(!scrubber.is_enabled());
+        let raw = "curl -H 'Authorization: Bearer sk-ant-api03-1234567890abcdef1234567890abcdef' --password=secret";
+        assert_eq!(scrubber.scrub(raw), raw);
+    }
+
+    #[test]
     fn test_scrubber_table() {
-        let scrubber = Scrubber::new();
+        let scrubber = Scrubber::enabled();
         assert!(
             SCRUB_TABLE.len() >= 80,
             "Must test at least 80 cases, got {}",
@@ -1791,7 +1826,7 @@ mod tests {
     proptest! {
         #[test]
         fn test_scrub_idempotent(s in ".*") {
-            let scrubber = Scrubber::new();
+            let scrubber = Scrubber::enabled();
             let first = scrubber.scrub(&s);
             let second = scrubber.scrub(&first);
             prop_assert_eq!(first, second);
@@ -1799,7 +1834,7 @@ mod tests {
 
         #[test]
         fn test_scrub_no_panic_arbitrary_utf8(s in "\\PC*") {
-            let scrubber = Scrubber::new();
+            let scrubber = Scrubber::enabled();
             let _ = scrubber.scrub(&s);
         }
 
@@ -1810,7 +1845,7 @@ mod tests {
             crlf in proptest::bool::ANY,
             spaces in 0..3usize,
         ) {
-            let scrubber = Scrubber::new();
+            let scrubber = Scrubber::enabled();
             let leak_cases: Vec<(&str, &str)> = SCRUB_TABLE
                 .iter()
                 .copied()
@@ -1856,7 +1891,7 @@ mod tests {
             hex in "[0-9a-fA-F]{40,64}",
             suffix in "\\PC*",
         ) {
-            let scrubber = Scrubber::new();
+            let scrubber = Scrubber::enabled();
             let input = format!("{}{}{}", prefix, hex, suffix);
             let _ = scrubber.scrub(&input);
         }
@@ -1864,7 +1899,7 @@ mod tests {
 
     #[test]
     fn test_git_sha_exemption_context() {
-        let scrubber = Scrubber::new();
+        let scrubber = Scrubber::enabled();
         let sha40 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
         // Redacted cases (exemption should not apply)
@@ -1890,7 +1925,7 @@ mod tests {
 
     #[test]
     fn test_generic_secret_kv_rule() {
-        let scrubber = Scrubber::new();
+        let scrubber = Scrubber::enabled();
 
         assert_eq!(scrubber.scrub("password: hunter2"), "password: <redacted>");
         assert_eq!(
@@ -1915,7 +1950,7 @@ mod tests {
 
     #[test]
     fn test_scrub_multibyte_boundary_no_panic() {
-        let scrubber = Scrubber::new();
+        let scrubber = Scrubber::enabled();
         let sha40 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
         let sha64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         for pad_len in 0..70 {

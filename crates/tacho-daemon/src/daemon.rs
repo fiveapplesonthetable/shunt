@@ -53,6 +53,9 @@ impl Daemon {
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         let mut recorder = Recorder::restore(logged_events.iter());
+        if config.scrub {
+            recorder.set_scrub(true);
+        }
         recorder.set_detector_config(tacho_core::DetectorConfig {
             silent_timeout_ns: config.detectors.silent_s * 1_000_000_000,
             loop_repeats: config.detectors.loop_count,

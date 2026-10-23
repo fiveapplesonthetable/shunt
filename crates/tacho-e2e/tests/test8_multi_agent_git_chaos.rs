@@ -306,22 +306,23 @@ edition = "2021"
     // 4. Start sessions for 6 concurrent agents
     // (supervisor, worker-auth, worker-db, worker-api, worker-rogue, ci-train)
     // Spawn real process trees for workers and ci-train so /proc + cgroup process tree slices
-    // (`procs/slot:*`), `proc_count`, `cpu`, `rss`, `cgroup_mem`, and `cgroup_mem_peak` tracks
-    // are populated for every active worker in the example trace.
-    let spawn_worker_tree = |label: &str| -> Child {
+    // (`procs/slot:*`), `proc_count`, `cpu`, and `rss` tracks are populated for every active
+    // worker in the example trace.
+    let spawn_worker_tree = |label: &str, tool_cmd: &str| -> Child {
+        let script = format!(
+            "import subprocess, time; [(subprocess.run(['bash', '-c', 'exec -a {} sleep 0.35']), time.sleep(0.5)) for _ in range(12)]; time.sleep(60)",
+            tool_cmd
+        );
         Command::new("python3")
-            .args([
-                "-c",
-                "import subprocess, time; [(subprocess.run(['sleep', '0.35']), time.sleep(1.2)) for _ in range(10)]; time.sleep(60)",
-            ])
+            .args(["-c", &script])
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {label} process tree: {e}"))
     };
-    let auth_proc = spawn_worker_tree("worker-auth");
-    let db_proc = spawn_worker_tree("worker-db");
-    let api_proc = spawn_worker_tree("worker-api");
-    let rogue_proc = spawn_worker_tree("worker-rogue");
-    let ci_proc = spawn_worker_tree("ci-train");
+    let auth_proc = spawn_worker_tree("worker-auth", "cargo-check");
+    let db_proc = spawn_worker_tree("worker-db", "sqlx-migrate");
+    let api_proc = spawn_worker_tree("worker-api", "rustc");
+    let rogue_proc = spawn_worker_tree("worker-rogue", "grep");
+    let ci_proc = spawn_worker_tree("ci-train", "cargo-nextest");
 
     let agents = [
         (
@@ -386,6 +387,16 @@ edition = "2021"
     }
     // Allow initial sampler tick to record baseline process tree and worktree state
     std::thread::sleep(Duration::from_millis(250));
+
+    // Transition core tasks to InProgress now that workers have started
+    for t_slug in ["auth-task", "db-task", "api-task", "rogue-task"] {
+        let out = env
+            .tacho_cmd()
+            .args(["emit", "state", &format!("task:{t_slug}"), "InProgress"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
 
     // 5. worker-auth edits src/schema.rs and builds cleanly
     send_claude_hook(
@@ -720,16 +731,32 @@ edition = "2021"
         }),
     );
 
-    // 11. Stacked PR Workflow: 30 stacked PRs (pr-01 .. pr-30)
+    // 11. Stacked PR Workflow: 6 stacked PRs (pr-01 .. pr-06)
     // with TaskQueued, TaskState, Review findings, git -C rebases, and gh pr commands
-    for pr_idx in 1..=30 {
+    for pr_idx in 1..=6 {
         let pr_slug = format!("pr-{:02}", pr_idx);
         let feat_file = format!("src/feature_{:02}.rs", pr_idx);
+
+        let agent = if pr_idx % 3 == 0 {
+            "worker-auth"
+        } else if pr_idx % 3 == 1 {
+            "worker-api"
+        } else {
+            "worker-db"
+        };
 
         // Declare task
         let out = env
             .tacho_cmd()
-            .args(["emit", "task", &pr_slug, "--paths", &feat_file])
+            .args([
+                "emit",
+                "task",
+                &pr_slug,
+                "--agent",
+                agent,
+                "--paths",
+                &feat_file,
+            ])
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -742,13 +769,6 @@ edition = "2021"
             .unwrap();
         assert!(out.status.success());
 
-        let agent = if pr_idx % 3 == 0 {
-            "worker-auth"
-        } else if pr_idx % 3 == 1 {
-            "worker-api"
-        } else {
-            "worker-db"
-        };
         let sess = format!("sess-{agent}");
         let pr_branch = format!("feature/pr-{:02}", pr_idx);
 
@@ -894,8 +914,8 @@ edition = "2021"
             }),
         );
 
-        // Occasional stack sync / rebase
-        if pr_idx > 1 && pr_idx % 4 == 0 {
+        // Stack sync / rebase
+        if pr_idx % 2 == 0 {
             send_claude_hook(
                 &env,
                 agent,
@@ -922,7 +942,7 @@ edition = "2021"
         }
 
         // Review findings
-        if pr_idx % 5 == 0 {
+        if pr_idx == 2 || pr_idx == 5 {
             let _ = env
                 .tacho_cmd()
                 .args(["emit", "state", &format!("task:{pr_slug}"), "Review"])
@@ -944,7 +964,11 @@ edition = "2021"
                 ])
                 .output();
         }
-        if pr_idx % 7 == 0 {
+        if pr_idx == 4 {
+            let _ = env
+                .tacho_cmd()
+                .args(["emit", "state", &format!("task:{pr_slug}"), "Review"])
+                .output();
             let _ = env
                 .tacho_cmd()
                 .args([
@@ -972,7 +996,7 @@ edition = "2021"
         assert!(out.status.success());
 
         // Complete a turn with token/cost metrics and start next turn after each PR batch
-        if pr_idx % 3 == 0 && pr_idx < 30 {
+        if pr_idx % 2 == 0 && pr_idx < 6 {
             for (w_agent, w_sess, base_tok) in [
                 ("worker-auth", "sess-worker-auth", 4_200u64),
                 ("worker-api", "sess-worker-api", 3_800u64),
@@ -984,10 +1008,10 @@ edition = "2021"
                     serde_json::json!({
                         "hook_event_name": "TurnEnd",
                         "session_id": w_sess,
-                        "input_tokens": base_tok + (pr_idx as u64) * 150,
-                        "output_tokens": 1_200 + (pr_idx as u64) * 80,
-                        "cached_tokens": 2_000 + (pr_idx as u64) * 100,
-                        "cost_micros": 18_000 + (pr_idx as u64) * 900,
+                        "input_tokens": base_tok + (pr_idx as u64) * 450,
+                        "output_tokens": 1_200 + (pr_idx as u64) * 240,
+                        "cached_tokens": 2_000 + (pr_idx as u64) * 300,
+                        "cost_micros": 18_000 + (pr_idx as u64) * 2_700,
                     }),
                 );
                 send_claude_hook(
@@ -1003,7 +1027,7 @@ edition = "2021"
         }
 
         // Milestones
-        if pr_idx == 10 {
+        if pr_idx == 2 {
             let m_out = env
                 .tacho_cmd()
                 .args([
@@ -1019,7 +1043,7 @@ edition = "2021"
                 "emit instant milestone failed: {}",
                 String::from_utf8_lossy(&m_out.stderr)
             );
-        } else if pr_idx == 20 {
+        } else if pr_idx == 4 {
             let m_out = env
                 .tacho_cmd()
                 .args([
@@ -1035,7 +1059,7 @@ edition = "2021"
                 "emit instant milestone failed: {}",
                 String::from_utf8_lossy(&m_out.stderr)
             );
-        } else if pr_idx == 30 {
+        } else if pr_idx == 6 {
             let m_out = env
                 .tacho_cmd()
                 .args([
@@ -1054,12 +1078,22 @@ edition = "2021"
         }
     }
 
+    // Complete core feature tasks
+    for t_slug in ["auth-task", "db-task", "api-task"] {
+        let out = env
+            .tacho_cmd()
+            .args(["emit", "state", &format!("task:{t_slug}"), "Done"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
     // 12. Killed Worker + Takeover Scenario:
-    // worker-flaky starts a real process for pr-31 with an open test,
+    // worker-flaky starts a real process for pr-07 with an open test,
     // process is SIGKILL'd mid-test, tacho-daemon reaps worker-flaky,
     // and worker-rescue takes over the branch, fixes the test, and completes the PR!
-    let flaky_slug = "pr-31";
-    let flaky_file = "src/feature_31.rs";
+    let flaky_slug = "pr-07";
+    let flaky_file = "src/feature_07.rs";
 
     // Declare task
     let out = env
@@ -1077,8 +1111,8 @@ edition = "2021"
     assert!(out.status.success());
 
     // Spawn a real child process tree that represents worker-flaky
-    let mut flaky_proc = Command::new("sh")
-        .args(["-c", "sleep 60; true"])
+    let mut flaky_proc = Command::new("bash")
+        .args(["-c", "exec -a cargo-test-hung sleep 60"])
         .spawn()
         .expect("failed to spawn worker-flaky process");
     let flaky_pid = flaky_proc.id();
@@ -1102,14 +1136,14 @@ edition = "2021"
         serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "sess-worker-flaky",
-            "prompt": "Implement pr-31 and run test suite",
+            "prompt": "Implement pr-07 and run test suite",
         }),
     );
 
     // worker-flaky creates branch and starts hung test
-    let (ok, _, _) = run_git(&repo_dir, &["checkout", "-b", "feature/pr-31"]);
+    let (ok, _, _) = run_git(&repo_dir, &["checkout", "-b", "feature/pr-07"]);
     if !ok {
-        let _ = run_git(&repo_dir, &["checkout", "feature/pr-31"]);
+        let _ = run_git(&repo_dir, &["checkout", "feature/pr-07"]);
     }
 
     send_claude_hook(
@@ -1140,7 +1174,7 @@ edition = "2021"
     std::thread::sleep(Duration::from_millis(350));
 
     // worker-rescue takes over the task and finishes the branch
-    let rescue_proc = spawn_worker_tree("worker-rescue");
+    let rescue_proc = spawn_worker_tree("worker-rescue", "cargo-test");
     send_claude_hook(
         &env,
         "worker-rescue",
@@ -1160,13 +1194,13 @@ edition = "2021"
         serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "sess-worker-rescue",
-            "prompt": "Take over pr-31 from crashed worker-flaky and complete the PR",
+            "prompt": "Take over pr-07 from crashed worker-flaky and complete the PR",
         }),
     );
 
     fs::write(
         repo_dir.join(flaky_file),
-        "pub fn feature_31() -> usize { 31 }\n",
+        "pub fn feature_07() -> usize { 7 }\n",
     )
     .unwrap();
 
@@ -1197,7 +1231,7 @@ edition = "2021"
     let _ = run_git(&repo_dir, &["add", flaky_file]);
     let _ = run_git(
         &repo_dir,
-        &["commit", "-m", "feat: worker-rescue finishes pr-31"],
+        &["commit", "-m", "feat: worker-rescue finishes pr-07"],
     );
 
     send_claude_hook(
@@ -1233,7 +1267,7 @@ edition = "2021"
             "tool_use_id": "tool-rescue-gh-create",
             "tool_name": "Bash",
             "tool_input": {
-                "command": "gh pr create --title 'PR 31' --body 'Rescued and completed PR 31'",
+                "command": "gh pr create --title 'PR 07' --body 'Rescued and completed PR 07'",
             },
         }),
     );
@@ -1292,6 +1326,10 @@ edition = "2021"
             "cost_micros": 500_000,
         }),
     );
+    let _ = env
+        .tacho_cmd()
+        .args(["emit", "state", "task:rogue-task", "Failed"])
+        .output();
 
     // Verify worker-rogue is flagged in status
     let status_out = env

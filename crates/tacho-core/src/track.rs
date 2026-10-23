@@ -66,21 +66,28 @@ pub fn compute_track_rank(key: &str, name: &str) -> i32 {
         }
     }
     match target_name {
+        "stalls" => 2,
+        "review" => 2,
+        "messages" => 2,
         "procs" => 40,
         "overflow" => 50,
         "waits" => 60,
+        "worktree" => 70,
         "tokens_in" => 100,
         "tokens_out" => 101,
         "tokens_cached" => 102,
         "cost" => 103,
+        "files_edited" => 104,
+        "commits" => 105,
         "cpu" => 110,
         "rss" => 111,
         "proc_count" => 112,
         "daemon" => 1,
         "agents" => 2,
-        "tasks" => 3,
-        "machine" => 4,
-        "providers" => 5,
+        "milestones" => 3,
+        "tasks" => 4,
+        "machine" => 5,
+        "providers" => 6,
         "custom" => 200,
         _ => 500,
     }
@@ -225,6 +232,42 @@ impl TrackRegistry {
     /// Returns true if no tracks are registered.
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
+    }
+
+    /// Prunes tracks that have neither direct events nor descendant tracks in `active_keys`.
+    /// Any kept ancestor track without direct events in `active_keys` is marked as `TrackKind::Group`.
+    pub fn retain_used(&mut self, active_keys: &std::collections::HashSet<String>) {
+        if active_keys.is_empty() {
+            self.tracks.clear();
+            self.key_to_idx.clear();
+            self.uuid_to_idx.clear();
+            return;
+        }
+
+        let mut keep_keys = std::collections::HashSet::with_capacity(active_keys.len() * 2);
+        for key in active_keys {
+            let mut cur = Some(key.as_str());
+            while let Some(k) = cur {
+                keep_keys.insert(k.to_string());
+                cur = self.get_by_key(k).and_then(|e| e.parent_key.as_deref());
+            }
+        }
+
+        let old_tracks = std::mem::take(&mut self.tracks);
+        self.key_to_idx.clear();
+        self.uuid_to_idx.clear();
+
+        for mut entry in old_tracks {
+            if keep_keys.contains(&entry.key) {
+                if !active_keys.contains(&entry.key) {
+                    entry.kind = TrackKind::Group;
+                }
+                let idx = self.tracks.len();
+                self.key_to_idx.insert(entry.key.clone(), idx);
+                self.uuid_to_idx.insert(entry.uuid, idx);
+                self.tracks.push(entry);
+            }
+        }
     }
 }
 

@@ -151,6 +151,9 @@ message ToolCall {
   optional uint64 input_bytes = 3;
   optional string tool_use_id = 4;     // <= 128
   optional string path = 5;            // <= 512
+  optional FileEditKind edit_kind = 6;
+  optional uint32 lines_added = 7;
+  optional uint32 lines_removed = 8;
 }
 
 message ToolCallEnded {

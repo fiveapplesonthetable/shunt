@@ -81,7 +81,7 @@ pub(crate) fn to_proto_edit_kind(k: FileEditKind) -> tacho::FileEditKind {
     }
 }
 
-pub(crate) type TrackHierarchyEntry = (
+pub type TrackHierarchyEntry = (
     String,
     Option<String>,
     String,
@@ -169,7 +169,7 @@ impl Recorder {
     }
 
     /// Resolves the parent-child track chain for a track key.
-    pub(crate) fn hierarchy_chain(
+    pub fn hierarchy_chain(
         &self,
         track_key: &str,
         default_kind: TrackKind,
@@ -210,6 +210,30 @@ impl Recorder {
         );
 
         if track_key == "tacho" || track_key == "daemon" {
+            return chain;
+        }
+
+        if track_key == "tacho/messages" || track_key == "messages" {
+            add(
+                track_key,
+                Some("tacho"),
+                "messages",
+                Some("Cross-agent message delivery spans"),
+                TrackKind::Slices,
+                None,
+            );
+            return chain;
+        }
+
+        if track_key == "milestones" {
+            add(
+                "milestones",
+                Some("tacho"),
+                "milestones",
+                Some("Fleet-wide milestone progression"),
+                TrackKind::State,
+                None,
+            );
             return chain;
         }
 
@@ -415,6 +439,16 @@ impl Recorder {
                         TrackKind::State,
                         None,
                     );
+                } else if segs[1] == "stalls" {
+                    let st = format!("{}/stalls", agent_key);
+                    add(
+                        &st,
+                        Some(agent_key),
+                        "stalls",
+                        Some("Active stall detector intervals (LOOP, FAILING, SILENT, SPIN, BURN, OFF_BRIEF)"),
+                        TrackKind::Slices,
+                        None,
+                    );
                 } else if segs[1] == "cpu" || segs[1] == "rss" {
                     let (unit, desc) = if segs[1] == "cpu" {
                         (
@@ -488,6 +522,11 @@ impl Recorder {
                                     None,
                                     Some("Blocking waits on subagents, checks, merge queues, or humans"),
                                 ),
+                                "worktree" => (
+                                    TrackKind::Slices,
+                                    None,
+                                    Some("Git worktree HEAD commit and branch movement spans"),
+                                ),
                                 "overflow" => (
                                     TrackKind::Slices,
                                     None,
@@ -512,6 +551,16 @@ impl Recorder {
                                     TrackKind::Counter,
                                     Some("micro-USD"),
                                     Some("Cumulative API cost in micro-USD ($1e-6)"),
+                                ),
+                                "files_edited" => (
+                                    TrackKind::Counter,
+                                    Some("files"),
+                                    Some("Cumulative files edited in this run"),
+                                ),
+                                "commits" => (
+                                    TrackKind::Counter,
+                                    Some("commits"),
+                                    Some("Cumulative git commits in this run"),
                                 ),
                                 "cpu" => (
                                     TrackKind::Counter,

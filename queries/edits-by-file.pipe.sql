@@ -19,6 +19,7 @@ FROM (
   LEFT JOIN args ag ON s.arg_set_id = ag.arg_set_id AND ag.key = 'agent'
   LEFT JOIN args la ON s.arg_set_id = la.arg_set_id AND la.key = 'file_edited.lines_added'
   LEFT JOIN args lr ON s.arg_set_id = lr.arg_set_id AND lr.key = 'file_edited.lines_removed'
+  WHERE s.name NOT LIKE 'FileEdited%'
   GROUP BY path
   ORDER BY path
 )

@@ -42,6 +42,17 @@ impl Encoder {
     ///
     /// Reuses internal buffers; performs zero allocations once warmed up.
     pub fn encode_event(&mut self, event: &Event, registry: &TrackRegistry, out: &mut Vec<u8>) {
+        self.encode_event_with_type(event, None, registry, out);
+    }
+
+    /// Encodes an `Event` with an optional `TrackEventType` override into a framed `TracePacket`.
+    pub fn encode_event_with_type(
+        &mut self,
+        event: &Event,
+        te_type_override: Option<TrackEventType>,
+        registry: &TrackRegistry,
+        out: &mut Vec<u8>,
+    ) {
         self.packet_buf.clear();
         self.track_event_buf.clear();
         self.body_buf.clear();
@@ -51,18 +62,20 @@ impl Encoder {
 
         // 2. Build TrackEvent (TracePacket field 11)
         // 9: optional Type type = 9;
-        let te_type = if event.counter_value.is_some() {
-            4 // TYPE_COUNTER
+        let eff_type = if event.counter_value.is_some() {
+            TrackEventType::Counter
         } else {
-            match event.kind.track_event_type() {
-                TrackEventType::SliceBegin => 1,
-                TrackEventType::SliceEnd => 2,
-                TrackEventType::Instant => 3,
-                TrackEventType::Counter => 4,
-                TrackEventType::State => 5,
-                TrackEventType::Unspecified => 0,
-            }
+            te_type_override.unwrap_or_else(|| event.kind.track_event_type())
         };
+        let te_type = match eff_type {
+            TrackEventType::SliceBegin => 1,
+            TrackEventType::SliceEnd => 2,
+            TrackEventType::Instant => 3,
+            TrackEventType::Counter => 4,
+            TrackEventType::State => 5,
+            TrackEventType::Unspecified => 0,
+        };
+        let is_end = eff_type == TrackEventType::SliceEnd || event.kind.is_end();
         encode_varint_field(9, te_type, &mut self.track_event_buf);
 
         // 11: optional uint64 track_uuid = 11;
@@ -73,7 +86,7 @@ impl Encoder {
         encode_varint_field(11, track_uuid, &mut self.track_event_buf);
 
         // Event name / name_iid (omitted on SliceEnd to merge into the open slice)
-        if !event.kind.is_end() {
+        if !is_end {
             if let Some(custom) = &event.custom_name {
                 encode_string_field(23, custom, &mut self.track_event_buf);
             } else if event.kind == Kind::AgentState {
@@ -126,7 +139,7 @@ impl Encoder {
         }
 
         // 22: repeated string categories = 22;
-        if !event.kind.is_end() {
+        if !is_end {
             if let Some(category) = event_category(event) {
                 encode_string_field(22, category, &mut self.track_event_buf);
             }
@@ -165,6 +178,30 @@ impl Encoder {
         if !self.body_buf.is_empty() {
             let ext_field = event.kind.extension_field_number();
             encode_bytes_field(ext_field, &self.body_buf, &mut self.track_event_buf);
+        }
+
+        // For FileEdit ToolCall duration slices, also attach `tacho.file_edited` (field 4013)
+        // so `edits-by-file` queries and UI details work directly on the Edit duration slice.
+        if event.kind == Kind::ToolCall {
+            if let Some(tacho::event::Body::ToolCall(tc)) = &event.body.body {
+                if tc.path.is_some() {
+                    self.body_buf.clear();
+                    let fe = tacho::FileEdited {
+                        path: tc.path.clone(),
+                        kind: tc.edit_kind,
+                        lines_added: tc.lines_added,
+                        lines_removed: tc.lines_removed,
+                        in_brief: None,
+                    };
+                    if fe.encode(&mut self.body_buf).is_ok() && !self.body_buf.is_empty() {
+                        encode_bytes_field(
+                            Kind::FileEdited.extension_field_number(),
+                            &self.body_buf,
+                            &mut self.track_event_buf,
+                        );
+                    }
+                }
+            }
         }
 
         // 3. Build TracePacket

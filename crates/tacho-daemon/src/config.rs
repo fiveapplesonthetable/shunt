@@ -20,6 +20,8 @@ pub struct Config {
     pub retention_days: u32,
     /// Optional OTLP HTTP receiver address (e.g. "127.0.0.1:4318").
     pub otlp_addr: Option<String>,
+    /// Opt-in secret scrubbing before writing to the event log (default: false).
+    pub scrub: bool,
 }
 
 impl Default for Config {
@@ -30,6 +32,7 @@ impl Default for Config {
             detectors: DetectorConfig::default(),
             retention_days: 7,
             otlp_addr: None,
+            scrub: false,
         }
     }
 }

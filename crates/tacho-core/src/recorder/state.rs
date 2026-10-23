@@ -234,7 +234,7 @@ impl Recorder {
         out: &mut Vec<Event>,
     ) {
         let track = format!("task:{}/state", slug);
-        self.ensure_track(&track, ts, out);
+        self.ensure_track_with_kind(&track, crate::track::TrackKind::State, None, ts, out);
         let t_ts = self.clamp_ts(&track, ts);
         let seq = self.alloc_seq();
 

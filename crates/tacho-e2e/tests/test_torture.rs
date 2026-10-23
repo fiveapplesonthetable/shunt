@@ -400,10 +400,10 @@ fn test_torture_concurrent_agents() {
 
     let env = TestEnv::new().unwrap();
 
-    // Fast 200ms sampler interval
+    // Fast 200ms sampler interval + opt-in secret scrubbing enabled
     fs::write(
         env.home_dir.join("config.toml"),
-        "[sampler]\ninterval_ms = 200\n",
+        "scrub = true\n[sampler]\ninterval_ms = 200\n",
     )
     .unwrap();
 

@@ -902,7 +902,11 @@ impl ProcSampler {
                         .entry(run.session.clone())
                         .or_default()
                         .update(&sample);
-                    let rss_bytes = sample.rss_bytes;
+                    let cg_mem = cgroup
+                        .as_ref()
+                        .and_then(|cg| cg.memory_current())
+                        .unwrap_or(0);
+                    let rss_bytes = sample.rss_bytes.max(cg_mem);
                     let live_procs = sample.procs;
                     run_track_buf.clear();
                     run_track_buf.push_str(&run.run_track);
@@ -937,33 +941,6 @@ impl ProcSampler {
                         Some("procs"),
                         now_ns,
                     );
-
-                    if let Some(ref cg) = cgroup {
-                        if let Some(mem_curr) = cg.memory_current() {
-                            run_track_buf.truncate(run.run_track.len());
-                            run_track_buf.push_str("/cgroup_mem");
-                            send_sample_if_changed(
-                                appender,
-                                &mut self.last_samples,
-                                run_track_buf,
-                                mem_curr as i64,
-                                Some("bytes"),
-                                now_ns,
-                            );
-                        }
-                        if let Some(mem_peak) = cg.memory_peak() {
-                            run_track_buf.truncate(run.run_track.len());
-                            run_track_buf.push_str("/cgroup_mem_peak");
-                            send_sample_if_changed(
-                                appender,
-                                &mut self.last_samples,
-                                run_track_buf,
-                                mem_peak as i64,
-                                Some("bytes"),
-                                now_ns,
-                            );
-                        }
-                    }
 
                     self.update_proc_slices(
                         &run.session,
