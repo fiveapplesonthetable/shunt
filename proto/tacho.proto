@@ -150,6 +150,7 @@ message ToolCall {
   optional string input_digest = 2;    // <= 64
   optional uint64 input_bytes = 3;
   optional string tool_use_id = 4;     // <= 128
+  optional string path = 5;            // <= 512
 }
 
 message ToolCallEnded {

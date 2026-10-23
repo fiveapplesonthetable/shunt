@@ -122,6 +122,7 @@ fn make_simple_tool_call(
         input_digest: Some(digest.to_string()),
         input_bytes: bytes,
         tool_use_id: Some(truncate_utf8(id, 128)),
+        path: None,
     })
 }
 
@@ -372,6 +373,7 @@ impl Recorder {
                         input_digest: Some(digest.clone()),
                         input_bytes: None,
                         tool_use_id: Some(truncate_utf8(tool_use_id, 128)),
+                        path: Some(s_rel),
                     }),
                     file_path: Some(rel),
                     file_edit: Some((kind, lines_added, lines_removed)),

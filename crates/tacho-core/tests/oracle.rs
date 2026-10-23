@@ -350,6 +350,7 @@ fn create_all_events(base_ts: u64) -> Vec<Event> {
                 input_digest: Some("abcdef0123456789".to_string()),
                 input_bytes: Some(64),
                 tool_use_id: Some("tool_1".to_string()),
+                path: None,
             })),
         },
     ));

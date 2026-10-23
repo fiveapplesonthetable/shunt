@@ -308,13 +308,18 @@ impl Recorder {
                 None,
             );
             if parts.len() > 1 {
+                let unit = match parts[1] {
+                    "tokens_out" | "tokens_in" | "tokens_cached" => Some("tokens"),
+                    "cost" => Some("usd_micros"),
+                    _ => default_unit,
+                };
                 add(
                     track_key,
                     Some(prov_track),
                     parts[1],
                     Some("Cumulative provider counter"),
                     TrackKind::Counter,
-                    default_unit,
+                    unit,
                 );
             }
             return chain;

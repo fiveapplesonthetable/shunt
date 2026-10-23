@@ -55,39 +55,51 @@ pub struct AppenderHandle {
 }
 
 impl AppenderHandle {
-    /// Sends an input event into the flight recorder pipeline.
+    /// Sends an input event into the flight recorder pipeline with a bounded timeout
+    /// so high-throughput streams get backpressure without hanging indefinitely if wedged.
+    #[allow(clippy::result_large_err)]
     pub fn send_input(
         &self,
         input: Input,
         received_at_ns: u64,
-    ) -> Result<(), crossbeam_channel::SendError<AppenderCommand>> {
-        self.sender
-            .send(AppenderCommand::Input(Box::new(input), received_at_ns))
+    ) -> Result<(), crossbeam_channel::SendTimeoutError<AppenderCommand>> {
+        self.sender.send_timeout(
+            AppenderCommand::Input(Box::new(input), received_at_ns),
+            Duration::from_secs(2),
+        )
     }
 
-    /// Sends a batch of input events into the flight recorder pipeline.
+    /// Sends a batch of input events into the flight recorder pipeline with a bounded timeout
+    /// so high-throughput streams get backpressure without hanging indefinitely if wedged.
     #[allow(clippy::result_large_err)]
     pub fn send_input_batch(
         &self,
         batch: Vec<(Input, u64)>,
-    ) -> Result<(), crossbeam_channel::SendError<AppenderCommand>> {
+    ) -> Result<(), crossbeam_channel::SendTimeoutError<AppenderCommand>> {
         if batch.is_empty() {
             return Ok(());
         }
-        self.sender.send(AppenderCommand::InputBatch(batch))
+        self.sender
+            .send_timeout(AppenderCommand::InputBatch(batch), Duration::from_secs(2))
     }
 
     /// Flushes all pending batches in the appender thread.
     pub fn flush(&self) {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        if self.sender.send(AppenderCommand::Flush(tx)).is_ok() {
+        if self
+            .sender
+            .send_timeout(AppenderCommand::Flush(tx), Duration::from_secs(2))
+            .is_ok()
+        {
             let _ = rx.recv_timeout(Duration::from_secs(5));
         }
     }
 
     /// Signals the appender thread to terminate cleanly.
     pub fn shutdown(&self) {
-        let _ = self.sender.send(AppenderCommand::Shutdown);
+        let _ = self
+            .sender
+            .send_timeout(AppenderCommand::Shutdown, Duration::from_millis(200));
     }
 
     /// Returns a shared, atomic reference to the latest published LiveState.
@@ -638,7 +650,13 @@ fn apply_input_with_tracking(
         }
     }
     if changed {
-        active_runs.store(Arc::new(active_runs_map.values().cloned().collect()));
+        let mut runs_vec: Vec<ActiveRun> = active_runs_map.values().cloned().collect();
+        runs_vec.sort_by(|a, b| {
+            a.agent_id
+                .cmp(&b.agent_id)
+                .then_with(|| a.run_track.cmp(&b.run_track))
+        });
+        active_runs.store(Arc::new(runs_vec));
     }
 }
 

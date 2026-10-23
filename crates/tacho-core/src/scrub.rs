@@ -84,13 +84,13 @@ static PATTERNS: LazyLock<ScrubberPatterns> = LazyLock::new(|| {
     .unwrap(),
     anthropic_token: Regex::new(r"(?i)\bsk-ant-[a-zA-Z0-9_\-]{32,}\b").unwrap(),
     openai_token: Regex::new(r"(?i)\bsk-(?:proj-|none-)?[a-zA-Z0-9_\-]{32,}\b").unwrap(),
-    slack_token: Regex::new(r"(?i)\bxox[abprs]-[0-9a-zA-Z\-]{10,}\b").unwrap(),
+    slack_token: Regex::new(r"(?i)\bxox[abprs]-[0-9a-zA-Z_\-]{10,}\b").unwrap(),
     jwt_token: Regex::new(
         r"(?i)\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
     )
     .unwrap(),
     stripe_token: Regex::new(
-        r"(?i)\b(?:(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,}|whsec_[0-9a-zA-Z]{24,})\b",
+        r"(?i)\b(?:(?:sk|rk)_(?:live|test)_[0-9a-zA-Z_]{24,}|whsec_[0-9a-zA-Z_]{24,})\b",
     )
     .unwrap(),
     npm_token: Regex::new(r"\bnpm_[A-Za-z0-9]{20,255}\b").unwrap(),
@@ -868,7 +868,7 @@ fn is_non_secret_p_context(prefix: &str) -> bool {
 }
 
 /// Determines whether a flag or variable name is sensitive.
-fn is_sensitive_name(raw: &str) -> bool {
+pub fn is_sensitive_name(raw: &str) -> bool {
     let clean = raw.trim_start_matches('-');
     let lower = clean.to_ascii_lowercase();
     let norm = lower.replace('-', "_");

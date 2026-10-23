@@ -424,9 +424,16 @@ impl Recorder {
 
         let proto_args: Vec<tacho::CustomArg> = args
             .into_iter()
-            .map(|(k, v)| tacho::CustomArg {
-                key: Some(truncate_utf8(&k, 64)),
-                value: Some(truncate_utf8(&self.scrubber.scrub(&v), 512)),
+            .map(|(k, v)| {
+                let scrubbed_val = if crate::scrub::is_sensitive_name(&k) {
+                    "<redacted>".to_string()
+                } else {
+                    self.scrubber.scrub(&v)
+                };
+                tacho::CustomArg {
+                    key: Some(truncate_utf8(&self.scrubber.scrub(&k), 64)),
+                    value: Some(truncate_utf8(&scrubbed_val, 512)),
+                }
             })
             .collect();
 
@@ -437,15 +444,19 @@ impl Recorder {
             name
         };
 
+        let scrubbed_id = id
+            .as_deref()
+            .map(|i| truncate_utf8(&self.scrubber.scrub(i), 128));
+
         let custom_body = match op {
             CustomOp::End => tacho::event::Body::CustomEnded(tacho::CustomEnded {
-                id: id.as_deref().map(|i| truncate_utf8(i, 128)),
+                id: scrubbed_id,
                 args: proto_args,
                 abandoned: Some(false),
             }),
             _ => tacho::event::Body::Custom(tacho::Custom {
                 name: scrubbed_name.clone(),
-                id: id.as_deref().map(|i| truncate_utf8(i, 128)),
+                id: scrubbed_id,
                 args: proto_args,
             }),
         };

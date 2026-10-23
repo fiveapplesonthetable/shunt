@@ -423,7 +423,8 @@ impl Recorder {
 
     /// Periodic tick for time-based detectors (e.g. SILENT detector).
     pub fn tick(&mut self, now_ns: u64, out: &mut Vec<Event>) {
-        let agent_ids: Vec<String> = self.detectors.keys().cloned().collect();
+        let mut agent_ids: Vec<String> = self.detectors.keys().cloned().collect();
+        agent_ids.sort();
         let cfg = self.detector_cfg.clone();
 
         for agent_id in agent_ids {

@@ -305,22 +305,23 @@ edition = "2021"
 
     // 4. Start sessions for 6 concurrent agents
     // (supervisor, worker-auth, worker-db, worker-api, worker-rogue, ci-train)
-    // Spawn real process trees for worker-auth and ci-train so /proc process tree slices
-    // (`procs`), `proc_count`, `cpu`, and `rss` tracks are populated in the example trace.
-    let mut auth_proc = Command::new("python3")
-        .args([
-            "-c",
-            "import subprocess, time; [(subprocess.run(['sleep', '0.35']), time.sleep(1.2)) for _ in range(10)]; time.sleep(60)",
-        ])
-        .spawn()
-        .expect("failed to spawn worker-auth process tree");
-    let mut ci_proc = Command::new("python3")
-        .args([
-            "-c",
-            "import subprocess, time; [(subprocess.run(['sleep', '0.35']), time.sleep(1.2)) for _ in range(10)]; time.sleep(60)",
-        ])
-        .spawn()
-        .expect("failed to spawn ci-train process tree");
+    // Spawn real process trees for workers and ci-train so /proc + cgroup process tree slices
+    // (`procs/slot:*`), `proc_count`, `cpu`, `rss`, `cgroup_mem`, and `cgroup_mem_peak` tracks
+    // are populated for every active worker in the example trace.
+    let spawn_worker_tree = |label: &str| -> Child {
+        Command::new("python3")
+            .args([
+                "-c",
+                "import subprocess, time; [(subprocess.run(['sleep', '0.35']), time.sleep(1.2)) for _ in range(10)]; time.sleep(60)",
+            ])
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn {label} process tree: {e}"))
+    };
+    let auth_proc = spawn_worker_tree("worker-auth");
+    let db_proc = spawn_worker_tree("worker-db");
+    let api_proc = spawn_worker_tree("worker-api");
+    let rogue_proc = spawn_worker_tree("worker-rogue");
+    let ci_proc = spawn_worker_tree("ci-train");
 
     let agents = [
         (
@@ -335,9 +336,24 @@ edition = "2021"
             Some("worker"),
             Some(auth_proc.id()),
         ),
-        ("worker-db", "sess-worker-db", Some("worker"), Some(0)),
-        ("worker-api", "sess-worker-api", Some("worker"), Some(0)),
-        ("worker-rogue", "sess-worker-rogue", Some("worker"), Some(0)),
+        (
+            "worker-db",
+            "sess-worker-db",
+            Some("worker"),
+            Some(db_proc.id()),
+        ),
+        (
+            "worker-api",
+            "sess-worker-api",
+            Some("worker"),
+            Some(api_proc.id()),
+        ),
+        (
+            "worker-rogue",
+            "sess-worker-rogue",
+            Some("worker"),
+            Some(rogue_proc.id()),
+        ),
         (
             "ci-train",
             "sess-ci-train",
@@ -521,7 +537,7 @@ edition = "2021"
     assert!(fail_out.status.success());
 
     // 9. Supervisor messages worker-db to unblock it, which aborts rebase, edits schema, and tests
-    let _ = env
+    let msg_out = env
         .tacho_cmd()
         .args([
             "emit",
@@ -530,10 +546,18 @@ edition = "2021"
             "supervisor",
             "--to",
             "worker-db",
-            "--summary",
-            "Abort conflicting rebase on src/schema.rs and re-apply migration cleanly",
+            "--bytes",
+            "72",
+            "--id",
+            "msg-unblock-db",
         ])
-        .output();
+        .output()
+        .unwrap();
+    assert!(
+        msg_out.status.success(),
+        "emit message failed: {}",
+        String::from_utf8_lossy(&msg_out.stderr)
+    );
     send_claude_hook(
         &env,
         "worker-db",
@@ -980,7 +1004,7 @@ edition = "2021"
 
         // Milestones
         if pr_idx == 10 {
-            let _ = env
+            let m_out = env
                 .tacho_cmd()
                 .args([
                     "emit",
@@ -988,9 +1012,15 @@ edition = "2021"
                     "milestones",
                     "Milestone: Foundation Stack Merged",
                 ])
-                .output();
+                .output()
+                .unwrap();
+            assert!(
+                m_out.status.success(),
+                "emit instant milestone failed: {}",
+                String::from_utf8_lossy(&m_out.stderr)
+            );
         } else if pr_idx == 20 {
-            let _ = env
+            let m_out = env
                 .tacho_cmd()
                 .args([
                     "emit",
@@ -998,9 +1028,15 @@ edition = "2021"
                     "milestones",
                     "Milestone: Core Services Ready",
                 ])
-                .output();
+                .output()
+                .unwrap();
+            assert!(
+                m_out.status.success(),
+                "emit instant milestone failed: {}",
+                String::from_utf8_lossy(&m_out.stderr)
+            );
         } else if pr_idx == 30 {
-            let _ = env
+            let m_out = env
                 .tacho_cmd()
                 .args([
                     "emit",
@@ -1008,7 +1044,13 @@ edition = "2021"
                     "milestones",
                     "Milestone: Release v1.0.0-rc1 Stack Ready",
                 ])
-                .output();
+                .output()
+                .unwrap();
+            assert!(
+                m_out.status.success(),
+                "emit instant milestone failed: {}",
+                String::from_utf8_lossy(&m_out.stderr)
+            );
         }
     }
 
@@ -1098,6 +1140,7 @@ edition = "2021"
     std::thread::sleep(Duration::from_millis(350));
 
     // worker-rescue takes over the task and finishes the branch
+    let rescue_proc = spawn_worker_tree("worker-rescue");
     send_claude_hook(
         &env,
         "worker-rescue",
@@ -1105,7 +1148,7 @@ edition = "2021"
             "hook_event_name": "SessionStart",
             "session_id": "sess-worker-rescue",
             "agent": "worker-rescue",
-            "pid": 0,
+            "pid": rescue_proc.id(),
             "task": flaky_slug,
             "cwd": repo_str,
             "model": "claude-3-5-sonnet",
@@ -1495,8 +1538,15 @@ edition = "2021"
         let _ = stop_cmd.status();
     }
 
-    let _ = auth_proc.kill();
-    let _ = auth_proc.wait();
-    let _ = ci_proc.kill();
-    let _ = ci_proc.wait();
+    for mut p in [
+        auth_proc,
+        db_proc,
+        api_proc,
+        rogue_proc,
+        rescue_proc,
+        ci_proc,
+    ] {
+        let _ = p.kill();
+        let _ = p.wait();
+    }
 }

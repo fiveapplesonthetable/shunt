@@ -16,7 +16,7 @@ use crate::log::EventLog;
 use crate::paths::DaemonPaths;
 use crate::recorder::Recorder;
 use crate::sampler::spawn_sampler;
-use crate::server::DaemonServer;
+use crate::server::{DaemonLock, DaemonServer};
 use crate::snapshot::{write_snapshot, SnapshotStats};
 
 /// Running daemon instance.
@@ -38,6 +38,10 @@ impl Daemon {
     /// Initializes and starts all daemon subsystems per design section 1 and 8.
     pub fn start(paths: DaemonPaths, config: Config) -> io::Result<Self> {
         paths.ensure_dirs()?;
+
+        // 0. Acquire single-instance advisory locks on both $TACHO_RUNTIME/daemon.lock and
+        // $TACHO_HOME/daemon.lock BEFORE opening SQLite WAL or spawning background threads.
+        let lock = DaemonLock::acquire_paths(&paths)?;
 
         // 1. Open SQLite WAL event log
         let log =
@@ -74,8 +78,13 @@ impl Daemon {
             shutdown_flag.clone(),
         );
 
-        // 5. Start UNIX domain socket servers (api.sock, trace.sock)
-        let server = DaemonServer::start(paths.clone(), appender.clone(), shutdown_flag.clone())?;
+        // 5. Start UNIX domain socket servers (api.sock, trace.sock) using the acquired lock
+        let server = DaemonServer::start_with_lock(
+            paths.clone(),
+            lock,
+            appender.clone(),
+            shutdown_flag.clone(),
+        )?;
 
         // 6. Spawn retention maintenance thread (hourly small-batch prune)
         let retention_thread =

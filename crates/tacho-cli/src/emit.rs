@@ -126,13 +126,17 @@ pub fn execute_emit(args: EmitArgs) -> Result<(), String> {
                     "because": because,
                 })
             } else {
+                let mut args_map = serde_json::Map::new();
+                if let Some(b) = because {
+                    args_map.insert("because".to_string(), serde_json::Value::String(b));
+                }
                 serde_json::json!({
                     "type": "custom",
                     "source_ts_ns": now_ns,
                     "track": target,
                     "op": "state",
                     "name": state,
-                    "args": because.map(|b| vec![serde_json::json!({"key": "because", "value": b})]),
+                    "args": args_map,
                 })
             }
         }
@@ -220,20 +224,26 @@ pub fn execute_emit(args: EmitArgs) -> Result<(), String> {
         }
     };
 
-    client
+    let resp = client
         .send_request(&serde_json::json!({ "input": input }))
         .map_err(|e| format!("failed to send input to daemon: {e}"))?;
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        return Err(format!("daemon rejected event: {err}"));
+    }
 
     Ok(())
 }
 
-fn parse_kv_args(args: &[String]) -> Vec<serde_json::Value> {
-    args.iter()
-        .filter_map(|s| {
-            let mut parts = s.splitn(2, '=');
-            let k = parts.next()?.trim();
-            let v = parts.next()?.trim();
-            Some(serde_json::json!({ "key": k, "value": v }))
-        })
-        .collect()
+fn parse_kv_args(args: &[String]) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for s in args {
+        let mut parts = s.splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            map.insert(
+                k.trim().to_string(),
+                serde_json::Value::String(v.trim().to_string()),
+            );
+        }
+    }
+    map
 }

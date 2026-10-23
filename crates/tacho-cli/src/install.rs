@@ -327,19 +327,18 @@ pub fn merge_provider_hooks(provider: Provider, root: &mut serde_json::Value) {
         }
         Provider::Jetski => {
             let tacho_obj = ensure_object(root, "tacho");
-            let events = ["PreToolUse", "PostToolUse", "SessionStart", "Stop"];
-            for event in events {
-                let entry = serde_json::json!([{
-                    "matcher": "*",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "tacho hook jetski"
-                    }]
-                }]);
-                tacho_obj
-                    .as_object_mut()
-                    .unwrap()
-                    .insert(event.to_string(), entry);
+            if let Some(tacho_map) = tacho_obj.as_object_mut() {
+                let events = ["PreToolUse", "PostToolUse", "SessionStart", "Stop"];
+                for event in events {
+                    let entry = serde_json::json!([{
+                        "matcher": "*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "tacho hook jetski"
+                        }]
+                    }]);
+                    tacho_map.insert(event.to_string(), entry);
+                }
             }
         }
     }
@@ -351,6 +350,7 @@ pub fn remove_provider_hooks(provider: Provider, root: &mut serde_json::Value) -
 
     match provider {
         Provider::Claude => {
+            let mut remove_hooks_key = false;
             if let Some(hooks_obj) = root.get_mut("hooks").and_then(|v| v.as_object_mut()) {
                 let mut empty_keys = Vec::new();
                 for (event, val) in hooks_obj.iter_mut() {
@@ -369,12 +369,18 @@ pub fn remove_provider_hooks(provider: Provider, root: &mut serde_json::Value) -
                     hooks_obj.remove(&k);
                 }
                 if hooks_obj.is_empty() {
-                    root.as_object_mut().unwrap().remove("hooks");
+                    remove_hooks_key = true;
                     modified = true;
+                }
+            }
+            if remove_hooks_key {
+                if let Some(root_obj) = root.as_object_mut() {
+                    root_obj.remove("hooks");
                 }
             }
         }
         Provider::Gemini => {
+            let mut remove_hooks_key = false;
             if let Some(hooks_obj) = root.get_mut("hooks").and_then(|v| v.as_object_mut()) {
                 let mut empty_keys = Vec::new();
                 for (event, val) in hooks_obj.iter_mut() {
@@ -393,8 +399,13 @@ pub fn remove_provider_hooks(provider: Provider, root: &mut serde_json::Value) -
                     hooks_obj.remove(&k);
                 }
                 if hooks_obj.is_empty() {
-                    root.as_object_mut().unwrap().remove("hooks");
+                    remove_hooks_key = true;
                     modified = true;
+                }
+            }
+            if remove_hooks_key {
+                if let Some(root_obj) = root.as_object_mut() {
+                    root_obj.remove("hooks");
                 }
             }
         }
@@ -411,11 +422,16 @@ pub fn remove_provider_hooks(provider: Provider, root: &mut serde_json::Value) -
 }
 
 fn ensure_object<'a>(parent: &'a mut serde_json::Value, key: &str) -> &'a mut serde_json::Value {
-    let obj = parent.as_object_mut().expect("parent must be an object");
+    if !parent.is_object() {
+        *parent = serde_json::json!({});
+    }
+    let obj = parent
+        .as_object_mut()
+        .expect("parent initialized as object");
     if !obj.contains_key(key) || !obj[key].is_object() {
         obj.insert(key.to_string(), serde_json::json!({}));
     }
-    obj.get_mut(key).unwrap()
+    obj.get_mut(key).expect("key inserted into object")
 }
 
 fn merge_standard_hook(
@@ -424,11 +440,15 @@ fn merge_standard_hook(
     matcher: Option<&str>,
     command_str: &str,
 ) {
-    let hooks_map = hooks_obj.as_object_mut().unwrap();
+    let Some(hooks_map) = hooks_obj.as_object_mut() else {
+        return;
+    };
     if !hooks_map.contains_key(event) || !hooks_map[event].is_array() {
         hooks_map.insert(event.to_string(), serde_json::json!([]));
     }
-    let arr = hooks_map.get_mut(event).unwrap().as_array_mut().unwrap();
+    let Some(arr) = hooks_map.get_mut(event).and_then(|v| v.as_array_mut()) else {
+        return;
+    };
 
     // Check if command already exists
     let already_present = arr.iter().any(|item| is_tacho_command(item, command_str));
@@ -440,10 +460,9 @@ fn merge_standard_hook(
             }]
         });
         if let Some(m) = matcher {
-            entry
-                .as_object_mut()
-                .unwrap()
-                .insert("matcher".to_string(), serde_json::json!(m));
+            if let Some(entry_obj) = entry.as_object_mut() {
+                entry_obj.insert("matcher".to_string(), serde_json::json!(m));
+            }
         }
         arr.push(entry);
     }

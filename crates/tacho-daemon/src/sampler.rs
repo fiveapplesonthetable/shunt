@@ -800,21 +800,37 @@ impl ProcSampler {
         self.cpu_accounts
             .retain(|s, _| active_runs.iter().any(|r| &r.session == s));
 
+        let live_state = appender.live_state();
         let mut polled_cwds = HashSet::new();
         for run in active_runs.iter() {
             if let Some(ref cwd) = run.cwd {
                 if polled_cwds.insert(cwd.as_str()) {
-                    // Prefer a Worker run if multiple agents share the same cwd
+                    // Prefer the Worker run with the most recent edit/command activity if multiple agents share cwd
+                    let recent_ts = |agent_id: &str| -> u64 {
+                        live_state
+                            .agents
+                            .get(agent_id)
+                            .map(|a| {
+                                let edit_ts = a.last_edit_ts_ns.unwrap_or(0);
+                                let cmd_ts = a.recent_commands.last().map(|c| c.ts_ns).unwrap_or(0);
+                                edit_ts.max(cmd_ts)
+                            })
+                            .unwrap_or(0)
+                    };
                     let owner_agent = active_runs
                         .iter()
-                        .find(|r| {
+                        .filter(|r| {
                             r.cwd.as_deref() == Some(cwd.as_str()) && r.role == AgentRole::Worker
                         })
+                        .max_by_key(|r| recent_ts(&r.agent_id))
                         .or_else(|| {
-                            active_runs.iter().find(|r| {
-                                r.cwd.as_deref() == Some(cwd.as_str())
-                                    && r.role != AgentRole::Orchestrator
-                            })
+                            active_runs
+                                .iter()
+                                .filter(|r| {
+                                    r.cwd.as_deref() == Some(cwd.as_str())
+                                        && r.role != AgentRole::Orchestrator
+                                })
+                                .max_by_key(|r| recent_ts(&r.agent_id))
                         })
                         .map(|r| r.agent_id.as_str())
                         .unwrap_or(&run.agent_id);

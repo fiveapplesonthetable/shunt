@@ -92,10 +92,11 @@ impl Recorder {
                 .map(|cs| vec![flow_ord::make(cs, flow_ord::STALL)])
                 .unwrap_or_default();
 
+            let scrubbed_evidence = self.scrubber.scrub(&firing.evidence);
             let stall_label = format!(
                 "Stall [{}]: {}",
                 flag_str,
-                truncate_utf8(&firing.evidence, 64)
+                truncate_utf8(&scrubbed_evidence, 128)
             );
             out.push(Event {
                 seq,
@@ -113,7 +114,7 @@ impl Recorder {
                         kind: Some(firing.kind as i32),
                         since_us: firing.since_us,
                         repeats: firing.repeats,
-                        evidence: Some(truncate_utf8(&firing.evidence, 512)),
+                        evidence: Some(truncate_utf8(&scrubbed_evidence, 512)),
                     })),
                 },
             });
@@ -125,7 +126,7 @@ impl Recorder {
                 agent.push_timeline(TimelineItem {
                     ts_ns: ts,
                     kind: "Stall".to_string(),
-                    summary: format!("{}: {}", flag_str, firing.evidence),
+                    summary: format!("{}: {}", flag_str, truncate_utf8(&scrubbed_evidence, 256)),
                     detail: None,
                 });
             }
@@ -134,7 +135,7 @@ impl Recorder {
                 agent_id,
                 "Stalled",
                 tacho::AgentStateType::Stalled,
-                &firing.evidence,
+                &scrubbed_evidence,
                 ts,
                 out,
             );

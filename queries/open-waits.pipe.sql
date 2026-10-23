@@ -27,7 +27,7 @@ FROM (
   LEFT JOIN args ag ON s.arg_set_id = ag.arg_set_id AND ag.key = 'agent'
   LEFT JOIN args wt ON s.arg_set_id = wt.arg_set_id AND wt.key = 'wait.target'
   LEFT JOIN args wo ON s.arg_set_id = wo.arg_set_id AND wo.key = 'wait.on'
-  WHERE s.name = 'Wait' AND s.dur < 0
+  WHERE (s.name = 'Wait' OR s.name LIKE 'Wait:%') AND s.dur < 0
   ORDER BY s.ts ASC
 )
 |> SELECT agent, run, target, reason, dur;

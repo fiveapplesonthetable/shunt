@@ -21,14 +21,36 @@ use crate::paths::DaemonPaths;
 use crate::recorder::{render_report, render_status};
 use crate::snapshot::write_snapshot;
 
-/// Single-instance advisory lock on `$TACHO_RUNTIME/daemon.lock`.
+/// Maximum allowed NDJSON line length on `api.sock` (16 MiB) to prevent OOM from unbounded lines.
+const MAX_API_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Single-instance advisory lock on `$TACHO_RUNTIME/daemon.lock` (and `$TACHO_HOME/daemon.lock`).
 pub struct DaemonLock {
-    _file: fs::File,
+    _files: Vec<fs::File>,
 }
 
 impl DaemonLock {
     /// Attempts to acquire an exclusive, non-blocking advisory flock on `lock_path`.
     pub fn acquire(lock_path: &Path) -> io::Result<Self> {
+        let file = Self::flock_exclusive(lock_path)?;
+        Ok(Self { _files: vec![file] })
+    }
+
+    /// Acquires exclusive, non-blocking advisory flocks on both `$TACHO_RUNTIME/daemon.lock`
+    /// and `$TACHO_HOME/daemon.lock` so a second daemon cannot share either runtime sockets
+    /// or the SQLite WAL event log directory.
+    pub fn acquire_paths(paths: &DaemonPaths) -> io::Result<Self> {
+        let runtime_lock_path = paths.lock_file();
+        let home_lock_path = paths.home.join("daemon.lock");
+        let mut files = Vec::with_capacity(2);
+        files.push(Self::flock_exclusive(&runtime_lock_path)?);
+        if home_lock_path != runtime_lock_path {
+            files.push(Self::flock_exclusive(&home_lock_path)?);
+        }
+        Ok(Self { _files: files })
+    }
+
+    fn flock_exclusive(lock_path: &Path) -> io::Result<fs::File> {
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -43,8 +65,7 @@ impl DaemonLock {
                 format!("another daemon instance holds lock {:?}", lock_path),
             ));
         }
-
-        Ok(Self { _file: file })
+        Ok(file)
     }
 }
 
@@ -59,16 +80,24 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
-    /// Starts the servers on `api.sock` and `trace.sock`.
+    /// Starts the servers on `api.sock` and `trace.sock`, acquiring the daemon lock first.
     pub fn start(
         paths: DaemonPaths,
         appender: AppenderHandle,
         shutdown_flag: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        // 1. Acquire single-instance flock
-        let lock = DaemonLock::acquire(&paths.lock_file())?;
+        let lock = DaemonLock::acquire_paths(&paths)?;
+        Self::start_with_lock(paths, lock, appender, shutdown_flag)
+    }
 
-        // 2. Clean up any stale socket files from prior unclean shutdown
+    /// Starts the servers on `api.sock` and `trace.sock` using an already-acquired [`DaemonLock`].
+    pub fn start_with_lock(
+        paths: DaemonPaths,
+        lock: DaemonLock,
+        appender: AppenderHandle,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        // 1. Clean up any stale socket files from prior unclean shutdown
         if paths.api_sock().exists() {
             let _ = fs::remove_file(paths.api_sock());
         }
@@ -213,6 +242,55 @@ fn run_api_worker(
     }
 }
 
+/// Reads a single newline-delimited UTF-8 line up to `max_bytes`.
+/// Returns `Err(InvalidData)` if the line exceeds `max_bytes` without a newline or contains invalid UTF-8.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line_buf: &mut String,
+    max_bytes: usize,
+) -> io::Result<usize> {
+    let mut raw = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let take_len = pos + 1;
+            if total + take_len > max_bytes {
+                reader.consume(take_len);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "API request line exceeds maximum allowed byte length",
+                ));
+            }
+            raw.extend_from_slice(&available[..take_len]);
+            reader.consume(take_len);
+            total += take_len;
+            break;
+        } else {
+            let take_len = available.len();
+            if total + take_len > max_bytes {
+                reader.consume(take_len);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "API request line exceeds maximum allowed byte length",
+                ));
+            }
+            raw.extend_from_slice(available);
+            reader.consume(take_len);
+            total += take_len;
+        }
+    }
+    if total == 0 {
+        return Ok(0);
+    }
+    let s = std::str::from_utf8(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line_buf.push_str(s);
+    Ok(total)
+}
+
 /// Processes NDJSON requests on a client stream until disconnection.
 fn handle_api_connection(
     stream: UnixStream,
@@ -231,7 +309,7 @@ fn handle_api_connection(
 
     while !stop.load(Ordering::Acquire) {
         line_buf.clear();
-        match reader.read_line(&mut line_buf) {
+        match read_bounded_line(&mut reader, &mut line_buf, MAX_API_LINE_BYTES) {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(_) => break,

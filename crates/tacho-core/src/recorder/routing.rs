@@ -254,7 +254,8 @@ impl Recorder {
                 run.is_exited = true;
                 run.turn_open = false;
                 run.turn_begin_seq = None;
-                let tools: Vec<_> = run.open_tools.values().cloned().collect();
+                let mut tools: Vec<_> = run.open_tools.values().cloned().collect();
+                tools.sort_by_key(|t| t.slice_id);
                 run.open_tools.clear();
                 (
                     abandoned,
@@ -340,6 +341,10 @@ impl Recorder {
             .as_deref()
             .map(|r| truncate_utf8(&self.scrubber.scrub(r), 256));
 
+        let exit_because = scrubbed_reason
+            .clone()
+            .unwrap_or_else(|| "run ended".to_string());
+
         out.push(Event {
             seq,
             ts_ns: run_ts,
@@ -377,7 +382,7 @@ impl Recorder {
             &agent_id,
             "Exited",
             tacho::AgentStateType::Exited,
-            "run ended",
+            &exit_because,
             ts,
             out,
         );
@@ -402,6 +407,22 @@ impl Recorder {
         let s_target = target
             .as_deref()
             .map(|t| truncate_utf8(&self.scrubber.scrub(t), 128));
+        let on_str = match on {
+            Some(WaitOn::Input) => Some("input"),
+            Some(WaitOn::Message) => Some("message"),
+            Some(WaitOn::Subagent) => Some("subagent"),
+            Some(WaitOn::RateLimit) => Some("rate_limit"),
+            Some(WaitOn::Other) => Some("other"),
+            None => None,
+        };
+        let wait_label = match (on_str, s_target.as_deref()) {
+            (Some(o), Some(t)) if !t.is_empty() => {
+                Some(format!("Wait: {} {}", o, truncate_utf8(t, 48)))
+            }
+            (None, Some(t)) if !t.is_empty() => Some(format!("Wait: {}", truncate_utf8(t, 48))),
+            (Some(o), _) => Some(format!("Wait: {}", o)),
+            (None, _) => None,
+        };
         let body = tacho::event::Body::Wait(tacho::Wait {
             target: s_target,
             on: proto_on.map(|o: tacho::WaitOn| o as i32),
@@ -413,7 +434,7 @@ impl Recorder {
             Some(slice_id),
             None,
             Some(agent_id.clone()),
-            None,
+            wait_label,
             Some(body),
             out,
         );
