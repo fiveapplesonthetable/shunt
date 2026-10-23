@@ -252,12 +252,19 @@ fn handle_api_connection(
                 for inp in batch.inputs {
                     input_batch.push((inp, now_ns));
                 }
+                let mut send_err = false;
                 if !input_batch.is_empty() {
                     if let Err(e) = appender.send_input_batch(std::mem::take(&mut input_batch)) {
                         eprintln!("[tacho-daemon] queue full: {}", e);
+                        send_err = true;
                     }
                 }
-                if writer.write_all(b"{\"status\":\"ok\"}\n").is_err() {
+                let reply: &[u8] = if send_err {
+                    b"{\"status\":\"error\",\"error\":\"queue full\"}\n"
+                } else {
+                    b"{\"status\":\"ok\"}\n"
+                };
+                if writer.write_all(reply).is_err() {
                     break;
                 }
                 if reader.buffer().is_empty() && writer.flush().is_err() {
@@ -276,13 +283,20 @@ fn handle_api_connection(
                     .as_nanos() as u64;
                 input_batch.push((ingest.input, now_ns));
 
-                // If batch limit reached or socket buffer drained, dispatch to appender BEFORE sending ack
-                if input_batch.len() >= 128 || reader.buffer().is_empty() {
+                // Dispatch any pending batch before writing each ack
+                let mut send_err = false;
+                if !input_batch.is_empty() {
                     if let Err(e) = appender.send_input_batch(std::mem::take(&mut input_batch)) {
                         eprintln!("[tacho-daemon] queue full: {}", e);
+                        send_err = true;
                     }
                 }
-                if writer.write_all(b"{\"status\":\"ok\"}\n").is_err() {
+                let reply: &[u8] = if send_err {
+                    b"{\"status\":\"error\",\"error\":\"queue full\"}\n"
+                } else {
+                    b"{\"status\":\"ok\"}\n"
+                };
+                if writer.write_all(reply).is_err() {
                     break;
                 }
                 if reader.buffer().is_empty() && writer.flush().is_err() {
@@ -502,5 +516,97 @@ fn process_ndjson_line(
         }
     } else {
         Some(b"{\"error\":\"missing 'input' or 'cmd' in request\"}".to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::appender::spawn_appender;
+    use crate::log::EventLog;
+    use tacho_core::Recorder;
+
+    #[test]
+    fn test_batch_and_single_fast_path_queue_full_error_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("server_test.sqlite");
+        let log = EventLog::open(&db_path).unwrap();
+        let recorder = Recorder::new();
+
+        // Capacity 1 so channel fills up immediately
+        let (appender, _thread) = spawn_appender(recorder, log, 1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let paths = DaemonPaths::custom(temp.path(), temp.path()).unwrap();
+
+        // Create a connected pair of UnixStream for testing handle_api_connection
+        let (mut client, server_stream) = UnixStream::pair().unwrap();
+
+        let appender_clone = appender.clone();
+        let stop_clone = stop.clone();
+        let paths_clone = paths.clone();
+        let worker_handle = std::thread::spawn(move || {
+            handle_api_connection(server_stream, &appender_clone, &stop_clone, &paths_clone);
+        });
+
+        let test_input = Input::RunStart {
+            source_ts_ns: Some(100),
+            provider: "test".into(),
+            session_id: "s1".into(),
+            agent: Some("a1".into()),
+            task: None,
+            pid: None,
+            cwd: None,
+            model: None,
+            parent_session: None,
+            git_tree: None,
+            role: None,
+        };
+
+        // 1. Shutdown the appender thread so send_input_batch fails (channel disconnected)
+        appender.shutdown();
+        let _ = _thread.join();
+
+        // 2. Send batch fast path: {"inputs": [...]} over client socket
+        let batch_req = serde_json::json!({
+            "inputs": [test_input.clone()]
+        });
+        client
+            .write_all(serde_json::to_string(&batch_req).unwrap().as_bytes())
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            line.contains("\"error\":\"queue full\""),
+            "batch fast path must return queue full error: {}",
+            line
+        );
+
+        // 3. Send single input fast path: {"input": ...} over client socket
+        let single_req = serde_json::json!({
+            "input": test_input
+        });
+        client
+            .write_all(serde_json::to_string(&single_req).unwrap().as_bytes())
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            line.contains("\"error\":\"queue full\""),
+            "single input fast path must return queue full error: {}",
+            line
+        );
+
+        stop.store(true, Ordering::Release);
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        drop(reader);
+        drop(client);
+        let _ = worker_handle.join();
     }
 }

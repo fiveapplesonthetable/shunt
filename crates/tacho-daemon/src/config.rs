@@ -64,6 +64,10 @@ pub struct SamplerConfig {
     pub interval_ms: u64,
     /// Filesystem mount points to monitor via statvfs (default: ["/"]).
     pub mounts: Vec<String>,
+    /// Whether per-agent cgroup accounting is enabled (default: true).
+    pub cgroup: bool,
+    /// Minimum interval between worktree file-change scans in seconds (default: 30 s).
+    pub worktree_scan_secs: u64,
 }
 
 impl Default for SamplerConfig {
@@ -71,6 +75,8 @@ impl Default for SamplerConfig {
         Self {
             interval_ms: 2000,
             mounts: vec!["/".to_string()],
+            cgroup: true,
+            worktree_scan_secs: 30,
         }
     }
 }
@@ -94,8 +100,10 @@ pub struct DetectorConfig {
     /// Check whether file edits fall outside task declared paths (default: true).
     pub off_brief: bool,
     /// Optional shell command to execute when a stall detector enters (`sh -c <cmd>`).
-    /// Receives TACHO_AGENT, TACHO_STALL_KIND, TACHO_STALL_REASON, TACHO_STALL_EVIDENCE, TACHO_SEQ.
+    /// Receives TACHO_AGENT, TACHO_STALL_KIND, TACHO_STALL_REASON, TACHO_SEQ, TACHO_TS_NS.
     pub on_stall: Option<String>,
+    /// Timeout in seconds for the on_stall effect hook command (default: 60 s).
+    pub on_stall_timeout_secs: u64,
 }
 
 impl Default for DetectorConfig {
@@ -109,6 +117,7 @@ impl Default for DetectorConfig {
             failing_count: 3,
             off_brief: true,
             on_stall: None,
+            on_stall_timeout_secs: 60,
         }
     }
 }
@@ -139,8 +148,11 @@ mod tests {
         assert_eq!(cfg.rings.agents_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.rings.machine_bytes, 8 * 1024 * 1024);
         assert_eq!(cfg.sampler.interval_ms, 2000);
+        assert!(cfg.sampler.cgroup);
+        assert_eq!(cfg.sampler.worktree_scan_secs, 30);
         assert_eq!(cfg.detectors.silent_s, 300);
         assert_eq!(cfg.detectors.loop_count, 4);
+        assert_eq!(cfg.detectors.on_stall_timeout_secs, 60);
     }
 
     #[test]

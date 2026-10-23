@@ -295,9 +295,19 @@ impl Recorder {
             });
         }
 
-        // Also close any open custom slices (such as `/procs` child process slices) under this run
-        let procs_track = format!("agent:{}/run:{}/procs", agent_id, run_n);
-        if let Some(mut stack) = self.open_custom_slices.remove(&procs_track) {
+        // Close any process slices the sampler left open on this run's `procs/slot:*` tracks.
+        let procs_prefix = format!("agent:{}/run:{}/procs", agent_id, run_n);
+        let mut proc_tracks: Vec<String> = self
+            .open_custom_slices
+            .keys()
+            .filter(|k| k.starts_with(&procs_prefix))
+            .cloned()
+            .collect();
+        proc_tracks.sort();
+        for procs_track in proc_tracks {
+            let Some(mut stack) = self.open_custom_slices.remove(&procs_track) else {
+                continue;
+            };
             while let Some(custom_id) = stack.pop() {
                 let ab_ts = self.clamp_ts(&procs_track, ts);
                 let ab_seq = self.alloc_seq();

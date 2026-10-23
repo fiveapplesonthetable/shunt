@@ -39,14 +39,33 @@ impl Recorder {
                 .strip_prefix("agent:")
                 .and_then(|s| s.split('/').next())
             {
+                let agent_id = agent_id.to_string();
                 let cpu_us = match unit.as_deref() {
                     Some("ms") => value.saturating_mul(1_000),
                     Some("ns") => value / 1_000,
                     Some("s") => value.saturating_mul(1_000_000),
                     _ => value,
                 };
-                if let Some(det) = self.detectors.get_mut(agent_id) {
+                let cleared_all = if let Some(det) = self.detectors.get_mut(&agent_id) {
                     det.record_cpu_sample(ts, cpu_us);
+                    !det.is_stalled
+                } else {
+                    false
+                };
+                let was_stalled = if let Some(agent) = self.live.agents.get(&agent_id) {
+                    agent.state == "Stalled"
+                } else {
+                    false
+                };
+                if cleared_all && was_stalled {
+                    self.transition_state(
+                        &agent_id,
+                        "Idle",
+                        tacho::AgentStateType::Idle,
+                        "cpu activity",
+                        ts,
+                        out,
+                    );
                 }
             }
         }
@@ -195,7 +214,7 @@ impl Recorder {
             && track.starts_with("agent:")
             && matches!(
                 name.as_deref(),
-                Some("WorktreeCommit" | "WorktreeFileChange")
+                Some("WorktreeCommit" | "WorktreeFileChange" | "WorktreeHeadMoved")
             )
         {
             let segs: Vec<&str> = track.split('/').collect();
@@ -209,6 +228,35 @@ impl Recorder {
             } else {
                 format!("agent:{}", agent_id)
             };
+            let short_hex = |s: Option<&String>| {
+                s.map(|s| s.trim())
+                    .filter(|s| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .map(|s| s[..s.len().min(8)].to_string())
+            };
+
+            // Checkout, reset, rebase and pull move HEAD without the agent making progress:
+            // record the move, but give no progress credit.
+            if name.as_deref() == Some("WorktreeHeadMoved") {
+                let from = short_hex(args.get("from")).unwrap_or_else(|| "?".into());
+                let to = short_hex(args.get("to")).unwrap_or_else(|| "?".into());
+                let label = format!("HeadMoved: {} -> {}", from, to);
+                let body = tacho::event::Body::Milestone(tacho::Milestone {
+                    name: name.clone(),
+                    description: Some(label.clone()),
+                });
+                self.emit(
+                    &target_track,
+                    Kind::Milestone,
+                    ts,
+                    None,
+                    None,
+                    Some(agent_id),
+                    Some(label),
+                    Some(body),
+                    out,
+                );
+                return;
+            }
             let is_commit = name.as_deref() == Some("WorktreeCommit");
             let raw_sha = args.get("sha").map(|s| s.trim());
             let short_sha = raw_sha.map(|s| {
@@ -353,7 +401,24 @@ impl Recorder {
                 .push(id.clone());
         } else if op == CustomOp::End {
             if let Some(stack) = self.open_custom_slices.get_mut(&track) {
-                stack.pop();
+                if let Some(ref target_id) = id {
+                    let truncated_target = truncate_utf8(target_id, 128);
+                    if let Some(idx) = stack.iter().rposition(|open_id| {
+                        open_id.as_deref() == Some(target_id.as_str())
+                            || open_id.as_deref() == Some(truncated_target.as_str())
+                    }) {
+                        stack.remove(idx);
+                    }
+                } else {
+                    stack.pop();
+                }
+            }
+            if self
+                .open_custom_slices
+                .get(&track)
+                .is_some_and(|s| s.is_empty())
+            {
+                self.open_custom_slices.remove(&track);
             }
         }
 
@@ -365,6 +430,13 @@ impl Recorder {
             })
             .collect();
 
+        let scrubbed_name = if op != CustomOp::Counter {
+            name.as_deref()
+                .map(|n| truncate_utf8(&self.scrubber.scrub(n), 128))
+        } else {
+            name
+        };
+
         let custom_body = match op {
             CustomOp::End => tacho::event::Body::CustomEnded(tacho::CustomEnded {
                 id: id.as_deref().map(|i| truncate_utf8(i, 128)),
@@ -372,7 +444,7 @@ impl Recorder {
                 abandoned: Some(false),
             }),
             _ => tacho::event::Body::Custom(tacho::Custom {
-                name: name.as_deref().map(|n| truncate_utf8(n, 128)),
+                name: scrubbed_name.clone(),
                 id: id.as_deref().map(|i| truncate_utf8(i, 128)),
                 args: proto_args,
             }),
@@ -385,7 +457,7 @@ impl Recorder {
             track_key: track,
             cause_seq,
             agent: None,
-            custom_name: name,
+            custom_name: scrubbed_name,
             flow_ids,
             terminating_flow_ids: terminating_flows,
             counter_value: value,
@@ -647,6 +719,170 @@ impl Recorder {
                 }
             }
             self.handle_detector_firings(&agent_id, firings, turn_seq, ts, out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::Input;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn test_custom_slice_out_of_order_end_determinism() {
+        let mut rec = Recorder::new();
+        let mut out = Vec::new();
+        let track = "custom_track".to_string();
+
+        rec.apply(
+            Input::Custom {
+                source_ts_ns: Some(1_000_000),
+                track: track.clone(),
+                op: CustomOp::Begin,
+                name: Some("slice_a".to_string()),
+                id: Some("a".to_string()),
+                args: BTreeMap::new(),
+                value: None,
+                flow_out: None,
+                flow_in: None,
+            },
+            1_000_000,
+            &mut out,
+        );
+
+        rec.apply(
+            Input::Custom {
+                source_ts_ns: Some(2_000_000),
+                track: track.clone(),
+                op: CustomOp::Begin,
+                name: Some("slice_b".to_string()),
+                id: Some("b".to_string()),
+                args: BTreeMap::new(),
+                value: None,
+                flow_out: None,
+                flow_in: None,
+            },
+            2_000_000,
+            &mut out,
+        );
+
+        // End "a" first (out of order relative to LIFO stack)
+        rec.apply(
+            Input::Custom {
+                source_ts_ns: Some(3_000_000),
+                track: track.clone(),
+                op: CustomOp::End,
+                name: Some("slice_a".to_string()),
+                id: Some("a".to_string()),
+                args: BTreeMap::new(),
+                value: None,
+                flow_out: None,
+                flow_in: None,
+            },
+            3_000_000,
+            &mut out,
+        );
+
+        // End "b" second
+        rec.apply(
+            Input::Custom {
+                source_ts_ns: Some(4_000_000),
+                track: track.clone(),
+                op: CustomOp::End,
+                name: Some("slice_b".to_string()),
+                id: Some("b".to_string()),
+                args: BTreeMap::new(),
+                value: None,
+                flow_out: None,
+                flow_in: None,
+            },
+            4_000_000,
+            &mut out,
+        );
+
+        // open_custom_slices must be empty
+        assert!(
+            rec.open_custom_slices
+                .get(&track)
+                .is_none_or(|stack| stack.is_empty()),
+            "Expected open_custom_slices to be empty, got: {:?}",
+            rec.open_custom_slices
+        );
+        assert!(rec.open_custom_slices.is_empty());
+
+        // Rebuild state via Recorder::restore
+        let mut restored = Recorder::restore(out.iter());
+
+        assert!(
+            restored
+                .open_custom_slices
+                .get(&track)
+                .is_none_or(|stack| stack.is_empty()),
+            "Expected restored open_custom_slices to be empty, got: {:?}",
+            restored.open_custom_slices
+        );
+        assert!(restored.open_custom_slices.is_empty());
+
+        assert_eq!(rec.open_custom_slices, restored.open_custom_slices);
+        assert_eq!(rec.next_seq, restored.next_seq);
+        assert_eq!(rec.registered_tracks, restored.registered_tracks);
+
+        // Subsequent inputs applied to both live and restored state produce identical events
+        let mut live_events = Vec::new();
+        let mut restored_events = Vec::new();
+        let next_input = Input::Custom {
+            source_ts_ns: Some(5_000_000),
+            track,
+            op: CustomOp::Instant,
+            name: Some("instant_c".to_string()),
+            id: None,
+            args: BTreeMap::new(),
+            value: None,
+            flow_out: None,
+            flow_in: None,
+        };
+        rec.apply(next_input.clone(), 5_000_000, &mut live_events);
+        restored.apply(next_input, 5_000_000, &mut restored_events);
+
+        assert_eq!(live_events.len(), restored_events.len());
+        for (l, r) in live_events.iter().zip(restored_events.iter()) {
+            assert_eq!(l.seq, r.seq);
+            assert_eq!(l.ts_ns, r.ts_ns);
+            assert_eq!(l.kind, r.kind);
+            assert_eq!(l.track_key, r.track_key);
+            assert_eq!(l.custom_name, r.custom_name);
+        }
+    }
+
+    #[test]
+    fn test_handle_custom_name_is_scrubbed() {
+        let mut rec = Recorder::new();
+        let mut out = Vec::new();
+        let track = "custom_track".to_string();
+
+        rec.apply(
+            Input::Custom {
+                source_ts_ns: Some(1_000_000),
+                track,
+                op: CustomOp::Begin,
+                name: Some("password: secretpassword123".to_string()),
+                id: Some("id1".to_string()),
+                args: BTreeMap::new(),
+                value: None,
+                flow_out: None,
+                flow_in: None,
+            },
+            1_000_000,
+            &mut out,
+        );
+
+        let ev = out.iter().find(|e| e.kind == Kind::Custom).unwrap();
+        assert_eq!(ev.custom_name.as_deref(), Some("password: <redacted>"));
+        if let Some(tacho::event::Body::Custom(c)) = &ev.body.body {
+            assert_eq!(c.name.as_deref(), Some("password: <redacted>"));
+        } else {
+            panic!("Expected Custom body");
         }
     }
 }

@@ -219,7 +219,13 @@ Tasks bound with `tacho emit task` enforce `--paths` scope on `OFF_BRIEF`, enfor
 
 ### 5. Live Transcript Tailing (`tacho tail`)
 
-Tails on-disk Claude Code `.jsonl` transcripts via `inotify`, tracking per-file byte offsets in `$TACHO_HOME/tail-offsets.json`:
+Tails on-disk Claude Code `.jsonl` transcripts via `inotify`, tracking per-file `(dev, inode, offset)` records atomically in `$TACHO_HOME/tail-offsets.json`:
+
+- **Atomic Offset Persistence:** Safely writes temporary files in the same directory, fsyncs, and renames to `$TACHO_HOME/tail-offsets.json`.
+- **Robust Line Processing:** Reads complete lines with `read_until(b'\n')`, keeping trailing partial lines until terminated, and decodes with `from_utf8_lossy` without stalling on invalid UTF-8.
+- **Rotation and Truncation Detection:** Tracks `(dev, inode, offset)` per file and restarts from byte 0 whenever file rotation or truncation is detected.
+- **Resilient Delivery:** Daemon send errors keep offsets un-advanced and retry with capped backoff (250ms..5s) in watch mode, returning the error in `--once` mode.
+- **Targeted inotify Rescans:** Wakeups are driven by `IN_MODIFY`, `IN_CLOSE_WRITE`, `IN_CREATE`, and `IN_MOVED_TO` events, watching newly created project directories on `IN_CREATE`.
 
 ```bash
 # Continuously watch and ingest transcripts under ~/.claude/projects

@@ -410,7 +410,7 @@ fn event_category(event: &Event) -> Option<&'static str> {
         Kind::Message => Some("message"),
         Kind::Review | Kind::ReviewEnded | Kind::ReviewFinding => Some("review"),
         Kind::Custom | Kind::CustomEnded => {
-            if event.track_key.ends_with("/procs") {
+            if event.track_key.contains("/procs") {
                 Some("proc")
             } else {
                 Some("custom")

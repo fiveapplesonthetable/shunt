@@ -54,6 +54,11 @@ fn send_claude_hook(env: &TestEnv, agent: &str, payload: serde_json::Value) {
 
 #[test]
 fn test_multi_agent_git_chaos() {
+    if tacho_core::find_trace_processor().is_none() {
+        eprintln!("Skipping test_multi_agent_git_chaos: trace_processor_shell binary not found (set $TACHO_TP or add to PATH)");
+        return;
+    }
+
     let env = TestEnv::new().unwrap();
 
     // 1. Create hermetic temp git repo with stacked branches:
@@ -1460,19 +1465,24 @@ edition = "2021"
         println!("{q_stdout}");
     }
 
-    // Copy generated trace to user Downloads directory
-    let downloads_trace = PathBuf::from(
-        "/usr/local/google/home/zezeozue/Downloads/tacho-example-fleet.perfetto-trace",
-    );
-    let copy_res = fs::copy(&fleet_trace_path, &downloads_trace);
+    // Write example trace to $TACHO_EXAMPLE_TRACE_OUT if set, else only to the temp dir
+    let example_trace_dest = if let Ok(val) = std::env::var("TACHO_EXAMPLE_TRACE_OUT") {
+        PathBuf::from(val.trim())
+    } else {
+        env.temp_dir
+            .path()
+            .join("tacho-example-fleet.perfetto-trace")
+    };
+    let copy_res = fs::copy(&fleet_trace_path, &example_trace_dest);
     assert!(
         copy_res.is_ok(),
-        "failed to copy trace to ~/Downloads: {:?}",
+        "failed to copy trace to {}: {:?}",
+        example_trace_dest.display(),
         copy_res.err()
     );
     println!(
         "Successfully wrote example fleet trace to {}",
-        downloads_trace.display()
+        example_trace_dest.display()
     );
 
     // Stop system session cleanly if active

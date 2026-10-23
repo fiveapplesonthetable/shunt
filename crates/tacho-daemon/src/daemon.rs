@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::appender::{spawn_appender_with_hook, AppenderHandle};
+use crate::appender::{spawn_appender_with_hook_timeout, AppenderHandle};
 use crate::config::Config;
 use crate::log::EventLog;
 use crate::paths::DaemonPaths;
@@ -58,14 +58,12 @@ impl Daemon {
             failing_repeats: config.detectors.failing_count,
         });
 
-        let on_stall = config.detectors.on_stall.clone().or_else(|| {
-            std::env::var("TACHO_ON_STALL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        });
+        let on_stall = config.detectors.on_stall.clone();
+        let on_stall_timeout = Duration::from_secs(config.detectors.on_stall_timeout_secs);
 
         // 3. Spawn appender thread (no in-memory rings; SQLite WAL is the sole source)
-        let (appender, appender_thread) = spawn_appender_with_hook(recorder, log, 65_536, on_stall);
+        let (appender, appender_thread) =
+            spawn_appender_with_hook_timeout(recorder, log, 65_536, on_stall, on_stall_timeout);
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 

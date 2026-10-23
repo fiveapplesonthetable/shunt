@@ -3,7 +3,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -28,30 +28,23 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// Resolves a path relative to Perfetto release binaries directory.
-fn find_perfetto_binary(name: &str) -> PathBuf {
-    if let Ok(dir) = env::var("PERFETTO_DIR") {
-        let candidate = Path::new(&dir).join("out/release").join(name);
-        if candidate.is_file() {
-            return candidate;
+/// Resolves a binary from an environment variable or PATH.
+fn find_binary(env_var: &str, name: &str) -> Option<PathBuf> {
+    if let Ok(val) = env::var(env_var) {
+        let p = PathBuf::from(val.trim());
+        if p.is_file() {
+            return Some(p);
         }
     }
-    if let Ok(home) = env::var("HOME") {
-        let candidate = PathBuf::from(home)
-            .join("dev/perfetto/out/release")
-            .join(name);
-        if candidate.is_file() {
-            return candidate;
+    if let Ok(paths) = env::var("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
-    let direct =
-        PathBuf::from("/usr/local/google/home/zezeozue/dev/perfetto/out/release").join(name);
-    if direct.is_file() {
-        return direct;
-    }
-    panic!(
-        "Could not locate Perfetto binary '{name}'. Ensure ~/dev/perfetto/out/release is built."
-    );
+    None
 }
 
 /// Parses a single integer result from Trace Processor query output.
@@ -79,11 +72,22 @@ fn test_system_tracing_lifecycle() {
         return;
     }
 
-    let traced_bin = find_perfetto_binary("traced");
-    let probes_bin = find_perfetto_binary("traced_probes");
-    let perfetto_bin = find_perfetto_binary("perfetto");
-    let tp_bin = tacho_core::find_trace_processor()
-        .unwrap_or_else(|| find_perfetto_binary("trace_processor_shell"));
+    let Some(traced_bin) = find_binary("TACHO_TRACED", "traced") else {
+        eprintln!("Skipping test_system_tracing_lifecycle: traced binary not found (set $TACHO_TRACED or add to PATH)");
+        return;
+    };
+    let Some(probes_bin) = find_binary("TACHO_TRACED_PROBES", "traced_probes") else {
+        eprintln!("Skipping test_system_tracing_lifecycle: traced_probes binary not found (set $TACHO_TRACED_PROBES or add to PATH)");
+        return;
+    };
+    let Some(perfetto_bin) = find_binary("TACHO_PERFETTO", "perfetto") else {
+        eprintln!("Skipping test_system_tracing_lifecycle: perfetto binary not found (set $TACHO_PERFETTO or add to PATH)");
+        return;
+    };
+    let Some(tp_bin) = tacho_core::find_trace_processor() else {
+        eprintln!("Skipping test_system_tracing_lifecycle: trace_processor_shell binary not found (set $TACHO_TP or add to PATH)");
+        return;
+    };
 
     let temp_dir = tempfile::tempdir().expect("failed to create tempdir");
     let producer_sock = temp_dir.path().join("producer.sock");

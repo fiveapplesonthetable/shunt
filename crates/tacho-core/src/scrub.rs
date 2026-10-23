@@ -55,6 +55,14 @@ struct ScrubberPatterns {
     json_unquoted_dquoted: Regex,
     json_unquoted_squoted: Regex,
     json_unquoted_unquoted: Regex,
+    /// Generic secret key=value / key: value pattern.
+    ///
+    /// Anchors keys with start-of-input, start-of-line, JSON/config delimiter (`{`, `[`, `,`, `;`),
+    /// or non-alphanumeric boundary. Keys may include prefixes like `FOO_TOKEN` or `--api-key`.
+    /// When using `:` as the separator, unprefixed keys must be standalone (at line/doc start or after
+    /// delimiters) to prevent redacting conversational prose such as `the secret: implementation` or
+    /// `see the secret: implementation_detail`. Values have a minimum length of 4 and fully consume
+    /// single or double quoted strings including whitespace.
     generic_secret_kv: Regex,
     hex_run: Regex,
     base64_run: Regex,
@@ -181,12 +189,20 @@ static PATTERNS: LazyLock<ScrubberPatterns> = LazyLock::new(|| {
     )
     .unwrap(),
     json_unquoted_unquoted: Regex::new(
-        r#"(?i)\b([a-zA-Z0-9_-]+)(?:\s*:\s*(?:\\\r?\n\s*)?)([^\s,;}{"'\\][^\s,;}{"']*)"#,
+        r#"(?i)(^|[\r\n{\[,;])\s*([a-zA-Z0-9_-]+)(?:\s*:\s*(?:\\\r?\n\s*)?)([^\s,;}{"'\\][^\s,;}{"']*)"#,
     )
     .unwrap(),
-    generic_secret_kv: Regex::new(
-        r#"(?i)(secret|password|passwd|token|api[_-]?key)(\s*[=:]\s*)(['"]?)([^\s'";&|]{8,})"#,
-    )
+    generic_secret_kv: Regex::new(concat!(
+        r#"(?i)"#,
+        // Branch 1: Standalone key followed by ':' at line/doc start or after delimiter
+        r#"(?:(^|[\r\n{\[,;])\s*([A-Za-z0-9_]*[_-]?(?:secret|password|passwd|pwd|token|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|credential|private[_-]?key|client[_-]?secret))\s*(:)\s*"#,
+        // Branch 2: Prefixed key (e.g. FOO_TOKEN, --api-key) followed by ':'
+        r#"|(?:\b((?:[A-Za-z0-9_]+[_-]|--)(?:secret|password|passwd|pwd|token|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|credential|private[_-]?key|client[_-]?secret)))\s*(:)\s*"#,
+        // Branch 3: Key or prefixed key followed by '=' anywhere with non-alnum boundary
+        r#"|(^|[^A-Za-z0-9_])((?:--|[A-Za-z0-9_]+[_-])?(?:secret|password|passwd|pwd|token|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|credential|private[_-]?key|client[_-]?secret))\s*(=)\s*)"#,
+        // Value: double-quoted, single-quoted, or unquoted (min length 4)
+        r#"("([^"\r\n]{4,})"|'([^'\r\n]{4,})'|([^\s'";&|]{4,}))"#
+    ))
     .unwrap(),
     hex_run: Regex::new(r"\b[0-9a-fA-F]{32,}\b").unwrap(),
     base64_run: Regex::new(r"\b[A-Za-z0-9+/]{32,}={0,2}").unwrap(),
@@ -574,8 +590,9 @@ impl Scrubber {
         s = p
             .json_unquoted_unquoted
             .replace_all(&s, |caps: &Captures| {
-                let key = &caps[1];
-                let val = &caps[2];
+                let prefix = caps.get(1).map_or("", |m| m.as_str());
+                let key = &caps[2];
+                let val = &caps[3];
                 if key.eq_ignore_ascii_case("authorization")
                     || key.eq_ignore_ascii_case("proxy-authorization")
                 {
@@ -587,7 +604,7 @@ impl Scrubber {
                     {
                         caps[0].to_string()
                     } else {
-                        format!("{}: <redacted>", key)
+                        format!("{}{}: <redacted>", prefix, key)
                     }
                 } else {
                     caps[0].to_string()
@@ -595,18 +612,57 @@ impl Scrubber {
             })
             .into_owned();
 
-        // 8b. Generic secret|password|passwd|token|api_key [=:] value (8+ chars) anywhere (even without word boundary)
+        // 8b. Generic secret key=value rule:
+        // Anchored by start/delimiter for ':' or non-alnum for '='.
+        // Key set: secret, password, passwd, pwd, token, api_key, apikey, access_key, auth_token, credential, private_key, client_secret
+        // (with optional prefix like FOO_TOKEN or --api-key). Values are min 4 chars and consume full quoted strings.
         s = p
             .generic_secret_kv
             .replace_all(&s, |caps: &Captures| {
-                let key = &caps[1];
-                let sep = &caps[2];
-                let quote = &caps[3];
-                let val = &caps[4];
-                if val.starts_with("<redacted>") {
-                    caps[0].to_string()
+                let (prefix, key, sep) = if let Some(k) = caps.get(2) {
+                    (
+                        caps.get(1).map_or("", |m| m.as_str()),
+                        k.as_str(),
+                        caps.get(3).unwrap().as_str(),
+                    )
+                } else if let Some(k) = caps.get(4) {
+                    ("", k.as_str(), caps.get(5).unwrap().as_str())
+                } else if let Some(k) = caps.get(7) {
+                    (
+                        caps.get(6).map_or("", |m| m.as_str()),
+                        k.as_str(),
+                        caps.get(8).unwrap().as_str(),
+                    )
                 } else {
-                    format!("{}{}{}<redacted>", key, sep, quote)
+                    return caps[0].to_string();
+                };
+
+                let full_val = caps.get(9).unwrap().as_str();
+                if full_val.contains("<redacted>") {
+                    return caps[0].to_string();
+                }
+
+                if caps.get(10).is_some() {
+                    // Double-quoted
+                    if sep == "=" {
+                        format!("{}{}=\"<redacted>\"", prefix, key)
+                    } else {
+                        format!("{}{}: \"<redacted>\"", prefix, key)
+                    }
+                } else if caps.get(11).is_some() {
+                    // Single-quoted
+                    if sep == "=" {
+                        format!("{}{}'<redacted>'", prefix, key)
+                    } else {
+                        format!("{}{}: '<redacted>'", prefix, key)
+                    }
+                } else {
+                    // Unquoted
+                    if sep == "=" {
+                        format!("{}{}=<redacted>", prefix, key)
+                    } else {
+                        format!("{}{}: <redacted>", prefix, key)
+                    }
                 }
             })
             .into_owned();
@@ -654,87 +710,140 @@ fn is_exempt_value_shape(s: &str, pos: usize, m: &str, is_base64: bool) -> bool 
     false
 }
 
-/// Checks if a 40-hex string is preceded by a git or commit context token.
+/// Checks if a 40-hex string is immediately preceded by a git context token.
 fn is_git_sha_40_in_context(s: &str, pos: usize, m: &str) -> bool {
-    if m.len() != 40 || !m.chars().all(|c| c.is_ascii_hexdigit()) {
+    if m.len() != 40 || !m.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
-    let window_start = pos.saturating_sub(64);
-    let prefix = s[window_start..pos].to_ascii_lowercase();
-    const GIT_TOKENS: &[&str] = &[
-        "git ",
-        "commit ",
-        "commit:",
-        "commit=",
-        "tree ",
-        "parent ",
-        "checkout ",
-        "reset ",
-        "revert ",
-        "cherry-pick ",
-        "show ",
-        "diff ",
-        "log ",
-        "merge ",
-        "rebase ",
-        "rev-parse ",
-        "blame ",
-        "bisect ",
-        "tag ",
-        "branch ",
-        "fetch ",
-        "pull ",
-        "push ",
-        "sha1:",
-        "sha1=",
-        "sha:",
-        "sha=",
-        "rev:",
-        "rev=",
-        "ref:",
-        "ref=",
-        "refs/",
-        "head",
+    let bytes = s.as_bytes();
+    let mut end = pos;
+    // Trim trailing spaces, tabs, '=', and ':'
+    while end > 0 && matches!(bytes[end - 1], b' ' | b'\t' | b'=' | b':') {
+        end -= 1;
+    }
+    let mut trimmed = &bytes[..end];
+
+    // Range forms: e.g. HEAD..<sha>, v1.0..<sha>, <sha1>..<sha2>, <sha1>...<sha2>
+    if trimmed.ends_with(b"..") || trimmed.ends_with(b"...") {
+        return true;
+    }
+
+    // Skip flags immediately preceding the SHA (e.g. `git reset --hard <sha>`)
+    while trimmed.ends_with(b"-")
+        || trimmed
+            .rsplit(|&b| b == b' ' || b == b'\t')
+            .next()
+            .is_some_and(|word| word.starts_with(b"-"))
+    {
+        let last_space = trimmed
+            .iter()
+            .rposition(|&b| b == b' ' || b == b'\t')
+            .unwrap_or(0);
+        let mut prev_end = last_space;
+        while prev_end > 0 && matches!(bytes[prev_end - 1], b' ' | b'\t' | b'=' | b':') {
+            prev_end -= 1;
+        }
+        if prev_end == trimmed.len() {
+            break;
+        }
+        trimmed = &bytes[..prev_end];
+    }
+
+    const GIT_CMD_TOKENS: &[&[u8]] = &[
+        b"commit",
+        b"checkout",
+        b"cherry-pick",
+        b"revert",
+        b"rebase",
+        b"reset",
+        b"merge-base",
+        b"rev-parse",
+        b"sha",
+        b"sha1",
+        b"show",
+        b"diff",
+        b"log",
+        b"tag",
+        b"branch",
+        b"merge",
+        b"blame",
+        b"bisect",
+        b"tree",
+        b"parent",
+        b"rev",
+        b"ref",
+        b"refs/heads/",
+        b"refs/tags/",
+        b"refs/remotes/",
+        b"refs/",
+        b"head",
     ];
-    GIT_TOKENS.iter().any(|tok| prefix.contains(tok))
+
+    for tok in GIT_CMD_TOKENS {
+        if trimmed.len() >= tok.len() {
+            let start = trimmed.len() - tok.len();
+            let suffix = &trimmed[start..];
+            if suffix
+                .iter()
+                .zip(tok.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+                && (start == 0 || !trimmed[start - 1].is_ascii_alphanumeric())
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Checks if a 64-hex string is immediately preceded by a digest/checksum token or in `sha256sum -c` format.
 fn is_digest_context(s: &str, pos: usize, hex: &str) -> bool {
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
+    let bytes = s.as_bytes();
     let window_start = pos.saturating_sub(32);
-    let prefix = s[window_start..pos].to_ascii_lowercase();
-    const DIGEST_PREFIXES: &[&str] = &[
-        "sha256:",
-        "sha256=",
-        "sha256 ",
-        "sha512:",
-        "sha1:",
-        "blake3:",
-        "blake3=",
-        "md5:",
-        "digest:",
-        "digest=",
-        "checksum:",
-        "checksum=",
-        "checksum ",
-        "sha256sum ",
-        "shasum ",
-        "b2sum ",
-        "md5sum ",
+    let prefix = &bytes[window_start..pos];
+
+    const DIGEST_PREFIXES: &[&[u8]] = &[
+        b"sha256:",
+        b"sha256=",
+        b"sha256 ",
+        b"sha512:",
+        b"sha1:",
+        b"blake3:",
+        b"blake3=",
+        b"md5:",
+        b"digest:",
+        b"digest=",
+        b"checksum:",
+        b"checksum=",
+        b"checksum ",
+        b"sha256sum ",
+        b"shasum ",
+        b"b2sum ",
+        b"md5sum ",
     ];
-    if DIGEST_PREFIXES
-        .iter()
-        .any(|tok| prefix.ends_with(tok) || prefix.contains(tok))
-    {
-        return true;
+
+    for tok in DIGEST_PREFIXES {
+        if prefix.len() >= tok.len() {
+            let start = prefix.len() - tok.len();
+            let suffix = &prefix[start..];
+            if suffix
+                .iter()
+                .zip(tok.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+            {
+                return true;
+            }
+        }
     }
+
     let end = pos + hex.len();
-    if end < s.len() {
-        let suffix = &s[end..];
-        if suffix.starts_with("  ") || suffix.starts_with(" *") {
+    if end < bytes.len() {
+        let suffix = &bytes[end..];
+        if suffix.starts_with(b"  ") || suffix.starts_with(b" *") {
             return true;
         }
     }
@@ -1739,6 +1848,81 @@ mod tests {
                     scrubbed
                 );
             }
+        }
+
+        #[test]
+        fn test_scrub_no_panic_multibyte_prefix_hex(
+            prefix in "\\PC*",
+            hex in "[0-9a-fA-F]{40,64}",
+            suffix in "\\PC*",
+        ) {
+            let scrubber = Scrubber::new();
+            let input = format!("{}{}{}", prefix, hex, suffix);
+            let _ = scrubber.scrub(&input);
+        }
+    }
+
+    #[test]
+    fn test_git_sha_exemption_context() {
+        let scrubber = Scrubber::new();
+        let sha40 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+        // Redacted cases (exemption should not apply)
+        assert_eq!(
+            scrubber.scrub(&format!("catalog {}", sha40)),
+            "catalog <redacted>"
+        );
+        assert_eq!(
+            scrubber.scrub(&format!("git clone x && echo {}", sha40)),
+            "git clone x && echo <redacted>"
+        );
+
+        // Preserved cases (immediately preceding git token)
+        assert_eq!(
+            scrubber.scrub(&format!("git checkout {}", sha40)),
+            format!("git checkout {}", sha40)
+        );
+        assert_eq!(
+            scrubber.scrub(&format!("git show {}", sha40)),
+            format!("git show {}", sha40)
+        );
+    }
+
+    #[test]
+    fn test_generic_secret_kv_rule() {
+        let scrubber = Scrubber::new();
+
+        assert_eq!(scrubber.scrub("password: hunter2"), "password: <redacted>");
+        assert_eq!(
+            scrubber.scrub("token: \"abc def ghi\""),
+            "token: \"<redacted>\""
+        );
+        assert_eq!(
+            scrubber.scrub("FOO_TOKEN=abcd1234 cmd"),
+            "FOO_TOKEN=<redacted> cmd"
+        );
+        assert_eq!(scrubber.scrub("--api-key abcdefgh"), "--api-key <redacted>");
+        // Prose forms must NOT be redacted
+        assert_eq!(
+            scrubber.scrub("the secret: implementation"),
+            "the secret: implementation"
+        );
+        assert_eq!(
+            scrubber.scrub("see the secret: implementation_detail"),
+            "see the secret: implementation_detail"
+        );
+    }
+
+    #[test]
+    fn test_scrub_multibyte_boundary_no_panic() {
+        let scrubber = Scrubber::new();
+        let sha40 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let sha64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for pad_len in 0..70 {
+            let input40 = format!("🦀{} {}", "a".repeat(pad_len), sha40);
+            let _ = scrubber.scrub(&input40);
+            let input64 = format!("🦀{} {}", "a".repeat(pad_len), sha64);
+            let _ = scrubber.scrub(&input64);
         }
     }
 }

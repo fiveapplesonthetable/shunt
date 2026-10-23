@@ -38,11 +38,6 @@ fn get_paired_clocks() -> (u64, u64) {
     (real_ns, boot_ns)
 }
 
-fn locate_trace_processor() -> PathBuf {
-    tacho_core::find_trace_processor()
-        .expect("trace_processor_shell binary not found; run scripts/oracle.sh or set TACHO_TP")
-}
-
 fn supports_pipe_syntax(tp: &Path, trace: &Path) -> bool {
     let mut child = match Command::new(tp)
         .arg(trace)
@@ -130,7 +125,10 @@ fn parse_tp_csv(output: &str) -> (Vec<String>, Vec<Vec<String>>) {
 
 #[test]
 fn test_scripted_fleet_queries() {
-    let tp = locate_trace_processor();
+    let Some(tp) = tacho_core::find_trace_processor() else {
+        eprintln!("Skipping test_scripted_fleet_queries: trace_processor_shell binary not found (set $TACHO_TP or add to PATH)");
+        return;
+    };
     let temp_dir = tempfile::tempdir().unwrap();
     let trace_path = temp_dir.path().join("fleet.pftrace");
 
@@ -1051,19 +1049,22 @@ impl Drop for DaemonGuard {
     }
 }
 
-fn find_perfetto_binary(name: &str) -> PathBuf {
-    if let Ok(dir) = env::var("PERFETTO_BIN_DIR") {
-        let p = PathBuf::from(dir).join(name);
+fn find_binary(env_var: &str, name: &str) -> Option<PathBuf> {
+    if let Ok(val) = env::var(env_var) {
+        let p = PathBuf::from(val.trim());
         if p.is_file() {
-            return p;
+            return Some(p);
         }
     }
-    let default_path =
-        PathBuf::from("/usr/local/google/home/zezeozue/dev/perfetto/out/release").join(name);
-    if default_path.is_file() {
-        return default_path;
+    if let Ok(paths) = env::var("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
     }
-    PathBuf::from(name)
+    None
 }
 
 #[test]
@@ -1075,10 +1076,22 @@ fn test_system_during_builds_with_real_traced() {
         return;
     }
 
-    let traced_bin = find_perfetto_binary("traced");
-    let probes_bin = find_perfetto_binary("traced_probes");
-    let perfetto_bin = find_perfetto_binary("perfetto");
-    let tp_bin = locate_trace_processor();
+    let Some(traced_bin) = find_binary("TACHO_TRACED", "traced") else {
+        eprintln!("Skipping test_system_during_builds_with_real_traced: traced binary not found (set $TACHO_TRACED or add to PATH)");
+        return;
+    };
+    let Some(probes_bin) = find_binary("TACHO_TRACED_PROBES", "traced_probes") else {
+        eprintln!("Skipping test_system_during_builds_with_real_traced: traced_probes binary not found (set $TACHO_TRACED_PROBES or add to PATH)");
+        return;
+    };
+    let Some(perfetto_bin) = find_binary("TACHO_PERFETTO", "perfetto") else {
+        eprintln!("Skipping test_system_during_builds_with_real_traced: perfetto binary not found (set $TACHO_PERFETTO or add to PATH)");
+        return;
+    };
+    let Some(tp_bin) = tacho_core::find_trace_processor() else {
+        eprintln!("Skipping test_system_during_builds_with_real_traced: trace_processor_shell binary not found (set $TACHO_TP or add to PATH)");
+        return;
+    };
 
     let temp_dir = tempfile::tempdir().expect("failed to create tempdir");
     let producer_sock = temp_dir.path().join("producer.sock");
@@ -1138,7 +1151,7 @@ fn test_system_during_builds_with_real_traced() {
 
     let mut busy_child = Command::new("python3")
         .arg("-c")
-        .arg("import time; data = bytearray(30 * 1024 * 1024); t = time.time() + 0.8; s = 0\nwhile time.time() < t: s += 1")
+        .arg("import time; data = bytearray(30 * 1024 * 1024); t = time.time() + 2.5; s = 0\nwhile time.time() < t: s += 1")
         .spawn()
         .expect("failed to spawn busy child");
     let child_pid = busy_child.id();

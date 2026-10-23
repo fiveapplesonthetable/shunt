@@ -74,32 +74,37 @@ pub fn trace_processor_path() -> PathBuf {
         .expect("trace_processor_shell binary not found; run scripts/oracle.sh or set TACHO_TP")
 }
 
-/// Locates the `perfetto` binary.
-pub fn perfetto_bin_path() -> Option<PathBuf> {
-    let pinned = PathBuf::from("/usr/local/google/home/zezeozue/dev/perfetto/out/release/perfetto");
-    if pinned.is_file() {
-        return Some(pinned);
+fn find_binary(env_var: &str, bin_name: &str) -> Option<PathBuf> {
+    if let Ok(val) = std::env::var(env_var) {
+        let p = PathBuf::from(val.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(bin_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
     }
     None
+}
+
+/// Locates the `perfetto` binary.
+pub fn perfetto_bin_path() -> Option<PathBuf> {
+    find_binary("TACHO_PERFETTO", "perfetto")
 }
 
 /// Locates the `traced` binary.
 pub fn traced_bin_path() -> Option<PathBuf> {
-    let pinned = PathBuf::from("/usr/local/google/home/zezeozue/dev/perfetto/out/release/traced");
-    if pinned.is_file() {
-        return Some(pinned);
-    }
-    None
+    find_binary("TACHO_TRACED", "traced")
 }
 
 /// Locates the `traced_probes` binary.
 pub fn traced_probes_bin_path() -> Option<PathBuf> {
-    let pinned =
-        PathBuf::from("/usr/local/google/home/zezeozue/dev/perfetto/out/release/traced_probes");
-    if pinned.is_file() {
-        return Some(pinned);
-    }
-    None
+    find_binary("TACHO_TRACED_PROBES", "traced_probes")
 }
 
 /// Path to `tests/fixtures`.
@@ -435,5 +440,26 @@ impl Drop for TestEnv {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_binary_env_and_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_bin = temp.path().join("fake_traced");
+        fs::write(&fake_bin, b"#!/bin/sh\n").unwrap();
+
+        std::env::set_var("TACHO_TRACED", &fake_bin);
+        assert_eq!(traced_bin_path(), Some(fake_bin));
+        std::env::remove_var("TACHO_TRACED");
+
+        assert_eq!(
+            find_binary("TACHO_NONEXISTENT", "nonexistent_binary_xyz"),
+            None
+        );
     }
 }

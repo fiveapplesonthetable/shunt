@@ -1,6 +1,7 @@
 //! Tachograph flight recorder daemon library crate.
 
 pub mod appender;
+pub mod cgroup;
 pub mod config;
 pub mod daemon;
 pub mod log;

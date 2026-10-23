@@ -135,8 +135,8 @@ impl Recorder {
                     assigned_track,
                     argv: details.argv,
                     command_class: details.command_class,
-                    file_path: None,
-                    file_edit: None,
+                    file_path: details.file_path,
+                    file_edit: details.file_edit,
                     triggered_stall,
                 },
             );
@@ -312,7 +312,6 @@ impl Recorder {
             );
             if !error && exit_code.unwrap_or(0) == 0 {
                 if let Some(det) = self.detectors.get_mut(&agent_id) {
-                    det.silent_fired = false;
                     det.clear_stall(tacho::StallKind::Silent);
                 }
             }

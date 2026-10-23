@@ -178,8 +178,9 @@ impl Recorder {
                     run.turn_begin_seq = None;
                     run.open_tools.clear();
                 }
-                let procs_track = format!("agent:{}/run:{}/procs", agent_id, run_n);
-                self.open_custom_slices.remove(&procs_track);
+                let procs_prefix = format!("agent:{}/run:{}/procs", agent_id, run_n);
+                self.open_custom_slices
+                    .retain(|k, _| !k.starts_with(&procs_prefix));
                 if let Some(agent) = self.live.agents.get_mut(agent_id) {
                     agent.state = "Exited".to_string();
                     agent.state_since_ns = event.ts_ns;
@@ -403,8 +404,28 @@ impl Recorder {
                 }
             }
             Kind::CustomEnded => {
+                let end_id = match &event.body.body {
+                    Some(tacho::event::Body::CustomEnded(ce)) => ce.id.as_deref(),
+                    _ => None,
+                };
                 if let Some(stack) = self.open_custom_slices.get_mut(&event.track_key) {
-                    stack.pop();
+                    if let Some(target_id) = end_id {
+                        if let Some(idx) = stack
+                            .iter()
+                            .rposition(|open_id| open_id.as_deref() == Some(target_id))
+                        {
+                            stack.remove(idx);
+                        }
+                    } else {
+                        stack.pop();
+                    }
+                }
+                if self
+                    .open_custom_slices
+                    .get(&event.track_key)
+                    .is_some_and(|s| s.is_empty())
+                {
+                    self.open_custom_slices.remove(&event.track_key);
                 }
             }
             Kind::TaskQueued => {
@@ -509,30 +530,13 @@ impl Recorder {
                             det.enter_stall(kind);
                         }
                         match k {
-                            Some(tacho::StallKind::Silent) => {
-                                det.silent_fired = true;
-                                "SILENT"
-                            }
-                            Some(tacho::StallKind::Loop) => {
-                                if let Some(rep) = st.repeats {
-                                    det.last_loop_digest = Some(rep.to_string());
-                                }
-                                "LOOP"
-                            }
-                            Some(tacho::StallKind::Spin) => {
-                                det.spin_fired = true;
-                                "SPIN"
-                            }
-                            Some(tacho::StallKind::Burn) => {
-                                det.burn_fired = true;
-                                "BURN"
-                            }
+                            Some(tacho::StallKind::Silent) => "SILENT",
+                            Some(tacho::StallKind::Loop) => "LOOP",
+                            Some(tacho::StallKind::Spin) => "SPIN",
+                            Some(tacho::StallKind::Burn) => "BURN",
                             Some(tacho::StallKind::Failing) => "FAILING",
                             Some(tacho::StallKind::OffBrief) => "OFF_BRIEF",
-                            Some(tacho::StallKind::StallClaim) => {
-                                det.claim_fired = true;
-                                "CLAIM"
-                            }
+                            Some(tacho::StallKind::StallClaim) => "CLAIM",
                             _ => "STALL",
                         }
                     }

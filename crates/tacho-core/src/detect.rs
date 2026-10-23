@@ -1,12 +1,41 @@
 //! Stall detectors for autonomous coding agents (design.md section 7).
 //!
-//! Detectors are pure functions over agent state and event streams:
-//! - SILENT: run open and no event for 300s while not in Wait
-//! - LOOP: same tool input digest 4 times in a row
-//! - SPIN: 8 turns with no FileEdited and no Command of class BUILD/TEST/COMMIT
-//! - BURN: tokens_out over 200k in 10 minutes
-//! - FAILING: same test/build command failed 3 times in a row
-//! - OFF_BRIEF: a FileEdited outside declared task paths (when declared)
+//! Detectors are pure functions over agent state and event streams. Each stall kind
+//! has distinct trigger and clearing semantics:
+//!
+//! - **SILENT**: Fires when a run is open and no events have arrived for `silent_timeout_ns`
+//!   (default: 300s) while not in Wait. CPU-rate aware: suppressed when process-tree CPU
+//!   consumption is at least 50ms/s (0.05 CPU-s/s). Cleared by any event arrival or active
+//!   CPU rate sample.
+//!
+//! - **LOOP**: Fires when the identical tool input digest is observed `loop_repeats` times
+//!   (default: 4) in a row. Cleared as soon as a non-repeating tool input digest arrives.
+//!
+//! - **SPIN**: Fires when `spin_turns` (default: 8) consecutive turns conclude without any
+//!   file edits (`FileEdited`) and without any build/test/commit commands (`CommandClass::Build`,
+//!   `CommandClass::Test`, `CommandClass::Commit`). Only applies to the Worker role. Cleared by
+//!   worktree progress, file edits, or build/test/commit commands.
+//!
+//! - **BURN**: Fires when cumulative token usage (`tokens_out`) exceeds `burn_tokens`
+//!   (default: 200,000, or `task_token_budget` if configured) within a sliding window of
+//!   `burn_window_ns` (default: 10 minutes). Cleared when the rolling token sum falls back to
+//!   or below the budget limit.
+//!
+//! - **FAILING**: Evaluates command completion specifically for commands classified as
+//!   `CommandClass::Build` or `CommandClass::Test`. Command execution is tracked per normalized
+//!   command string (`argv.trim()`). When the same test or build command fails consecutively
+//!   `failing_repeats` times (default: 3), FAILING fires. Cleared only when that specific command
+//!   subsequently succeeds (exit code 0), resetting its consecutive failure counter and clearing
+//!   the FAILING stall. General commands and other classes do not trigger or clear FAILING.
+//!
+//! - **OFF_BRIEF**: Fires when a file edit (`FileEdited`) occurs outside declared task paths
+//!   (`task_declared_paths`). Unlike other detectors, OFF_BRIEF is sticky across subsequent
+//!   in-brief edits: an in-brief edit must NOT clear an active OFF_BRIEF stall. It clears only
+//!   on task change (`set_declared_paths`) or run end.
+//!
+//! - **CLAIM**: Evaluates at run end for agents with the Worker role. Fires if files were
+//!   edited during the run without a subsequent passing test command (`CommandClass::Test` with
+//!   exit code 0).
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use tacho_proto::tacho;
@@ -85,11 +114,6 @@ pub struct AgentDetectorState {
     pub task_declared_paths: Option<Vec<String>>,
     pub active_stalls: BTreeSet<i32>,
     pub is_stalled: bool,
-    pub silent_fired: bool,
-    pub last_loop_digest: Option<String>,
-    pub spin_fired: bool,
-    pub burn_fired: bool,
-    pub claim_fired: bool,
 }
 
 impl AgentDetectorState {
@@ -114,22 +138,24 @@ impl AgentDetectorState {
     /// Records event arrival time and resets silence flag.
     pub fn touch_event(&mut self, ts_ns: u64) {
         self.last_event_ts_ns = self.last_event_ts_ns.max(ts_ns);
-        self.silent_fired = false;
         self.clear_stall(tacho::StallKind::Silent);
     }
 
     /// Records CPU activity for CPU-aware silence detection.
     pub fn touch_cpu_activity(&mut self, ts_ns: u64) {
         self.last_cpu_activity_ns = Some(ts_ns);
-        self.silent_fired = false;
         self.clear_stall(tacho::StallKind::Silent);
     }
 
     /// Records a cumulative CPU counter sample (in microseconds) and suppresses `SILENT`
     /// only when the process-tree CPU rate is at least 50ms/s (50,000 us/s = 0.05 CPU-s/s).
+    /// The first sample only sets the baseline without rate checks or activity touching.
     pub fn record_cpu_sample(&mut self, ts_ns: u64, cpu_us: i64) {
         const MIN_ACTIVE_CPU_US_PER_SEC: u128 = 50_000;
-        let (prev_ts, prev_cpu_us) = self.last_cpu_sample.unwrap_or((self.last_event_ts_ns, 0));
+        let Some((prev_ts, prev_cpu_us)) = self.last_cpu_sample else {
+            self.last_cpu_sample = Some((ts_ns, cpu_us));
+            return;
+        };
         self.last_cpu_sample = Some((ts_ns, cpu_us));
 
         let dt_ns = ts_ns.saturating_sub(prev_ts);
@@ -144,9 +170,10 @@ impl AgentDetectorState {
         }
     }
 
-    /// Configures declared paths for OFF_BRIEF detector.
+    /// Configures declared paths for OFF_BRIEF detector. Clears any existing OFF_BRIEF stall.
     pub fn set_declared_paths(&mut self, paths: Vec<String>) {
         self.task_declared_paths = Some(paths);
+        self.clear_stall(tacho::StallKind::OffBrief);
     }
 
     /// Credits worktree progress (git commit or file modification observed in `cwd`),
@@ -154,20 +181,24 @@ impl AgentDetectorState {
     pub fn record_worktree_progress(&mut self, ts_ns: u64) {
         self.touch_event(ts_ns);
         self.spin_turn_has_progress = true;
-        self.spin_fired = false;
         self.spin_turns_count = 0;
         self.clear_stall(tacho::StallKind::Spin);
     }
 
     /// Evaluates if run ended without a passing test after file edits (CLAIM detector).
+    /// Also clears run-scoped stall conditions such as OFF_BRIEF.
     pub fn check_claim(&mut self) -> Option<DetectorFiring> {
-        if self.role != AgentRole::Worker || self.claim_fired {
+        self.clear_stall(tacho::StallKind::OffBrief);
+        if self.role != AgentRole::Worker
+            || self
+                .active_stalls
+                .contains(&(tacho::StallKind::StallClaim as i32))
+        {
             return None;
         }
         if let Some(edit_ts) = self.last_edit_ts_ns {
             let needs_test = self.last_passing_test_ts_ns.is_none_or(|t| t < edit_ts);
             if needs_test && self.enter_stall(tacho::StallKind::StallClaim) {
-                self.claim_fired = true;
                 return Some(DetectorFiring {
                     kind: tacho::StallKind::StallClaim,
                     repeats: None,
@@ -178,6 +209,11 @@ impl AgentDetectorState {
             }
         }
         None
+    }
+
+    /// Handles run end, clearing run-scoped stall conditions such as OFF_BRIEF.
+    pub fn on_run_end(&mut self) {
+        self.clear_stall(tacho::StallKind::OffBrief);
     }
 
     /// Checks for silence timeout (SILENT detector) on tick.
@@ -191,7 +227,6 @@ impl AgentDetectorState {
         if is_waiting
             || is_exited
             || self.last_event_ts_ns == 0
-            || self.silent_fired
             || self.suppress_live_silent
             || self
                 .active_stalls
@@ -209,7 +244,6 @@ impl AgentDetectorState {
         if now_ns >= self.last_event_ts_ns + cfg.silent_timeout_ns {
             let elapsed_ns = now_ns - self.last_event_ts_ns;
             let since_us = elapsed_ns / 1_000;
-            self.silent_fired = true;
             self.enter_stall(tacho::StallKind::Silent);
             Some(DetectorFiring {
                 kind: tacho::StallKind::Silent,
@@ -239,12 +273,9 @@ impl AgentDetectorState {
         if self.recent_tool_digests.len() == cfg.loop_repeats
             && self.recent_tool_digests.iter().all(|d| d == digest)
         {
-            if self.last_loop_digest.as_deref() == Some(digest)
-                || !self.enter_stall(tacho::StallKind::Loop)
-            {
+            if !self.enter_stall(tacho::StallKind::Loop) {
                 return None;
             }
-            self.last_loop_digest = Some(digest.to_string());
             Some(DetectorFiring {
                 kind: tacho::StallKind::Loop,
                 repeats: Some(cfg.loop_repeats as u32),
@@ -255,15 +286,18 @@ impl AgentDetectorState {
                 ),
             })
         } else {
-            if self.last_loop_digest.as_deref() != Some(digest) {
-                self.last_loop_digest = None;
-                self.clear_stall(tacho::StallKind::Loop);
-            }
+            self.clear_stall(tacho::StallKind::Loop);
             None
         }
     }
 
     /// Evaluates file edits for task path compliance (OFF_BRIEF detector) and progress.
+    ///
+    /// Semantics of OFF_BRIEF:
+    /// - Fires when a file edit occurs outside declared task paths.
+    /// - Crucially, OFF_BRIEF is sticky across subsequent in-brief edits: an in-brief edit
+    ///   does NOT clear an active OFF_BRIEF stall.
+    /// - It clears only on run end or task change (new declared paths).
     pub fn on_file_edited(
         &mut self,
         path: &str,
@@ -271,7 +305,6 @@ impl AgentDetectorState {
         cfg: &DetectorConfig,
     ) -> Option<DetectorFiring> {
         self.spin_turn_has_progress = true;
-        self.spin_fired = false;
         self.last_edit_ts_ns = Some(ts_ns);
         self.clear_stall(tacho::StallKind::Spin);
 
@@ -285,31 +318,24 @@ impl AgentDetectorState {
                     || d.starts_with(&format!("{}/", path.trim_end_matches('/')))
             });
             if matches_brief {
-                Some(None)
+                None
             } else {
-                Some(Some(format!(
+                Some(format!(
                     "file '{}' edited outside declared task paths {:?}",
                     path, declared
-                )))
+                ))
             }
         });
 
-        match off_brief_evidence {
-            Some(Some(evidence)) => {
-                if self.enter_stall(tacho::StallKind::OffBrief) {
-                    return Some(DetectorFiring {
-                        kind: tacho::StallKind::OffBrief,
-                        repeats: None,
-                        since_us: None,
-                        evidence,
-                    });
-                }
-                return None;
+        if let Some(evidence) = off_brief_evidence {
+            if self.enter_stall(tacho::StallKind::OffBrief) {
+                return Some(DetectorFiring {
+                    kind: tacho::StallKind::OffBrief,
+                    repeats: None,
+                    since_us: None,
+                    evidence,
+                });
             }
-            Some(None) => {
-                self.clear_stall(tacho::StallKind::OffBrief);
-            }
-            None => {}
         }
 
         let _ = cfg;
@@ -317,6 +343,13 @@ impl AgentDetectorState {
     }
 
     /// Evaluates command termination for failures (FAILING detector) and progress.
+    ///
+    /// Semantics of FAILING:
+    /// - Applies exclusively to commands classified as `CommandClass::Build` or `CommandClass::Test`.
+    /// - Tracks failures per normalized command string (`argv.trim()`).
+    /// - Fires when the same command fails `cfg.failing_repeats` consecutive times.
+    /// - Cleared only when that specific command subsequently succeeds (`exit_code == Some(0)`),
+    ///   resetting its consecutive failure count and removing the `Failing` stall kind.
     pub fn on_command_ended(
         &mut self,
         argv: &str,
@@ -330,7 +363,6 @@ impl AgentDetectorState {
             CommandClass::Build | CommandClass::Test | CommandClass::Commit
         ) {
             self.spin_turn_has_progress = true;
-            self.spin_fired = false;
             self.clear_stall(tacho::StallKind::Spin);
         }
 
@@ -382,15 +414,10 @@ impl AgentDetectorState {
         if self.spin_turn_has_progress {
             self.spin_turns_count = 0;
             self.spin_turn_has_progress = false;
-            self.spin_fired = false;
             self.clear_stall(tacho::StallKind::Spin);
         } else if self.role == AgentRole::Worker {
             self.spin_turns_count += 1;
-            if self.spin_turns_count >= cfg.spin_turns
-                && !self.spin_fired
-                && self.enter_stall(tacho::StallKind::Spin)
-            {
-                self.spin_fired = true;
+            if self.spin_turns_count >= cfg.spin_turns && self.enter_stall(tacho::StallKind::Spin) {
                 firings.push(DetectorFiring {
                     kind: tacho::StallKind::Spin,
                     repeats: Some(self.spin_turns_count as u32),
@@ -417,8 +444,7 @@ impl AgentDetectorState {
 
             let limit = self.task_token_budget.unwrap_or(cfg.burn_tokens);
             let sum: u64 = self.burn_window.iter().map(|(_, k)| *k).sum();
-            if sum > limit && !self.burn_fired && self.enter_stall(tacho::StallKind::Burn) {
-                self.burn_fired = true;
+            if sum > limit && self.enter_stall(tacho::StallKind::Burn) {
                 firings.push(DetectorFiring {
                     kind: tacho::StallKind::Burn,
                     repeats: Some(sum as u32),
@@ -426,7 +452,6 @@ impl AgentDetectorState {
                     evidence: format!("tokens_out {} in last 10m exceeded limit {}", sum, limit),
                 });
             } else if sum <= limit {
-                self.burn_fired = false;
                 self.clear_stall(tacho::StallKind::Burn);
             }
         }
@@ -509,5 +534,91 @@ mod tests {
             .on_file_edited("secret/keys.pem", 2_000, &cfg)
             .expect("should fire off-brief");
         assert_eq!(firing.kind, tacho::StallKind::OffBrief);
+        assert!(state
+            .active_stalls
+            .contains(&(tacho::StallKind::OffBrief as i32)));
+
+        // Crucial test for Item 5: subsequent in-brief edit must NOT clear OFF_BRIEF
+        assert!(state.on_file_edited("src/main.rs", 3_000, &cfg).is_none());
+        assert!(state
+            .active_stalls
+            .contains(&(tacho::StallKind::OffBrief as i32)));
+
+        // Clears only on task change
+        state.set_declared_paths(vec![
+            "src/main.rs".to_string(),
+            "secret/keys.pem".to_string(),
+        ]);
+        assert!(!state
+            .active_stalls
+            .contains(&(tacho::StallKind::OffBrief as i32)));
+
+        // Or on run end
+        let _ = state.on_file_edited("other.txt", 4_000, &cfg);
+        assert!(state
+            .active_stalls
+            .contains(&(tacho::StallKind::OffBrief as i32)));
+        state.on_run_end();
+        assert!(!state
+            .active_stalls
+            .contains(&(tacho::StallKind::OffBrief as i32)));
+    }
+
+    #[test]
+    fn test_record_cpu_sample_baseline_and_activity() {
+        let mut state = AgentDetectorState::new();
+        state.enter_stall(tacho::StallKind::Silent);
+        assert!(state.is_stalled);
+
+        // First sample: only sets baseline, no activity, doesn't clear Silent stall
+        state.record_cpu_sample(1_000_000_000, 100_000_000); // 100s cumulative CPU at t=1s
+        assert!(state
+            .active_stalls
+            .contains(&(tacho::StallKind::Silent as i32)));
+        assert_eq!(state.last_cpu_activity_ns, None);
+
+        // Second sample with low rate (< 50ms/s = 50,000 us/s):
+        // dt = 1s = 1_000_000_000ns. d_cpu = 10,000us (10ms). Rate = 10,000 us/s < 50,000 us/s.
+        state.record_cpu_sample(2_000_000_000, 100_010_000);
+        assert!(state
+            .active_stalls
+            .contains(&(tacho::StallKind::Silent as i32)));
+        assert_eq!(state.last_cpu_activity_ns, None);
+
+        // Third sample with high rate (>= 50,000 us/s):
+        // dt = 1s = 1_000_000_000ns. d_cpu = 200,000us (200ms). Rate = 200,000 us/s.
+        state.record_cpu_sample(3_000_000_000, 100_210_000);
+        // Active CPU rate detected: touch_cpu_activity clears Silent!
+        assert!(!state
+            .active_stalls
+            .contains(&(tacho::StallKind::Silent as i32)));
+        assert!(!state.is_stalled);
+        assert_eq!(state.last_cpu_activity_ns, Some(3_000_000_000));
+    }
+
+    #[test]
+    fn test_active_stalls_single_source_of_truth() {
+        let mut state = AgentDetectorState::new();
+        assert!(!state.is_stalled);
+        assert!(state.active_stalls.is_empty());
+
+        assert!(state.enter_stall(tacho::StallKind::Spin));
+        assert!(state.is_stalled);
+        // Repeated enter returns false (deduplication)
+        assert!(!state.enter_stall(tacho::StallKind::Spin));
+
+        // Add second stall
+        assert!(state.enter_stall(tacho::StallKind::Loop));
+        assert_eq!(state.active_stalls.len(), 2);
+
+        // Clear one stall: still stalled
+        state.clear_stall(tacho::StallKind::Spin);
+        assert!(state.is_stalled);
+        assert_eq!(state.active_stalls.len(), 1);
+
+        // Clear remaining stall: no longer stalled
+        state.clear_stall(tacho::StallKind::Loop);
+        assert!(!state.is_stalled);
+        assert!(state.active_stalls.is_empty());
     }
 }

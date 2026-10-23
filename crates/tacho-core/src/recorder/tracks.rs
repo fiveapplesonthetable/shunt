@@ -412,9 +412,15 @@ impl Recorder {
                     );
                 } else if segs[1] == "cpu" || segs[1] == "rss" {
                     let (unit, desc) = if segs[1] == "cpu" {
-                        ("us", "Cumulative CPU time consumed by agent process tree")
+                        (
+                            "us",
+                            "Cumulative CPU microseconds of the whole agent tree incl. exited and daemonized processes when cgroup accounting is on",
+                        )
                     } else {
-                        ("bytes", "Resident set size (RSS) of agent process tree")
+                        (
+                            "bytes",
+                            "Total Resident Set Size (RSS) across all live member processes",
+                        )
                     };
                     add(
                         track_key,
@@ -437,70 +443,105 @@ impl Recorder {
 
                     if segs.len() > 2 {
                         let sub_name = segs[2];
-                        let (kind, unit, desc) = match sub_name {
-                            "turns" => (
-                                TrackKind::Slices,
+                        if sub_name == "procs" {
+                            let procs_key = format!("{}/procs", run_key);
+                            add(
+                                &procs_key,
+                                Some(&run_key),
+                                "procs",
+                                Some("Processes spawned by this agent (one slot per concurrently running process)"),
+                                TrackKind::Group,
                                 None,
-                                Some("Model turns, prompts, sequential tools, and worktree commits"),
-                            ),
-                            "procs" => (
-                                TrackKind::Slices,
-                                None,
-                                Some("Live child processes (forks/execs/exits) in the agent's process tree"),
-                            ),
-                            "waits" => (
-                                TrackKind::Slices,
-                                None,
-                                Some("Blocking waits on subagents, checks, merge queues, or humans"),
-                            ),
-                            "overflow" => (
-                                TrackKind::Slices,
-                                None,
-                                Some("Overflow tool execution lane (>8 concurrent tools)"),
-                            ),
-                            "tokens_in" => (
-                                TrackKind::Counter,
-                                Some("tokens"),
-                                Some("Cumulative input tokens consumed in this run"),
-                            ),
-                            "tokens_out" => (
-                                TrackKind::Counter,
-                                Some("tokens"),
-                                Some("Cumulative output tokens generated in this run"),
-                            ),
-                            "tokens_cached" => (
-                                TrackKind::Counter,
-                                Some("tokens"),
-                                Some("Cumulative prompt cache hit tokens in this run"),
-                            ),
-                            "cost" => (
-                                TrackKind::Counter,
-                                Some("micro-USD"),
-                                Some("Cumulative API cost in micro-USD ($1e-6)"),
-                            ),
-                            "cpu" => (
-                                TrackKind::Counter,
-                                Some("us"),
-                                Some("Cumulative CPU time (user+sys) of the agent process tree"),
-                            ),
-                            "rss" => (
-                                TrackKind::Counter,
-                                Some("bytes"),
-                                Some("Total Resident Set Size (RSS) across the agent process tree"),
-                            ),
-                            "proc_count" => (
-                                TrackKind::Counter,
-                                Some("procs"),
-                                Some("Number of live processes in the agent process tree"),
-                            ),
-                            s if s.starts_with("lane:") => (
-                                TrackKind::Slices,
-                                None,
-                                Some("Parallel tool/command execution lane"),
-                            ),
-                            _ => (default_kind, default_unit, None),
-                        };
-                        add(track_key, Some(&run_key), sub_name, desc, kind, unit);
+                            );
+                            if segs.len() > 3 {
+                                let slot_part = segs[3];
+                                let slot_name = if let Some(k) = slot_part.strip_prefix("slot:") {
+                                    format!("slot {}", k)
+                                } else {
+                                    slot_part.to_string()
+                                };
+                                add(
+                                    track_key,
+                                    Some(&procs_key),
+                                    &slot_name,
+                                    Some(
+                                        "Process execution slot for concurrently running processes",
+                                    ),
+                                    TrackKind::Slices,
+                                    None,
+                                );
+                            }
+                        } else {
+                            let (kind, unit, desc) = match sub_name {
+                                "turns" => (
+                                    TrackKind::Slices,
+                                    None,
+                                    Some("Model turns, prompts, sequential tools, and worktree commits"),
+                                ),
+                                "waits" => (
+                                    TrackKind::Slices,
+                                    None,
+                                    Some("Blocking waits on subagents, checks, merge queues, or humans"),
+                                ),
+                                "overflow" => (
+                                    TrackKind::Slices,
+                                    None,
+                                    Some("Overflow tool execution lane (>8 concurrent tools)"),
+                                ),
+                                "tokens_in" => (
+                                    TrackKind::Counter,
+                                    Some("tokens"),
+                                    Some("Cumulative input tokens consumed in this run"),
+                                ),
+                                "tokens_out" => (
+                                    TrackKind::Counter,
+                                    Some("tokens"),
+                                    Some("Cumulative output tokens generated in this run"),
+                                ),
+                                "tokens_cached" => (
+                                    TrackKind::Counter,
+                                    Some("tokens"),
+                                    Some("Cumulative prompt cache hit tokens in this run"),
+                                ),
+                                "cost" => (
+                                    TrackKind::Counter,
+                                    Some("micro-USD"),
+                                    Some("Cumulative API cost in micro-USD ($1e-6)"),
+                                ),
+                                "cpu" => (
+                                    TrackKind::Counter,
+                                    Some("us"),
+                                    Some("Cumulative CPU microseconds of the whole agent tree incl. exited and daemonized processes when cgroup accounting is on"),
+                                ),
+                                "rss" => (
+                                    TrackKind::Counter,
+                                    Some("bytes"),
+                                    Some("Total Resident Set Size (RSS) across all live member processes"),
+                                ),
+                                "proc_count" => (
+                                    TrackKind::Counter,
+                                    Some("procs"),
+                                    Some("Number of live processes in the agent process tree"),
+                                ),
+                                "cgroup_mem" => (
+                                    TrackKind::Counter,
+                                    Some("bytes"),
+                                    Some("Current cgroup memory usage (memory.current, includes page cache)"),
+                                ),
+                                "cgroup_mem_peak" => (
+                                    TrackKind::Counter,
+                                    Some("bytes"),
+                                    Some("Peak cgroup memory usage (memory.peak, includes page cache)"),
+                                ),
+                                s if s.starts_with("lane:") => (
+                                    TrackKind::Slices,
+                                    None,
+                                    Some("Parallel tool/command execution lane"),
+                                ),
+                                _ => (default_kind, default_unit, None),
+                            };
+                            add(track_key, Some(&run_key), sub_name, desc, kind, unit);
+                        }
                     }
                 } else {
                     add(
