@@ -1054,6 +1054,9 @@ fn run_sampler_loop(config: SamplerConfig, appender: AppenderHandle, stop_flag: 
 
         let elapsed = loop_start.elapsed();
         if elapsed < interval {
+            // Hardware sampling necessity: The Linux kernel does not provide an epoll/inotify
+            // event interface for CPU counters or memory usage in /proc/stat and /proc/<pid>/stat.
+            // Continuous hardware metrics fundamentally require periodic rate sampling.
             std::thread::sleep(interval - elapsed);
         }
     }

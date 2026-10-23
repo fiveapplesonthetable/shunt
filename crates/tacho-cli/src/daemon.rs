@@ -1,7 +1,6 @@
 //! Daemon process implementation for `tacho daemon`.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use tacho_daemon::{Config, Daemon, DaemonPaths};
 
 use crate::cli::DaemonArgs;
@@ -31,9 +30,22 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
     let pid_file = runtime.join("daemon.pid");
     let _ = std::fs::write(&pid_file, std::process::id().to_string());
 
-    // Wait until daemon receives shutdown signal
-    while !daemon.shutdown_flag.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(50));
+    // Wait until daemon receives shutdown signal via kernel signal-hook self-pipe (no sleep loop)
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGQUIT,
+    ])
+    .map_err(|e| e.to_string())?;
+
+    for sig in signals.forever() {
+        if sig == signal_hook::consts::SIGTERM
+            || sig == signal_hook::consts::SIGINT
+            || sig == signal_hook::consts::SIGQUIT
+        {
+            daemon.shutdown_flag.store(true, Ordering::Release);
+            break;
+        }
     }
 
     let _ = std::fs::remove_file(&pid_file);

@@ -723,6 +723,12 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
     );
 
     // 4. `tacho batch` refuses to mark a batch as passed if a PR's head SHA moves while the batch is running
+    Command::new("git")
+        .args(["branch", "feat-77", &main_sha])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+
     store
         .mutate(None, |st| {
             st.open_prs_cache = vec![PullFacts {
@@ -739,15 +745,10 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
         })
         .unwrap();
 
-    // While the batch command runs, mutate PR #77's head SHA in SQLite to simulate a force-push mid-batch
-    let db_path = tacho_home.join("events.sqlite");
-    let move_head_cmd = format!(
-        "sqlite3 '{}' \"UPDATE fleet_state SET state_json = replace(state_json, '\\\"head\\\":\\\"{}\\\"', '\\\"head\\\":\\\"deadbeef9999\\\"') WHERE id = 1;\"",
-        db_path.display(),
-        main_sha
-    );
+    // While the batch command runs, advance branch feat-77 to simulate a force-push mid-batch
+    let move_head_cmd = "git commit --allow-empty -m 'moved head' && git branch -f feat-77 HEAD";
     let batch_moved = Command::new(tacho_bin())
-        .args(["batch", "77", "--cmd", &move_head_cmd])
+        .args(["batch", "77", "--cmd", move_head_cmd])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
         .output()

@@ -199,7 +199,14 @@ fn run_api_acceptor(listener: UnixListener, conn_tx: Sender<UnixStream>, stop: A
                 let _ = conn_tx.send(stream);
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
+                let mut pfd = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    let _ = libc::poll(&mut pfd, 1, 100);
+                }
             }
             Err(_) => break,
         }
@@ -219,7 +226,14 @@ fn run_trace_server(listener: UnixListener, db_path: std::path::PathBuf, stop: A
                 let _ = stream.flush();
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
+                let mut pfd = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    let _ = libc::poll(&mut pfd, 1, 100);
+                }
             }
             Err(_) => break,
         }
@@ -474,6 +488,72 @@ fn process_ndjson_line(
         match cmd {
             "ping" => Some(b"{\"pong\":true}".to_vec()),
 
+            "flush" => {
+                appender.flush();
+                Some(b"{\"status\":\"ok\",\"flushed\":true}".to_vec())
+            }
+
+            "tick" | "decide" => {
+                let dry_run = val
+                    .get("dry_run")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if let Ok(store) = crate::fleet::FleetStore::open(&paths.events_db()) {
+                    if let Ok(state) = store.load() {
+                        let live = appender.live_state();
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let decision_state = tacho_core::decide::DecisionState {
+                            max_parallel: state.max_workers,
+                            todo: state.todo.clone(),
+                            agents: state.agents.clone(),
+                            retired: state.retired.clone(),
+                            holds: state.holds.clone(),
+                            passed: state.passed.clone(),
+                            failed: state.failed.clone(),
+                            merged_prs: state.merged_prs.clone(),
+                            closed_prs: state.closed_prs.clone(),
+                            batches: state.batches.clone(),
+                            flakes: state.flakes.clone(),
+                            samples: state.samples.clone(),
+                            nudged: state.nudged.clone(),
+                            rebase_attempts: state.rebase_attempts.clone(),
+                            fix_notified: state.fix_notified.clone(),
+                            notified_keys: state.notified_failures.clone(),
+                            area_rules: state.area_rules.clone(),
+                            refused_self_update_sha: state.refused_self_update_sha.clone(),
+                            last_tick_ts: state.last_tick_ts,
+                            last_watchdog_alert_ts: state.last_watchdog_alert_ts,
+                            tidy_min_age_secs: 3_600,
+                        };
+                        let live_keys: std::collections::BTreeSet<String> =
+                            live.agents.keys().cloned().collect();
+                        let world_obs = tacho_core::decide::WorldObservation {
+                            now,
+                            main_sha: String::new(),
+                            open_prs: state.open_prs_cache.clone(),
+                            merged_prs: state.merged_prs.clone(),
+                            closed_prs: state.closed_prs.clone(),
+                            live_keys,
+                            ..Default::default()
+                        };
+                        let plan = tacho_core::decide::decide(&decision_state, &world_obs);
+                        if !dry_run {
+                            let _ =
+                                store.record_decision_tick(now, &decision_state, &world_obs, &plan);
+                        }
+                        let resp = serde_json::json!({
+                            "status": "ok",
+                            "plan": plan,
+                        });
+                        return Some(serde_json::to_vec(&resp).unwrap_or_default());
+                    }
+                }
+                Some(b"{\"status\":\"error\",\"message\":\"failed to evaluate decision\"}".to_vec())
+            }
+
             "status" => {
                 let json = val.get("json").and_then(|v| v.as_bool()).unwrap_or(false);
                 let state = appender.live_state();
@@ -563,7 +643,14 @@ fn process_ndjson_line(
                         }
                     }
 
-                    std::thread::sleep(Duration::from_millis(20));
+                    let mut pfd = libc::pollfd {
+                        fd: stream.as_raw_fd(),
+                        events: libc::POLLERR | libc::POLLHUP,
+                        revents: 0,
+                    };
+                    unsafe {
+                        let _ = libc::poll(&mut pfd, 1, 25);
+                    }
                 }
                 let _ = stream.flush();
                 let _ = stream.shutdown(std::net::Shutdown::Both);

@@ -95,7 +95,7 @@ fn test_status_vs_agents_now_sql() {
     assert!(output.status.success());
 
     // Allow daemon appender to process inputs
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(env.flush());
 
     // 1. Fetch tacho status --json
     let status_out = env

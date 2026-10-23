@@ -194,28 +194,33 @@ fn run_stall_worker(
         };
 
         let child_pid = child.id() as libc::pid_t;
-        let start = Instant::now();
         let mut exited = false;
-        let mut sleep_ms = 5;
 
-        while start.elapsed() < timeout {
-            match child.try_wait() {
-                Ok(Some(_status)) => {
+        let pid_fd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid as libc::c_int, 0) as i32 };
+        if pid_fd >= 0 {
+            let mut pfd = libc::pollfd {
+                fd: pid_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            let poll_rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            unsafe {
+                let _ = libc::close(pid_fd);
+            }
+            if poll_rc > 0 {
+                exited = true;
+                let _ = child.wait();
+            }
+        } else {
+            match child.wait() {
+                Ok(_) => {
                     exited = true;
-                    break;
-                }
-                Ok(None) => {
-                    let remaining = timeout.saturating_sub(start.elapsed());
-                    let sleep_dur = Duration::from_millis(sleep_ms).min(remaining);
-                    if sleep_dur > Duration::ZERO {
-                        std::thread::sleep(sleep_dur);
-                    }
-                    sleep_ms = (sleep_ms * 2).min(50);
                 }
                 Err(e) => {
-                    eprintln!("[tacho-daemon] on_stall try_wait error: {}", e);
+                    eprintln!("[tacho-daemon] on_stall wait error: {}", e);
                     exited = true;
-                    break;
                 }
             }
         }
@@ -378,7 +383,8 @@ fn run_appender_loop(
     const MAX_BATCH_SIZE: usize = 256;
 
     'outer: loop {
-        // Test hook: block appender if wedged is requested
+        // Chaos injection hook: intentionally wedges the appender thread to simulate SQLite lock contention
+        // and verify daemon degrades cleanly without blocking hook clients (test14_wedged_appender).
         while hooks.wedged.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -871,11 +877,37 @@ fi"#,
         }
         appender.flush();
 
-        // 3. Poll for second_marker to appear
-        let start = Instant::now();
-        let poll_timeout = Duration::from_secs(5);
-        while !second_marker.exists() && start.elapsed() < poll_timeout {
-            std::thread::sleep(Duration::from_millis(20));
+        // 3. Wait for second_marker to appear using inotify event waiting (no sleep loop)
+        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if inotify_fd >= 0 {
+            if let Ok(path_c) = std::ffi::CString::new(temp.path().to_str().unwrap_or_default()) {
+                let wd = unsafe {
+                    libc::inotify_add_watch(
+                        inotify_fd,
+                        path_c.as_ptr(),
+                        libc::IN_CREATE | libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO,
+                    )
+                };
+                while !second_marker.exists() {
+                    let mut pfd = libc::pollfd {
+                        fd: inotify_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let rc = unsafe { libc::poll(&mut pfd, 1, 5_000) };
+                    if rc <= 0 {
+                        break;
+                    }
+                    let mut buf = [0u8; 1024];
+                    let _ = unsafe {
+                        libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    };
+                }
+                if wd >= 0 {
+                    unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+                }
+            }
+            unsafe { libc::close(inotify_fd) };
         }
 
         let content = std::fs::read_to_string(&second_marker)

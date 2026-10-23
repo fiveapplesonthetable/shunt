@@ -282,6 +282,26 @@ impl TestEnv {
         self.signal_daemon(libc::SIGTERM)
     }
 
+    /// Sends a flush command to `api.sock` and waits synchronously for the daemon to confirm
+    /// all buffered inputs are persisted to SQLite.
+    pub fn flush(&self) -> bool {
+        let sock = self.api_sock();
+        let mut stream = match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        use std::io::{BufRead, BufReader, Write};
+        let _ = stream.write_all(b"{\"cmd\":\"flush\"}\n");
+        let _ = stream.flush();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_ok() {
+            line.contains("\"status\":\"ok\"")
+        } else {
+            false
+        }
+    }
+
     /// Waits deterministically for a condition to become true within `timeout`.
     pub fn wait_until<F>(&self, timeout: Duration, step: Duration, mut f: F) -> bool
     where
@@ -297,15 +317,60 @@ impl TestEnv {
         f()
     }
 
-    /// Waits for `api.sock` to become available and responding.
+    /// Waits for `api.sock` to become available and responding using kernel inotify and connect checks.
     pub fn wait_for_api_sock(&self, timeout: Duration) -> bool {
-        self.wait_until(timeout, Duration::from_millis(10), || {
-            let sock = self.api_sock();
-            if !sock.exists() {
-                return false;
+        let sock = self.api_sock();
+        if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            return true;
+        }
+        let parent = match sock.parent() {
+            Some(p) => p,
+            None => return false,
+        };
+        let _ = std::fs::create_dir_all(parent);
+        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if inotify_fd >= 0 {
+            if let Ok(path_c) = std::ffi::CString::new(parent.to_str().unwrap_or_default()) {
+                let wd = unsafe {
+                    libc::inotify_add_watch(
+                        inotify_fd,
+                        path_c.as_ptr(),
+                        libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB,
+                    )
+                };
+                let start = Instant::now();
+                while start.elapsed() < timeout {
+                    if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                        if wd >= 0 {
+                            unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+                        }
+                        unsafe { libc::close(inotify_fd) };
+                        return true;
+                    }
+                    let remaining = timeout
+                        .saturating_sub(start.elapsed())
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32;
+                    let mut pfd = libc::pollfd {
+                        fd: inotify_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let rc = unsafe { libc::poll(&mut pfd, 1, remaining.max(10)) };
+                    if rc > 0 {
+                        let mut buf = [0u8; 1024];
+                        let _ = unsafe {
+                            libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        };
+                    }
+                }
+                if wd >= 0 {
+                    unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
+                }
             }
-            std::os::unix::net::UnixStream::connect(&sock).is_ok()
-        })
+            unsafe { libc::close(inotify_fd) };
+        }
+        sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
     }
 
     /// Queries the trace via `trace_processor_shell` using standard SQL through stdin.

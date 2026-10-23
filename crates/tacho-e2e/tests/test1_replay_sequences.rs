@@ -90,7 +90,7 @@ fn test_replay_claude_sequential() {
     assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
 
     replay_jsonl_sequential(&env, "claude", &claude_fixture);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(env.flush());
 
     let trace_path = env.home_dir.join("trace/claude_seq.perfetto-trace");
     let status = env
@@ -134,7 +134,7 @@ fn test_replay_jetski_parallel() {
     assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
 
     replay_jsonl_parallel(&env, "jetski", &jetski_fixture);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(env.flush());
 
     let trace_path = env.home_dir.join("trace/jetski_par.perfetto-trace");
     let status = env

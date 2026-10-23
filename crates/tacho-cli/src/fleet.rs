@@ -33,7 +33,7 @@ use tacho_core::decide::watch::{
     ProcEntry, ProgressSample, SuperviseAction, TidyDecision, TidySnapshot, Verdict,
     WorktreeCandidate,
 };
-use tacho_core::decide::{decide, DecisionState, WorldObservation};
+use tacho_core::decide::{decide, BatchOutcomeObs, BurnerProcess, DecisionState, WorldObservation};
 use tacho_core::{Scrubber, TaskStatus};
 use tacho_daemon::{FleetState, FleetStore};
 
@@ -97,6 +97,87 @@ fn pid_alive(pid: u32) -> bool {
         }
     }
     true
+}
+
+/// Verify that a PID on the system actually belongs to the agent before signalling.
+///
+/// Prevents signalling or killing a reused PID if the agent process previously exited
+/// and its PID was recycled by the OS for an unrelated system process.
+pub(crate) fn verify_agent_pid(
+    pid: u32,
+    agent_key: &str,
+    session_id: Option<&str>,
+    recorded_starttime: Option<u64>,
+) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+
+    // 1. Check starttime from /proc/<pid>/stat if recorded
+    let stat_path = format!("/proc/{pid}/stat");
+    if let Ok(content) = fs::read_to_string(&stat_path) {
+        if let Some(rparen) = content.rfind(')') {
+            let rest = &content[rparen + 2..];
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            // Field 22 is index 19 in fields (since field 3 'state' is index 0)
+            if let Some(st_str) = fields.get(19) {
+                if let Ok(st) = st_str.parse::<u64>() {
+                    if let Some(expected_st) = recorded_starttime {
+                        if st != expected_st {
+                            eprintln!(
+                                "[tacho-safety] PID {pid} starttime ({st}) does not match recorded ({expected_st}); refusing signal to reused PID"
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        return true;
+    }
+
+    // 2. Check cgroup, cmdline, or environment for agent attribution
+    let cgroup_path = format!("/proc/{pid}/cgroup");
+    if let Ok(cg) = fs::read_to_string(&cgroup_path) {
+        if cg.contains(agent_key) || cg.contains("tachograph") {
+            return true;
+        }
+    }
+
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    if let Ok(cmd) = fs::read(&cmdline_path) {
+        let cmd_str = String::from_utf8_lossy(&cmd);
+        if cmd_str.contains(agent_key)
+            || session_id.map(|s| cmd_str.contains(s)).unwrap_or(false)
+            || cmd_str.contains("claude")
+            || cmd_str.contains("gemini")
+            || cmd_str.contains("codex")
+            || cmd_str.contains("tacho")
+        {
+            return true;
+        }
+    }
+
+    let env_path = format!("/proc/{pid}/environ");
+    if let Ok(env_bytes) = fs::read(&env_path) {
+        let env_str = String::from_utf8_lossy(&env_bytes);
+        if env_str.contains(agent_key)
+            || session_id.map(|s| env_str.contains(s)).unwrap_or(false)
+            || env_str.contains("TACHO_AGENT")
+        {
+            return true;
+        }
+    }
+
+    if recorded_starttime.is_some() {
+        return true;
+    }
+
+    eprintln!(
+        "[tacho-safety] PID {pid} has no matching cgroup, cmdline, or environment for agent '{agent_key}'; refusing signal"
+    );
+    false
 }
 
 fn live_agent_keys(state: &FleetState) -> BTreeSet<String> {
@@ -640,7 +721,7 @@ pub fn execute_stop(args: StopArgs) -> io::Result<()> {
         let _ = Command::new(prog).args(stop_args).status();
     }
     if let Some(pid) = stop_plan.pid {
-        if pid_alive(pid) {
+        if verify_agent_pid(pid, &args.key, agent.session_id.as_deref(), None) {
             unsafe {
                 let _ = libc::kill(-(pid as i32), libc::SIGTERM);
                 let _ = libc::kill(pid as i32, libc::SIGTERM);
@@ -782,52 +863,70 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
         TellPlan::ResumeWithMessage { key, command, .. } => {
             if is_live {
                 if let Some(pid) = last.pid {
-                    unsafe {
-                        let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-                    }
-                }
-            }
-            let mut resumed_pid = None;
-            if !last.worktree.is_empty() && Path::new(&last.worktree).is_dir() {
-                if let Ok(log_file) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&last.log)
-                {
-                    if let Ok(log_err) = log_file.try_clone() {
-                        let mut cmd = Command::new(&command.program);
-                        cmd.args(&command.args)
-                            .current_dir(&last.worktree)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::from(log_file))
-                            .stderr(Stdio::from(log_err))
-                            .process_group(0);
-                        for (ek, ev) in &command.env {
-                            cmd.env(ek, ev);
-                        }
-                        if let Ok(child) = cmd.spawn() {
-                            resumed_pid = Some(child.id());
+                    if verify_agent_pid(pid, &key, last.session_id.as_deref(), None) {
+                        unsafe {
+                            let _ = libc::kill(-(pid as i32), libc::SIGTERM);
                         }
                     }
                 }
             }
+            if last.worktree.is_empty() || !Path::new(&last.worktree).is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Cannot resume worker {key} with message: worktree '{}' does not exist or is not a directory",
+                        last.worktree
+                    ),
+                ));
+            }
+            let log_file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&last.log)
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "Cannot resume worker {key}: failed to open log '{}': {e}",
+                        last.log
+                    ))
+                })?;
+            let log_err = log_file.try_clone().map_err(|e| {
+                io::Error::other(format!(
+                    "Cannot resume worker {key}: failed to clone log fd: {e}"
+                ))
+            })?;
+            let mut cmd = Command::new(&command.program);
+            cmd.args(&command.args)
+                .current_dir(&last.worktree)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_err))
+                .process_group(0);
+            for (ek, ev) in &command.env {
+                cmd.env(ek, ev);
+            }
+            let child = cmd.spawn().map_err(|e| {
+                io::Error::other(format!(
+                    "Cannot resume worker {key}: failed to spawn command '{}': {e}",
+                    command.program
+                ))
+            })?;
+            let resumed_pid = child.id();
             let because = format!("resumed session {key} with message: {}", args.message);
             store.mutate(Some(("watch", "tell", &key, &because)), |st| {
                 st.nudged.insert(key.clone());
                 if let Some(a) = st.agents.get_mut(&key) {
-                    if let Some(new_pid) = resumed_pid {
-                        a.pid = Some(new_pid);
-                        a.finished_at = None;
-                        a.exit_code = None;
-                    } else {
-                        a.resume_at = Some(now);
-                    }
+                    a.pid = Some(resumed_pid);
+                    a.finished_at = None;
+                    a.exit_code = None;
                     a.status_note = format!("nudged: {}", args.message);
                     a.brief = format!("{}\n\nGuidance from operator:\n{}", a.brief, args.message);
                 }
             })?;
             emit_decision_event(&format!("agent:{key}"), "watch:tell", &because);
-            println!("Sent message to {} (resumed session with message)", key);
+            println!(
+                "Sent message to {} (resumed session with message, PID {})",
+                key, resumed_pid
+            );
         }
     }
     Ok(())
@@ -1058,6 +1157,19 @@ fn resolve_live_main_sha(cwd: &Path) -> String {
             }
         }
     }
+    // Local refs/heads/main fallback for offline or origin-less repositories
+    if let Ok(out) = Command::new("git")
+        .args(["rev-parse", "refs/heads/main"])
+        .current_dir(cwd)
+        .output()
+    {
+        if out.status.success() {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !sha.is_empty() {
+                return sha;
+            }
+        }
+    }
     Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(cwd)
@@ -1104,6 +1216,20 @@ fn resolve_live_pr_heads(
                 if let Some(sha) = remote_refs.get(&format!("refs/heads/{}", p.branch)) {
                     current_shas.insert(n, sha.clone());
                     continue;
+                }
+                // Check local ref if remote was absent/unconfigured
+                if let Ok(out) = Command::new("git")
+                    .args(["rev-parse", &format!("refs/heads/{}", p.branch)])
+                    .current_dir(cwd)
+                    .output()
+                {
+                    if out.status.success() {
+                        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if !sha.is_empty() {
+                            current_shas.insert(n, sha);
+                            continue;
+                        }
+                    }
                 }
             }
             current_shas.insert(n, p.head.clone());
@@ -1483,7 +1609,7 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
             st.batches.push(b_run);
         })?;
         emit_decision_event(&format!("batch:{batch_id}"), "verify:flake", &because);
-        println!(
+        eprintln!(
             "Batch {batch_id} FLAKE recorded: {:?}",
             recorded_flake_names
         );
@@ -1707,11 +1833,42 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 /// Executes `tacho replay <batch-id>`.
 pub fn execute_replay(args: ReplayArgs) -> io::Result<()> {
     let store = open_fleet_store()?;
+    // If a tick ID is supplied or no batch_id supplied, replay decision tick deterministically from logged inputs!
+    let tick_data = if let Ok(tick_id) = args.batch_id.parse::<i64>() {
+        store.load_decision_tick(tick_id).ok()
+    } else {
+        None
+    };
+
+    if let Some((logged_state, logged_obs, logged_plan)) = tick_data.or_else(|| {
+        store
+            .load_latest_decision_tick()
+            .ok()
+            .flatten()
+            .map(|(_, s, o, p)| (s, o, p))
+    }) {
+        println!("Replaying pure decision evaluation from recorded tick inputs...");
+        let replayed_plan = decide(&logged_state, &logged_obs);
+        assert_eq!(
+            replayed_plan, logged_plan,
+            "Replayed decisions diverged from recorded decision plan!"
+        );
+        println!("Deterministic decision replay VERIFIED: exact 1:1 match with recorded plan.");
+        println!(
+            "Dispatched: {} tasks, Resumed: {} tasks, Reaped: {} agents, Batch resolutions: {}",
+            replayed_plan.dispatched_tasks.len(),
+            replayed_plan.resumed_tasks.len(),
+            replayed_plan.reaped_agents.len(),
+            replayed_plan.batch_resolutions.len(),
+        );
+        return Ok(());
+    }
+
     let state = store.load()?;
     let Some(b) = state.batches.iter().find(|b| b.id == args.batch_id) else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("batch '{}' not found", args.batch_id),
+            format!("batch or decision tick '{}' not found", args.batch_id),
         ));
     };
     println!(
@@ -1846,6 +2003,7 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
     let ordered_nums = order_train_prs(&elig, &state.open_prs_cache);
     let parent_map = parents(&state.open_prs_cache);
     let cwd = std::env::current_dir()?;
+    let initial_main = resolve_live_main_sha(&cwd);
     let compile_cmd = std::env::var("TACHO_COMPILE_CMD")
         .ok()
         .or_else(|| state.train_compile_cmd.clone())
@@ -1862,12 +2020,83 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(",");
+
+        // Build the merged tree for the slice in a scratch worktree
+        let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let scratch_path = scratch.path();
+        let add_out = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                scratch_path.to_str().unwrap(),
+                &initial_main,
+            ])
+            .current_dir(&cwd)
+            .output()
+            .map_err(|e| format!("git worktree add failed: {e}"))?;
+        if !add_out.status.success() {
+            return Err(format!(
+                "Failed to create scratch worktree at {initial_main}: {}",
+                String::from_utf8_lossy(&add_out.stderr)
+            ));
+        }
+
+        // Merge each PR head into scratch worktree
+        for &pr_num in slice {
+            let Some(pr) = state.open_prs_cache.iter().find(|p| p.number == pr_num) else {
+                let _ = Command::new("git")
+                    .args([
+                        "worktree",
+                        "remove",
+                        "--force",
+                        scratch_path.to_str().unwrap(),
+                    ])
+                    .current_dir(&cwd)
+                    .output();
+                return Err(format!("PR #{pr_num} not found in open PR cache"));
+            };
+            let merge_out = Command::new("git")
+                .args(["merge", "--no-ff", "--no-edit", &pr.head])
+                .current_dir(scratch_path)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !merge_out.status.success() {
+                let _ = Command::new("git")
+                    .args([
+                        "worktree",
+                        "remove",
+                        "--force",
+                        scratch_path.to_str().unwrap(),
+                    ])
+                    .current_dir(&cwd)
+                    .output();
+                return Err(format!(
+                    "Merge conflict merging PR #{pr_num} ({}) onto train: {}",
+                    pr.head,
+                    String::from_utf8_lossy(&merge_out.stderr)
+                ));
+            }
+        }
+
+        // Compile the merged slice inside the scratch worktree
         let out = Command::new("bash")
             .args(["-c", &compile_cmd])
-            .current_dir(&cwd)
+            .current_dir(scratch_path)
             .env("TACHO_TRAIN_SLICE_PRS", &prs_str)
             .output()
             .map_err(|e| e.to_string())?;
+
+        let _ = Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                scratch_path.to_str().unwrap(),
+            ])
+            .current_dir(&cwd)
+            .output();
+
         if !out.status.success() {
             let err_txt = format!(
                 "{}{}",
@@ -1888,6 +2117,20 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
                 changed_union.insert(f.clone());
             }
         }
+    }
+
+    // Verify that neither main nor any surviving member head moved during compilation
+    let live_main_after = resolve_live_main_sha(&cwd);
+    let live_pr_shas_after = resolve_live_pr_heads(&cwd, &surviving, &member_shas, &state);
+    if let Some(moved_reason) = batch_refs_moved(
+        &initial_main,
+        &live_main_after,
+        &member_shas,
+        &live_pr_shas_after,
+    ) {
+        return Err(io::Error::other(format!(
+            "Release train refused because refs moved during merged-tree compilation: {moved_reason}"
+        )));
     }
     let changed_vec: Vec<String> = changed_union.into_iter().collect();
     let settled_cmds = settle(&changed_vec, &state.generators);
@@ -2566,6 +2809,28 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         tidy_min_age_secs: 3_600,
     };
 
+    let mut batch_outcomes = Vec::new();
+    for b in &state.batches {
+        if b.status == "passed" || b.status == "failed" || b.status == "flake" {
+            batch_outcomes.push(BatchOutcomeObs {
+                batch_id: b.id.clone(),
+                passed: b.status == "passed",
+                failed_area: b.areas.first().cloned(),
+                log_output: b.log.clone(),
+                tree_sha: b.tree.clone().unwrap_or_default(),
+            });
+        }
+    }
+
+    let mut burner_obs = Vec::new();
+    for b in burners(&procs) {
+        burner_obs.push(BurnerProcess {
+            pid: b.pid,
+            comm: b.comm,
+            elapsed_secs: b.elapsed_secs,
+        });
+    }
+
     let world_obs = WorldObservation {
         now,
         main_sha,
@@ -2575,19 +2840,63 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         live_keys: live.clone(),
         agent_samples,
         agent_log_tails,
-        batch_outcomes: Vec::new(),
+        batch_outcomes,
         deploy_runs,
         behind_commits,
         detached_checkout,
         failed_main_jobs,
         ready_trains,
         tidy_snapshot,
+        burners: burner_obs,
     };
 
     // 3. Call the pure decision engine (`decide`) — nothing else decides!
     let plan = decide(&decision_state, &world_obs);
 
+    // Record decision tick inputs and output plan for deterministic replay
+    let _ = store.record_decision_tick(now, &decision_state, &world_obs, &plan);
+
     // 4. Execute side-effects prescribed by `plan`
+    for b in &plan.burner_kills {
+        let because = format!(
+            "killed runaway burner pid={} ({}) elapsed={}s",
+            b.pid, b.comm, b.elapsed_secs
+        );
+        if !args.dry_run {
+            if verify_agent_pid(b.pid, &b.comm, None, None) || b.elapsed_secs >= 600 {
+                unsafe {
+                    let _ = libc::kill(b.pid as i32, libc::SIGKILL);
+                }
+            }
+            let _ = store.record_decision("watch", "kill_burner", &b.pid.to_string(), &because);
+            emit_decision_event("system", "watch:kill_burner", &because);
+        }
+        println!("{because}");
+    }
+
+    for t in &plan.tidy_decisions {
+        if let TidyDecision::RemoveTree {
+            path,
+            rescue,
+            because,
+        } = t
+        {
+            if !args.dry_run {
+                if *rescue {
+                    let _ = Command::new("git").args(["-C", path, "stash"]).status();
+                }
+                let _ = Command::new("git")
+                    .args(["worktree", "remove", "--force", path])
+                    .status();
+                let _ = store.mutate(Some(("watch", "remove_worktree", path, because)), |st| {
+                    st.worktrees.retain(|_, w| &w.path != path);
+                });
+                let _ = store.record_decision("watch", "remove_worktree", path, because);
+            }
+            println!("Tidy remove worktree: {path} ({because})");
+        }
+    }
+
     if !plan.reaped_agents.is_empty() && !args.dry_run {
         store.mutate(
             Some((
@@ -2641,8 +2950,10 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
                 if !args.dry_run {
                     if let Some(a) = state.agents.get(key) {
                         if let Some(pid) = a.pid {
-                            unsafe {
-                                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+                            if verify_agent_pid(pid, key, a.session_id.as_deref(), None) {
+                                unsafe {
+                                    let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+                                }
                             }
                         }
                         let resumed = resume_task(a, because, "", now);

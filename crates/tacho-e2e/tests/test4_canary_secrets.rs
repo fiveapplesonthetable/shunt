@@ -128,7 +128,7 @@ printf '%s\n' '{{"type":"assistant","session_id":"canary-run","message":{{"conte
     assert!(emit_out.status.success());
 
     // Wait for appender to flush
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(env.flush());
 
     // 4. Check snapshot file
     let trace_path = env.home_dir.join("trace/canary.perfetto-trace");

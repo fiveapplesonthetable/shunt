@@ -17,6 +17,7 @@ use tacho_core::decide::dispatch::{
 use tacho_core::decide::land::{TrainPrState, TrainRecord};
 use tacho_core::decide::verify::{AreaRule, BatchRun, FailedRecord, FlakeEntry, PassedRecord};
 use tacho_core::decide::watch::{CostRecord, PhaseNote, ProgressSample};
+use tacho_core::decide::{DecisionPlan, DecisionState, WorldObservation};
 use tacho_core::{Kind, Scrubber, TaskStatus};
 use tacho_proto::tacho;
 
@@ -192,6 +193,23 @@ impl FleetStore {
 
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);",
+            [],
+        );
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS decision_ticks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                state_json TEXT NOT NULL,
+                obs_json TEXT NOT NULL,
+                plan_json TEXT NOT NULL
+            );",
+            [],
+        )
+        .map_err(sql_err)?;
+
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decision_ticks_ts ON decision_ticks(ts);",
             [],
         );
 
@@ -495,6 +513,96 @@ impl FleetStore {
             )
             .map_err(sql_err)?;
         Ok(())
+    }
+
+    /// Records a complete orchestrator decision tick with both its input state and its output plan
+    /// into `decision_ticks` so the tick can be deterministically replayed offline.
+    pub fn record_decision_tick(
+        &self,
+        ts: i64,
+        state: &DecisionState,
+        obs: &WorldObservation,
+        plan: &DecisionPlan,
+    ) -> io::Result<i64> {
+        let state_json = serde_json::to_string(state)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let obs_json = serde_json::to_string(obs)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let plan_json = serde_json::to_string(plan)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        self.conn
+            .execute(
+                "INSERT INTO decision_ticks (ts, state_json, obs_json, plan_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![ts, state_json, obs_json, plan_json],
+            )
+            .map_err(sql_err)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Loads the latest logged decision tick for replay.
+    pub fn load_latest_decision_tick(
+        &self,
+    ) -> io::Result<Option<(i64, DecisionState, WorldObservation, DecisionPlan)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, state_json, obs_json, plan_json
+                 FROM decision_ticks
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .map_err(sql_err)?;
+        let mut rows = stmt.query([]).map_err(sql_err)?;
+        if let Some(row) = rows.next().map_err(sql_err)? {
+            let id: i64 = row.get(0).map_err(sql_err)?;
+            let s_json: String = row.get(1).map_err(sql_err)?;
+            let o_json: String = row.get(2).map_err(sql_err)?;
+            let p_json: String = row.get(3).map_err(sql_err)?;
+            let st = serde_json::from_str(&s_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let obs = serde_json::from_str(&o_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let plan = serde_json::from_str(&p_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(Some((id, st, obs, plan)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Loads a specific logged decision tick by ID.
+    pub fn load_decision_tick(
+        &self,
+        tick_id: i64,
+    ) -> io::Result<(DecisionState, WorldObservation, DecisionPlan)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT state_json, obs_json, plan_json
+                 FROM decision_ticks
+                 WHERE id = ?1",
+            )
+            .map_err(sql_err)?;
+        let mut rows = stmt.query([tick_id]).map_err(sql_err)?;
+        if let Some(row) = rows.next().map_err(sql_err)? {
+            let s_json: String = row.get(0).map_err(sql_err)?;
+            let o_json: String = row.get(1).map_err(sql_err)?;
+            let p_json: String = row.get(2).map_err(sql_err)?;
+            let st = serde_json::from_str(&s_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let obs = serde_json::from_str(&o_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let plan = serde_json::from_str(&p_json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok((st, obs, plan))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("decision tick {tick_id} not found"),
+            ))
+        }
     }
 }
 

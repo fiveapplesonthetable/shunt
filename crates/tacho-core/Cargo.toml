@@ -17,3 +17,7 @@ blake3 = "1.5"
 [dev-dependencies]
 proptest = "1.12"
 tempfile = "3.27"
+
+[[bench]]
+name = "restore_bench"
+harness = false

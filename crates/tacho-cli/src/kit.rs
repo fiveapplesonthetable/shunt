@@ -934,6 +934,12 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
             format!("refusing to kill pid {pid}: process group leader is {pgid} (expected {pid})"),
         ));
     }
+    if !crate::fleet::verify_agent_pid(pid, &args.name, None, None) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to kill pid {pid}: process does not belong to agent {} (possible PID reuse)", args.name),
+        ));
+    }
     let target = -(pid as i32);
 
     let pid_watcher = FdEventWatcher::new_for_dir_and_pid(Some(&dir), pid);

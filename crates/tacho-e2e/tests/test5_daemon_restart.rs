@@ -38,7 +38,7 @@ fn test_daemon_restart_lifecycle() {
     assert!(child.wait().unwrap().success());
 
     // Flush batch to disk
-    std::thread::sleep(Duration::from_millis(150));
+    assert!(env.flush());
 
     // 3. SIGKILL daemon mid-session
     assert!(env.kill_daemon_9(), "failed to send SIGKILL to daemon");
@@ -129,7 +129,7 @@ fn test_daemon_restart_lifecycle() {
     }
     assert!(cont_child.wait().unwrap().success());
 
-    std::thread::sleep(Duration::from_millis(150));
+    assert!(env.flush());
 
     let cont_trace = env.home_dir.join("trace/continued.perfetto-trace");
     let cont_out = env

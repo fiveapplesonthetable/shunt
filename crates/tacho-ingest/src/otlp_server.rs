@@ -84,7 +84,15 @@ pub fn serve_otlp_with_config(
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+                use std::os::unix::io::AsRawFd;
+                let mut pfd = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    let _ = libc::poll(&mut pfd, 1, 100);
+                }
             }
             Err(e) => return Err(e),
         }

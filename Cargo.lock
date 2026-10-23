@@ -1153,6 +1153,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "flate2",
+ "libc",
  "opentelemetry-proto",
  "proptest",
  "prost",
@@ -1174,6 +1175,7 @@ dependencies = [
 name = "tacho-system"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tacho-core",
  "tempfile",
 ]

@@ -484,8 +484,12 @@ fn test_torture_concurrent_agents() {
             for turn in 0..turns_per_agent {
                 let tid = format!("tool-{agent_idx}-{turn}");
 
-                // Tool selection: Bash, Edit, Read, Grep, Task
-                let tool_choice = agent_rng.next_usize(5);
+                // Tool selection: Bash, Edit, Read, Grep, Task (guarantee at least one secret test on turn 0)
+                let tool_choice = if agent_idx == 0 && turn == 0 {
+                    0
+                } else {
+                    agent_rng.next_usize(5)
+                };
                 let (tool_name, tool_input, _cmd_str) = match tool_choice {
                     0 => {
                         let canary = CANARY_SECRETS[agent_rng.next_usize(CANARY_SECRETS.len())];

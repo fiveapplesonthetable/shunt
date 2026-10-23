@@ -88,6 +88,11 @@ pub fn still_ready(
     if pr.head != record.sha {
         return false;
     }
+    if let Some(b) = batch {
+        if b.status != "passed" {
+            return false;
+        }
+    }
     if current_main == record.main_sha {
         return true;
     }

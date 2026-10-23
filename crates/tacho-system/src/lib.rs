@@ -304,7 +304,9 @@ impl Perfetto {
             }
         }
 
-        // Wait up to 2 seconds for session to appear in traced service state
+        // Wait up to 2 seconds for session to appear in traced service state.
+        // Perfetto traced protocol necessity: `traced` manages session states over Unix domain
+        // socket IPC without exposing an inotify/eventfd mechanism; query-raw sampling is required.
         for _ in 0..20 {
             thread::sleep(Duration::from_millis(100));
             if self.status()?.is_some() {
@@ -339,14 +341,26 @@ impl Perfetto {
             }
         }
 
-        // Wait up to 3 seconds for graceful termination
+        // Wait up to 3 seconds for graceful termination via kernel pidfd
         let mut stopped = false;
-        for _ in 0..30 {
-            thread::sleep(Duration::from_millis(100));
-            if self.status()?.is_none() {
-                stopped = true;
-                break;
+        if let Some(pid) = target_pid {
+            let pidfd =
+                unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) as i32 };
+            if pidfd >= 0 {
+                let mut pfd = libc::pollfd {
+                    fd: pidfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let poll_rc = unsafe { libc::poll(&mut pfd, 1, 3000) };
+                unsafe { libc::close(pidfd) };
+                if poll_rc > 0 {
+                    stopped = true;
+                }
             }
+        }
+        if !stopped && self.status()?.is_none() {
+            stopped = true;
         }
 
         if !stopped {
@@ -355,12 +369,17 @@ impl Perfetto {
                     let _ = Command::new("kill")
                         .args(["-KILL", &pid.to_string()])
                         .output();
-                    for _ in 0..10 {
-                        thread::sleep(Duration::from_millis(100));
-                        if self.status()?.is_none() {
-                            stopped = true;
-                            break;
-                        }
+                    let pidfd = unsafe {
+                        libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) as i32
+                    };
+                    if pidfd >= 0 {
+                        let mut pfd = libc::pollfd {
+                            fd: pidfd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let _ = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                        unsafe { libc::close(pidfd) };
                     }
                 }
             }

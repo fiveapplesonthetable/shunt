@@ -44,8 +44,8 @@ done < "{}"
         "stdout was not byte-identical to fixture {fixture_name}"
     );
 
-    // Wait briefly for appender to flush batch
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Flush batch to disk deterministically
+    assert!(env.flush());
 
     // Snapshot trace
     let trace_path = env

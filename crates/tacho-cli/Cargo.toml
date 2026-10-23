@@ -28,3 +28,7 @@ tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "hook_bench"
+harness = false

@@ -6,7 +6,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 /// Handle to an active agent cgroup scope under `/sys/fs/cgroup`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,35 +74,20 @@ impl AgentCgroup {
         cmd.stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        let start = Instant::now();
-        let timeout = Duration::from_secs(2);
-
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if status.success() {
-                    return Ok(());
-                } else {
-                    let mut err_msg = String::new();
-                    if let Some(mut err_pipe) = child.stderr.take() {
-                        use std::io::Read;
-                        let _ = err_pipe.read_to_string(&mut err_msg);
-                    }
-                    return Err(io::Error::other(format!(
-                        "busctl failed with status {}: {}",
-                        status,
-                        err_msg.trim()
-                    )));
+        match child.wait()? {
+            status if status.success() => Ok(()),
+            status => {
+                let mut err_msg = String::new();
+                if let Some(mut err_pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err_pipe.read_to_string(&mut err_msg);
                 }
+                Err(io::Error::other(format!(
+                    "busctl failed with status {}: {}",
+                    status,
+                    err_msg.trim()
+                )))
             }
-            if start.elapsed() >= timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "busctl StartTransientUnit timed out after 2s",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

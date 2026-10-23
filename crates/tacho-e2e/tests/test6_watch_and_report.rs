@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tacho_e2e::TestEnv;
 
@@ -97,6 +97,38 @@ fn test_watch_until_stalled_and_report() {
 fn test_report_diff_claims() {
     let env = TestEnv::new().unwrap();
 
+    let worktree_dir = env.home_dir.join("worktree");
+    std::fs::create_dir_all(&worktree_dir).unwrap();
+
+    // Initialize git repository in test worktree so git status checks pass cleanly
+    Command::new("git")
+        .args(["init"])
+        .current_dir(&worktree_dir)
+        .output()
+        .expect("git init failed");
+    Command::new("git")
+        .args(["config", "user.name", "Tacho Test"])
+        .current_dir(&worktree_dir)
+        .output()
+        .expect("git config user.name failed");
+    Command::new("git")
+        .args(["config", "user.email", "tacho@test.local"])
+        .current_dir(&worktree_dir)
+        .output()
+        .expect("git config user.email failed");
+    let init_file = worktree_dir.join("init.txt");
+    std::fs::write(&init_file, "init\n").unwrap();
+    Command::new("git")
+        .args(["add", "init.txt"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&worktree_dir)
+        .output()
+        .unwrap();
+
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();
     assert!(env.wait_for_api_sock(Duration::from_secs(3)));
@@ -123,7 +155,7 @@ fn test_report_diff_claims() {
         "hook_event_name": "SessionStart",
         "session_id": "sess-verified",
         "agent": "verified-worker",
-        "cwd": env.home_dir.to_str().unwrap(),
+        "cwd": worktree_dir.to_str().unwrap(),
     }));
 
     // 2. File edit
@@ -200,7 +232,7 @@ fn test_report_diff_claims() {
     assert!(report_str.contains("Commits Succeeded:    1"));
     assert!(report_str.contains("Pushes Succeeded:     1"));
     assert!(report_str.contains("Claim Stall Flags:    NONE"));
-    assert!(report_str.contains("Git Worktree Status:"));
+    assert!(report_str.contains("Git Worktree Status:  CLEAN"));
 
     // Verify brevity (< 100 tokens, approx 400 chars)
     assert!(
@@ -235,7 +267,7 @@ fn test_report_diff_claims() {
         "reason": "done",
     }));
 
-    std::thread::sleep(Duration::from_millis(50));
+    assert!(env.flush());
 
     let unverified_out = env
         .tacho_cmd()

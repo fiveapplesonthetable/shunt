@@ -104,6 +104,16 @@ pub struct WorldObservation {
     pub ready_trains: Vec<(String, Vec<u64>, BTreeMap<u64, String>)>,
     #[serde(default)]
     pub tidy_snapshot: TidySnapshot,
+    #[serde(default)]
+    pub burners: Vec<BurnerProcess>,
+}
+
+/// An observed runaway burner process (e.g. stress, yes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BurnerProcess {
+    pub pid: u32,
+    pub comm: String,
+    pub elapsed_secs: i64,
 }
 
 /// Pure resolution of a completed batch run.
@@ -148,6 +158,10 @@ pub struct DecisionPlan {
     pub self_update: SelfUpdateDecision,
     pub watchdog_alert: Option<String>,
     pub next_state: DecisionState,
+    #[serde(default)]
+    pub burner_kills: Vec<BurnerProcess>,
+    #[serde(default)]
+    pub tell_actions: Vec<(String, String)>,
 }
 
 /// Replayable pure decision function `(DecisionState, WorldObservation) -> DecisionPlan`.
@@ -511,6 +525,13 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         next.last_watchdog_alert_ts = Some(obs.now);
     }
 
+    let mut burner_kills = Vec::new();
+    for b in &obs.burners {
+        if b.elapsed_secs >= 600 {
+            burner_kills.push(b.clone());
+        }
+    }
+
     DecisionPlan {
         reaped_agents,
         supervision_actions,
@@ -528,6 +549,8 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         self_update,
         watchdog_alert,
         next_state: next,
+        burner_kills,
+        tell_actions: Vec::new(),
     }
 }
 
