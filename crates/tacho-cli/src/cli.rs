@@ -83,6 +83,161 @@ pub enum Commands {
     ///
     /// Example: tacho tail ~/.claude/projects
     Tail(TailArgs),
+
+    /// Create an isolated worker worktree at a pinned base SHA with an allocated port block.
+    ///
+    /// Example: tacho start fix-auth-race --base main
+    Start(StartArgs),
+
+    /// Run scoped proof checks for the current worktree and record .tachoproof/summary.json.
+    ///
+    /// Example: tacho prove
+    Prove(ProveArgs),
+
+    /// Start a detached background job in the current worktree (.tachorun/<name>).
+    ///
+    /// Example: tacho job dev-server -- cargo run
+    Job(JobArgs),
+
+    /// Wait up to 9 minutes for a named worktree job, streaming output (exits 3 if still running).
+    ///
+    /// Example: tacho wait dev-server
+    Wait(WaitArgs),
+
+    /// Stop a named worktree job and its entire process group.
+    ///
+    /// Example: tacho kill dev-server --now
+    Kill(KillArgs),
+
+    /// Validate proof and preflight guardrails, push branch, and open/update a draft PR.
+    ///
+    /// Example: tacho pr "Fix auth race" -m "Eliminates lock ordering inversion."
+    Pr(PrArgs),
+
+    /// Record a structured phase note (read, write, test, fix, push) for an agent.
+    ///
+    /// Example: tacho note fix-auth-race "test: reproducing race under starve"
+    Note(NoteArgs),
+
+    /// Run a command on a CPU-starved core slice to reproduce timing/concurrency flakes.
+    ///
+    /// Example: tacho starve -- cargo test flaky_wal
+    Starve(StarveArgs),
+
+    /// View or enqueue tasks on the fleet work queue.
+    ///
+    /// Example: tacho todo fix-auth "Fix login race" --area auth
+    Todo(TodoArgs),
+
+    /// Start or resume a managed worker agent session.
+    ///
+    /// Example: tacho session fix-auth --resume
+    Session(SessionArgs),
+
+    /// Place or list holds on tasks, PRs (pr:<n>), or areas (area:<name>).
+    ///
+    /// Example: tacho hold pr:42 --reason "awaiting schema migration"
+    Hold(HoldArgs),
+
+    /// Release an active hold on a task, PR, or area.
+    ///
+    /// Example: tacho release pr:42
+    Release(ReleaseArgs),
+
+    /// Retire a task or agent lineage from the fleet.
+    ///
+    /// Example: tacho retire fix-auth
+    Retire(RetireArgs),
+
+    /// Confirm or attach a PR number (or 'none') to a finished agent run.
+    ///
+    /// Example: tacho attach fix-auth 42
+    Attach(AttachArgs),
+
+    /// Stop a running worker agent and place a hold on its task key.
+    ///
+    /// Example: tacho stop fix-auth
+    Stop(StopArgs),
+
+    /// Send operator guidance to a worker agent and schedule immediate resume.
+    ///
+    /// Example: tacho tell fix-auth "Check the WAL checkpoint lock"
+    Tell(TellArgs),
+
+    /// Preview what the next orchestrator tick will dispatch and verify.
+    ///
+    /// Example: tacho next
+    Next(NextArgs),
+
+    /// Show live agent progress verdicts (MOVING, STALLED, HUNG) and area chain throughput.
+    ///
+    /// Example: tacho progress
+    Progress(ProgressArgs),
+
+    /// List recorded test flakes and auto-queued flake fix tasks.
+    ///
+    /// Example: tacho flakes
+    Flakes(FlakesArgs),
+
+    /// Run a speculative verification batch across open PRs with automatic binary bisection.
+    ///
+    /// Example: tacho batch 41 42
+    Batch(BatchArgs),
+
+    /// Replay a recorded verification batch.
+    ///
+    /// Example: tacho replay b001
+    Replay(ReplayArgs),
+
+    /// View or open a verified merge train from a passed batch.
+    ///
+    /// Example: tacho train --from-batch b001
+    Train(TrainArgs),
+
+    /// Assemble or approve a combined release-train pull request.
+    ///
+    /// Example: tacho release-train --approve
+    ReleaseTrain(ReleaseTrainArgs),
+
+    /// Land verified PRs from the ready queue or open merge train.
+    ///
+    /// Example: tacho land
+    Land(LandArgs),
+
+    /// Show the ordered ready-to-land PR queue.
+    ///
+    /// Example: tacho queue
+    Queue(QueueArgs),
+
+    /// Clean up stale worktrees, batch checkouts, containers, and zombie processes.
+    ///
+    /// Example: tacho tidy --dry-run
+    Tidy(TidyArgs),
+
+    /// Execute one orchestrator & supervisor tick (supervise, resume, verify, dispatch).
+    ///
+    /// Example: tacho tick
+    Tick(TickArgs),
+
+    /// Query the persistent decision log (every decision and its 'because' reason).
+    ///
+    /// Example: tacho events --limit 25
+    Events(EventsArgs),
+
+    /// Show the compact fleet dashboard and 'NEEDS YOU' attention items.
+    ///
+    /// Example: tacho top
+    Top(TopArgs),
+
+    /// Serve read-only fleet status over local HTTP JSON.
+    ///
+    /// Example: tacho serve --addr 127.0.0.1:7420
+    Serve(ServeArgs),
+
+    /// Check whether the orchestrator tick loop is healthy while work is pending.
+    ///
+    /// Example: tacho watchdog
+    Watchdog(WatchdogArgs),
 }
 
 #[derive(Args, Debug)]
@@ -465,4 +620,344 @@ pub struct TailArgs {
     /// Example: --agent worker-1
     #[arg(long)]
     pub agent: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct StartArgs {
+    /// Worker slug (3..80 chars, lowercase letters/digits/hyphens).
+    pub slug: String,
+    /// Base commit, branch, or PR number (e.g. main, 42, pr:42).
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Optional parent directory for worktrees.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct ProveArgs {
+    /// Optional worktree directory (defaults to current working directory).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    /// Override base commit SHA.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Print planned checks without executing them.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Continue running remaining checks even if one fails.
+    #[arg(long)]
+    pub keep_going: bool,
+    /// Screenshot file paths to record in the proof summary.
+    #[arg(long = "screenshot")]
+    pub screenshots: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct JobArgs {
+    /// Job name (used for .tachorun/<name>.{pid,log,exit}).
+    pub name: String,
+    /// Command and arguments to run in a detached process group.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub cmd: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    /// Job name started with `tacho job`.
+    pub name: String,
+    /// Maximum seconds to wait in this call (capped at 540s / 9m).
+    #[arg(long)]
+    pub timeout: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct KillArgs {
+    /// Job name to stop.
+    pub name: String,
+    /// Send SIGKILL immediately instead of SIGTERM + grace period.
+    #[arg(long)]
+    pub now: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct PrArgs {
+    /// Pull request title.
+    pub title: String,
+    /// Pull request description body.
+    #[arg(short = 'm', long = "message")]
+    pub message: String,
+    /// Validate preflight guardrails and print body without pushing or calling gh.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteArgs {
+    /// Agent or task key.
+    pub key: String,
+    /// Note formatted as `<phase>: <summary>` (phases: read, write, test, fix, push).
+    pub note: String,
+}
+
+#[derive(Args, Debug)]
+pub struct StarveArgs {
+    /// Number of CPUs in the starvation slice (default: 1/8 of system CPUs).
+    #[arg(long)]
+    pub slice: Option<usize>,
+    /// Explicit CPU set (e.g. "0-1" or "6,7").
+    #[arg(long)]
+    pub cpu_set: Option<String>,
+    /// Maximum timeout in seconds (capped at 300s).
+    #[arg(long)]
+    pub timeout: Option<u64>,
+    /// Print the starvation plan without spawning burners.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Command to execute under CPU starvation.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub cmd: Vec<String>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct TodoArgs {
+    /// Task key (omit to list the current queue).
+    pub key: Option<String>,
+    /// Task brief text.
+    pub brief: Option<String>,
+    /// Read task brief from a file.
+    #[arg(long)]
+    pub brief_file: Option<PathBuf>,
+    /// Area chain name (tasks in the same area run one at a time and stack on each other).
+    #[arg(long)]
+    pub area: Option<String>,
+    /// Base branch or PR number.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Comma-separated prerequisites (task keys or `pr:<n>`).
+    #[arg(long)]
+    pub after: Option<String>,
+    /// Boost task priority to the front of the queue.
+    #[arg(long)]
+    pub priority: bool,
+    /// Agent provider (`claude`, `codex`, `gemini`).
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model shorthand or ID (`opus`, `sonnet`, `haiku`, `gpt-5.4`, `gemini-pro`, etc.).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Reasoning effort level (`low`, `medium`, `high`).
+    #[arg(long)]
+    pub effort: Option<String>,
+    /// Comma-separated models/providers for side-by-side comparison (e.g. `opus,codex,gemini`).
+    #[arg(long)]
+    pub compare: Option<String>,
+    /// Output queue as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SessionArgs {
+    /// Task or session key.
+    pub key: String,
+    /// Optional brief for a new session.
+    pub brief: Option<String>,
+    /// Resume the latest stopped run in this key's lineage.
+    #[arg(long)]
+    pub resume: bool,
+    /// Area name.
+    #[arg(long)]
+    pub area: Option<String>,
+    /// Base branch or PR.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Provider (`claude`, `codex`, `gemini`).
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model shorthand or ID.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Reasoning effort level.
+    #[arg(long)]
+    pub effort: Option<String>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct HoldArgs {
+    /// Target to hold (`<key>`, `pr:<n>`, or `area:<name>`). Omit to list active holds.
+    pub target: Option<String>,
+    /// Reason for placing the hold.
+    #[arg(long)]
+    pub reason: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ReleaseArgs {
+    /// Target to release (`<key>`, `pr:<n>`, or `area:<name>`).
+    pub target: String,
+}
+
+#[derive(Args, Debug)]
+pub struct RetireArgs {
+    /// Task or agent key to retire.
+    pub key: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AttachArgs {
+    /// Agent key.
+    pub key: String,
+    /// PR number (e.g. `42`) or `none`.
+    pub pr: String,
+}
+
+#[derive(Args, Debug)]
+pub struct StopArgs {
+    /// Running agent key to stop.
+    pub key: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TellArgs {
+    /// Agent key to message/nudge.
+    pub key: String,
+    /// Guidance message for the agent.
+    pub message: String,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct NextArgs {
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct ProgressArgs {
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct FlakesArgs {
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct BatchArgs {
+    /// PR numbers to verify in this batch (omit to auto-plan from open PRs).
+    pub prs: Vec<u64>,
+    /// Custom verification command (defaults to `cargo test --workspace`).
+    #[arg(long)]
+    pub cmd: Option<String>,
+    /// Print batch plan without running checks.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ReplayArgs {
+    /// Batch ID to replay (e.g. `b001`).
+    pub batch_id: String,
+    /// Optional override command.
+    #[arg(long)]
+    pub cmd: Option<String>,
+    /// Dry-run mode.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct TrainArgs {
+    /// Open a new verified merge train from a passed batch ID (e.g. `b001`).
+    #[arg(long)]
+    pub from_batch: Option<String>,
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct ReleaseTrainArgs {
+    /// Record review approval for the current release-train head SHA.
+    #[arg(long)]
+    pub approve: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct LandArgs {
+    /// Dry-run without mutating state.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct QueueArgs {
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct TidyArgs {
+    /// Preview cleanup decisions without removing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Minimum idle age in seconds before cleaning up a worktree (default: 3600).
+    #[arg(long)]
+    pub min_age: Option<i64>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct TickArgs {
+    /// Preview tick decisions without spawning or mutating state.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct EventsArgs {
+    /// Maximum number of decisions to display (default: 50).
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Filter by category (`dispatch`, `verify`, `land`, `watch`, `kit`).
+    #[arg(long)]
+    pub category: Option<String>,
+    /// Filter by target key/PR/batch.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct TopArgs {
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct ServeArgs {
+    /// Bind address (default: 127.0.0.1:7420).
+    #[arg(long)]
+    pub addr: Option<String>,
+    /// Serve a single HTTP request and exit (useful for tests).
+    #[arg(long)]
+    pub once: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct WatchdogArgs {
+    /// Maximum allowed seconds since last tick when work is active (default: 600).
+    #[arg(long)]
+    pub max_stale: Option<i64>,
+    /// Alert cooldown in seconds (default: 3600).
+    #[arg(long)]
+    pub cooldown: Option<i64>,
 }

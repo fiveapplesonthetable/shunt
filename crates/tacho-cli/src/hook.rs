@@ -55,6 +55,55 @@ pub fn execute_hook(provider: Provider) {
         }
     };
 
+    // Optional worker guardrail enforcement when opted in via TACHO_GUARDRAILS=1 or TACHO_MANAGED_WORKER=1
+    let guardrails_enabled = std::env::var("TACHO_GUARDRAILS").ok().as_deref() == Some("1")
+        || std::env::var("TACHO_MANAGED_WORKER").ok().as_deref() == Some("1");
+    if guardrails_enabled {
+        let event_name = val
+            .get("hook_event_name")
+            .or_else(|| val.get("event"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if event_name.is_empty()
+            || event_name == "PreToolUse"
+            || event_name == "BeforeTool"
+            || event_name == "tool_begin"
+        {
+            let tool_name = val
+                .get("tool_name")
+                .or_else(|| val.get("tool"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_shell = matches!(
+                tool_name,
+                "Bash" | "bash" | "run_shell_command" | "run_command" | "shell"
+            );
+            if is_shell {
+                let cmd = val
+                    .get("tool_input")
+                    .and_then(|ti| {
+                        ti.get("command")
+                            .or_else(|| ti.get("cmd"))
+                            .or_else(|| ti.get("CommandLine"))
+                    })
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let run_in_bg = val
+                    .get("tool_input")
+                    .and_then(|ti| ti.get("run_in_background"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let under_starve = std::env::var("TACHO_STARVE").ok().as_deref() == Some("1");
+                if let Err(refusal) =
+                    tacho_core::decide::dispatch::guard_bash_tool(run_in_bg, cmd, under_starve)
+                {
+                    eprintln!("{refusal}");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+
     // 3. Map provider payload to typed Input messages via tacho-ingest::hooks
     let mut inputs = map_hook_payload(provider, &val);
     if inputs.is_empty() {

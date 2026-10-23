@@ -749,13 +749,7 @@ edition = "2021"
         let out = env
             .tacho_cmd()
             .args([
-                "emit",
-                "task",
-                &pr_slug,
-                "--agent",
-                agent,
-                "--paths",
-                &feat_file,
+                "emit", "task", &pr_slug, "--agent", agent, "--paths", &feat_file,
             ])
             .output()
             .unwrap();

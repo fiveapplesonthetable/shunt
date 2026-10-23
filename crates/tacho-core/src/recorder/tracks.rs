@@ -386,6 +386,82 @@ impl Recorder {
             return chain;
         }
 
+        if track_key == "fleet"
+            || track_key.starts_with("fleet/")
+            || track_key == "batches"
+            || track_key.starts_with("batch:")
+            || track_key == "trains"
+            || track_key.starts_with("train:")
+        {
+            add(
+                "fleet",
+                Some("tacho"),
+                "fleet",
+                Some("Orchestrator ticks, verification batches, and merge trains"),
+                TrackKind::Group,
+                None,
+            );
+            if track_key == "fleet/ticks" {
+                add(
+                    "fleet/ticks",
+                    Some("fleet"),
+                    "ticks",
+                    Some("Orchestrator tick pass duration slices"),
+                    TrackKind::Slices,
+                    None,
+                );
+            } else if track_key.starts_with("fleet/") {
+                let sub = track_key.strip_prefix("fleet/").unwrap_or(track_key);
+                add(
+                    track_key,
+                    Some("fleet"),
+                    sub,
+                    None,
+                    default_kind,
+                    default_unit,
+                );
+            } else if track_key == "batches" || track_key.starts_with("batch:") {
+                add(
+                    "batches",
+                    Some("fleet"),
+                    "batches",
+                    Some("Speculative verification batches and binary bisection probes"),
+                    TrackKind::Group,
+                    None,
+                );
+                if track_key != "batches" {
+                    add(
+                        track_key,
+                        Some("batches"),
+                        track_key,
+                        Some("Verification batch execution and bisection probe spans"),
+                        TrackKind::Slices,
+                        None,
+                    );
+                }
+            } else if track_key == "trains" || track_key.starts_with("train:") {
+                add(
+                    "trains",
+                    Some("fleet"),
+                    "trains",
+                    Some("Speculative merge trains and combined release trains"),
+                    TrackKind::Group,
+                    None,
+                );
+                if track_key != "trains" {
+                    add(
+                        track_key,
+                        Some("trains"),
+                        track_key,
+                        Some("Merge train state band (open -> landed / aborted / mismatch)"),
+                        TrackKind::State,
+                        None,
+                    );
+                }
+            }
+            return chain;
+        }
+
         if track_key.starts_with("custom") || track_key.starts_with("custom:") {
             add(
                 "custom",

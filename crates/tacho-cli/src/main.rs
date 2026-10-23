@@ -4,8 +4,10 @@ pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod emit;
+pub mod fleet;
 pub mod hook;
 pub mod install;
+pub mod kit;
 pub mod paths;
 pub mod query;
 pub mod run;
@@ -95,6 +97,194 @@ fn main() {
         }
         Commands::Tail(args) => {
             if let Err(e) = tail::execute_tail(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Start(args) => {
+            if let Err(e) = kit::execute_start(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Prove(args) => {
+            if let Err(e) = kit::execute_prove(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Job(args) => {
+            if let Err(e) = kit::execute_job(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Wait(args) => match kit::execute_wait(args) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        Commands::Kill(args) => {
+            if let Err(e) = kit::execute_kill(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Pr(args) => {
+            if let Err(e) = kit::execute_pr(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Note(args) => {
+            if let Err(e) = kit::execute_note(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Starve(args) => match kit::execute_starve(args) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        Commands::Todo(args) => {
+            if let Err(e) = fleet::execute_todo(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Session(args) => {
+            if let Err(e) = fleet::execute_session(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Hold(args) => {
+            if let Err(e) = fleet::execute_hold(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Release(args) => {
+            if let Err(e) = fleet::execute_release(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Retire(args) => {
+            if let Err(e) = fleet::execute_retire(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Attach(args) => {
+            if let Err(e) = fleet::execute_attach(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Stop(args) => {
+            if let Err(e) = fleet::execute_stop(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Tell(args) => {
+            if let Err(e) = fleet::execute_tell(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Next(args) => {
+            if let Err(e) = fleet::execute_next(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Progress(args) => {
+            if let Err(e) = fleet::execute_progress(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Flakes(args) => {
+            if let Err(e) = fleet::execute_flakes(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Batch(args) => {
+            if let Err(e) = fleet::execute_batch(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Replay(args) => {
+            if let Err(e) = fleet::execute_replay(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Train(args) => {
+            if let Err(e) = fleet::execute_train(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::ReleaseTrain(args) => {
+            if let Err(e) = fleet::execute_release_train(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Land(args) => {
+            if let Err(e) = fleet::execute_land(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Queue(args) => {
+            if let Err(e) = fleet::execute_queue(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Tidy(args) => {
+            if let Err(e) = fleet::execute_tidy(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Tick(args) => {
+            if let Err(e) = fleet::execute_tick(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Events(args) => {
+            if let Err(e) = fleet::execute_events(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Top(args) => {
+            if let Err(e) = fleet::execute_top(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Serve(args) => {
+            if let Err(e) = fleet::execute_serve(args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Watchdog(args) => {
+            if let Err(e) = fleet::execute_watchdog(args) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

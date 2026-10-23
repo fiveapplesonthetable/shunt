@@ -175,7 +175,7 @@ struct OpenSynthSlice {
     open_seq: u64,
     agent: Option<String>,
     target_agent: Option<String>,
-     waiting_for_delivery: bool,
+    waiting_for_delivery: bool,
 }
 
 #[derive(Default)]
@@ -193,7 +193,10 @@ struct SnapshotProjector {
 
 impl SnapshotProjector {
     fn next_track_ts(&mut self, track: &str, candidate_ts: u64) -> u64 {
-        let last = self.synth_track_last_ts.entry(track.to_string()).or_insert(0);
+        let last = self
+            .synth_track_last_ts
+            .entry(track.to_string())
+            .or_insert(0);
         let ts = (*last).max(candidate_ts);
         *last = ts;
         ts
@@ -455,18 +458,15 @@ impl SnapshotProjector {
             }
 
             Kind::Stall => {
-                let agent_id = ev
-                    .agent
-                    .clone()
-                    .unwrap_or_else(|| {
-                        ev.track_key
-                            .split('/')
-                            .next()
-                            .unwrap_or("unknown")
-                            .strip_prefix("agent:")
-                            .unwrap_or("unknown")
-                            .to_string()
-                    });
+                let agent_id = ev.agent.clone().unwrap_or_else(|| {
+                    ev.track_key
+                        .split('/')
+                        .next()
+                        .unwrap_or("unknown")
+                        .strip_prefix("agent:")
+                        .unwrap_or("unknown")
+                        .to_string()
+                });
                 let stall_track = if ev.track_key.ends_with("/stalls") {
                     ev.track_key.clone()
                 } else {
@@ -484,15 +484,18 @@ impl SnapshotProjector {
                 );
                 writer.write_all(packet_buf)?;
                 *total_bytes += packet_buf.len() as u64;
-                self.open_stalls.entry(agent_id).or_default().push(OpenSynthSlice {
-                    track_key: stall_track,
-                    kind: Kind::Stall,
-                    open_ts: begin_ts,
-                    open_seq: ev.seq,
-                    agent: ev.agent,
-                    target_agent: None,
-                    waiting_for_delivery: false,
-                });
+                self.open_stalls
+                    .entry(agent_id)
+                    .or_default()
+                    .push(OpenSynthSlice {
+                        track_key: stall_track,
+                        kind: Kind::Stall,
+                        open_ts: begin_ts,
+                        open_seq: ev.seq,
+                        agent: ev.agent,
+                        target_agent: None,
+                        waiting_for_delivery: false,
+                    });
                 Ok(())
             }
 

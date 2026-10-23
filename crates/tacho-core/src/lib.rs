@@ -7,6 +7,7 @@
 //! and lane allocator.
 
 pub mod classify;
+pub mod decide;
 pub mod detect;
 pub mod encoder;
 pub mod event;

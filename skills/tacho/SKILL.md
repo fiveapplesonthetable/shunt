@@ -1,124 +1,163 @@
 ---
 name: tacho
-description: Flight recorder for agent supervision, timeline tracing, stall detection, and telemetry querying.
+description: Flight recorder, worker kit, and fleet orchestrator for coding agents — worktrees, proof preflight, speculative batch verification, merge trains, stall detection, and Perfetto timeline tracing.
 ---
 
-# tacho: Agent Flight Recorder & Supervisor Skill
+# tacho: Agent Flight Recorder, Worker Kit & Fleet Orchestrator Skill
 
-Use `tacho` to monitor, supervise, and diagnose fleets of coding agents without polluting your context window with megabytes of raw transcripts.
-
-## When to Use
-
-- **Supervising Subagents:** When running background workers, use `tacho status` and `tacho watch` instead of parsing raw stdout or log files.
-- **Diagnosing Stalls & Loops:** When a worker is unresponsive, stuck in a retry loop, or failing builds, use `tacho report <agent>` to inspect the root cause.
-- **Performance & Bottlenecks:** When investigating slow builds, test contention, or token burn, use `tacho query <query-name>` or export a trace with `tacho trace`.
-- **Emitting Custom Spans:** When writing orchestrator pipelines, use `tacho emit` to trace stages, tasks, and state transitions.
+Use `tacho` both as a **worker agent** (isolated worktrees, background jobs, CPU starvation reproduction, scoped proof checks, and PR preflight guardrails) and as a **fleet orchestrator & supervisor** (work queue, area serialization, speculative batch verification with binary bisection, verified merge trains, progress/stall detection, and Perfetto timeline tracing).
 
 ---
 
-## Quick Reference Commands
+## Part 1: Worker Agent Kit (`start`, `job`, `wait`, `kill`, `starve`, `prove`, `pr`, `note`)
 
-### 1. Monitor Fleet Status
-Get a compact, single-line overview of every active agent:
+Every worker agent follows this lifecycle:
+
+### 1. Create an Isolated Worktree (`tacho start`)
+```bash
+tacho start <slug> --base main
+# or stack on an upstream PR:
+tacho start <slug> --base 42
+```
+- Validates `<slug>` (`3..80` lowercase alphanumeric + single hyphens).
+- Resolves `--base` to an **exact commit SHA** (never a mutable branch reference).
+- Allocates an isolated 20-port block (`20000..32000`, verified free in both fleet state and TCP bind).
+- Writes `.tachoenv` (`SLUG`, `BASE_SHA`, `BASE_PR`, `PORT`, `PORT_LAST`, `CARGO_TARGET_DIR`) and adds `.tachoenv`, `.tachoproof/`, and `.tachorun/` to `.git/info/exclude`.
+
+### 2. Record Phase Notes (`tacho note`)
+Keep the supervisor informed as you move between phases (`read`, `write`, `test`, `fix`, `push`):
+```bash
+tacho note <slug> "read: inspecting WAL recovery and lock ordering"
+tacho note <slug> "write: implementing pure bisection state machine"
+tacho note <slug> "test: reproducing race under CPU starvation"
+```
+
+### 3. Manage Background Processes (`tacho job`, `tacho wait`, `tacho kill`)
+Never leave orphan background processes or block a tool call past its 10-minute timeout:
+```bash
+# Launch a detached process group under .tachorun/<name>
+tacho job full-suite -- cargo test --workspace
+
+# Stream output for up to 9 minutes (exits 0 on pass, non-zero on failure, 3 if still running)
+tacho wait full-suite
+
+# Terminate the job's entire process group (verifies worktree ownership first)
+tacho kill full-suite --now
+```
+
+### 4. Reproduce Timing & Concurrency Flakes (`tacho starve`)
+```bash
+tacho starve -- cargo test -p tacho-core flaky_test
+```
+- Allocates at most 1/8th of host CPUs (highest-numbered cores first), spawns 4 `yes` burners per core in that slice, and pins the command to the starved cores with a 5-minute timeout.
+- Automatically refuses if a verification batch is running and yields immediately if a batch starts.
+
+### 5. Prove Your Changes (`tacho prove`)
+Before opening or updating a PR, run `tacho prove`:
+```bash
+tacho prove
+```
+- Computes the exact git tree hash of the working tree (including unstaged and untracked files via a temporary index) and maps changed files to scoped checks (`git diff --check`, `bash -n`, `cargo clippy`, `cargo test`).
+- Writes `.tachoproof/summary.json` recording `head`, `tree`, `base`, `ok`, and per-check durations.
+
+### 6. Open or Update a Pull Request (`tacho pr`)
+```bash
+tacho pr "Fix WAL checkpoint race" -m "Eliminates lock inversion between appender and snapshot reader."
+```
+- Preflight refuses if: title/description is empty, diff is empty, branch has merge commits, worktree has uncommitted changes, `.tachoproof/summary.json` is missing/failed/stale (`proof.tree != HEAD^{tree}`), or any commit/title/description contains `Co-Authored-By`, `Generated with/by`, or robot emoji.
+- Pushes with `--force-with-lease`, opens/updates a draft PR with a formatted `## Proof` table, and prints `PR: #<n>`.
+- Always end your final worker output with `PR: #<n>` (or `PR: none` if no code changes were needed).
+
+---
+
+## Part 2: Fleet Orchestration, Verification & Landing
+
+### 1. Enqueue & Dispatch Work (`tacho todo`, `tacho next`, `tacho tick`)
+```bash
+# Queue a task in an area chain (tasks in the same area run one at a time and stack on each other)
+tacho todo auth-step-1 "Extract token verifier" --area auth
+tacho todo auth-step-2 "Add rotation support" --area auth --after auth-step-1
+
+# Side-by-side multi-model comparison (expands into parallel unscoped runs)
+tacho todo parser-opt "Optimize wire varint decoder" --compare opus,codex,gemini
+
+# Preview what the next tick will dispatch and verify
+tacho next
+
+# Execute one orchestrator & supervisor pass
+tacho tick
+```
+
+### 2. Control Workers, Holds & Retirement (`tacho hold`, `tacho release`, `tacho retire`, `tacho attach`, `tacho tell`, `tacho stop`)
+```bash
+tacho hold pr:42 --reason "waiting on schema migration"
+tacho hold area:auth --reason "holding auth chain"
+tacho release pr:42
+tacho attach my-task 42        # or: tacho attach my-task none
+tacho tell my-task "Use BTreeMap for deterministic ordering"
+tacho stop my-task
+tacho retire my-task
+```
+
+### 3. Speculative Batch Verification & Flake Ledger (`tacho batch`, `tacho replay`, `tacho flakes`)
+```bash
+# Verify open PRs in batches of up to 6 (taking stacks whole; CI changes run solo)
+tacho batch
+
+# Replay a specific batch
+tacho replay b001
+
+# Inspect the persistent flake ledger (auto-queues a fix task when a test flakes >= 2 times)
+tacho flakes
+```
+- When a batch fails, binary bisection probes `main` (`k = 0`) before blaming a single or first PR, and the failure classifier always classifies named failing tests or `"minimal failing input"` counterexamples as `"code"` even beside infrastructure noise.
+
+### 4. Verified Merge Trains & Ready Queue (`tacho queue`, `tacho train`, `tacho release-train`, `tacho land`)
+```bash
+tacho queue
+tacho train --from-batch b001
+tacho release-train --approve
+tacho land
+```
+- Verifies that `main`'s post-merge `git_tree` equals the verified train `tree`.
+
+### 5. Supervision, Progress, Janitor & Audit (`tacho top`, `tacho progress`, `tacho events`, `tacho tidy`, `tacho watchdog`)
+```bash
+tacho top                 # Compact dashboard + NEEDS YOU attention items
+tacho progress            # MOVING / STALLED (45m) / HUNG (30m) verdicts + area chain velocity
+tacho events --limit 30   # Audit log of every decision and its 'because' reason
+tacho tidy --dry-run      # Clean up stale worktrees (rescuing dirty/unpushed work)
+tacho watchdog            # Alert if orchestrator tick is stale while work is pending
+```
+
+---
+
+## Part 3: Flight Recorder, Claim Verification & Perfetto Tracing
+
+### 1. Monitor Fleet Status & Block on State Changes
 ```bash
 tacho status
-```
-Output columns:
-- `agent`: Agent identifier (from `TACHO_AGENT` or provider session).
-- `state`: Current state (`Thinking`, `Tool`, `Waiting`, `Stalled`, `Idle`, `Exited`).
-- `for`: Duration in the current state.
-- `run`: Current session run number.
-- `turn`: Turn count in this run.
-- `last action`: Current command, tool call, or wait target.
-- `tokens out`: Cumulative output tokens.
-- `flags`: Active anomaly detector flags (`LOOP`, `SPIN`, `SILENT`, `BURN`, `FAILING`, `OFF_BRIEF`, `CLAIM`).
-
-For programmatic consumption:
-```bash
 tacho status --json
-```
-
-### 2. Block on State Changes (Zero Polling)
-Block your orchestrator until a worker triggers a condition, instead of polling in a loop:
-```bash
-# Block until any worker stalls (loop, spin, timeout, failing command, false claim)
 tacho watch --until stalled
-
-# Block until all workers become idle or exit
 tacho watch --until idle
 tacho watch --until exit
 ```
 
-### 3. Diagnose a Specific Worker & Verify Claims
-When an agent encounters an anomaly, finishes a task, or makes completion claims:
+### 2. Diagnose a Specific Worker & Verify Claims
 ```bash
-# Recent turns, tool calls, exit codes, modified files, and stall evidence
 tacho report <agent-id> --since 30m
-
-# Verify agent completion claims against verifiable ground truth
 tacho report <agent-id> --diff-claims
 ```
-`--diff-claims` asserts that:
-- File modifications were recorded (`FileEdited`).
-- A passing `TEST` command (`exit 0`) completed *after* the final file modification.
-- Commits or pushes were performed and the git working tree is clean.
 
-### 4. Run Analytical Queries
-Execute pre-packaged PerfettoSQL queries against the live database:
+### 3. Run Analytical PerfettoSQL Queries & Export Traces
 ```bash
-# Show active blocking waits across runs
+tacho query agents-now
 tacho query open-waits
-
-# Show failing commands and non-zero exit codes
 tacho query failing-commands
-
-# Wall-clock time spent in Build, Test, Lint, and Format
 tacho query time-by-class
-
-# Files modified, line deltas, and modifying agents
 tacho query edits-by-file
-
-# Active anomaly detector firings with evidence
 tacho query stalls
-
-# Git trees with passing builds, tests, and lints for CI reuse
 tacho query verified-trees
-```
-
-### 5. Task Orchestration & Budgets (`tacho emit task`)
-Declare tasks to bound scope, enforce budgets, and link retries:
-```bash
-tacho emit task auth-refactor \
-  --paths src/auth.rs,src/token.rs \
-  --agent worker-1 \
-  --base-commit abc1234 \
-  --token-budget 100000 \
-  --cost-budget 500000 \
-  --brief-file brief.md
-```
-- Sets declared `--paths` for `OFF_BRIEF` detection.
-- Sets per-task token and cost ceilings for `BURN` detection.
-- Links subsequent runs of the same task with a Perfetto flow arrow (`task_run_flow:<slug>`).
-
-### 6. Export Trace for Visual Inspection
-Export a `.perfetto-trace` file to open in [ui.perfetto.dev](https://ui.perfetto.dev):
-```bash
 tacho trace -o trace.perfetto-trace --since 1h
 ```
 
----
-
-## Best Practices for Orchestrators
-
-1. **Tag Child Processes:** Always export `TACHO_AGENT=<name>` when spawning worker subagents so all hooks and commands attribute to that worker:
-   ```bash
-   export TACHO_AGENT=worker-1
-   ```
-2. **Never Ingest Raw Transcripts:** Raw agent logs easily exceed 50-100 MB. Always use `tacho status` or `tacho report` to maintain a lean context window.
-3. **Verify Claims Before Acceptance:** Run `tacho report <agent> --diff-claims` when an agent claims completion to confirm that tests were actually run and passed after file edits.
-4. **Handle Stalls Proactively:**
-   - If `flags` contains `CLAIM`: Agent reported completion without verifying tests. Reject and instruct agent to run test suite.
-   - If `flags` contains `LOOP`: Worker is calling the same tool repeatedly. Interrupt or send corrective feedback.
-   - If `flags` contains `FAILING`: The worker has failed the same build/test 3 times. Provide explicit test failure details.
-   - If `flags` contains `OFF_BRIEF`: Worker modified files outside task's `--paths`. Revert changes and re-anchor prompt.
-   - If `flags` contains `SILENT`: Worker process is quiet. If not consuming CPU, process may be wedged or dead.
