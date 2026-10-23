@@ -2,9 +2,9 @@
 
 **A flight recorder for coding agents.**
 
-One lightweight daemon records what every coding agent does into a single SQLite WAL event log, and answers two readers:
-1. **Supervising agents** asking *"what are my workers doing?"* in under 200 tokens via CLI.
-2. **Engineers** inspecting nanosecond execution traces in [ui.perfetto.dev](https://ui.perfetto.dev).
+One lightweight daemon records what every coding agent does into a single SQLite WAL event log (`$TACHO_HOME/events.sqlite`), and answers two readers:
+1. **Supervising agents** asking *"what are my workers doing?"* and verifying completion claims in under 200 tokens via CLI.
+2. **Engineers** inspecting nanosecond duration slices, state bands, and step-function counters in [ui.perfetto.dev](https://ui.perfetto.dev).
 
 <p align="center">
   <img src="docs/img/architecture.svg" alt="tachograph architecture" width="100%" />
@@ -14,16 +14,15 @@ One lightweight daemon records what every coding agent does into a single SQLite
 
 ## Key Highlights
 
-- **Single Source of Truth:** Everything is stored in `$TACHO_HOME/events.sqlite` with WAL mode. Snapshots are streamed directly from SQLite rows through a zero-allocation O(1) memory encoder.
-- **Resilient Fallback & Graceful Degradation:** If the daemon process crashes, `tacho trace` opens the SQLite WAL file directly in read-only mode. If SQLite encounters a read-only or full disk, in-memory `LiveState` continues updating so agent hooks never block. Dead/zombie worker processes (`ESRCH` / `'Z'`) are automatically reaped, closing open slices with `abandoned = true`.
-- **High-Throughput Ingestion:** Sustains a release-mode floor of **&ge; 50,000 inputs/sec** on `api.sock` (up to **511,195 inputs/sec** peak on an unloaded workstation, and over **51,800 inputs/sec** during concurrent 10-million-row snapshot exports).
-- **Fast Streaming Snapshots:** Exports 100,000 rows in **96.3 ms** (1.04M rows/s), 1,000,000 rows in **790.6 ms** (1.26M rows/s), and 10,000,000 rows (641 MB) in **7.87 s** (1.27M rows/s) with only a **+4.0 MB RSS delta** from 1M to 10M rows.
-- **Supervisor Control Loop & 7 Detectors:** Turns 97 MB of messy worker transcripts into ~180 tokens. Detects `LOOP`, `SPIN`, `BURN`, `FAILING`, `OFF_BRIEF`, CPU-aware `SILENT` (which checks `/proc` CPU counters so long compiles never false-positive), and `CLAIM` (flags runs exiting 0 after edits without passing tests).
-- **Claim Verification (`--diff-claims`):** `tacho report <agent> --diff-claims` cross-references recorded edits, tests, commits, and worktree clean status against agent claims.
+- **Single Source of Truth (`events.sqlite`):** Everything flows through `$TACHO_HOME/events.sqlite` in SQLite WAL mode. There are no separate in-memory event ring buffers: traces, PerfettoSQL queries, and supervisor status/reports are all backed by the same SQLite WAL log.
+- **Resilient Direct SQLite Fallback:** If the daemon process is unreachable or crashed, `tacho trace`, `tacho status`, and `tacho report` open `events.sqlite` directly in read-only mode. Dead/zombie worker processes (`ESRCH` / `'Z'`) are automatically reaped, closing open slices with `abandoned = true`.
+- **Duration, State & Counter-First Perfetto UX:** `SnapshotProjector` pairs every lifecycle interval into true duration slices (`turns`, `lane:1..k`, `stalls`, `worktree`, `procs/slot 0..k`, `messages`, `review`), `TYPE_STATE` bands (`agent:<id>/state`, `task:<slug>/state`, `milestones`), and step-function counters (`files_edited`, `commits`, `proc_count`, `cpu`, `rss`, `tokens_*`, `cost`) with **zero zero-duration instant clutter**.
+- **High-Throughput Ingestion & Fast Streaming Snapshots:** Sustains **&ge; 50,000 inputs/sec** on `api.sock` (up to **511,195 inputs/sec** peak) and streams 10,000,000 rows (641 MB) in **7.87 s** (1.27M rows/s) with only a **+4.0 MB RSS delta** from 1M to 10M rows.
+- **Supervisor Control Loop & 7 Detectors:** Turns 97 MB of messy worker transcripts into ~180 tokens. Detects `LOOP`, `SPIN`, `BURN`, `FAILING`, `OFF_BRIEF`, CPU-aware `SILENT` (checks `/proc` + cgroup CPU counters so long compiles never false-positive), and `CLAIM` (flags runs exiting 0 after edits without passing tests), with an optional `on_stall` shell hook.
+- **Claim Verification (`--diff-claims`):** `tacho report <agent> --diff-claims` cross-references recorded edits, passing tests after the final edit, commits, pushes, and git worktree status against agent claims.
 - **Git Tree Verification:** Every build, test, and run records `git_tree` hash (`git rev-parse HEAD^{tree}`), queryable via `tacho query verified-trees` for CI reuse and merge trains.
-- **Properly Nested Lanes:** Parallel tool calls and concurrent subagents are routed into deterministic virtual tracks (`turns`, `lane:1`, `lane:2`), avoiding Perfetto slice stack collisions.
-- **Host Corroboration:** Integrates with Perfetto `traced` to overlay kernel scheduler slices, CPU frequency, and per-process memory alongside agent turns.
-- **Zero Leaks:** Strict privacy firewall scrubs secrets, tokens, API keys, credentials, and userinfo before persistence or display.
+- **Process Tree & cgroup v2 Tracking:** Tracks child process lifetimes (`procs/slot 0..k`) and unified `/proc` + cgroup v2 CPU/RSS metrics alongside optional Perfetto `traced` kernel scheduling slices.
+- **Content Firewall & Opt-In Secret Scrubber:** Never stores raw prompts, model prose, tool stdout/stderr, or file diffs (only 8-byte BLAKE3 digests and byte counts). Secret pattern redaction on `argv` and custom strings is opt-in via `scrub = true` in `config.toml` or `TACHO_SCRUB=1`.
 
 ---
 
@@ -99,12 +98,12 @@ STALL DETECTED: LOOP (identical input digest 4x in a row)
 Example `--diff-claims` output when an agent claims all tests pass without running them:
 ```text
 === Claim Verification: worker-2 ===
-Claimed:  "Task complete, all tests passing"
-Actual:   CLAIM STALL DETECTED (STALL_CLAIM)
-  - FileEdits: 4 files modified (src/auth.rs, src/token.rs, ...)
-  - Last Test: None after last FileEdited! (exit code 0 required)
-  - Worktree:  Dirty (uncommitted changes remain)
-Result:   REJECTED — Agent exited without running tests after modifying code.
+Edits:                4
+Test After Last Edit: UNVERIFIED
+Commits Succeeded:    0
+Pushes Succeeded:     0
+Claim Stall Flags:    CLAIM
+Git Worktree Status:  DIRTY (4 uncommitted/untracked files)
 ```
 
 ### Seven Anomaly Detectors
@@ -123,17 +122,17 @@ Result:   REJECTED — Agent exited without running tests after modifying code.
 
 ## Visualizing in Perfetto UI
 
-Open any exported snapshot in [ui.perfetto.dev](https://ui.perfetto.dev) to inspect turns, tool calls, subagents, and host telemetry:
+Open any exported snapshot in [ui.perfetto.dev](https://ui.perfetto.dev) to inspect turns, tool calls, child processes, subagents, tasks, and host telemetry:
 
 <p align="center">
   <img src="docs/img/timeline.svg" alt="Perfetto timeline visualization" width="100%" />
 </p>
 
 Features rendered in the trace:
-- **State Band:** `Thinking`, `Tool`, `Waiting`, `Stalled`, `Idle`, and `Exited`.
-- **Turns & Tools:** Hierarchical nested slices for every tool call, build, test, and file edit.
-- **Flow Arrows:** Explicit causal arrows linking tool invocations to subagent runs and messages.
-- **Host Telemetry:** Machine load, memory usage, and kernel scheduler slices aligned by `ClockSnapshot`.
+- **State Bands (`TYPE_STATE`):** `agent:<id>/state` (`Thinking`, `Tool`, `Waiting`, `Stalled`, `Idle`, `Exited`), `task:<slug>/state` (`Queued`, `InProgress`, `Review`, `Done`, `Failed`), and `tacho/milestones`.
+- **Duration Slices (0 Instant Clutter):** Nested `turns` and `lane:1..k` tool calls, `agent:<id>/stalls` stall windows, `run:<n>/worktree` dirty-to-commit intervals, `run:<n>/procs/slot 0..k` child process lifetimes, `task:<slug>/review` spans, and `tacho/messages` delivery flights.
+- **Step-Function Counters:** `files_edited`, `commits`, `proc_count`, `cpu`, `rss`, `tokens_in`, `tokens_out`, `tokens_cached`, `cost`, and `machine/*` metrics.
+- **Causal Flow Arrows:** Explicit flow arrows linking tool invocations to subagent runs, inter-agent messages, stall recoveries, and multi-run task retries.
 
 ---
 
@@ -158,9 +157,9 @@ Perfetto requires slice tracks to nest like a strict call stack. LLMs frequently
 </p>
 
 - **Hook Ingest:** Completes in &lt; 5 ms. Non-blocking; drops silently after 200 ms timeout to protect agent execution.
-- **Appender Batch:** Single-threaded writer commits up to 256 events per transaction to SQLite WAL.
-- **Live State:** Atomically publishes updated `ArcSwap<LiveState>` pointer; answers `tacho status` in &lt; 100 &mu;s with zero disk I/O.
-- **Snapshot Reader:** Streams SQLite rows directly into Perfetto protobuf packets. If the daemon is dead, the CLI falls back to direct read-only WAL access.
+- **Appender Batch:** Single-threaded writer commits up to 256 events per transaction to `$TACHO_HOME/events.sqlite` (SQLite WAL).
+- **Status / Report / Watch:** Answered from the WAL-derived state fold (`Recorder::restore`), with automatic direct read-only SQLite fallback when the daemon is down.
+- **Snapshot Reader:** Streams SQLite WAL rows directly through `SnapshotProjector` into Perfetto protobuf packets in O(1) memory.
 
 ---
 
@@ -179,7 +178,7 @@ tacho install jetski
 
 ### 2. Process Wrapping (`tacho run`)
 
-Runs an agent inside a supervisor process that tees stdout, parses stream-json output, and samples CPU/RSS over the process tree:
+Runs an agent inside a supervisor process (placed into a dedicated cgroup v2 leaf when available) that tees stdout, parses stream-json output, and samples child process slots, CPU, and RSS over the process tree:
 
 ```bash
 tacho run -- claude --output-format stream-json
@@ -209,9 +208,9 @@ tacho emit task refactor-auth \
   --cost-budget 500000 \
   --brief-file brief.md
 
-# Emit spans
+# Emit spans and task state changes
 tacho emit span begin custom:pipeline "codegen" --arg schema=v2
-tacho emit instant custom:pipeline "checkpoint" --arg status=ok
+tacho emit state refactor-auth InProgress --because "worker-1 started"
 tacho emit span end custom:pipeline
 ```
 
@@ -247,7 +246,7 @@ Execute pre-packaged analytics queries directly using `tacho query <name>`:
 | `open-waits` | Active blocking waits across runs |
 | `failing-commands` | Non-zero exit code commands grouped by class |
 | `time-by-class` | Wall-clock time spent in Build, Test, Lint, and Format |
-| `edits-by-file` | Modifed files, agent counts, and lines added/removed |
+| `edits-by-file` | Modified files, agent counts, and lines added/removed |
 | `tokens-by-agent` | Input, output, and cached token consumption |
 | `stalls` | Recorded anomaly detector firings with evidence |
 | `verified-trees` | Git tree hashes (`git_tree`) with passing builds/tests/lints for CI reuse |
@@ -256,14 +255,13 @@ Execute pre-packaged analytics queries directly using `tacho query <name>`:
 
 ---
 
-## Privacy Firewall
+## Content Firewall & Opt-In Secret Scrubber
 
-tachograph ensures confidential code and tokens never enter traces:
+tachograph separates structural telemetry from raw content and supports opt-in secret scrubbing:
 
-- **Dropped by Default:** Prompts, model prose, tool outputs, file diffs, and raw message bodies are never stored. Only Blake3 digests and sizes are retained.
-- **Pattern Redaction:** Flags (`--token`, `--password`, `-p`), headers (`Authorization: Bearer`), and key shapes (AWS `AKIA`, GCP `ya29`, GitHub `ghp_`, Anthropic `sk-ant-`, OpenAI `sk-`, JWTs, PEM blocks) are replaced with `<redacted>`.
-- **SHA Preservation:** 40-character hexadecimal Git commit hashes are explicitly exempted from hex secret redaction.
+- **Dropped Always (Content Firewall):** Prompts, model prose, tool outputs, file diffs, and raw message bodies are never stored. Only 8-byte BLAKE3 digests and byte sizes are retained.
 - **Relative Paths:** Workspace paths are made relative to the project root. External paths are masked as `<outside>/...`.
+- **Opt-In Pattern Redaction (`scrub = true` or `TACHO_SCRUB=1`):** Disabled by default (`scrub = false`) so local command lines remain unredacted during debugging. When enabled in `$TACHO_HOME/config.toml` (`scrub = true`) or via `TACHO_SCRUB=1`, flags (`--token`, `--password`, `-p`), headers (`Authorization: Bearer`), URL userinfo, and key shapes (AWS `AKIA`, GCP `ya29`, GitHub `ghp_`, Anthropic `sk-ant-`, OpenAI `sk-`, JWTs, PEM blocks, 32+ char hex/base64 runs) are replaced with `<redacted>`, while 40-character Git commit SHAs are preserved.
 
 ---
 
@@ -287,8 +285,8 @@ tacho trace --system -o full-system.perfetto-trace
 ## Counter Semantics & Deduplication
 
 Perfetto counter tracks are step-functions (each sample holds its value until the next sample):
-- **Event-driven counters:** `active_builds`, `active_tests`, `tokens_in`, `tokens_out`, `tokens_cached`, and `cost_micros` emit strictly on event occurrence or value change.
-- **Polled host/process counters:** Machine counters (`load1`, `cpu_busy`, `mem_used`, `disk:*`) and per-agent process metrics (`cpu`, `rss`) are polled every 2s from `/proc`, and step-function deduplicated in the sampler: written to SQLite WAL only when the value actually changes.
+- **Event-driven counters:** `active_builds`, `active_tests`, `files_edited`, `commits`, `tokens_in`, `tokens_out`, `tokens_cached`, and `cost` emit strictly on event occurrence or value change.
+- **Polled host/process counters:** Machine counters (`load1`, `cpu_busy`, `mem_used`, `disk:*`) and per-agent process metrics (`proc_count`, `cpu`, `rss`) are polled every 2s from `/proc` and cgroup v2, and step-function deduplicated in the sampler: written to SQLite WAL only when the value actually changes.
 
 ---
 
@@ -297,12 +295,12 @@ Perfetto counter tracks are step-functions (each sample holds its value until th
 ```text
 crates/
 ├── tacho-proto/     # Protobuf schemas and prost bindings for Perfetto & tachograph extensions
-├── tacho-core/      # Event model, SQLite WAL storage, TrackEvent encoder, scrubber, classifier, LaneAllocator
+├── tacho-core/      # Event model, TrackEvent encoder, SnapshotProjector, scrubber, classifier, LaneAllocator
 ├── tacho-ingest/    # Provider hooks (Claude/Gemini/Jetski), stream-json tee reader, OTLP HTTP receiver
 ├── tacho-system/    # Perfetto traced integration, dual-clock sync, system session controller
-├── tacho-daemon/    # Background daemon, appender thread, /proc sampler, query service, snapshot server
-├── tacho-cli/       # CLI commands, daemon auto-spawner, status/report formatters, SQL query runner
-└── tacho-e2e/       # End-to-end integration and black-box verification test suite
+├── tacho-daemon/    # Background daemon, appender thread, SQLite WAL log, /proc + cgroup sampler, snapshot server
+├── tacho-cli/       # CLI commands, daemon auto-spawner, status/report formatters, tailer, SQL query runner
+└── tacho-e2e/       # End-to-end integration, chaos torture, and black-box verification test suite
 ```
 
 ## Documentation

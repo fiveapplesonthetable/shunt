@@ -173,7 +173,7 @@ All experiments were executed on this machine (`zezeozue.c.googlers.com`, Linux 
        ```
      - Even with `--full-sort`, any packet carrying `SEQ_NEEDS_INCREMENTAL_STATE` encountered in the stream before `SEQ_INCREMENTAL_STATE_CLEARED` on that sequence is skipped immediately by the tokenizer in `ProtoTraceReader::ParsePacket`.
 - **Design Impact**:
-  Important operational rule: In `design.md` Section 9, the requirement that the snapshot thread writes sequence defaults, `InternedData`, and `SEQ_INCREMENTAL_STATE_CLEARED` in the header *before* any ring chunks is critical. Out-of-order timestamps within ring chunks sort cleanly, but the per-sequence interned dictionary header must be physically earlier in the stream.
+  Important operational rule: In `design.md` Section 9, the requirement that the snapshot thread writes sequence defaults, `InternedData`, and `SEQ_INCREMENTAL_STATE_CLEARED` in the header *before* any event packets streamed from SQLite WAL is critical. Out-of-order timestamps sort cleanly, but the per-sequence interned dictionary header must be physically earlier in the stream.
 
 ---
 

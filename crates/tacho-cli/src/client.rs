@@ -224,7 +224,7 @@ impl DaemonClient {
         Ok(())
     }
 
-    /// Fetches an in-memory trace snapshot from the daemon and streams bytes to `w`.
+    /// Fetches a trace snapshot from the daemon (streaming from `events.sqlite` WAL) and writes bytes to `w`.
     ///
     /// Connects to `trace.sock` first (when unfiltered and not `from_log`).
     /// Otherwise falls back to `api.sock`.

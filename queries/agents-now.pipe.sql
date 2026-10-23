@@ -10,6 +10,8 @@ SELECT max(ts) AS end_ts FROM (
   SELECT ts FROM slice
   UNION ALL
   SELECT ts FROM state
+  UNION ALL
+  SELECT ts FROM counter
 );
 
 CREATE PERFETTO TABLE _latest_states AS

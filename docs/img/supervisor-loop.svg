@@ -59,7 +59,7 @@
 
   <rect width="1020" height="540" class="bg"/>
 
-  <text x="30" y="30" class="text-title">The Supervisor Control Loop: turning 97 MB of worker logs into ~200 tokens</text>
+  <text x="30" y="30" class="text-title">The Supervisor Control Loop: turning 97 MB of worker logs into ~180 tokens</text>
 
   <!-- COLUMN 1: N CHEAP WORKERS -->
   <text x="30" y="65" class="text-section">1 · N Worker Agents (Cheap Models)</text>
@@ -107,34 +107,34 @@
 
   <g transform="translate(330, 80)">
     <rect width="280" height="315" class="box-filter"/>
-    <text x="16" y="26" class="text-title">Tachograph Daemon</text>
+    <text x="16" y="26" class="text-title">Tachograph Daemon (events.sqlite)</text>
     
     <!-- Sub-boxes for reduction features -->
     <g transform="translate(12, 42)">
       <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
-      <text x="10" y="20" class="text-body" font-weight="600">Privacy &amp; Content Firewall</text>
-      <text x="10" y="36" class="text-desc">0 prose, 0 file content, 0 output stored</text>
+      <text x="10" y="20" class="text-body" font-weight="600">Content Firewall &amp; Opt-in Scrubber</text>
+      <text x="10" y="36" class="text-desc">0 prose/diffs stored; opt-in secret redaction</text>
     </g>
 
     <g transform="translate(12, 102)">
       <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
-      <text x="10" y="20" class="text-body" font-weight="600">Command Classifier</text>
-      <text x="10" y="36" class="text-desc">"cargo test --lib" → CommandClass::Test</text>
+      <text x="10" y="20" class="text-body" font-weight="600">Command Classifier &amp; Git Tree</text>
+      <text x="10" y="36" class="text-desc">"cargo test --lib" → TEST + HEAD^{tree} SHA</text>
     </g>
 
     <g transform="translate(12, 162)">
       <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
-      <text x="10" y="20" class="text-body" font-weight="600">Live State Machine</text>
+      <text x="10" y="20" class="text-body" font-weight="600">SQLite WAL State Fold</text>
       <text x="10" y="36" class="text-desc">Thinking → Tool → Waiting → Idle/Stalled</text>
     </g>
 
     <g transform="translate(12, 222)">
       <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
-      <text x="10" y="20" class="text-body" font-weight="600">Anomaly Detectors</text>
-      <text x="10" y="36" class="text-desc">Identical call loop, tool hang, churn</text>
+      <text x="10" y="20" class="text-body" font-weight="600">7 Detectors &amp; on_stall Hook</text>
+      <text x="10" y="36" class="text-desc">SILENT, LOOP, SPIN, BURN, FAILING, OFF_BRIEF, CLAIM</text>
     </g>
 
-    <text x="16" y="295" class="text-desc">All events stamped to 8-byte digest + durations</text>
+    <text x="16" y="295" class="text-desc">All events stamped to 8-byte BLAKE3 digest + durations</text>
   </g>
 
   <!-- Compression ratio banner -->
@@ -170,18 +170,18 @@
       <text x="10" y="50" class="text-desc">State, current slice, elapsed ms, token usage</text>
     </g>
 
-    <!-- Step 3: Targeted Anomaly Drilldown -->
+    <!-- Step 3: Targeted Anomaly & Claim Drilldown -->
     <g transform="translate(14, 187)">
       <rect width="292" height="52" fill="#ffffff" stroke="#aecbfa" rx="3"/>
-      <text x="10" y="19" class="text-sup">tacho report worker-k  (only on stall)</text>
-      <text x="10" y="35" class="text-desc">Diagnose loop / failed command without noise</text>
+      <text x="10" y="19" class="text-sup">tacho report worker-k --diff-claims</text>
+      <text x="10" y="35" class="text-desc">Verify edits, passing tests, commits &amp; clean tree</text>
     </g>
 
     <!-- Step 4: Intervene -->
     <g transform="translate(14, 251)">
       <rect width="292" height="48" fill="#ffffff" stroke="#aecbfa" rx="3"/>
       <text x="10" y="19" class="text-sup">Direct Workers (Kill, Nudge, Reseed)</text>
-      <text x="10" y="35" class="text-desc">High-level steering commands</text>
+      <text x="10" y="35" class="text-desc">Automated via on_stall hook or supervisor CLI</text>
     </g>
   </g>
 
@@ -190,5 +190,5 @@
   <text x="450" y="485" class="text-sup">Steering &amp; Intervention (Kill, Reassign, Unstick)</text>
 
   <!-- Bottom Legend -->
-  <text x="30" y="520" class="text-desc">• Result: One strong supervisor orchestrates an arbitrary number of parallel workers without context window rot, token budget blow-ups, or lost anomaly visibility.</text>
+  <text x="30" y="520" class="text-desc">• Result: One strong supervisor orchestrates an arbitrary number of parallel workers without context window rot, token budget blow-ups, or unverified completion claims.</text>
 </svg>

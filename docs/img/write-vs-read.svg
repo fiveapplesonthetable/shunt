@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 520" width="100%" height="auto">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 460" width="100%" height="auto">
   <defs>
     <style>
       .bg { fill: #ffffff; }
@@ -39,24 +39,22 @@
     </style>
   </defs>
 
-  <rect width="1020" height="520" class="bg"/>
+  <rect width="1020" height="460" class="bg"/>
 
-  <text x="24" y="30" class="text-title">Step-by-step path comparison: solid boxes execute; dashed boxes are completely eliminated</text>
+  <text x="24" y="30" class="text-title">Step-by-step path comparison: solid boxes execute; dashed boxes are bypassed</text>
 
   <!-- Horizontal Stage Dividers -->
   <line x1="20" y1="120" x2="1000" y2="120" class="grid-line"/>
   <line x1="20" y1="190" x2="1000" y2="190" class="grid-line"/>
   <line x1="20" y1="260" x2="1000" y2="260" class="grid-line"/>
   <line x1="20" y1="330" x2="1000" y2="330" class="grid-line"/>
-  <line x1="20" y1="400" x2="1000" y2="400" class="grid-line"/>
 
   <!-- Stage Labels (Left Margin) -->
   <text x="24" y="85" class="text-stage">1. Ingest</text>
   <text x="24" y="155" class="text-stage">2. Queue</text>
   <text x="24" y="225" class="text-stage">3. Transform</text>
-  <text x="24" y="295" class="text-stage">4. Memory</text>
-  <text x="24" y="365" class="text-stage">5. Storage</text>
-  <text x="24" y="435" class="text-stage">6. Render</text>
+  <text x="24" y="295" class="text-stage">4. SQLite WAL</text>
+  <text x="24" y="365" class="text-stage">5. Render</text>
 
   <!-- COLUMN 1: Hook Ingest -->
   <g transform="translate(130, 42)">
@@ -86,17 +84,11 @@
     <!-- Stage 4 (Skipped) -->
     <g transform="translate(0, 240)">
       <rect width="205" height="42" class="b-skipped"/>
-      <text x="12" y="25" class="text-skip">Skipped: no memory locks</text>
+      <text x="12" y="25" class="text-skip">Skipped: 0 disk I/O on hook</text>
     </g>
 
     <!-- Stage 5 (Skipped) -->
     <g transform="translate(0, 310)">
-      <rect width="205" height="42" class="b-skipped"/>
-      <text x="12" y="25" class="text-skip">Skipped: 0 disk I/O on hook</text>
-    </g>
-
-    <!-- Stage 6 (Skipped) -->
-    <g transform="translate(0, 380)">
       <rect width="205" height="42" class="b-skipped"/>
       <text x="12" y="25" class="text-skip">Skipped: no trace encoding</text>
     </g>
@@ -123,73 +115,60 @@
     <!-- Stage 3 -->
     <g transform="translate(0, 170)">
       <rect width="205" height="42" class="b-active-amber"/>
-      <text x="8" y="17" class="text-step">Scrub, classify, allocate lanes</text>
+      <text x="8" y="17" class="text-step">Classify, allocate lanes, fold</text>
       <text x="8" y="32" class="text-desc">Single-threaded, zero locks</text>
     </g>
 
     <!-- Stage 4 -->
     <g transform="translate(0, 240)">
-      <rect width="205" height="42" class="b-active-green"/>
-      <text x="8" y="17" class="text-step">Atomic LiveState swap</text>
-      <text x="8" y="32" class="text-desc">ArcSwap update; no readers blocked</text>
-    </g>
-
-    <!-- Stage 5 -->
-    <g transform="translate(0, 310)">
       <rect width="205" height="42" class="b-active-red"/>
       <text x="8" y="17" class="text-step">SQLite WAL commit</text>
-      <text x="8" y="32" class="text-desc">Batched prepared INSERT; synchronous</text>
-    </g>
-
-    <!-- Stage 6 (Skipped) -->
-    <g transform="translate(0, 380)">
-      <rect width="205" height="42" class="b-skipped"/>
-      <text x="12" y="25" class="text-skip">Skipped: trace encoded on demand</text>
-    </g>
-  </g>
-
-  <!-- COLUMN 3: Live Status / Watch -->
-  <g transform="translate(570, 42)">
-    <rect width="205" height="24" rx="3" fill="#e6f4ea"/>
-    <text x="12" y="17" class="text-col-head" fill="#137333">Path C · Live status / watch</text>
-    
-    <!-- Stage 1 -->
-    <g transform="translate(0, 30)">
-      <rect width="205" height="42" class="b-active-blue"/>
-      <text x="8" y="17" class="text-step">Request status / watch</text>
-      <text x="8" y="32" class="text-desc">Unix socket or CLI query</text>
-    </g>
-
-    <!-- Stage 2 (Skipped) -->
-    <g transform="translate(0, 100)">
-      <rect width="205" height="42" class="b-skipped"/>
-      <text x="12" y="25" class="text-skip">Bypasses appender channel</text>
-    </g>
-
-    <!-- Stage 3 (Skipped) -->
-    <g transform="translate(0, 170)">
-      <rect width="205" height="42" class="b-skipped"/>
-      <text x="12" y="25" class="text-skip">Already scrubbed in LiveState</text>
-    </g>
-
-    <!-- Stage 4 -->
-    <g transform="translate(0, 240)">
-      <rect width="205" height="42" class="b-active-green"/>
-      <text x="8" y="17" class="text-step">Read ArcSwap&lt;LiveState&gt;</text>
-      <text x="8" y="32" class="text-desc">Direct lock-free memory load</text>
+      <text x="8" y="32" class="text-desc">Batched prepared INSERT to events.sqlite</text>
     </g>
 
     <!-- Stage 5 (Skipped) -->
     <g transform="translate(0, 310)">
       <rect width="205" height="42" class="b-skipped"/>
-      <text x="12" y="25" class="text-skip">0 disk reads: pure RAM</text>
+      <text x="12" y="25" class="text-skip">Skipped: trace encoded on demand</text>
+    </g>
+  </g>
+
+  <!-- COLUMN 3: Live Status / Watch / Report -->
+  <g transform="translate(570, 42)">
+    <rect width="205" height="24" rx="3" fill="#e6f4ea"/>
+    <text x="12" y="17" class="text-col-head" fill="#137333">Path C · status / report / watch</text>
+    
+    <!-- Stage 1 -->
+    <g transform="translate(0, 30)">
+      <rect width="205" height="42" class="b-active-blue"/>
+      <text x="8" y="17" class="text-step">Request status / report / watch</text>
+      <text x="8" y="32" class="text-desc">api.sock or direct RO SQLite fallback</text>
     </g>
 
-    <!-- Stage 6 -->
-    <g transform="translate(0, 380)">
+    <!-- Stage 2 (Skipped) -->
+    <g transform="translate(0, 100)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Bypasses ingest channel</text>
+    </g>
+
+    <!-- Stage 3 (Skipped) -->
+    <g transform="translate(0, 170)">
+      <rect width="205" height="42" class="b-skipped"/>
+      <text x="12" y="25" class="text-skip">Already folded from WAL events</text>
+    </g>
+
+    <!-- Stage 4 -->
+    <g transform="translate(0, 240)">
+      <rect width="205" height="42" class="b-active-green"/>
+      <text x="8" y="17" class="text-step">Read WAL-derived state fold</text>
+      <text x="8" y="32" class="text-desc">Rebuilt from events.sqlite on start/fallback</text>
+    </g>
+
+    <!-- Stage 5 -->
+    <g transform="translate(0, 310)">
       <rect width="205" height="42" class="b-active-purple"/>
-      <text x="8" y="17" class="text-step">Format summary / tokens</text>
-      <text x="8" y="32" class="text-desc">&lt; 200 tokens JSON / human</text>
+      <text x="8" y="17" class="text-step">Format summary / diff-claims</text>
+      <text x="8" y="32" class="text-desc">&lt; 200 tokens JSON / human table</text>
     </g>
   </g>
 
@@ -214,31 +193,24 @@
     <!-- Stage 3 (Skipped) -->
     <g transform="translate(0, 170)">
       <rect width="205" height="42" class="b-skipped"/>
-      <text x="12" y="25" class="text-skip">Stored pre-scrubbed in DB</text>
+      <text x="12" y="25" class="text-skip">Stored in events.sqlite</text>
     </g>
 
     <!-- Stage 4 -->
     <g transform="translate(0, 240)">
-      <rect width="205" height="42" class="b-active-green"/>
-      <text x="8" y="17" class="text-step">Fetch track descriptors</text>
-      <text x="8" y="32" class="text-desc">Registry folded from TrackCreated</text>
-    </g>
-
-    <!-- Stage 5 -->
-    <g transform="translate(0, 310)">
       <rect width="205" height="42" class="b-active-red"/>
       <text x="8" y="17" class="text-step">Read SQLite WAL cursor</text>
       <text x="8" y="32" class="text-desc">Concurrent non-blocking WAL read</text>
     </g>
 
-    <!-- Stage 6 -->
-    <g transform="translate(0, 380)">
+    <!-- Stage 5 -->
+    <g transform="translate(0, 310)">
       <rect width="205" height="42" class="b-active-purple"/>
       <text x="8" y="17" class="text-step">Stream Perfetto protobuf</text>
-      <text x="8" y="32" class="text-desc">Chunked streaming; bounded memory</text>
+      <text x="8" y="32" class="text-desc">SnapshotProjector; O(1) memory</text>
     </g>
   </g>
 
   <!-- Summary Footer -->
-  <text x="24" y="490" class="text-desc">• Hook ingest returns in &lt; 5 ms with zero disk writes. Live status/watch reads ArcSwap memory without disk reads. Trace snapshots stream directly from SQLite WAL without inflating RAM.</text>
+  <text x="24" y="425" class="text-desc">• Hook ingest returns in &lt; 5 ms with zero disk writes. Every recorded event commits to SQLite WAL (events.sqlite), which backs both CLI state queries and streaming Perfetto trace snapshots.</text>
 </svg>

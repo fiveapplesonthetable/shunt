@@ -33,8 +33,10 @@ Goals:
    ftrace, or without root for /proc-based data), `tacho trace --system` clones
    the system session and writes one file with both: agent slices beside
    scheduling, CPU frequency and per-process memory.
-7. Nothing secret leaves the machine. Prose, tool output, file content, diffs
-   and prompts never enter the trace. Command lines and titles are scrubbed.
+7. Nothing secret leaves the machine unintentionally. Prose, tool output, file
+   content, diffs and prompts never enter the trace. Opt-in regex/shape
+   scrubbing (`scrub = true` in `config.toml` or `TACHO_SCRUB=1`) redacts
+   credentials and tokens from command lines and titles.
 
 Non-goals: controlling agents (kill, resume, schedule), hosted dashboards, MCP.
 A supervisor with a shell calls the CLI; that is the integration surface.
@@ -48,37 +50,41 @@ A supervisor with a shell calls the CLI; that is the integration surface.
  tacho emit   ─┘              ▼
                      ┌─────────────────┐        WAL (single writer,
  tacho run -- cmd ──►│ appender thread │──────► SQLite event log ◄───────┐
-  (stream-json)      │ stamp, scrub,   │        (events.sqlite)          │
- OTLP :4318 ────────►│ classify, lane, │               │                 │
- sampler (/proc) ───►│ log, fold       │               ▼                 │
-                     └─────────────────┘        snapshot reader ──► tacho trace
-                              │                  (trace.sock or          ▲
-                              │                   direct RO open)        │ (clone)
-                              │                                    traced (optional)
-                              └─► live state (fold) ─► tacho status / report / watch
+ tacho tail (.jsonl)►│ stamp, classify,│        (events.sqlite)          │
+ OTLP :4318 ────────►│ lane, log, fold │               │                 │
+ sampler (/proc+cg)─►└─────────────────┘               ├──► snapshot ────► tacho trace
+                                                       │    (trace.sock    ▲
+                                                       │     or direct RO) │ (clone)
+                                                       │             traced (optional)
+                                                       └──► state fold ──► tacho status / report / watch
 ```
 
 One process, `tacho daemon`, started on demand by any client that finds no
 socket (like sccache), or by a user service. No async runtime: plain OS
 threads and blocking sockets. Threads:
 
-- **acceptors**: one per listening source (api.sock, OTLP, each `tacho run`
-  connection). They parse input into `Input` values and send them on one
-  bounded channel. They never touch the log or state.
+- **acceptors**: one per listening source (api.sock, OTLP, each `tacho run` or
+  `tacho tail` connection). They parse input into `Input` values and send them
+  on one bounded channel. They never touch the log or state.
 - **appender**: the only consumer of the channel and the only writer of the
-  SQLite WAL log, the track registry and the live state. It batches inserts
-  into one transaction per channel drain (up to 256 events or 50 ms) with
-  `synchronous = NORMAL` and a prepared statement.
+  SQLite WAL log (`$TACHO_HOME/events.sqlite`). It batches inserts into one
+  transaction per channel drain (up to 256 events or 50 ms) with
+  `synchronous = NORMAL` and a prepared statement, and folds the event stream
+  for status/report/watch readers.
 - **snapshot**: owns `trace.sock`. Opens its own read-only SQLite connection
-  (WAL readers never block the writer and the writer never blocks readers) and
-  streams rows through the core encoder. Shares only the registry snapshot with
-  the appender. Answers even when the appender is stuck; and if the daemon is
-  dead (`SIGKILL`), `tacho trace` opens `events.sqlite` read-only in the CLI
-  process and runs the same function.
-- **sampler**: every `sample_interval` (default 2 s) reads /proc and sends
-  counter samples to the appender.
-- **query**: serves status/report/watch on api.sock from a read-mostly copy of
-  the live state the appender publishes after each batch.
+  (WAL readers never block the writer and the writer never blocks readers),
+  reconstructs the track registry from `TrackCreated` rows, and streams rows
+  through `SnapshotProjector` and the core encoder. Answers even when the
+  appender is stuck; and if the daemon is dead (`SIGKILL`), `tacho trace`,
+  `tacho status`, and `tacho report` open `events.sqlite` read-only in the CLI
+  process itself.
+- **sampler**: every `sample_interval` (default 2 s) reads `/proc` and cgroup v2
+  leaf metrics and sends process-tree slot slices and step-deduplicated counter
+  samples to the appender.
+- **query**: serves `status`/`report`/`watch` on `api.sock` from the WAL-derived
+  state fold (`Recorder::restore` on daemon startup, updated on each committed
+  WAL batch, with direct read-only SQLite fallback in the CLI when the daemon
+  is down).
 
 State lives in `$TACHO_HOME` (default `$XDG_STATE_HOME/tacho`, else
 `~/.local/state/tacho`). Sockets live in `$TACHO_RUNTIME` (default
@@ -138,24 +144,30 @@ live state, rebuilt from the log on start.
 
 ```
 tacho                                   root; description: host, version
-├── machine                             counters: load1, cpu_busy, mem_used, disk:<mount>
-├── daemon                              lifecycle, snapshots, clock steps, errors
+├── milestones                          TYPE_STATE: project-wide milestone phases
+├── messages                            duration slices: MessageSent -> MessageDelivered
+├── machine                             counters: load1, cpu_busy, mem_used, active_builds, active_tests, disk:<mount>
+├── daemon                              lifecycle duration slice (DaemonStarted -> Stop/Snapshot)
 │   └── counters                        events, trace_us, queue_depth
 ├── agents
 │   └── agent:<id>                      description: provider, model, cwd
 │       ├── state                       TYPE_STATE: Idle, Thinking, Tool, Waiting, Stalled, Exited
+│       ├── stalls                      duration slices: StallDetected -> recovery / run end
 │       └── run:<n>                     slice: Run
-│           ├── turns                   Turn > ToolCall | Build | Test | Read | ...
+│           ├── turns                   Turn > ToolCall | Build | Test | Read | Edit | ...
 │           ├── lane:1 .. lane:k        overlapping tool calls (section 4.2)
 │           ├── waits                   Wait slices
+│           ├── worktree                duration slices: dirty worktree -> clean commit
+│           ├── procs/slot 0 .. k       child process lifetime slices (rustc, cargo-nextest, ...)
+│           ├── files_edited / commits  step-function counters
 │           ├── tokens_in / tokens_out / tokens_cached / cost
-│           └── cpu / rss               wrap mode or pid known
+│           └── proc_count / cpu / rss  /proc + cgroup v2 process-tree counters
 ├── tasks
 │   └── task:<slug>
-│       ├── state                       TYPE_STATE: Queued .. Done
-│       └── review                      Review, ReviewFinding
+│       ├── state                       TYPE_STATE: Queued, InProgress, Review, Done, Failed
+│       └── review                      Review duration slices with aggregated findings
 ├── providers
-│   └── provider:<name>                 errors, rate limits; tokens, cost (summed)
+│   └── provider:<name>                 error_count, rate_limits, tokens_out, cost (summed)
 └── custom
     └── custom:<name>                   tracks created by `tacho emit span|instant|counter|state`
 ```
@@ -165,10 +177,11 @@ tacho                                   root; description: host, version
 Every track has a textual key (above). Its uuid is `xxh3_64(key)` with the top
 bit cleared. The registry records each track once as a `TrackCreated` log row
 before the first event on it; on a hash collision the second key takes
-`xxh3_64(key + "#2")` and the row says so. Snapshots write descriptors from the
-registry; a `--from-log` rebuild writes them from the rows. Tracks are never
-renamed. Children use `child_ordering = EXPLICIT` and `sibling_order_rank` by
-creation order, so agents appear in the order they started.
+`xxh3_64(key + "#2")` and the row says so. Snapshots reconstruct descriptors
+from the `TrackCreated` rows in `events.sqlite` and prune descriptors for empty
+tracks so Perfetto UI only displays populated tracks. Children use
+`child_ordering = EXPLICIT` and `sibling_order_rank` by creation order, so
+agents appear in the order they started.
 
 ### 4.2 Lanes: overlapping slices on one run
 
@@ -183,12 +196,12 @@ track whose top of stack it nests inside:
 2. otherwise the lowest `lane:k` with nothing open;
 3. otherwise a new `lane:k+1`.
 
-Lane assignment is a pure function of the event sequence, so ring and log
-rebuild agree. An end whose begin is unknown becomes an instant
-`Unmatched<Kind>` plus a `trace_error` count, never an unbalanced end. When a
-run ends, every slice still open on its tracks is closed at the run's end with
-`abandoned = true`. Result: for any interleaving of input, every slice track in
-every trace is properly nested. A property test holds this.
+Lane assignment is a pure function of the event sequence in `events.sqlite`, so
+any snapshot or rebuild produces the exact same tracks. An end whose begin is
+unknown increments the `trace_error` count and never emits an unbalanced end.
+When a run ends, every slice still open on its tracks is closed at the run's
+end with `abandoned = true`. Result: for any interleaving of input, every slice
+track in every trace is properly nested. A property test holds this.
 
 ### 4.3 State tracks
 
@@ -346,12 +359,13 @@ agent's state to `Stalled` until the next event that is not itself evidence.
 
 | kind      | fires when (defaults, all configurable)                              |
 |-----------|----------------------------------------------------------------------|
-| SILENT    | a run is open and no event for 300 s while not in a Wait             |
+| SILENT    | a run is open and no event for 300 s while not in a Wait (CPU-aware: suppressed while child process tree consumes CPU) |
 | LOOP      | the same tool input digest 4 times in a row                          |
 | SPIN      | 8 turns with no FileEdited and no Command of class BUILD/TEST/COMMIT |
-| BURN      | tokens_out over 200k in 10 minutes                                   |
+| BURN      | tokens_out over 200k in 10 minutes (or per-task token/cost budget)   |
 | FAILING   | the same test/build command failed 3 times in a row                  |
 | OFF_BRIEF | a FileEdited outside the task's declared paths (when declared)       |
+| CLAIM     | a Run exits 0 after FileEdited without a subsequent passing TEST     |
 
 ## 8. Ingestion
 
@@ -509,6 +523,8 @@ Required queries (each with a test over a scripted fleet):
 - `edits-by-file`: files edited, by how many agents, lines added/removed.
 - `tokens-by-agent`: token totals and rate per agent.
 - `stalls`: every detector firing with its evidence.
+- `verified-trees`: git tree hashes (`git_tree`) verified by passing BUILD/TEST
+  commands.
 - `system-during-builds` (needs `--system`): CPU time and peak RSS of each
   agent's process tree during its Build and Test slices, using interval
   intersection of the slices with process and sched data.
@@ -517,24 +533,25 @@ Required queries (each with a test over a scripted fleet):
 
 ## 11. Privacy
 
-Enforced in the appender, before encoding, so log and trace are clean together.
+Never stored (content firewall): prompt text, model prose, tool output, file
+content, diffs, message text, or raw environment values. Represented by 8-byte
+BLAKE3 digest and byte size, or a count, or nothing. Paths are made relative to
+the run's cwd; absolute paths outside it keep their first two components and
+become `<outside>/...`.
 
-Never stored: prompt text, model prose, tool output, file content, diffs,
-message text, environment values, tokens or keys. Represented by digest and
-size, or a count, or nothing.
-
-Stored after scrubbing: command argv, review finding titles, custom args,
-custom names. The scrubber replaces with `<redacted>`: `Authorization:` and
-`Bearer` values, `--token|--password|--secret|--api-key[= ]value`,
+Opt-in secret scrubbing (`scrub = true` in `$TACHO_HOME/config.toml` or
+`TACHO_SCRUB=1`, default `false`): when enabled, command argv, review finding
+titles, custom args, and custom names pass through regex and shape scrubbers
+before persistence. The scrubber replaces with `<redacted>`: `Authorization:`
+and `Bearer` values, `--token|--password|--secret|--api-key[= ]value`,
 `key=|secret=|token=|password=` values, URL userinfo, AWS/GCP/GitHub/
 Anthropic/OpenAI/Slack token shapes, PEM blocks, and base64 or hex runs of 32+
-characters; plus user patterns from `$TACHO_HOME/scrub.toml`. Scrub happens
-before truncation. Paths are made relative to the run's cwd; absolute paths
-outside it keep their first two components and become `<outside>/...`.
+characters (while preserving 40-character hexadecimal Git commit SHAs); plus
+user patterns from `$TACHO_HOME/scrub.toml`. Scrub happens before truncation.
 
-A canary test seeds one secret of each shape through every source and asserts
-no snapshot, rebuild, log row, status output or report contains any of their
-bytes.
+A canary test seeds one secret of each shape through every source with
+`scrub = true` and asserts no snapshot, rebuild, log row, status output or
+report contains any of their bytes.
 
 ## 12. Testing
 

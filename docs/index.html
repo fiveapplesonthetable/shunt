@@ -151,16 +151,16 @@
   <a href="#catalogue">4. Event catalogue</a>
   <a href="#detectors">5. Anomaly detectors</a>
   <a href="#ingestion">6. Ingestion modes</a>
-  <a href="#system">7. System tracing</a>
+  <a href="#system">7. System &amp; cgroup v2</a>
   <a href="#queries">8. PerfettoSQL queries</a>
-  <a href="#privacy">9. Privacy firewall</a>
+  <a href="#privacy">9. Privacy &amp; opt-in scrub</a>
   <a href="#performance">10. Performance numbers</a>
 </nav>
 
 <main>
 
 <h1>tachograph: system guide</h1>
-<p class="lead">A flight recorder for coding agents. One daemon per machine records agent actions into a single SQLite WAL event log, serving compact status to supervising agents in ~180 tokens and microsecond traces to ui.perfetto.dev.</p>
+<p class="lead">A flight recorder for coding agents. One daemon per machine records agent actions into a single SQLite WAL event log (<code>events.sqlite</code>), serving compact status and claim verification to supervising agents in ~180 tokens and duration-first traces to ui.perfetto.dev.</p>
 
 <!-- ───────────── Section 1 ───────────── -->
 <div class="part">Part 1 &mdash; Fundamentals</div>
@@ -171,10 +171,10 @@
 <ul>
   <li><b>Context exhaustion:</b> Raw agent logs are enormous. A single four-worker refactoring run generates 97 MB of JSON transcripts. Ingesting those transcripts into a supervisor agent exhausts its context window in two turns.</li>
   <li><b>Invisible parallel work:</b> Agents execute parallel tool calls and subagent trees. Text logs flatten overlapping async calls into sequential output, obscuring which tool blocked, which command ran concurrently, and where wall-clock time was lost.</li>
-  <li><b>Post-mortem blindspots:</b> When an agent enters an infinite retry loop or silently hangs on a compilation command, developers have no deterministic way to inspect host system counters (CPU, memory, load) alongside agent actions.</li>
+  <li><b>Post-mortem blindspots:</b> When an agent enters an infinite retry loop, silently hangs on a compilation command, or claims tests pass without running them, developers have no deterministic way to inspect host system counters (CPU, memory, child process trees) alongside agent actions.</li>
 </ul>
 
-<p>tachograph solves this by recording every turn, tool call, command, wait, and counter into a structured binary timeline. A supervisor inspects running workers via <code>tacho status</code> and <code>tacho watch</code> using under 200 tokens. A developer opens <code>tacho trace</code> in <a href="https://ui.perfetto.dev">ui.perfetto.dev</a> to inspect microscopic timings down to the nanosecond.</p>
+<p>tachograph solves this by recording every turn, tool call, command, wait, and counter into a structured SQLite WAL timeline. A supervisor inspects running workers via <code>tacho status</code>, <code>tacho watch</code>, and <code>tacho report --diff-claims</code> using under 200 tokens. A developer opens <code>tacho trace</code> in <a href="https://ui.perfetto.dev">ui.perfetto.dev</a> to inspect duration slices, state bands, and step-function counters down to the nanosecond.</p>
 
 <figure>
 <svg viewBox="0 0 1000 360" role="img" aria-label="Supervisor control loop and log filtering">
@@ -187,9 +187,9 @@
   <text x="46" y="136" class="ts">Blocks until worker state change</text>
   <text x="46" y="150" class="ts">Zero CPU polling overhead</text>
   <rect x="36" y="174" width="248" height="64" class="b0" rx="3"/>
-  <text x="46" y="196" class="tm">tacho report worker-2</text>
+  <text x="46" y="196" class="tm">tacho report worker-2 --diff-claims</text>
   <text x="46" y="214" class="ts">Structured 180-token summary</text>
-  <text x="46" y="228" class="ts">Identifies loop / stuck build</text>
+  <text x="46" y="228" class="ts">Verifies edits, tests, commits &amp; loops</text>
   <rect x="36" y="252" width="248" height="52" class="bg" rx="3"/>
   <text x="46" y="274" class="tb tg">180 Tokens Received</text>
   <text x="46" y="290" class="ts">538x context reduction ratio</text>
@@ -197,20 +197,20 @@
   <!-- Middle filter: tachograph daemon -->
   <rect x="360" y="30" width="280" height="290" class="b" rx="4"/>
   <text x="376" y="58" class="tb">tachograph daemon</text>
-  <text x="376" y="78" class="tms">Single source of truth (WAL)</text>
+  <text x="376" y="78" class="tms">Single source of truth (events.sqlite)</text>
   <rect x="376" y="96" width="248" height="38" class="b2" rx="3"/>
-  <text x="386" y="114" class="tm">Scrubber &amp; Classifier</text>
-  <text x="386" y="126" class="ts">Redacts secrets, classifies commands</text>
+  <text x="386" y="114" class="tm">Classifier &amp; Opt-in Scrubber</text>
+  <text x="386" y="126" class="ts">12 command classes, git_tree, digest</text>
   <rect x="376" y="144" width="248" height="38" class="b2" rx="3"/>
   <text x="386" y="162" class="tm">Deterministic LaneAllocator</text>
-  <text x="386" y="174" class="ts">Virtual lanes for parallel tools</text>
+  <text x="386" y="174" class="ts">Virtual lanes &amp; process-tree slots</text>
   <rect x="376" y="192" width="248" height="38" class="b2" rx="3"/>
-  <text x="386" y="210" class="tm">Anomaly Detectors</text>
-  <text x="386" y="222" class="ts">LOOP, SPIN, SILENT, BURN, FAILING</text>
-  <rect x="376" y="240" width="248" height="64" class="ba" rx="3"/>
-  <text x="386" y="260" class="tm">LiveState (ArcSwap)</text>
-  <text x="386" y="276" class="ts">Microsecond status / watch queries</text>
-  <text x="386" y="292" class="ts">Zero disk I/O on status path</text>
+  <text x="386" y="210" class="tm">7 Anomaly Detectors &amp; Hooks</text>
+  <text x="386" y="222" class="ts">SILENT, LOOP, SPIN, BURN, FAILING, CLAIM</text>
+  <rect x="376" y="240" width="248" height="64" class="bw" rx="3"/>
+  <text x="386" y="260" class="tm">SQLite WAL Event Log</text>
+  <text x="386" y="276" class="ts">Backs status, report, watch &amp; trace</text>
+  <text x="386" y="292" class="ts">Direct read-only CLI fallback if down</text>
 
   <!-- Right box: Workers -->
   <rect x="700" y="30" width="280" height="290" class="bw" rx="4"/>
@@ -236,7 +236,7 @@
   <path d="M360,180 L300,180" class="lna" marker-end="url(#aha)"/>
   <text x="312" y="172" class="th">Filtered</text>
 </svg>
-<figcaption>Figure 1: The supervisor control loop. Raw worker transcripts (97 MB) are ingested via provider hooks, sanitized, and folded into live state. The supervisor polls or blocks via <code>tacho watch</code>, receiving actionable summaries in 180 tokens.</figcaption>
+<figcaption>Figure 1: The supervisor control loop. Raw worker transcripts (97 MB) are ingested via provider hooks or live transcript tailing, classified, and committed to SQLite WAL. The supervisor blocks via <code>tacho watch</code> or verifies claims via <code>tacho report --diff-claims</code> in ~180 tokens.</figcaption>
 </figure>
 
 <!-- ───────────── Section 2 ───────────── -->
@@ -245,63 +245,66 @@
 
 <p>tachograph operates as a single resident process (<code>tacho daemon</code>) started on demand by any client that finds no socket. It uses no async runtime: all paths run on plain OS threads and non-blocking IPC sockets.</p>
 
-<p>Every event recorded by the system is persisted into a single SQLite WAL table (<code>$TACHO_HOME/events.sqlite</code>). There are no secondary in-memory event rings: SQLite WAL is the <b>sole durable source of truth</b>. Every trace written by <code>tacho trace</code> is rendered directly from SQLite rows through a streaming zero-allocation encoder.</p>
+<p>Every event recorded by the system is persisted into a single SQLite WAL table (<code>$TACHO_HOME/events.sqlite</code>). There are no separate in-memory event ring buffers: SQLite WAL is the <b>sole durable source of truth</b>. Every trace written by <code>tacho trace</code> is rendered directly from SQLite rows through a streaming zero-allocation projector, and supervisor state is deterministically folded from the exact same event stream.</p>
 
 <figure>
-<svg viewBox="0 0 1000 380" role="img" aria-label="System architecture diagram">
+<svg viewBox="0 0 1000 390" role="img" aria-label="System architecture diagram">
   <!-- Ingest Sources -->
-  <rect x="20" y="24" width="180" height="330" class="b" rx="4"/>
-  <text x="34" y="48" class="tb">Ingest Sources</text>
-  <rect x="32" y="66" width="156" height="34" class="b2" rx="3"/><text x="42" y="87" class="tm">Claude hooks</text>
-  <rect x="32" y="108" width="156" height="34" class="b2" rx="3"/><text x="42" y="129" class="tm">Gemini hooks</text>
-  <rect x="32" y="150" width="156" height="34" class="b2" rx="3"/><text x="42" y="171" class="tm">Jetski hooks</text>
-  <rect x="32" y="192" width="156" height="34" class="b2" rx="3"/><text x="42" y="213" class="tm">tacho run (tee)</text>
-  <rect x="32" y="234" width="156" height="34" class="b2" rx="3"/><text x="42" y="255" class="tm">OTLP :4318</text>
-  <rect x="32" y="276" width="156" height="34" class="b2" rx="3"/><text x="42" y="297" class="tm">/proc sampler</text>
-  <rect x="32" y="318" width="156" height="30" class="b2" rx="3"/><text x="42" y="337" class="tm">tacho emit</text>
+  <rect x="20" y="20" width="180" height="350" class="b" rx="4"/>
+  <text x="34" y="42" class="tb">Ingest Sources</text>
+  <rect x="32" y="54" width="156" height="32" class="b2" rx="3"/><text x="42" y="74" class="tm">Claude hooks</text>
+  <rect x="32" y="92" width="156" height="32" class="b2" rx="3"/><text x="42" y="112" class="tm">Gemini hooks</text>
+  <rect x="32" y="130" width="156" height="32" class="b2" rx="3"/><text x="42" y="150" class="tm">Jetski hooks</text>
+  <rect x="32" y="168" width="156" height="32" class="b2" rx="3"/><text x="42" y="188" class="tm">tacho run (tee)</text>
+  <rect x="32" y="206" width="156" height="32" class="b2" rx="3"/><text x="42" y="226" class="tm">tacho tail (inotify)</text>
+  <rect x="32" y="244" width="156" height="32" class="b2" rx="3"/><text x="42" y="264" class="tm">OTLP :4318</text>
+  <rect x="32" y="282" width="156" height="32" class="b2" rx="3"/><text x="42" y="302" class="tm">/proc + cgroup v2</text>
+  <rect x="32" y="320" width="156" height="32" class="b2" rx="3"/><text x="42" y="340" class="tm">tacho emit</text>
 
   <!-- Channel -->
-  <path d="M200,190 L250,190" class="ln" marker-end="url(#ah)"/>
-  <text x="204" y="180" class="th">NDJSON</text>
-  <rect x="250" y="160" width="50" height="60" class="b0" rx="3"/>
-  <text x="256" y="186" class="tms">Bounded</text>
-  <text x="258" y="202" class="tms">Channel</text>
-  <path d="M300,190 L340,190" class="ln" marker-end="url(#ah)"/>
+  <path d="M200,195 L250,195" class="ln" marker-end="url(#ah)"/>
+  <text x="204" y="185" class="th">NDJSON</text>
+  <rect x="250" y="165" width="50" height="60" class="b0" rx="3"/>
+  <text x="256" y="191" class="tms">Bounded</text>
+  <text x="258" y="207" class="tms">Channel</text>
+  <path d="M300,195 L340,195" class="ln" marker-end="url(#ah)"/>
 
   <!-- Appender -->
-  <rect x="340" y="40" width="220" height="300" class="ba" rx="4"/>
-  <text x="356" y="66" class="tb">Appender Thread</text>
-  <text x="356" y="84" class="tms">Sole writer to disk &amp; state</text>
-  <rect x="354" y="100" width="192" height="32" class="b0" rx="3"/><text x="364" y="120" class="tm">1. Stamp (wall clock)</text>
-  <rect x="354" y="138" width="192" height="32" class="b0" rx="3"/><text x="364" y="158" class="tm">2. Privacy scrubber</text>
-  <rect x="354" y="176" width="192" height="32" class="b0" rx="3"/><text x="364" y="196" class="tm">3. Command classifier</text>
-  <rect x="354" y="214" width="192" height="32" class="b0" rx="3"/><text x="364" y="234" class="tm">4. Virtual lane alloc</text>
-  <rect x="354" y="252" width="192" height="32" class="b0" rx="3"/><text x="364" y="272" class="tm">5. Anomaly detectors</text>
-  <rect x="354" y="290" width="192" height="36" class="bg" rx="3"/><text x="364" y="312" class="tm">Batch commit (&le;256)</text>
+  <rect x="340" y="30" width="220" height="330" class="ba" rx="4"/>
+  <text x="356" y="56" class="tb">Appender Thread</text>
+  <text x="356" y="74" class="tms">Sole writer to events.sqlite</text>
+  <rect x="354" y="90" width="192" height="34" class="b0" rx="3"/><text x="364" y="111" class="tm">1. Stamp &amp; clamp clock</text>
+  <rect x="354" y="132" width="192" height="34" class="b0" rx="3"/><text x="364" y="153" class="tm">2. Opt-in scrubber</text>
+  <rect x="354" y="174" width="192" height="34" class="b0" rx="3"/><text x="364" y="195" class="tm">3. Command classifier</text>
+  <rect x="354" y="216" width="192" height="34" class="b0" rx="3"/><text x="364" y="237" class="tm">4. Lane &amp; slot allocator</text>
+  <rect x="354" y="258" width="192" height="34" class="b0" rx="3"/><text x="364" y="279" class="tm">5. 7 Detectors &amp; fold</text>
+  <rect x="354" y="300" width="192" height="40" class="bg" rx="3"/><text x="364" y="325" class="tm">6. Batch WAL commit (&le;256)</text>
 
-  <!-- Branches to Storage & LiveState -->
-  <path d="M560,140 L620,100" class="ln" marker-end="url(#ah)"/>
-  <path d="M560,260 L620,290" class="lna" marker-end="url(#aha)"/>
+  <!-- Arrow to Unified SQLite WAL -->
+  <path d="M560,195 L615,195" class="lna" marker-end="url(#aha)"/>
 
-  <!-- Top Right: SQLite WAL -->
-  <rect x="620" y="30" width="360" height="130" class="bw" rx="4"/>
-  <text x="636" y="56" class="tb">SQLite WAL (events.sqlite)</text>
-  <text x="636" y="74" class="tms">PRAGMA synchronous = NORMAL; indexed on ts_ns</text>
-  <rect x="636" y="86" width="328" height="60" class="b0" rx="3"/>
-  <text x="646" y="106" class="tm">events(seq, ts_ns, kind, track_key, cause_seq, agent, body)</text>
-  <text x="646" y="124" class="ts">WAL readers never block writers; writers never block readers</text>
-  <text x="646" y="138" class="ts">Fallback: tacho trace opens directly if daemon is dead</text>
+  <!-- Right: Unified SQLite WAL Single Source of Truth -->
+  <rect x="615" y="30" width="365" height="330" class="bw" rx="4"/>
+  <text x="631" y="56" class="tb">SQLite WAL Single Source of Truth (events.sqlite)</text>
+  <text x="631" y="74" class="tms">PRAGMA synchronous = NORMAL; indexed on seq and ts_ns</text>
+  <rect x="631" y="88" width="333" height="68" class="b0" rx="3"/>
+  <text x="641" y="108" class="tm">events(seq, ts_ns, kind, track_key, cause_seq, agent, body)</text>
+  <text x="641" y="126" class="ts">Stores all lifecycle slices, states, counters &amp; TrackCreated UUIDs</text>
+  <text x="641" y="142" class="ts">WAL readers never block writer; writer never blocks readers</text>
 
-  <!-- Bottom Right: LiveState -->
-  <rect x="620" y="230" width="360" height="130" class="bg" rx="4"/>
-  <text x="636" y="256" class="tb">LiveState (ArcSwap&lt;LiveState&gt;)</text>
-  <text x="636" y="274" class="tms">In-memory copy published atomically after each batch</text>
-  <rect x="636" y="286" width="328" height="60" class="b0" rx="3"/>
-  <text x="646" y="306" class="tm">tacho status | tacho report | tacho watch</text>
-  <text x="646" y="324" class="ts">Microsecond responses with zero disk reads</text>
-  <text x="646" y="338" class="ts">Streams state transitions &amp; detector alerts</text>
+  <rect x="631" y="168" width="333" height="82" class="bv" rx="3"/>
+  <text x="641" y="188" class="tm">tacho trace | tacho query &lt;name&gt;</text>
+  <text x="641" y="206" class="ts">Streams WAL rows through SnapshotProjector in O(1) memory</text>
+  <text x="641" y="222" class="ts">Pairs durations, state bands &amp; counters (0 instant clutter)</text>
+  <text x="641" y="238" class="ts">Direct read-only SQLite fallback if daemon is unreachable</text>
+
+  <rect x="631" y="262" width="333" height="82" class="bg" rx="3"/>
+  <text x="641" y="282" class="tm">tacho status | tacho report | tacho watch</text>
+  <text x="641" y="300" class="ts">Folded from SQLite WAL via Recorder::restore on startup</text>
+  <text x="641" y="316" class="ts">Answers status, --diff-claims &amp; watch alerts in &lt; 200 tokens</text>
+  <text x="641" y="332" class="ts">Direct read-only SQLite fold fallback when daemon is down</text>
 </svg>
-<figcaption>Figure 2: System architecture. Ingestion sources push to a bounded channel. The single appender thread stamps, scrubs, classifies, and commits batches to SQLite WAL, then atomically publishes updated <code>LiveState</code> to memory.</figcaption>
+<figcaption>Figure 2: System architecture. All eight ingestion sources push to a bounded channel. The single appender thread stamps, classifies, and commits batches to SQLite WAL (<code>events.sqlite</code>), which serves both streaming Perfetto snapshots and folded supervisor state.</figcaption>
 </figure>
 
 <h3>Write path vs Read path execution</h3>
@@ -309,36 +312,36 @@
 
 <table>
   <thead>
-    <tr><th>Path</th><th>Mechanism</th><th>Latency</th><th>Disk Access</th><th>Failure Mode</th></tr>
+    <tr><th>Path</th><th>Mechanism</th><th>Latency</th><th>Storage Access</th><th>Resilience / Fallback</th></tr>
   </thead>
   <tbody>
     <tr>
       <td><b>Hook Ingest</b></td>
       <td><code>tacho hook &lt;provider&gt;</code> &rarr; Unix domain socket</td>
       <td>&lt; 5 ms</td>
-      <td>None (socket only)</td>
+      <td>Socket enqueue only</td>
       <td>Drops silently after 200 ms timeout; agent never blocked</td>
     </tr>
     <tr>
       <td><b>Appender Batch</b></td>
       <td>Channel drain &rarr; prepared statement &rarr; WAL commit</td>
       <td>&le; 50 ms</td>
-      <td>Sequential append</td>
+      <td>Sequential WAL batch</td>
       <td>Batches up to 256 events per transaction</td>
     </tr>
     <tr>
-      <td><b>Live Status / Watch</b></td>
-      <td><code>ArcSwap&lt;LiveState&gt;</code> atomic pointer swap</td>
+      <td><b>Status / Report / Watch</b></td>
+      <td>WAL-derived state fold (<code>Recorder::restore</code>)</td>
       <td>&lt; 100 &mu;s</td>
-      <td>Zero disk reads</td>
-      <td>Served from query thread memory cache</td>
+      <td>Folded from <code>events.sqlite</code></td>
+      <td>If daemon is down, CLI folds <code>events.sqlite</code> directly</td>
     </tr>
     <tr>
       <td><b>Trace Snapshot</b></td>
-      <td>Streaming SQLite RO cursor &rarr; Core Encoder</td>
-      <td>&lt; 25 ms / 100k</td>
-      <td>Read-only WAL read</td>
-      <td>If daemon is dead, CLI opens <code>events.sqlite</code> directly</td>
+      <td>Streaming SQLite RO cursor &rarr; <code>SnapshotProjector</code></td>
+      <td>&lt; 100 ms / 100k</td>
+      <td>Read-only WAL cursor</td>
+      <td>If daemon is dead, CLI opens <code>events.sqlite</code> read-only</td>
     </tr>
   </tbody>
 </table>
@@ -349,7 +352,7 @@
 
 <p>Perfetto models events along tracks. Slice tracks in Perfetto represent execution as a strict stack: a child slice must begin after and end before its parent. Overlapping sibling slices on a single track corrupt the visualization.</p>
 
-<p>Coding agents routinely violate stack nesting: LLMs fire multiple parallel tool calls within a single turn, subagents run concurrently, and tools take variable time to return. tachograph resolves this with a deterministic <b>LaneAllocator</b>.</p>
+<p>Coding agents routinely violate stack nesting: LLMs fire multiple parallel tool calls within a single turn, subagents run concurrently, and tools take variable time to return. tachograph resolves this with a deterministic <b>LaneAllocator</b> and projecting every event as a true duration slice, <code>TYPE_STATE</code> transition, or step-function counter — with zero zero-duration instant clutter.</p>
 
 <figure>
 <svg viewBox="0 0 1000 320" role="img" aria-label="Parallel tool calls and virtual lane allocation">
@@ -385,24 +388,32 @@
 
 <h3>Track hierarchy structure</h3>
 <pre><code>tacho                                   <span class="c"># Root track: host identity, version</span>
-├── machine                             <span class="c"># Counters: load1, cpu_busy, mem_used, disk</span>
-├── daemon                              <span class="c"># Lifecycle, snapshots, clock steps, errors</span>
+├── milestones                          <span class="c"># TYPE_STATE: project-wide milestone phases</span>
+├── messages                            <span class="c"># Duration slices: MessageSent &rarr; MessageDelivered</span>
+├── machine                             <span class="c"># Counters: load1, cpu_busy, mem_used, active_builds, active_tests</span>
+├── daemon                              <span class="c"># Lifecycle duration slice (DaemonStarted &rarr; Stop/Snapshot)</span>
 │   └── counters                        <span class="c"># events, trace_us, queue_depth</span>
 ├── agents
 │   └── agent:&lt;id&gt;                      <span class="c"># Long-lived worker (provider, model, cwd)</span>
 │       ├── state                       <span class="c"># TYPE_STATE: Idle, Thinking, Tool, Waiting, Stalled, Exited</span>
-│       └── run:&lt;n&gt;                     <span class="c"># Provider session</span>
-│           ├── turns                   <span class="c"># Nested: Turn &gt; ToolCall | Build | Test | Read</span>
+│       ├── stalls                      <span class="c"># Duration slices: StallDetected &rarr; recovery / run end</span>
+│       └── run:&lt;n&gt;                     <span class="c"># Provider session duration slice</span>
+│           ├── turns                   <span class="c"># Nested: Turn &gt; ToolCall | Build | Test | Read | Edit</span>
 │           ├── lane:1 .. lane:k        <span class="c"># Virtual lanes for concurrent tool executions</span>
 │           ├── waits                   <span class="c"># Blocked intervals (user prompt, subagent message)</span>
+│           ├── worktree                <span class="c"># Duration slices: dirty working tree &rarr; clean commit</span>
+│           ├── procs/slot 0 .. k       <span class="c"># Child process lifetime slices (rustc, cargo-nextest, ...)</span>
+│           ├── files_edited / commits  <span class="c"># Cumulative file edit &amp; git commit step counters</span>
 │           ├── tokens_in / out / cost  <span class="c"># Token accounting and cumulative cost counters</span>
-│           └── cpu / rss               <span class="c"># Process-tree resource counters from /proc</span>
+│           └── proc_count / cpu / rss  <span class="c"># Process-tree &amp; cgroup v2 resource counters</span>
 ├── tasks
 │   └── task:&lt;slug&gt;                     <span class="c"># Orchestrator work item with declared paths</span>
-│       ├── state                       <span class="c"># TYPE_STATE: Queued, Active, Review, Done</span>
-│       └── review                      <span class="c"># Review findings and code inspection spans</span>
+│       ├── state                       <span class="c"># TYPE_STATE: Queued, InProgress, Review, Done, Failed</span>
+│       └── review                      <span class="c"># Review duration slices with aggregated findings</span>
+├── providers
+│   └── provider:&lt;name&gt;                 <span class="c"># Cumulative provider tokens_out, cost, error_count, rate_limits</span>
 └── custom
-    └── custom:&lt;name&gt;                   <span class="c"># Spans and counters emitted via `tacho emit`</span></code></pre>
+    └── custom:&lt;name&gt;                   <span class="c"># Spans, states, and counters emitted via `tacho emit`</span></code></pre>
 
 <!-- ───────────── Section 4 ───────────── -->
 <div class="part">Part 4 &mdash; Protocol &amp; Schema</div>
@@ -418,14 +429,19 @@
     <tr><td><code>seq</code></td><td>4000</td><td><code>uint64</code></td><td>Global monotonically increasing event sequence number</td></tr>
     <tr><td><code>cause_seq</code></td><td>4001</td><td><code>uint64</code></td><td>Sequence number of the causal antecedent event</td></tr>
     <tr><td><code>agent</code></td><td>4002</td><td><code>string</code></td><td>Agent identifier, enabling SQL filters without track joins</td></tr>
-    <tr><td><code>command</code></td><td>4003</td><td><code>Command</code></td><td>Argv, command class, exit code, working directory, <code>git_tree</code> (SHA)</td></tr>
-    <tr><td><code>tool_call</code></td><td>4004</td><td><code>ToolCall</code></td><td>Tool name, input digest (Blake3), call ID</td></tr>
-    <tr><td><code>turn_ended</code></td><td>4005</td><td><code>TurnEnded</code></td><td>Turn duration, tokens in, tokens out, tokens cached</td></tr>
-    <tr><td><code>file_access</code></td><td>4006</td><td><code>FileAccess</code></td><td>Path relative to cwd, access kind (Read, Search, List)</td></tr>
-    <tr><td><code>file_edited</code></td><td>4007</td><td><code>FileEdited</code></td><td>Path, lines added, lines removed, patch digest</td></tr>
-    <tr><td><code>wait</code></td><td>4008</td><td><code>Wait</code></td><td>Wait reason, timeout, target sender ID</td></tr>
-    <tr><td><code>stall</code></td><td>4009</td><td><code>Stall</code></td><td>Detector kind (LOOP, SPIN, SILENT, BURN, FAILING, OFF_BRIEF, CLAIM), evidence</td></tr>
-    <tr><td><code>task_meta</code></td><td>4010</td><td><code>TaskMeta</code></td><td>Slug, paths, bound agent, base commit, token budget, cost budget</td></tr>
+    <tr><td><code>run</code> / <code>run_ended</code></td><td>4003&ndash;4004</td><td><code>Run</code> / <code>RunEnded</code></td><td>PID, provider, model, session ID, cwd, task, <code>git_tree</code>, exit code</td></tr>
+    <tr><td><code>turn</code> / <code>turn_ended</code></td><td>4005&ndash;4006</td><td><code>Turn</code> / <code>TurnEnded</code></td><td>Turn number, model, input/output/cached tokens, cost micro-USD</td></tr>
+    <tr><td><code>tool_call</code> / <code>tool_call_ended</code></td><td>4007&ndash;4008</td><td><code>ToolCall</code> / <code>ToolCallEnded</code></td><td>Tool name, BLAKE3 input digest, file edit metadata, result bytes</td></tr>
+    <tr><td><code>command</code> / <code>command_ended</code></td><td>4009&ndash;4010</td><td><code>Command</code> / <code>CommandEnded</code></td><td>Argv, command class (12 classes), exit code, working directory, <code>git_tree</code></td></tr>
+    <tr><td><code>file_access</code> / <code>file_access_ended</code></td><td>4011&ndash;4012</td><td><code>FileAccess</code> / <code>FileAccessEnded</code></td><td>Relative path, access kind (Read, Search, List), bytes read, items found</td></tr>
+    <tr><td><code>file_edited</code></td><td>4013</td><td><code>FileEdited</code></td><td>Path, edit kind (Edit, Create, Delete, Rename), lines added/removed, in_brief</td></tr>
+    <tr><td><code>wait</code> / <code>wait_ended</code></td><td>4014&ndash;4015</td><td><code>Wait</code> / <code>WaitEnded</code></td><td>Wait target, wait reason (Input, Message, Subagent, RateLimit), timeout</td></tr>
+    <tr><td><code>prompt</code> / <code>message</code> / <code>compacted</code></td><td>4016&ndash;4018</td><td><code>Prompt</code> / <code>Message</code> / <code>Compacted</code></td><td>Prompt digest/bytes, inter-agent message routing, context compaction stats</td></tr>
+    <tr><td><code>stall</code></td><td>4019</td><td><code>Stall</code></td><td>Detector kind (SILENT, LOOP, SPIN, BURN, FAILING, OFF_BRIEF, STALL_CLAIM), evidence</td></tr>
+    <tr><td><code>provider_error</code></td><td>4020</td><td><code>ProviderError</code></td><td>Provider name, error code, rate limit flag, retry_after_ms</td></tr>
+    <tr><td><code>task_queued</code> / <code>task_state</code> / <code>agent_state</code></td><td>4021&ndash;4023</td><td><code>TaskQueued</code> / <code>TaskState</code> / <code>AgentState</code></td><td>Task slug, brief digest, declared paths, state transition &amp; reason</td></tr>
+    <tr><td><code>milestone</code> / <code>review</code> / <code>review_finding</code></td><td>4024&ndash;4027</td><td><code>Milestone</code> / <code>Review</code> / <code>ReviewFinding</code></td><td>Milestone phase, reviewer, approval status, finding severity/path/line</td></tr>
+    <tr><td><code>snapshot</code> / <code>daemon</code> / <code>custom</code></td><td>4028&ndash;4035</td><td><code>Snapshot</code> / <code>Daemon</code> / <code>Custom</code></td><td>Daemon lifecycle, clock step, TrackCreated UUID, custom span annotations</td></tr>
   </tbody>
 </table>
 
@@ -433,15 +449,15 @@
 <p>Perfetto counter tracks are rendered as step-functions: each sample retains its value until the next sample on that track. To prevent log bloat without losing precision, tachograph applies strict event-driven and deduplicated recording rules:</p>
 
 <ul>
-  <li><b>Event-driven counters:</b> Slices and telemetry such as <code>active_builds</code>, <code>active_tests</code>, <code>tokens_in</code>, <code>tokens_out</code>, <code>tokens_cached</code>, and <code>cost_micros</code> emit strictly on event occurrence or value change.</li>
-  <li><b>Polled host and process counters:</b> Machine load (<code>machine/load1</code>, <code>machine/cpu_busy</code>, <code>machine/mem_used</code>, <code>machine/disk:*</code>) and per-agent process tree metrics (<code>agent:&lt;id&gt;/run:&lt;n&gt;/cpu</code>, <code>agent:&lt;id&gt;/run:&lt;n&gt;/rss</code>) are polled every 2 seconds from <code>/proc</code>. Consecutive identical values are deduplicated in the sampler: a sample is written to SQLite WAL only when its value actually changes.</li>
+  <li><b>Event-driven counters:</b> Slices and telemetry such as <code>active_builds</code>, <code>active_tests</code>, <code>files_edited</code>, <code>commits</code>, <code>tokens_in</code>, <code>tokens_out</code>, <code>tokens_cached</code>, and <code>cost</code> emit strictly on event occurrence or value change.</li>
+  <li><b>Polled host and process counters:</b> Machine load (<code>machine/load1</code>, <code>machine/cpu_busy</code>, <code>machine/mem_used</code>, <code>machine/disk:*</code>) and per-agent process tree metrics (<code>agent:&lt;id&gt;/run:&lt;n&gt;/proc_count</code>, <code>cpu</code>, <code>rss</code>) are polled every 2 seconds from <code>/proc</code> and cgroup v2. Consecutive identical values are deduplicated in the sampler: a sample is written to SQLite WAL only when its value actually changes.</li>
 </ul>
 
 <!-- ───────────── Section 5 ───────────── -->
 <div class="part">Part 5 &mdash; Anomaly Detection</div>
 <h2 id="detectors"><span class="n">5</span>Anomaly &amp; stall detectors</h2>
 
-<p>The appender evaluates stall detectors after every ingested event and on a 1-second periodic tick. When a detector fires, it emits a <code>StallDetected</code> instant and transitions the agent track to <code>Stalled</code>.</p>
+<p>The appender evaluates stall detectors after every ingested event and on a periodic tick. When a detector fires, it records a <code>Stall</code> event, transitions <code>agent:&lt;id&gt;/state</code> to <code>Stalled</code>, opens a duration slice on <code>agent:&lt;id&gt;/stalls</code> until the agent recovers or exits, and optionally invokes the configured <code>on_stall</code> shell hook.</p>
 
 <table>
   <thead>
@@ -500,18 +516,18 @@ tacho report worker-2 --diff-claims
 
 <span class="c"># Example output when an agent claims completion without testing:</span>
 <span class="hl">=== Claim Verification: worker-2 ===</span>
-<span class="hl">Claimed:  "Task complete, all tests passing"</span>
-<span class="hl">Actual:   CLAIM STALL DETECTED (STALL_CLAIM)</span>
-<span class="hl">  - FileEdits: 4 files modified (src/auth.rs, src/token.rs, ...)</span>
-<span class="hl">  - Last Test: None after last FileEdited! (exit code 0 required)</span>
-<span class="hl">  - Worktree:  Dirty (uncommitted changes remain)</span>
-<span class="hl">Result:   REJECTED — Agent exited without running tests after modifying code.</span></code></pre>
+<span class="hl">Edits:                4</span>
+<span class="hl">Test After Last Edit: UNVERIFIED</span>
+<span class="hl">Commits Succeeded:    0</span>
+<span class="hl">Pushes Succeeded:     0</span>
+<span class="hl">Claim Stall Flags:    CLAIM</span>
+<span class="hl">Git Worktree Status:  DIRTY (4 uncommitted/untracked files)</span></code></pre>
 
 <!-- ───────────── Section 6 ───────────── -->
 <div class="part">Part 6 &mdash; Integration</div>
 <h2 id="ingestion"><span class="n">6</span>Ingestion modes</h2>
 
-<p>tachograph requires no changes to agent binaries. Four ingestion modes capture events across different environments:</p>
+<p>tachograph requires no changes to agent binaries. Five ingestion modes capture events across different environments:</p>
 
 <h3>1. Provider hooks (Claude Code, Gemini CLI, Jetski)</h3>
 <p>Hooks execute in &lt; 5 ms. They convert provider lifecycle events into NDJSON and send them to <code>api.sock</code>. Hooks exit 0 silently if the daemon is unavailable.</p>
@@ -521,15 +537,23 @@ tacho install gemini
 tacho install jetski</code></pre>
 
 <h3>2. Process wrapping: <code>tacho run -- &lt;cmd&gt;</code></h3>
-<p>Executes the target command in a child process, tees stdout, parses stream-json events, and tracks CPU/RSS over the process tree using its known PID.</p>
+<p>Executes the target command in a child process (placed into a dedicated systemd / cgroup v2 scope when available), tees stdout, parses stream-json events, and tracks child processes, CPU, and RSS over the process tree.</p>
 <pre><code><span class="c"># Wrap any agent CLI: stdout is passed through byte-for-byte</span>
 tacho run -- claude --output-format stream-json
 tacho run -- codex exec --json "implement feature x"</code></pre>
 
-<h3>3. OpenTelemetry: OTLP HTTP receiver</h3>
+<h3>3. Live transcript tailing: <code>tacho tail</code></h3>
+<p>Watches on-disk Claude Code <code>.jsonl</code> transcripts via <code>inotify</code>, persisting per-file <code>(dev, inode, offset)</code> checkpoints atomically in <code>$TACHO_HOME/tail-offsets.json</code> and handling file rotation or truncation automatically.</p>
+<pre><code><span class="c"># Continuously watch and ingest transcripts under ~/.claude/projects</span>
+tacho tail ~/.claude/projects
+
+<span class="c"># Ingest new lines once and exit</span>
+tacho tail ~/.claude/projects --once --agent worker-1</code></pre>
+
+<h3>4. OpenTelemetry: OTLP HTTP receiver</h3>
 <p>Accepts standard OTLP/HTTP protobuf or JSON on <code>127.0.0.1:4318</code> for agents instrumented with OpenTelemetry.</p>
 
-<h3>4. Shell scripting: <code>tacho emit</code></h3>
+<h3>5. Shell scripting: <code>tacho emit</code></h3>
 <pre><code><span class="c"># Declare a supervisor task with declared paths, assigned agent, base commit, and budgets</span>
 tacho emit task auth-refactor \
   --paths crates/core/src/auth.rs,crates/core/src/token.rs \
@@ -539,66 +563,81 @@ tacho emit task auth-refactor \
   --cost-budget 500000 \
   --brief-file brief.md
 
-<span class="c"># Emit custom spans and progress instants</span>
+<span class="c"># Emit custom spans and task state transitions</span>
 tacho emit span begin custom:migration "phase-1" --arg schema=v2
-tacho emit instant custom:migration "checkpoint" --arg status=ok
+tacho emit state auth-refactor InProgress --because "worker-1 started"
 tacho emit span end custom:migration</code></pre>
 
 <p>Declared task paths bound the scope for the <code>OFF_BRIEF</code> detector. Per-task token and cost budgets set thresholds for the <code>BURN</code> detector. Subsequent runs assigned to the same task are automatically connected with Perfetto flow arrows (<code>task_run_flow:&lt;slug&gt;</code>) to preserve execution lineage across retries.</p>
 
 <!-- ───────────── Section 7 ───────────── -->
 <div class="part">Part 7 &mdash; Host Corroboration</div>
-<h2 id="system"><span class="n">7</span>System tracing with Perfetto traced</h2>
+<h2 id="system"><span class="n">7</span>Process tree tracking (cgroup v2 + /proc) &amp; Perfetto traced</h2>
 
-<p>When investigating performance issues or heavy builds, tachograph correlates agent slices with kernel activity via Perfetto's system daemon (<code>traced</code>).</p>
+<p>Coding agents spawn deep trees of short-lived child processes (<code>cargo check</code>, <code>rustc</code>, <code>cargo-nextest</code>, <code>git</code>). tachograph tracks both kernel cgroup v2 accounting and <code>/proc</code> process hierarchies:</p>
 
-<p>tachograph synchronizes clocks by capturing paired readings of <code>CLOCK_REALTIME</code> and <code>CLOCK_BOOTTIME</code> at the start of the trace. When writing a snapshot with <code>tacho trace --system</code>, tachograph clones the active <code>tacho-system</code> ring buffer and merges the packets.</p>
+<ul>
+  <li><b>Process-tree slot tracks (<code>procs/slot 0..k</code>):</b> Child processes spawned under an agent run are tracked across sampling intervals and rendered as duration slices on deterministic slot tracks (e.g. <code>rustc (pid 4120)</code>), with shell noise filtered out.</li>
+  <li><b>Unified cgroup v2 + <code>/proc</code> metrics:</b> When a run executes inside a dedicated cgroup v2 leaf, the sampler reads <code>cgroup.procs</code>, <code>cpu.stat</code>, and <code>memory.current</code> alongside <code>/proc/&lt;pid&gt;</code> traversal, reporting the maximum of <code>/proc</code> RSS and cgroup <code>memory.current</code> on <code>agent:&lt;id&gt;/run:&lt;n&gt;/rss</code>.</li>
+  <li><b>Perfetto <code>traced</code> merge:</b> Dual-clock synchronization (<code>CLOCK_REALTIME</code> + <code>CLOCK_BOOTTIME</code>) merges kernel scheduler slices and CPU frequency from <code>traced</code> when running <code>tacho trace --system</code>.</li>
+</ul>
 
 <figure>
-<svg viewBox="0 0 1000 320" role="img" aria-label="Perfetto UI merged agent and system timeline">
+<svg viewBox="0 0 1000 350" role="img" aria-label="Perfetto UI merged agent and system timeline">
   <!-- UI Window Header -->
   <rect x="20" y="20" width="960" height="30" class="b2" rx="3"/>
   <circle cx="38" cy="35" r="5" class="br"/><circle cx="54" cy="35" r="5" class="bw"/><circle cx="70" cy="35" r="5" class="bg"/>
-  <text x="94" y="39" class="tm">ui.perfetto.dev &mdash; merged trace snapshot</text>
+  <text x="94" y="39" class="tm">ui.perfetto.dev &mdash; duration slices, TYPE_STATE bands &amp; process tree slots</text>
 
   <!-- Track 1: machine counters -->
-  <rect x="20" y="60" width="960" height="32" class="b0"/>
-  <text x="30" y="80" class="tm">machine/load1</text>
-  <path d="M200,86 L350,82 L500,68 L650,65 L800,80 L960,85" class="lna"/>
-  <text x="920" y="78" class="tms ta">3.82</text>
+  <rect x="20" y="58" width="960" height="30" class="b0"/>
+  <text x="30" y="77" class="tm">machine/load1</text>
+  <path d="M220,82 L350,78 L500,64 L650,62 L800,76 L960,81" class="lna"/>
+  <text x="920" y="75" class="tms ta">3.82</text>
 
   <!-- Track 2: agent state -->
-  <rect x="20" y="100" width="960" height="36" class="b"/>
-  <text x="30" y="122" class="tm">agent:worker-1/state</text>
-  <rect x="200" y="104" width="120" height="28" class="ba" rx="2"/><text x="230" y="122" class="tms">Thinking</text>
-  <rect x="320" y="104" width="340" height="28" class="bw" rx="2"/><text x="440" y="122" class="tms">Tool (Build)</text>
-  <rect x="660" y="104" width="140" height="28" class="br" rx="2"/><text x="700" y="122" class="tms">Stalled (LOOP)</text>
-  <rect x="800" y="104" width="160" height="28" class="bg" rx="2"/><text x="860" y="122" class="tms">Idle</text>
+  <rect x="20" y="94" width="960" height="34" class="b"/>
+  <text x="30" y="115" class="tm">agent:worker-1/state</text>
+  <rect x="220" y="98" width="100" height="26" class="ba" rx="2"/><text x="242" y="115" class="tms">Thinking</text>
+  <rect x="320" y="98" width="340" height="26" class="bw" rx="2"/><text x="440" y="115" class="tms">Tool (Build)</text>
+  <rect x="660" y="98" width="140" height="26" class="br" rx="2"/><text x="700" y="115" class="tms">Stalled (LOOP)</text>
+  <rect x="800" y="98" width="160" height="26" class="bg" rx="2"/><text x="860" y="115" class="tms">Idle</text>
 
-  <!-- Track 3: agent turns -->
-  <rect x="20" y="144" width="960" height="42" class="b0"/>
-  <text x="30" y="168" class="tm">agent:worker-1/turns</text>
-  <rect x="200" y="148" width="600" height="34" class="ba" rx="2"/>
-  <text x="210" y="168" class="tms">Turn 12</text>
-  <rect x="320" y="152" width="320" height="26" class="bw" rx="2"/>
-  <text x="330" y="168" class="tm">Build cargo build --release</text>
+  <!-- Track 3: agent stalls duration slice -->
+  <rect x="20" y="134" width="960" height="30" class="b0"/>
+  <text x="30" y="153" class="tm">agent:worker-1/stalls</text>
+  <rect x="660" y="138" width="140" height="22" class="br" rx="2"/><text x="672" y="153" class="tms">LOOP (4x identical)</text>
 
-  <!-- Track 4: traced kernel sched -->
-  <rect x="20" y="194" width="960" height="36" class="b"/>
-  <text x="30" y="216" class="tm">traced/cpu:3 sched</text>
-  <rect x="325" y="198" width="45" height="28" class="bg" rx="1"/>
-  <rect x="375" y="198" width="80" height="28" class="bg" rx="1"/>
-  <rect x="460" y="198" width="60" height="28" class="bg" rx="1"/>
-  <rect x="525" y="198" width="110" height="28" class="bg" rx="1"/>
-  <text x="430" y="216" class="tms tg">rustc PID 41208 &mdash; 98.4% CPU</text>
+  <!-- Track 4: agent turns -->
+  <rect x="20" y="170" width="960" height="40" class="b"/>
+  <text x="30" y="194" class="tm">run:1/turns</text>
+  <rect x="220" y="174" width="580" height="32" class="ba" rx="2"/>
+  <text x="230" y="194" class="tms">Turn 12</text>
+  <rect x="320" y="178" width="320" height="24" class="bw" rx="2"/>
+  <text x="330" y="194" class="tm">Build cargo build --release</text>
 
-  <!-- Track 5: traced process rss -->
-  <rect x="20" y="238" width="960" height="36" class="b0"/>
-  <text x="30" y="260" class="tm">traced/proc:rustc rss</text>
-  <path d="M320,270 L380,262 L450,252 L550,244 L640,242 L650,270" class="lnw"/>
-  <text x="600" y="254" class="tms tw">1.42 GB Peak RSS</text>
+  <!-- Track 5: procs/slot 0 -->
+  <rect x="20" y="216" width="960" height="34" class="b0"/>
+  <text x="30" y="237" class="tm">run:1/procs/slot 0</text>
+  <rect x="325" y="220" width="140" height="26" class="bg" rx="2"/><text x="335" y="237" class="tms">cargo-check (4110)</text>
+  <rect x="470" y="220" width="165" height="26" class="bg" rx="2"/><text x="480" y="237" class="tms">rustc (pid 4120)</text>
+
+  <!-- Track 6: traced kernel sched -->
+  <rect x="20" y="256" width="960" height="34" class="b"/>
+  <text x="30" y="277" class="tm">traced/cpu:3 sched</text>
+  <rect x="325" y="260" width="45" height="26" class="bg" rx="1"/>
+  <rect x="375" y="260" width="80" height="26" class="bg" rx="1"/>
+  <rect x="460" y="260" width="60" height="26" class="bg" rx="1"/>
+  <rect x="525" y="260" width="110" height="26" class="bg" rx="1"/>
+  <text x="430" y="277" class="tms tg">rustc PID 4120 &mdash; 98.4% CPU</text>
+
+  <!-- Track 7: process rss -->
+  <rect x="20" y="296" width="960" height="34" class="b0"/>
+  <text x="30" y="317" class="tm">run:1/rss (cgroup v2)</text>
+  <path d="M320,326 L380,318 L450,308 L550,300 L640,298 L650,326" class="lnw"/>
+  <text x="600" y="312" class="tms tw">1.42 GB Peak RSS</text>
 </svg>
-<figcaption>Figure 4: Perfetto UI visualization. The agent's <code>Build</code> slice aligns directly with <code>rustc</code> scheduler slices on CPU 3 and RSS growth captured by <code>traced</code>.</figcaption>
+<figcaption>Figure 4: Perfetto UI visualization. The agent's <code>Build</code> slice aligns directly with child process lifetime slices on <code>procs/slot 0</code>, kernel scheduler slices on CPU 3, and cgroup v2 RSS growth.</figcaption>
 </figure>
 
 <h3>Fault-tolerant process reaping and storage degradation</h3>
@@ -606,7 +645,7 @@ tacho emit span end custom:migration</code></pre>
 
 <ul>
   <li><b>Dead worker reaping:</b> During each <code>/proc</code> sampling cycle, the daemon inspects the PID tree of active runs. If a tracked PID terminates or enters a zombie state (<code>ESRCH</code> or process state <code>'Z'</code>), the daemon automatically marks the run complete and closes all open child tool slices with <code>abandoned = true</code>.</li>
-  <li><b>Graceful storage degradation:</b> If the host disk runs out of space (<code>ENOSPC</code>) or the filesystem becomes read-only, SQLite WAL writes degrade safely. The appender continues updating in-memory <code>LiveState</code> and draining the channel so agent hook callers never block or fail.</li>
+  <li><b>Graceful storage degradation:</b> If the host disk runs out of space (<code>ENOSPC</code>) or the filesystem becomes read-only, SQLite WAL writes degrade safely without crashing the daemon or blocking agent hook callers.</li>
 </ul>
 
 <!-- ───────────── Section 8 ───────────── -->
@@ -659,23 +698,21 @@ tacho query verified-trees</code></pre>
 
 <!-- ───────────── Section 9 ───────────── -->
 <div class="part">Part 9 &mdash; Privacy</div>
-<h2 id="privacy"><span class="n">9</span>Privacy firewall &amp; scrubbing</h2>
+<h2 id="privacy"><span class="n">9</span>Content firewall &amp; opt-in secret scrubber</h2>
 
-<p>tachograph enforces a strict privacy firewall in the appender thread <b>before persistence</b>. If a secret is intercepted, it is redacted before writing to SQLite or memory.</p>
+<p>tachograph separates structural telemetry from raw content and provides an opt-in regex/shape scrubber for environments that require command-line redaction:</p>
 
 <ul>
-  <li><b>Never Stored:</b> Model prose, user prompts, tool stdout/stderr, file diff contents, raw environment variables, and message bodies are dropped immediately. They are represented solely by Blake3 8-byte digests and byte lengths.</li>
-  <li><b>Always Scrubbed:</b> Command-line arguments (<code>argv</code>), custom args, and task titles pass through regex and shape scrubbers.</li>
-  <li><b>Redaction Patterns:</b>
+  <li><b>Always Dropped (Content Firewall):</b> Model prose, user prompts, tool stdout/stderr, file diff contents, raw environment variables, and message bodies are never stored. They are represented solely by 8-byte BLAKE3 digests and byte lengths.</li>
+  <li><b>Path Relativization:</b> Absolute file paths inside the workspace are converted to relative paths (<code>src/main.rs</code>). Paths outside the workspace are masked to <code>&lt;outside&gt;/...</code>.</li>
+  <li><b>Opt-in Secret Scrubber (<code>scrub = true</code> or <code>TACHO_SCRUB=1</code>):</b> By default, command-line arguments (<code>argv</code>), custom args, and finding titles are recorded unmodified for local debugging clarity. When <code>scrub = true</code> is set in <code>$TACHO_HOME/config.toml</code> (or <code>TACHO_SCRUB=1</code> in the environment), the appender redacts:
     <ul>
       <li>Sensitive flags: <code>--token</code>, <code>--password</code>, <code>-p</code>, <code>--api-key</code>, <code>--secret</code> replaced with <code>&lt;redacted&gt;</code>.</li>
-      <li>Sensitive headers: <code>Authorization: Bearer &lt;redacted&gt;</code>.</li>
+      <li>Sensitive headers &amp; URL userinfo: <code>Authorization: Bearer &lt;redacted&gt;</code>, <code>https://user:&lt;redacted&gt;@host</code>.</li>
       <li>Key shapes: AWS (<code>AKIA...</code>), GCP (<code>ya29...</code>), GitHub (<code>ghp_...</code>, <code>github_pat_...</code>), Anthropic (<code>sk-ant-...</code>), OpenAI (<code>sk-...</code>), Slack (<code>xoxb-...</code>), JWT triples, and PEM blocks.</li>
-      <li>High-entropy hex/base64 runs &ge; 32 characters.</li>
-      <li><b>Preserved:</b> 40-character hexadecimal Git commit SHAs are explicitly exempted and preserved.</li>
+      <li>High-entropy hex/base64 runs &ge; 32 characters (with 40-character hexadecimal Git commit SHAs explicitly preserved).</li>
     </ul>
   </li>
-  <li><b>Path Relativization:</b> Absolute file paths inside the workspace are converted to relative paths (<code>src/main.rs</code>). Paths outside the workspace are masked to <code>&lt;outside&gt;/...</code>.</li>
 </ul>
 
 <!-- ───────────── Section 10 ───────────── -->
@@ -750,6 +787,5 @@ tacho query verified-trees</code></pre>
     localStorage.setItem('zc-theme', next);
   }
 </script>
-
 </body>
 </html>

@@ -2,7 +2,7 @@
 //!
 //! Enforces single-instance locking via flock, handles stale socket cleanup,
 //! serves `api.sock` using a bounded worker pool (8 threads), and serves
-//! `trace.sock` via a dedicated single thread accessing only rings and registry.
+//! `trace.sock` via a dedicated single thread streaming directly from SQLite WAL.
 
 use crossbeam_channel::{Receiver, Sender};
 use std::fs;

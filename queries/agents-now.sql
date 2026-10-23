@@ -8,6 +8,8 @@ WITH trace_end AS (
     SELECT ts FROM slice
     UNION ALL
     SELECT ts FROM state
+    UNION ALL
+    SELECT ts FROM counter
   )
 ),
 latest_states AS (

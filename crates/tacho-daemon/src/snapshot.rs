@@ -199,6 +199,7 @@ impl SnapshotProjector {
         ts
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_synth_end<W: Write>(
         &mut self,
         slice: &OpenSynthSlice,
@@ -1274,7 +1275,7 @@ pub fn rebuild_from_log(
     let mut projector = SnapshotProjector::default();
 
     for ev in all_events {
-        let in_window = !since.is_some_and(|s| ev.ts_ns < s) && !until.is_some_and(|u| ev.ts_ns > u);
+        let in_window = since.is_none_or(|s| ev.ts_ns >= s) && until.is_none_or(|u| ev.ts_ns <= u);
         projector.process_event(
             ev,
             in_window,

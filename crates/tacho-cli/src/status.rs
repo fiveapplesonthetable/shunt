@@ -1,28 +1,70 @@
-//! Status, report, and watch commands querying the live flight recorder state.
+//! Status, report, and watch commands querying the flight recorder state.
 
+use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tacho_daemon::{render_report, render_status, EventLog, Recorder};
 
 use crate::cli::{ReportArgs, StatusArgs, WatchArgs};
 use crate::client::DaemonClient;
 
+/// Resolves the SQLite WAL database path (`$TACHO_HOME/events.sqlite`).
+fn resolve_events_db() -> std::path::PathBuf {
+    let home = crate::paths::resolve_home();
+    let sqlite = home.join("events.sqlite");
+    if sqlite.exists() {
+        sqlite
+    } else {
+        let db = home.join("events.db");
+        if db.exists() {
+            db
+        } else {
+            sqlite
+        }
+    }
+}
+
 /// Executes `tacho status [--json]`.
 pub fn execute_status(args: StatusArgs) -> io::Result<()> {
     let client = DaemonClient::new();
-    let resp = client.send_request(&serde_json::json!({
+    match client.send_request(&serde_json::json!({
         "cmd": "status",
         "json": args.json,
-    }))?;
-
-    if let Some(output) = resp.get("output").and_then(|v| v.as_str()) {
-        println!("{output}");
-    } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_default()
-        );
+    })) {
+        Ok(resp) => {
+            if let Some(output) = resp.get("output").and_then(|v| v.as_str()) {
+                println!("{output}");
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let db_path = resolve_events_db();
+            let events = if db_path.exists() {
+                EventLog::open(&db_path)
+                    .and_then(|log| log.load_all())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let recorder = Recorder::restore(events.iter());
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let mut text = render_status(recorder.live_state(), args.json, now_ns);
+            let db_size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+            if !args.json {
+                text.push_str(&format!("\nevents.sqlite: {} bytes\n", db_size));
+            }
+            println!("{text}");
+            Ok(())
+        }
     }
-
-    Ok(())
 }
 
 /// Executes `tacho report <agent> [--since 30m] [--diff-claims]`.
@@ -33,12 +75,36 @@ pub fn execute_report(args: ReportArgs) -> io::Result<()> {
         .as_deref()
         .and_then(crate::trace::parse_since_duration_ns);
 
-    let resp = client.send_request(&serde_json::json!({
+    let resp = match client.send_request(&serde_json::json!({
         "cmd": "report",
         "agent": args.agent,
         "since": since_ns,
         "diff_claims": args.diff_claims,
-    }))?;
+    })) {
+        Ok(r) => r,
+        Err(_) => {
+            let db_path = resolve_events_db();
+            let events = if db_path.exists() {
+                EventLog::open(&db_path)
+                    .and_then(|log| log.load_all())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let recorder = Recorder::restore(events.iter());
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let text = render_report(recorder.live_state(), &args.agent, since_ns, now_ns);
+            let agent_state = recorder.live_state().agents.get(&args.agent);
+            serde_json::json!({
+                "status": "ok",
+                "output": text,
+                "agent_state": agent_state,
+            })
+        }
+    };
 
     if args.diff_claims {
         print_diff_claims(&args.agent, &resp);
