@@ -44,10 +44,30 @@ pub enum Commands {
     /// Example: tacho trace -o trace.pftrace
     Trace(TraceArgs),
 
-    /// Show live status of all recorded agents.
+    /// Show live status of all recorded agents and fleet sections.
     ///
-    /// Example: tacho status
+    /// Example: tacho status --section needs
     Status(StatusArgs),
+
+    /// Show items needing operator attention (`status --section needs`).
+    ///
+    /// Example: tacho needs
+    Needs(StatusArgs),
+
+    /// Show running commit, main commit, commits behind, and last self-update move.
+    ///
+    /// Example: tacho version
+    Version(VersionArgs),
+
+    /// Initialize or update the fleet environment file and systemd unit links.
+    ///
+    /// Example: tacho setup --dry-run
+    Setup(SetupArgs),
+
+    /// Start or tear down an isolated per-worktree database.
+    ///
+    /// Example: tacho db fix-auth --rm
+    Db(DbArgs),
 
     /// Print a short timeline report for an agent.
     ///
@@ -129,14 +149,14 @@ pub enum Commands {
     /// Example: tacho todo fix-auth "Fix login race" --area auth
     Todo(TodoArgs),
 
-    /// Start or resume a managed worker agent session.
+    /// Start or resume a managed worker agent session, or configure the fleet session default.
     ///
     /// Example: tacho session fix-auth --resume
-    Session(SessionArgs),
+    Session(SessionCliArgs),
 
     /// Place or list holds on tasks, PRs (pr:<n>), or areas (area:<name>).
     ///
-    /// Example: tacho hold pr:42 --reason "awaiting schema migration"
+    /// Example: tacho hold pr:42 --why "awaiting schema migration"
     Hold(HoldArgs),
 
     /// Release an active hold on a task, PR, or area.
@@ -146,7 +166,7 @@ pub enum Commands {
 
     /// Retire a task or agent lineage from the fleet.
     ///
-    /// Example: tacho retire fix-auth
+    /// Example: tacho retire fix-auth --why "superseded by pr:99"
     Retire(RetireArgs),
 
     /// Confirm or attach a PR number (or 'none') to a finished agent run.
@@ -181,27 +201,32 @@ pub enum Commands {
 
     /// Run a speculative verification batch across open PRs with automatic binary bisection.
     ///
-    /// Example: tacho batch 41 42
-    Batch(BatchArgs),
+    /// Example: tacho batch 41 42 --areas core --foreground
+    Batch(BatchCliArgs),
 
-    /// Replay a recorded verification batch.
+    /// Replay a recorded verification batch or decision tick.
     ///
     /// Example: tacho replay b001
     Replay(ReplayArgs),
 
-    /// View or open a verified merge train from a passed batch.
+    /// Replay a recorded verification batch or pure decision tick (alias for `replay`).
     ///
-    /// Example: tacho train --from-batch b001
+    /// Example: tacho decide-replay latest
+    DecideReplay(ReplayArgs),
+
+    /// View or open a verified merge train from a passed batch or PR list.
+    ///
+    /// Example: tacho train 41 42 --max 4
     Train(TrainArgs),
 
     /// Assemble or approve a combined release-train pull request.
     ///
-    /// Example: tacho release-train --approve
+    /// Example: tacho release-train 99 --approve
     ReleaseTrain(ReleaseTrainArgs),
 
     /// Land verified PRs from the ready queue or open merge train.
     ///
-    /// Example: tacho land
+    /// Example: tacho land t001
     Land(LandArgs),
 
     /// Show the ordered ready-to-land PR queue.
@@ -425,12 +450,31 @@ pub enum Provider {
     Jetski,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookTarget {
+    Claude,
+    Gemini,
+    Jetski,
+    Guard,
+}
+
+impl HookTarget {
+    pub fn as_provider(self) -> Option<Provider> {
+        match self {
+            HookTarget::Claude => Some(Provider::Claude),
+            HookTarget::Gemini => Some(Provider::Gemini),
+            HookTarget::Jetski => Some(Provider::Jetski),
+            HookTarget::Guard => None,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct HookArgs {
-    /// Agent provider whose hook payload is being piped to stdin.
+    /// Agent provider (`claude`, `gemini`, `jetski`) or `guard` for PreToolUse Bash guardrails.
     ///
     /// Example: claude
-    pub provider: Provider,
+    pub provider: HookTarget,
 }
 
 #[derive(Args, Debug)]
@@ -475,13 +519,44 @@ pub struct TraceArgs {
     pub from_log: Option<Option<String>>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct StatusArgs {
     /// Output status as structured JSON.
     ///
     /// Example: --json
     #[arg(long)]
     pub json: bool,
+
+    /// Filter output to one or more named sections (headline, needs, attention, pipeline, agents, machine, cost, held, stale, progress, flakes).
+    ///
+    /// Example: --section needs --section machine
+    #[arg(long = "section")]
+    pub section: Vec<String>,
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct VersionArgs {
+    /// Output version details as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct SetupArgs {
+    /// Print planned setup actions without modifying files or symlinks.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct DbArgs {
+    /// Worktree or database slug name.
+    pub name: String,
+    /// Optional checkout path (defaults to current working directory).
+    pub checkout: Option<PathBuf>,
+    /// Tear down the per-agent database instead of starting it.
+    #[arg(long)]
+    pub rm: bool,
 }
 
 #[derive(Args, Debug)]
@@ -680,16 +755,19 @@ pub struct KillArgs {
     pub now: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct PrArgs {
     /// Pull request title.
     pub title: String,
     /// Pull request description body.
-    #[arg(short = 'm', long = "message")]
+    #[arg(short = 'm', long = "message", default_value = "")]
     pub message: String,
     /// Validate preflight guardrails and print body without pushing or calling gh.
     #[arg(long)]
     pub dry_run: bool,
+    /// Allow opening a PR even when visual screenshot diffs exceed pixel tolerance.
+    #[arg(long)]
+    pub shots_anyway: bool,
 }
 
 #[derive(Args, Debug)]
@@ -719,7 +797,7 @@ pub struct StarveArgs {
     pub cmd: Vec<String>,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct TodoArgs {
     /// Task key (omit to list the current queue).
     pub key: Option<String>,
@@ -740,6 +818,12 @@ pub struct TodoArgs {
     /// Boost task priority to the front of the queue.
     #[arg(long)]
     pub priority: bool,
+    /// Boost task priority and dispatch immediately if a worker slot is available.
+    #[arg(long)]
+    pub now: bool,
+    /// Include or list retired task keys.
+    #[arg(long)]
+    pub retired: bool,
     /// Agent provider (`claude`, `codex`, `gemini`).
     #[arg(long)]
     pub provider: Option<String>,
@@ -757,7 +841,7 @@ pub struct TodoArgs {
     pub json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct SessionArgs {
     /// Task or session key.
     pub key: String,
@@ -783,28 +867,72 @@ pub struct SessionArgs {
     pub effort: Option<String>,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
+pub struct SessionCliArgs {
+    /// Optional task or session key (omit when setting or viewing fleet-wide default provider/model).
+    pub key: Option<String>,
+    /// Optional brief for a new session.
+    pub brief: Option<String>,
+    /// Resume the latest stopped run in this key's lineage.
+    #[arg(long)]
+    pub resume: bool,
+    /// Clear fleet-wide session provider/model override back to default (`claude`).
+    #[arg(long)]
+    pub clear: bool,
+    /// Area name.
+    #[arg(long)]
+    pub area: Option<String>,
+    /// Base branch or PR.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Provider (`claude`, `codex`, `gemini`).
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model shorthand or ID.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Reasoning effort level.
+    #[arg(long)]
+    pub effort: Option<String>,
+}
+
+#[derive(Args, Debug, Default, Clone)]
 pub struct HoldArgs {
     /// Target to hold (`<key>`, `pr:<n>`, or `area:<name>`). Omit to list active holds.
     pub target: Option<String>,
-    /// Reason for placing the hold.
-    #[arg(long)]
+    /// Reason for placing the hold (`--why` or `--reason`).
+    #[arg(long = "why", visible_alias = "reason")]
     pub reason: Option<String>,
 }
 
-#[derive(Args, Debug)]
+impl HoldArgs {
+    pub fn why(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+#[derive(Args, Debug, Default, Clone)]
 pub struct ReleaseArgs {
     /// Target to release (`<key>`, `pr:<n>`, or `area:<name>`).
     pub target: String,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct RetireArgs {
     /// Task or agent key to retire.
     pub key: String,
+    /// Reason for retiring the task or agent lineage (`--why` or `--reason`).
+    #[arg(long = "why", visible_alias = "reason")]
+    pub reason: Option<String>,
 }
 
-#[derive(Args, Debug)]
+impl RetireArgs {
+    pub fn why(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+#[derive(Args, Debug, Default, Clone)]
 pub struct AttachArgs {
     /// Agent key.
     pub key: String,
@@ -812,13 +940,13 @@ pub struct AttachArgs {
     pub pr: String,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct StopArgs {
     /// Running agent key to stop.
     pub key: String,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct TellArgs {
     /// Agent key to message/nudge.
     pub key: String,
@@ -826,28 +954,28 @@ pub struct TellArgs {
     pub message: String,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct NextArgs {
     /// Output as JSON.
     #[arg(long)]
     pub json: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct ProgressArgs {
     /// Output as JSON.
     #[arg(long)]
     pub json: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct FlakesArgs {
     /// Output as JSON.
     #[arg(long)]
     pub json: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct BatchArgs {
     /// PR numbers to verify in this batch (omit to auto-plan from open PRs).
     pub prs: Vec<u64>,
@@ -865,9 +993,21 @@ pub struct BatchArgs {
     pub dry_run: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
+pub struct BatchCliArgs {
+    #[command(flatten)]
+    pub inner: BatchArgs,
+    /// Comma-separated area names to restrict batch verification to (e.g. `core,api`).
+    #[arg(long)]
+    pub areas: Option<String>,
+    /// Run batch verification in the foreground and stream output.
+    #[arg(long)]
+    pub foreground: bool,
+}
+
+#[derive(Args, Debug, Default, Clone)]
 pub struct ReplayArgs {
-    /// Batch ID to replay (e.g. `b001`).
+    /// Batch ID or decision tick ID to replay (e.g. `b001`, `latest`, `tick:<ts>`).
     pub batch_id: String,
     /// Optional override command.
     #[arg(long)]
@@ -877,8 +1017,13 @@ pub struct ReplayArgs {
     pub dry_run: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct TrainArgs {
+    /// Optional PR numbers to include in the merge train.
+    pub prs: Vec<u64>,
+    /// Maximum number of PRs in the train.
+    #[arg(long)]
+    pub max: Option<usize>,
     /// Open a new verified merge train from a passed batch ID (e.g. `b001`).
     #[arg(long)]
     pub from_batch: Option<String>,
@@ -887,28 +1032,35 @@ pub struct TrainArgs {
     pub json: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct ReleaseTrainArgs {
+    /// Optional release-train PR number.
+    pub pr: Option<u64>,
     /// Record review approval for the current release-train head SHA.
     #[arg(long)]
     pub approve: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct LandArgs {
+    /// Optional train ID or branch to land.
+    pub train: Option<String>,
+    /// Optional `--train <id>` flag alias.
+    #[arg(long = "train", hide = true)]
+    pub train_flag: Option<String>,
     /// Dry-run without mutating state.
     #[arg(long)]
     pub dry_run: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct QueueArgs {
     /// Output as JSON.
     #[arg(long)]
     pub json: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct TidyArgs {
     /// Preview cleanup decisions without removing anything.
     #[arg(long)]
@@ -916,20 +1068,29 @@ pub struct TidyArgs {
     /// Minimum idle age in seconds before cleaning up a worktree (default: 3600).
     #[arg(long)]
     pub min_age: Option<i64>,
+    /// Retire unfinished or abandoned runs older than N days with no open PR.
+    #[arg(long)]
+    pub stale_runs: Option<i64>,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct TickArgs {
     /// Preview tick decisions without spawning or mutating state.
     #[arg(long)]
     pub dry_run: bool,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct EventsArgs {
     /// Maximum number of decisions to display (default: 50).
-    #[arg(long)]
+    #[arg(short = 'n', long = "limit", visible_alias = "last")]
     pub limit: Option<usize>,
+    /// Show events since duration (e.g. `15m`, `2h`, `1d`) or unix timestamp.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Follow new events as they are appended.
+    #[arg(short = 'f', long = "follow")]
+    pub follow: bool,
     /// Filter by category (`dispatch`, `verify`, `land`, `watch`, `kit`).
     #[arg(long)]
     pub category: Option<String>,

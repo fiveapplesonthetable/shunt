@@ -15,9 +15,9 @@ use crate::config::Config;
 use crate::log::EventLog;
 use crate::paths::DaemonPaths;
 use crate::recorder::Recorder;
-use crate::sampler::spawn_sampler;
+use crate::sampler::{spawn_sampler_with_waker, SamplerWaker};
 use crate::server::{DaemonLock, DaemonServer};
-use crate::snapshot::{write_snapshot, SnapshotStats};
+use crate::snapshot::{write_snapshot, write_snapshot_file_atomic, SnapshotStats};
 
 /// Running daemon instance.
 pub struct Daemon {
@@ -31,6 +31,7 @@ pub struct Daemon {
     otlp_thread: Option<JoinHandle<()>>,
     otlp_shutdown_fds: Option<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)>,
     sampler_thread: Option<JoinHandle<()>>,
+    sampler_waker: SamplerWaker,
     retention_thread: Option<JoinHandle<()>>,
     appender_thread: Option<JoinHandle<()>>,
     signal_thread: Option<JoinHandle<()>>,
@@ -44,10 +45,12 @@ impl Daemon {
         // 0. Acquire single-instance advisory locks on both $TACHO_RUNTIME/daemon.lock and
         // $TACHO_HOME/daemon.lock BEFORE opening SQLite WAL or spawning background threads.
         let lock = DaemonLock::acquire_paths(&paths)?;
-        let _ = fs::write(
-            paths.runtime.join("daemon.pid"),
-            std::process::id().to_string(),
-        );
+        if let Err(e) = crate::snapshot::write_file_atomic(
+            &paths.runtime.join("daemon.pid"),
+            std::process::id().to_string().as_bytes(),
+        ) {
+            eprintln!("[tacho-daemon] failed to write daemon.pid: {}", e);
+        }
 
         // 1. Open SQLite WAL event log
         let log =
@@ -72,6 +75,13 @@ impl Daemon {
         let on_stall = config.detectors.on_stall.clone();
         let on_stall_timeout = Duration::from_secs(config.detectors.on_stall_timeout_secs);
 
+        // Fallible setup that needs no threads happens first, so an error here cannot leak
+        // half-started background threads.
+        let otlp_listener = match config.otlp_addr.as_deref() {
+            Some(addr) => Some((std::net::TcpListener::bind(addr)?, shutdown_pipe()?)),
+            None => None,
+        };
+
         // 3. Spawn appender thread (no in-memory rings; SQLite WAL is the sole source)
         let (appender, appender_thread) =
             spawn_appender_with_hook_timeout(recorder, log, 65_536, on_stall, on_stall_timeout);
@@ -79,19 +89,38 @@ impl Daemon {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // 4. Spawn sampler thread
-        let sampler_thread = spawn_sampler(
+        let (sampler_thread, sampler_waker) = match spawn_sampler_with_waker(
             config.sampler.clone(),
             appender.clone(),
             shutdown_flag.clone(),
-        );
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                appender.shutdown();
+                let _ = appender_thread.join();
+                return Err(e);
+            }
+        };
 
         // 5. Start UNIX domain socket servers (api.sock, trace.sock) using the acquired lock
-        let server = DaemonServer::start_with_lock(
+        let server = match DaemonServer::start_with_lock(
             paths.clone(),
             lock,
             appender.clone(),
             shutdown_flag.clone(),
-        )?;
+        ) {
+            Ok(server) => server,
+            Err(e) => {
+                // Unwind the threads started so far before reporting the error.
+                shutdown_flag.store(true, Ordering::Release);
+                appender.shutdown();
+                drop(sampler_waker);
+                let _ = sampler_thread.join();
+                let _ = appender_thread.join();
+                return Err(e);
+            }
+        };
+        server.set_sampler_waker(sampler_waker.clone());
 
         // 6. Spawn retention maintenance thread (hourly small-batch prune)
         let (retention_wake_tx, retention_wake_rx) = crossbeam_channel::bounded::<()>(1);
@@ -107,47 +136,41 @@ impl Daemon {
             spawn_signal_handler(shutdown_flag.clone(), paths.clone(), appender.clone());
 
         // 8. Optional OTLP HTTP receiver (design section 1 and 8)
-        let (otlp_thread, otlp_shutdown_fds) = if let Some(ref addr_str) = config.otlp_addr {
-            let listener = std::net::TcpListener::bind(addr_str)?;
-            let shutdown_clone = shutdown_flag.clone();
-            let appender_clone = appender.clone();
-            let mut fds = [0i32; 2];
-            unsafe {
-                libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK);
-            }
-            let otlp_rx = fds[0];
-            let otlp_tx = fds[1];
-            let otlp_cfg = tacho_ingest::otlp_server::OtlpServerConfig {
-                shutdown_fd: Some(otlp_rx),
-                ..Default::default()
+        let (otlp_thread, otlp_shutdown_fds) =
+            if let Some((listener, (otlp_rx, otlp_tx))) = otlp_listener {
+                let shutdown_clone = shutdown_flag.clone();
+                let appender_clone = appender.clone();
+                let otlp_cfg = tacho_ingest::otlp_server::OtlpServerConfig {
+                    shutdown_fd: Some(otlp_rx),
+                    ..Default::default()
+                };
+                let handle = std::thread::Builder::new()
+                    .name("tacho-otlp".to_string())
+                    .spawn(move || {
+                        let on_inputs = move |inputs: Vec<tacho_core::Input>| {
+                            let now_ns = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64;
+                            let batch: Vec<(tacho_core::Input, u64)> =
+                                inputs.into_iter().map(|inp| (inp, now_ns)).collect();
+                            let _ = appender_clone.send_input_batch(batch);
+                        };
+                        let _ = tacho_ingest::otlp_server::serve_otlp_with_config(
+                            listener,
+                            shutdown_clone,
+                            otlp_cfg,
+                            on_inputs,
+                        );
+                        if otlp_rx >= 0 {
+                            unsafe { libc::close(otlp_rx) };
+                        }
+                    })
+                    .expect("failed to spawn otlp thread");
+                (Some(handle), Some((otlp_rx, otlp_tx)))
+            } else {
+                (None, None)
             };
-            let handle = std::thread::Builder::new()
-                .name("tacho-otlp".to_string())
-                .spawn(move || {
-                    let on_inputs = move |inputs: Vec<tacho_core::Input>| {
-                        let now_ns = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos() as u64;
-                        let batch: Vec<(tacho_core::Input, u64)> =
-                            inputs.into_iter().map(|inp| (inp, now_ns)).collect();
-                        let _ = appender_clone.send_input_batch(batch);
-                    };
-                    let _ = tacho_ingest::otlp_server::serve_otlp_with_config(
-                        listener,
-                        shutdown_clone,
-                        otlp_cfg,
-                        on_inputs,
-                    );
-                    if otlp_rx >= 0 {
-                        unsafe { libc::close(otlp_rx) };
-                    }
-                })
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            (Some(handle), Some((otlp_rx, otlp_tx)))
-        } else {
-            (None, None)
-        };
 
         Ok(Self {
             paths,
@@ -160,6 +183,7 @@ impl Daemon {
             otlp_thread,
             otlp_shutdown_fds,
             sampler_thread: Some(sampler_thread),
+            sampler_waker,
             retention_thread: Some(retention_thread),
             appender_thread: Some(appender_thread),
             signal_thread,
@@ -178,7 +202,7 @@ impl Daemon {
         until: Option<u64>,
         w: &mut impl Write,
     ) -> io::Result<SnapshotStats> {
-        write_snapshot(&self.paths.events_db(), since, until, w)
+        crate::snapshot::rebuild_from_log(&self.paths.events_db(), since, until, w)
     }
 
     /// Cleanly stops all daemon threads and writes final snapshot.
@@ -197,8 +221,10 @@ impl Daemon {
         self.server.stop();
 
         // Write final trace to last.perfetto-trace
-        if let Ok(mut f) = fs::File::create(self.paths.last_trace()) {
-            let _ = write_snapshot(&self.paths.events_db(), None, None, &mut f);
+        if let Err(e) =
+            write_snapshot_file_atomic(&self.paths.events_db(), &self.paths.last_trace())
+        {
+            eprintln!("[tacho-daemon] failed to write final trace: {}", e);
         }
 
         if let Some((_rx, tx)) = self.otlp_shutdown_fds.take() {
@@ -212,6 +238,7 @@ impl Daemon {
         if let Some(t) = self.retention_thread.take() {
             let _ = t.join();
         }
+        self.sampler_waker.wake();
         if let Some(t) = self.sampler_thread.take() {
             let _ = t.join();
         }
@@ -228,6 +255,15 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Creates the pipe whose write end, when closed, tells the OTLP server to exit.
+fn shutdown_pipe() -> io::Result<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)> {
+    let mut fds = [-1i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
 }
 
 /// Spawns the retention pruning background thread.
@@ -321,8 +357,9 @@ fn spawn_signal_handler(
                 appender.flush();
 
                 // Save final trace
-                if let Ok(mut f) = fs::File::create(paths.last_trace()) {
-                    let _ = write_snapshot(&paths.events_db(), None, None, &mut f);
+                if let Err(e) = write_snapshot_file_atomic(&paths.events_db(), &paths.last_trace())
+                {
+                    eprintln!("[tacho-daemon] failed to write final trace: {}", e);
                 }
 
                 let _ = fs::remove_file(paths.api_sock());

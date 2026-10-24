@@ -480,3 +480,31 @@ fn is_tacho_command(item: &serde_json::Value, target_cmd: &str) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_and_remove_hooks_cover_bash_pre_tool_use() {
+        for (provider, expected_cmd) in [
+            (Provider::Claude, "tacho hook claude"),
+            (Provider::Gemini, "tacho hook gemini"),
+            (Provider::Jetski, "tacho hook jetski"),
+        ] {
+            let mut root = serde_json::json!({});
+            merge_provider_hooks(provider, &mut root);
+            let serialized = serde_json::to_string(&root).unwrap();
+            assert!(serialized.contains(expected_cmd));
+
+            // Re-merging is idempotent
+            let before = root.clone();
+            merge_provider_hooks(provider, &mut root);
+            assert_eq!(root, before);
+
+            // Removing cleans up the hook
+            assert!(remove_provider_hooks(provider, &mut root));
+            assert!(!remove_provider_hooks(provider, &mut root));
+        }
+    }
+}

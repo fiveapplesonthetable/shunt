@@ -48,9 +48,8 @@ fn test_system_tracing_with_traced() {
     let traced_child = traced_cmd.spawn().expect("failed to spawn traced");
 
     // Wait for private sockets
-    let sockets_ready = env.wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
-        producer_sock.exists() && consumer_sock.exists()
-    });
+    let sockets_ready =
+        TestEnv::wait_for_path(&producer_sock) && TestEnv::wait_for_path(&consumer_sock);
     assert!(sockets_ready, "traced private sockets failed to bind");
 
     // 2. Start private traced_probes instance

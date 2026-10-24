@@ -5,7 +5,6 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 use tacho_system::{Perfetto, Profile, SystemError};
 
 /// Guard that ensures child daemon processes are terminated and reaped on test exit.
@@ -44,6 +43,26 @@ fn find_binary(env_var: &str, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Blocks until every path in `paths` (all directly inside `dir`) exists,
+/// woken by inotify rather than polling.
+fn wait_for_paths(dir: &std::path::Path, paths: &[&std::path::Path]) {
+    use std::os::unix::ffi::OsStrExt;
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    assert!(fd >= 0, "inotify_init1 failed");
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+    // Watch first, then check, so a creation between the two is not missed.
+    let wd =
+        unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO) };
+    assert!(wd >= 0, "inotify_add_watch failed");
+    let mut buf = [0u8; 4096];
+    while !paths.iter().all(|p| p.exists()) {
+        // Blocking read: returns when something is created in `dir`.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n > 0, "inotify read failed");
+    }
+    unsafe { libc::close(fd) };
 }
 
 /// Parses a single integer result from Trace Processor query output.
@@ -104,10 +123,7 @@ fn test_system_tracing_lifecycle() {
     let traced_child = traced_cmd.spawn().expect("failed to start traced");
 
     // Wait for traced socket to appear
-    let cap = std::time::Instant::now() + Duration::from_secs(5);
-    while (!consumer_sock.exists() || !producer_sock.exists()) && std::time::Instant::now() < cap {
-        std::thread::yield_now();
-    }
+    wait_for_paths(temp_dir.path(), &[&consumer_sock, &producer_sock]);
 
     // Start unprivileged traced_probes
     let mut probes_cmd = Command::new(&probes_bin);
@@ -163,14 +179,8 @@ fn test_system_tracing_lifecycle() {
         .start(Profile::Default)
         .expect("idempotent start should succeed");
 
-    // Wait until trace packets are written to sink file
-    let sink_file = runtime_dir.join("tacho-system-sink.pftrace");
-    let cap = std::time::Instant::now() + Duration::from_secs(5);
-    while fs::metadata(&sink_file).map(|m| m.len()).unwrap_or(0) == 0
-        && std::time::Instant::now() < cap
-    {
-        std::thread::yield_now();
-    }
+    // `start` used `--background-wait`, so the session is live and cloneable
+    // now; no need to wait for the sink file to grow.
 
     // Clone session into Vec<u8>
     let mut trace_bytes = Vec::new();
@@ -246,4 +256,112 @@ fn test_system_tracing_lifecycle() {
         SystemError::NoActiveSession(_) => {}
         other => panic!("expected NoActiveSession, got: {other:?}"),
     }
+}
+
+/// A fake `perfetto` that models one session with a state file: `--query`
+/// lists `tacho-system` while the file exists, `--background-wait` creates it
+/// and forks a holder process that removes it on SIGTERM.
+const FAKE_PERFETTO: &str = r#"#!/bin/sh
+D="$FAKE_PERFETTO_DIR"
+case "$1" in
+  --query)
+    if [ -f "$D/state" ]; then
+      printf 'TRACING SESSIONS:\n\nID UID STATE BUF KB DUR DS STARTED NAME\n1 1000 STARTED (1) 1 0 1 00:00 tacho-system\n'
+    fi
+    exit 0 ;;
+  --background-wait|--background)
+    echo "$1" >> "$D/modes"
+    if [ -n "$FAKE_NO_WAIT_FLAG" ] && [ "$1" = "--background-wait" ]; then
+      echo "perfetto: unrecognized option '--background-wait'" >&2
+      exit 1
+    fi
+    touch "$D/state"
+    sh -c 'sleep 1000000 & S=$!; trap "rm -f \"$0/state\"; kill $S; exit 0" TERM; wait' "$D" >/dev/null 2>&1 </dev/null &
+    echo $!
+    exit 0 ;;
+esac
+exit 2
+"#;
+
+fn fake_perfetto(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("perfetto");
+    fs::write(&bin, FAKE_PERFETTO).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// The fake reads its state dir from the environment; tests that set it run
+/// one at a time.
+static FAKE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run_fake_lifecycle(no_wait_flag: bool) -> String {
+    let _env = FAKE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let bin = fake_perfetto(dir.path());
+    env::set_var("FAKE_PERFETTO_DIR", dir.path());
+    if no_wait_flag {
+        env::set_var("FAKE_NO_WAIT_FLAG", "1");
+    } else {
+        env::remove_var("FAKE_NO_WAIT_FLAG");
+    }
+    let runtime = dir.path().join("run");
+    let p = Perfetto::from_binary(&bin).with_runtime_dir(&runtime);
+
+    assert!(p.status().unwrap().is_none());
+    p.start(Profile::Default).unwrap();
+    assert_eq!(p.status().unwrap().unwrap().name, "tacho-system");
+    // The pid file records "<pid> <start_time>".
+    let rec = fs::read_to_string(runtime.join("tacho-system.pid")).unwrap();
+    assert_eq!(rec.split_whitespace().count(), 2, "{rec:?}");
+    // Idempotent.
+    p.start(Profile::Default).unwrap();
+
+    p.stop().unwrap();
+    assert!(p.status().unwrap().is_none());
+    assert!(!runtime.join("tacho-system.pid").exists());
+    env::remove_var("FAKE_NO_WAIT_FLAG");
+    fs::read_to_string(dir.path().join("modes")).unwrap()
+}
+
+#[test]
+fn test_fake_perfetto_start_stop_uses_background_wait() {
+    assert_eq!(run_fake_lifecycle(false), "--background-wait\n");
+}
+
+#[test]
+fn test_fake_perfetto_falls_back_without_background_wait() {
+    assert_eq!(
+        run_fake_lifecycle(true),
+        "--background-wait\n--background\n"
+    );
+}
+
+#[test]
+fn test_stop_ignores_pid_file_for_foreign_process() {
+    let _env = FAKE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let bin = fake_perfetto(dir.path());
+    env::set_var("FAKE_PERFETTO_DIR", dir.path());
+    let runtime = dir.path().join("run");
+    fs::create_dir_all(&runtime).unwrap();
+    // Session "running" but the pid file names an unrelated process of ours
+    // with a start time that does not match: a recycled pid.
+    fs::write(dir.path().join("state"), "").unwrap();
+    let mut victim = Command::new("cat").stdin(Stdio::piped()).spawn().unwrap();
+    fs::write(
+        runtime.join("tacho-system.pid"),
+        format!("{} 1\n", victim.id()),
+    )
+    .unwrap();
+
+    let p = Perfetto::from_binary(&bin).with_runtime_dir(&runtime);
+    assert!(
+        p.stop().is_err(),
+        "unverified pid must not count as stopped"
+    );
+    // The victim is untouched: closing its stdin makes it exit normally.
+    drop(victim.stdin.take());
+    let status = victim.wait().unwrap();
+    assert!(status.success(), "victim was signalled: {status:?}");
 }

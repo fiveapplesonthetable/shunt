@@ -1,0 +1,505 @@
+//! Persistent fleet store helpers, extended metadata store, atomic file I/O,
+//! Linux `/proc` process inspection, git plumbing helpers, and environment file loading.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tacho_daemon::{FleetState, FleetStore};
+
+use crate::client::DaemonClient;
+
+/// Opens the persistent [`FleetStore`] in `$TACHO_HOME/events.sqlite`.
+pub fn open_fleet_store() -> io::Result<FleetStore> {
+    let home = crate::paths::resolve_home();
+    let _ = crate::paths::ensure_dir_0700(&home);
+    let db = home.join("events.sqlite");
+    FleetStore::open(&db).map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Writes `path` atomically: a crash leaves either the old file or the complete new one,
+/// never a truncated mix (temp file in the same dir, fsync, rename).
+pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Current epoch time in seconds.
+pub fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Current epoch time in nanoseconds.
+pub fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Best-effort emission of an instant decision event to the running daemon socket.
+pub fn emit_decision_event(track: &str, name: &str, because: &str) {
+    let client = DaemonClient::new();
+    let _ = client.send_request(&serde_json::json!({
+        "input": {
+            "type": "custom",
+            "source_ts_ns": now_ns(),
+            "track": track,
+            "name": name,
+            "op": "instant",
+            "args": {
+                "because": because,
+            }
+        }
+    }));
+}
+
+/// Returns `true` if `pid` exists, `/proc/<pid>/stat` is readable, and the process is not a zombie (`Z`).
+///
+/// Fails closed (`false`) if `/proc/<pid>/stat` cannot be read or parsed.
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc != 0 {
+        return false;
+    }
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    !stat[rparen + 1..].trim_start().starts_with('Z')
+}
+
+/// Returns `true` if `pid` is alive in `/proc/<pid>/stat`, not a zombie, and matches
+/// `expected_starttime` when `expected_starttime` is `Some`.
+///
+/// Fails closed (`false`) if `/proc/<pid>/stat` cannot be read or parsed.
+pub fn pid_alive_matching(pid: u32, expected_starttime: Option<u64>) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    let Some(actual_st) = proc_pid_starttime(pid) else {
+        return false;
+    };
+    if let Some(expected_st) = expected_starttime {
+        if actual_st != expected_st {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reads field 22 (`starttime` in clock ticks since boot) of `/proc/<pid>/stat`.
+pub fn proc_pid_starttime(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{pid}/stat");
+    let content = fs::read_to_string(&stat_path).ok()?;
+    let rparen = content.rfind(')')?;
+    let rest = &content[rparen + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(19).and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Verify that a PID on the system actually belongs to the agent before signalling.
+///
+/// Prevents signalling or killing a reused PID if the agent process previously exited
+/// and its PID was recycled by the OS for an unrelated system process.
+pub(crate) fn verify_agent_pid(
+    pid: u32,
+    agent_key: &str,
+    session_id: Option<&str>,
+    recorded_starttime: Option<u64>,
+) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+
+    let actual_st = proc_pid_starttime(pid);
+    if actual_st.is_none() {
+        // If /proc/<pid>/stat cannot be read, the process is unverified or dead. Refuse!
+        return false;
+    }
+
+    // 1. If starttime was recorded, it MUST match the running process's starttime!
+    if let Some(expected_st) = recorded_starttime {
+        if actual_st != Some(expected_st) {
+            eprintln!(
+                "[tacho-safety] PID {pid} starttime ({:?}) does not match recorded ({expected_st}); refusing signal to reused PID",
+                actual_st
+            );
+            return false;
+        }
+        return true;
+    }
+
+    // 2. Check cgroup for agent attribution
+    let cgroup_path = format!("/proc/{pid}/cgroup");
+    if let Ok(cg) = fs::read_to_string(&cgroup_path) {
+        if cg.contains(agent_key) || session_id.map(|s| cg.contains(s)).unwrap_or(false) {
+            return true;
+        }
+    }
+
+    // 3. Check environment for agent attribution
+    let env_path = format!("/proc/{pid}/environ");
+    if let Ok(env_bytes) = fs::read(&env_path) {
+        let env_str = String::from_utf8_lossy(&env_bytes);
+        if env_str.contains(&format!("TACHO_AGENT={agent_key}"))
+            || env_str.contains(&format!("TACHO_TASK={agent_key}"))
+            || env_str.contains(&format!("TACHO_JOB_NAME={agent_key}"))
+            || session_id.map(|s| env_str.contains(s)).unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    // 4. Check cmdline for exact agent/session attribution
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    if let Ok(cmd) = fs::read(&cmdline_path) {
+        let cmd_str = String::from_utf8_lossy(&cmd);
+        if cmd_str.contains(agent_key) || session_id.map(|s| cmd_str.contains(s)).unwrap_or(false) {
+            return true;
+        }
+    }
+
+    eprintln!(
+        "[tacho-safety] PID {pid} has no matching cgroup, cmdline, or environment for agent '{agent_key}'; refusing signal"
+    );
+    false
+}
+
+/// Wait up to `timeout` for `pid` to exit using Linux `pidfd_open` + `libc::poll`
+/// (with `yield_now` fallback).
+pub fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    if !pid_alive(pid) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) as libc::c_int;
+        if pidfd >= 0 {
+            let mut pfd = libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+            let _ = libc::poll(&mut pfd, 1, ms);
+            libc::close(pidfd);
+            return !pid_alive(pid);
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    while pid_alive(pid) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    !pid_alive(pid)
+}
+
+/// Returns the set of agent keys whose processes are currently alive and match their recorded `(pid, starttime)`.
+pub fn live_agent_keys(state: &FleetState) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for a in state.agents.values() {
+        if a.finished_at.is_none() {
+            if let Some(pid) = a.pid {
+                if pid_alive_matching(pid, a.starttime) {
+                    out.insert(a.key.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Stored retirement metadata for a retired task or lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RetiredMeta {
+    pub key: String,
+    pub why: String,
+    pub at: i64,
+    #[serde(default)]
+    pub task: String,
+    #[serde(default)]
+    pub held_for: String,
+}
+
+/// Four-state notice delivery state for `release-train` and owner notifications.
+/// Once a notice enters `Uncertain`, it is never automatically retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NoticeState {
+    #[default]
+    Pending,
+    Sending {
+        head: String,
+        at: i64,
+    },
+    Sent {
+        head: String,
+        at: i64,
+    },
+    Uncertain {
+        head: String,
+        at: i64,
+        error: String,
+    },
+}
+
+impl NoticeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NoticeState::Pending => "Pending",
+            NoticeState::Sending { .. } => "Sending",
+            NoticeState::Sent { .. } => "Sent",
+            NoticeState::Uncertain { .. } => "Uncertain",
+        }
+    }
+
+    pub fn head(&self) -> Option<&str> {
+        match self {
+            NoticeState::Pending => None,
+            NoticeState::Sending { head, .. }
+            | NoticeState::Sent { head, .. }
+            | NoticeState::Uncertain { head, .. } => Some(head.as_str()),
+        }
+    }
+}
+
+/// Tracked open watchdog GitHub issue state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchdogIssueState {
+    pub number: u64,
+    pub last_comment_at: i64,
+}
+
+/// Record of the last successful self-update move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeMoveRecord {
+    pub from_sha: String,
+    pub to_sha: String,
+    pub at: i64,
+}
+
+/// Extended fleet metadata persisted atomically in `$TACHO_HOME/fleet_meta.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FleetMeta {
+    #[serde(default)]
+    pub retired: BTreeMap<String, RetiredMeta>,
+    #[serde(default)]
+    pub train_notices: BTreeMap<String, NoticeState>,
+    #[serde(default)]
+    pub watchdog_issue: Option<WatchdogIssueState>,
+    #[serde(default)]
+    pub last_code_moved: Option<CodeMoveRecord>,
+}
+
+pub fn fleet_meta_path() -> PathBuf {
+    let home = crate::paths::resolve_home();
+    let _ = crate::paths::ensure_dir_0700(&home);
+    home.join("fleet_meta.json")
+}
+
+pub fn load_fleet_meta() -> io::Result<FleetMeta> {
+    let path = fleet_meta_path();
+    if !path.is_file() {
+        return Ok(FleetMeta::default());
+    }
+    let raw = fs::read_to_string(&path)?;
+    Ok(serde_json::from_str::<FleetMeta>(&raw).unwrap_or_default())
+}
+
+pub fn save_fleet_meta(meta: &FleetMeta) -> io::Result<()> {
+    let path = fleet_meta_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let bytes = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
+    write_atomic(&path, &bytes)
+}
+
+pub fn mutate_fleet_meta<F, R>(f: F) -> io::Result<R>
+where
+    F: FnOnce(&mut FleetMeta) -> R,
+{
+    let mut meta = load_fleet_meta().unwrap_or_default();
+    let out = f(&mut meta);
+    save_fleet_meta(&meta)?;
+    Ok(out)
+}
+
+/// Parses a systemd-compatible `EnvironmentFile` (`KEY=VALUE`, optional quotes, `#` comments).
+pub fn parse_systemd_env_file(text: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut val = v.trim();
+        if (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
+            || (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
+        {
+            val = &val[1..val.len() - 1];
+        }
+        map.insert(key.to_string(), val.to_string());
+    }
+    map
+}
+
+/// Loads environment configuration from `env_file_override`, `$TACHO_ENV_FILE`, or
+/// `$TACHO_HOME/fleet.env`, merging with process environment so process env always wins.
+pub fn load_fleet_env(env_file_override: Option<&Path>) -> BTreeMap<String, String> {
+    let default_path = std::env::var_os("TACHO_ENV_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = crate::paths::resolve_home();
+            let p1 = home.join("fleet.env");
+            if p1.is_file() {
+                Some(p1)
+            } else {
+                Some(home.join("tacho.env"))
+            }
+        });
+    let file_path = env_file_override.map(Path::to_path_buf).or(default_path);
+    let mut merged = file_path
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|txt| parse_systemd_env_file(&txt))
+        .unwrap_or_default();
+    for (k, v) in std::env::vars() {
+        merged.insert(k, v);
+    }
+    merged
+}
+
+/// Runs `git -C <dir> <args>` and returns trimmed stdout, failing on a non-zero exit so callers
+/// never act on a half-done git step.
+pub fn git_stdout(dir: &Path, args: &[&str]) -> io::Result<String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Resolves the live `main` SHA from `origin` (`refs/heads/main`), falling back to local `refs/heads/main` or `HEAD`.
+pub fn resolve_live_main_sha(cwd: &Path) -> String {
+    if let Ok(out) = Command::new("git")
+        .args(["ls-remote", "origin", "refs/heads/main"])
+        .current_dir(cwd)
+        .output()
+    {
+        if out.status.success() {
+            if let Some(sha) = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().next())
+                .filter(|s| !s.is_empty())
+            {
+                return sha.to_string();
+            }
+        }
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["rev-parse", "refs/heads/main"])
+        .current_dir(cwd)
+        .output()
+    {
+        if out.status.success() {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !sha.is_empty() {
+                return sha;
+            }
+        }
+    }
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+/// Resolves live PR head SHAs from `origin` or local branches to detect ref movement during batch/train runs.
+pub fn resolve_live_pr_heads(
+    cwd: &Path,
+    pr_nums: &[u64],
+    expected_shas: &BTreeMap<u64, String>,
+    latest_state: &FleetState,
+) -> BTreeMap<u64, String> {
+    let mut current_shas = expected_shas.clone();
+    let mut remote_refs: BTreeMap<String, String> = BTreeMap::new();
+    if let Ok(out) = Command::new("git")
+        .args(["ls-remote", "origin"])
+        .current_dir(cwd)
+        .output()
+    {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut parts = line.split_whitespace();
+                if let (Some(sha), Some(rname)) = (parts.next(), parts.next()) {
+                    remote_refs.insert(rname.to_string(), sha.to_string());
+                }
+            }
+        }
+    }
+    for &n in pr_nums {
+        if latest_state.closed_prs.contains(&n) {
+            current_shas.remove(&n);
+            continue;
+        }
+        if let Some(sha) = remote_refs.get(&format!("refs/pull/{n}/head")) {
+            current_shas.insert(n, sha.clone());
+            continue;
+        }
+        if let Some(p) = latest_state.open_prs_cache.iter().find(|p| p.number == n) {
+            if !p.branch.is_empty() {
+                if let Some(sha) = remote_refs.get(&format!("refs/heads/{}", p.branch)) {
+                    current_shas.insert(n, sha.clone());
+                    continue;
+                }
+                if let Ok(out) = Command::new("git")
+                    .args(["rev-parse", &format!("refs/heads/{}", p.branch)])
+                    .current_dir(cwd)
+                    .output()
+                {
+                    if out.status.success() {
+                        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if !sha.is_empty() {
+                            current_shas.insert(n, sha);
+                            continue;
+                        }
+                    }
+                }
+            }
+            current_shas.insert(n, p.head.clone());
+        }
+    }
+    current_shas
+}

@@ -1,0 +1,1101 @@
+//! Unified pluggable architecture and [`ProjectPolicy`] configuration for `tacho-core`.
+//!
+//! Any engineering team can adapt `tachograph` to their repository, agent CLI, code host,
+//! notification channels, worktree provisioning, and deploy gates via configuration or custom
+//! trait implementations without modifying core decision logic:
+//!
+//! - [`ProviderPlugin`]: Agent lifecycle (`start`, `resume`, `tell`, `alive`, `stop`, `cost`)
+//!   backed by argv templates with zero shell interpolation.
+//! - [`ForgePlugin`] / [`CodeHostPlugin`]: Code-host and pull-request adapter (PR facts,
+//!   mergeable state, CI checks, and scrubbed issue body/comment updates).
+//! - [`NotifierPlugin`]: Owner issue, PR/issue comment, and mail/webhook sink notifications,
+//!   unconditionally scrubbed through [`Scrubber::enabled()`](crate::scrub::Scrubber::enabled).
+//! - [`ProvisionerPlugin`]: Worktree environment provisioning (deterministic port block,
+//!   ephemeral DB container recipe, dependency cache mounts, and `.tachoenv` rendering).
+//! - [`WatcherPlugin`]: Custom workflow and deploy gates plus project-specific burner rules.
+//! - [`ProjectPolicy`]: Unified project configuration aggregating [`DispatchConfig`],
+//!   [`VerifyConfig`], [`LandConfig`], [`WatchConfig`], [`OpsConfig`], [`AreaRule`], and
+//!   [`ProviderSpec`] definitions.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::decide::dispatch::model::Mergeable as DispatchMergeable;
+use crate::decide::dispatch::{
+    builtin_providers, DispatchConfig, Provider, ProviderCommand, ProviderSpec, StopPlan, TellPlan,
+};
+use crate::decide::land::LandConfig;
+use crate::decide::ops::snapshot::redact_json;
+use crate::decide::ops::OpsConfig;
+use crate::decide::verify::{
+    allocate_ports, env_file, AreaRule, PathAreaRule, VerifyConfig, PORT_BLOCK_SIZE,
+};
+use crate::decide::watch::WatchConfig;
+use crate::decide::BurnerProcess;
+use crate::scrub::Scrubber;
+
+// ============================================================================
+// 1. ProviderPlugin
+// ============================================================================
+
+/// Rejects any `program` or `argv` slice that attempts to invoke an interactive or command shell.
+pub fn ensure_no_shell_argv(program: &str, args: &[String]) -> Result<(), String> {
+    let prog_trim = program.trim();
+    if prog_trim.is_empty() {
+        return Err("provider program cannot be empty".to_string());
+    }
+    let bin = prog_trim.rsplit('/').next().unwrap_or(prog_trim);
+    if matches!(bin, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+        return Err(format!(
+            "shell binary '{bin}' is forbidden in ProviderPlugin program"
+        ));
+    }
+    if matches!(bin, "env" | "nice" | "timeout") {
+        if let Some(first) = args.first() {
+            let first_bin = first.rsplit('/').next().unwrap_or(first.as_str());
+            if matches!(first_bin, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+                return Err(format!(
+                    "shell wrapper '{bin} {first_bin}' is forbidden in ProviderPlugin argv"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pluggable agent provider interface (`start`, `resume`, `tell`, `alive`, `stop`, `cost`).
+///
+/// Backed by config argv templates without shell invocation so untrusted task briefs,
+/// branch names, or PR titles can never cause shell injection.
+pub trait ProviderPlugin: Send + Sync {
+    /// Canonical provider identifier (e.g. `"claude"`, `"codex"`, `"gemini"`).
+    fn name(&self) -> &str;
+
+    /// Plan the direct `argv` command to launch a fresh agent session in `worktree`.
+    fn start(
+        &self,
+        key: &str,
+        worktree: &str,
+        prompt: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<ProviderCommand, String>;
+
+    /// Plan the direct `argv` command to resume an existing agent session.
+    fn resume(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<ProviderCommand, String>;
+
+    /// Plan how to deliver `message` to a running or stopped agent without cold-restarting a live turn.
+    #[allow(clippy::too_many_arguments)]
+    fn tell(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        is_live: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> TellPlan;
+
+    /// Check whether a worker is alive given its recorded `pid` and the set of live host PIDs.
+    fn alive(&self, pid: Option<u32>, live_pids: &BTreeSet<u32>) -> bool;
+
+    /// Plan how to stop a worker cleanly.
+    fn stop(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+    ) -> StopPlan;
+
+    /// Compute the USD cost of a provider run from JSONL transcript lines.
+    fn cost(&self, jsonl_lines: &[&str], model: Option<&str>) -> f64;
+}
+
+impl ProviderPlugin for ProviderSpec {
+    fn name(&self) -> &str {
+        <ProviderSpec as Provider>::name(self)
+    }
+
+    fn start(
+        &self,
+        key: &str,
+        worktree: &str,
+        prompt: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<ProviderCommand, String> {
+        let cmd = <ProviderSpec as Provider>::start(self, key, worktree, prompt, model, effort);
+        ensure_no_shell_argv(&cmd.program, &cmd.args)?;
+        Ok(cmd)
+    }
+
+    fn resume(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<ProviderCommand, String> {
+        let cmd = <ProviderSpec as Provider>::resume(
+            self, key, worktree, session_id, message, model, effort,
+        );
+        ensure_no_shell_argv(&cmd.program, &cmd.args)?;
+        Ok(cmd)
+    }
+
+    fn tell(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        message: &str,
+        is_live: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> TellPlan {
+        <ProviderSpec as Provider>::tell(
+            self, key, worktree, session_id, message, is_live, model, effort,
+        )
+    }
+
+    fn alive(&self, pid: Option<u32>, live_pids: &BTreeSet<u32>) -> bool {
+        <ProviderSpec as Provider>::alive(self, pid, live_pids)
+    }
+
+    fn stop(
+        &self,
+        key: &str,
+        worktree: &str,
+        session_id: Option<&str>,
+        pid: Option<u32>,
+    ) -> StopPlan {
+        <ProviderSpec as Provider>::stop(self, key, worktree, session_id, pid)
+    }
+
+    fn cost(&self, jsonl_lines: &[&str], model: Option<&str>) -> f64 {
+        <ProviderSpec as Provider>::cost(self, jsonl_lines, model)
+    }
+}
+
+// ============================================================================
+// 2. ForgePlugin / CodeHostPlugin
+// ============================================================================
+
+/// Normalized pull-request metadata returned by a [`ForgePlugin`] / [`CodeHostPlugin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ForgePrFacts {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub is_draft: bool,
+    pub mergeable: ForgeMergeableState,
+    pub labels: Vec<String>,
+    pub changed_files: Vec<String>,
+    pub review_approved: bool,
+}
+
+/// Normalized mergeability state across code hosts (GitHub, GitLab, Gitea).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ForgeMergeableState {
+    Mergeable,
+    Conflicting,
+    #[default]
+    Unknown,
+}
+
+impl ForgeMergeableState {
+    /// Convert into [`dispatch::model::Mergeable`](DispatchMergeable).
+    pub fn to_dispatch(self) -> DispatchMergeable {
+        match self {
+            Self::Mergeable => DispatchMergeable::Mergeable,
+            Self::Conflicting => DispatchMergeable::Conflicting,
+            Self::Unknown => DispatchMergeable::Unknown,
+        }
+    }
+}
+
+/// Single check-run / status context observation on a PR or commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ForgeCheckObs {
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub details_url: Option<String>,
+}
+
+/// Aggregated check evaluation result for a PR or commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ForgeChecksVerdict {
+    pub all_passed: bool,
+    pub pending_jobs: Vec<String>,
+    pub failed_jobs: Vec<String>,
+    pub missing_required: Vec<String>,
+}
+
+/// Pluggable code-host / forge interface (PR facts, mergeable state, CI checks, and
+/// issue/PR body & comment updates).
+///
+/// Also exported as [`CodeHostPlugin`].
+pub trait ForgePlugin: Send + Sync {
+    /// Identifier of the forge backend (e.g. `"github"`, `"gitlab"`).
+    fn forge_name(&self) -> &str;
+
+    /// Build the direct `argv` command to query PR facts (head SHA, mergeable state, labels, files).
+    fn plan_pr_facts_cmd(&self, pr_number: u64) -> Vec<String>;
+
+    /// Build the direct `argv` command to query a PR's mergeable state.
+    fn plan_mergeable_cmd(&self, pr_number: u64) -> Vec<String>;
+
+    /// Build the direct `argv` command to query check runs for a PR or git ref.
+    fn plan_checks_cmd(&self, pr_or_ref: &str) -> Vec<String>;
+
+    /// Build the direct `argv` command to update an issue or PR body (scrubbed by default).
+    fn plan_update_issue_body_cmd(&self, issue_number: u64, body: &str) -> Vec<String>;
+
+    /// Build the direct `argv` command to post an issue or PR comment (scrubbed by default).
+    fn plan_issue_comment_cmd(&self, issue_number: u64, body: &str) -> Vec<String>;
+
+    /// Resolve a raw mergeable string from the forge API, preserving `was_conflicting` when
+    /// the forge transiently reports `"UNKNOWN"` right after a push.
+    fn resolve_mergeable(&self, raw: &str, was_conflicting: bool) -> ForgeMergeableState {
+        if crate::decide::dispatch::select::is_conflicting_str(raw, was_conflicting) {
+            ForgeMergeableState::Conflicting
+        } else if raw.trim().eq_ignore_ascii_case("MERGEABLE") {
+            ForgeMergeableState::Mergeable
+        } else {
+            ForgeMergeableState::Unknown
+        }
+    }
+
+    /// Evaluate observed check runs against the project's required check names.
+    fn evaluate_checks(
+        &self,
+        checks: &[ForgeCheckObs],
+        required_checks: &[String],
+    ) -> ForgeChecksVerdict {
+        let mut pending_jobs = Vec::new();
+        let mut failed_jobs = Vec::new();
+        for check in checks {
+            let status = check.status.to_ascii_lowercase();
+            let conclusion = check
+                .conclusion
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if status != "completed" && status != "success" {
+                pending_jobs.push(check.name.clone());
+            } else if matches!(
+                conclusion.as_str(),
+                "failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure"
+            ) || status == "failure"
+                || status == "error"
+            {
+                failed_jobs.push(check.name.clone());
+            }
+        }
+        let mut missing_required = Vec::new();
+        for req in required_checks {
+            let found = checks.iter().any(|c| &c.name == req);
+            if !found {
+                missing_required.push(req.clone());
+            }
+        }
+        pending_jobs.sort();
+        pending_jobs.dedup();
+        failed_jobs.sort();
+        failed_jobs.dedup();
+        missing_required.sort();
+        missing_required.dedup();
+
+        let all_passed =
+            pending_jobs.is_empty() && failed_jobs.is_empty() && missing_required.is_empty();
+        ForgeChecksVerdict {
+            all_passed,
+            pending_jobs,
+            failed_jobs,
+            missing_required,
+        }
+    }
+}
+
+/// Alias for [`ForgePlugin`] so callers can refer to either `ForgePlugin` or `CodeHostPlugin`.
+pub use ForgePlugin as CodeHostPlugin;
+
+/// Configurable CLI-backed forge plugin (defaults to GitHub CLI `gh` with explicit argv, no shell).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliForgePlugin {
+    pub name: String,
+    pub cli_bin: String,
+    pub repo: Option<String>,
+}
+
+impl Default for CliForgePlugin {
+    fn default() -> Self {
+        Self {
+            name: "github".to_string(),
+            cli_bin: "gh".to_string(),
+            repo: None,
+        }
+    }
+}
+
+impl CliForgePlugin {
+    fn repo_args(&self) -> Vec<String> {
+        match &self.repo {
+            Some(r) if !r.is_empty() => vec!["--repo".to_string(), r.clone()],
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl ForgePlugin for CliForgePlugin {
+    fn forge_name(&self) -> &str {
+        &self.name
+    }
+
+    fn plan_pr_facts_cmd(&self, pr_number: u64) -> Vec<String> {
+        let mut argv = vec![self.cli_bin.clone(), "pr".to_string(), "view".to_string()];
+        argv.extend(self.repo_args());
+        argv.push(pr_number.to_string());
+        argv.push("--json".to_string());
+        argv.push(
+            "number,title,body,author,headRefOid,baseRefName,isDraft,mergeable,labels,files,reviewDecision"
+                .to_string(),
+        );
+        argv
+    }
+
+    fn plan_mergeable_cmd(&self, pr_number: u64) -> Vec<String> {
+        let mut argv = vec![self.cli_bin.clone(), "pr".to_string(), "view".to_string()];
+        argv.extend(self.repo_args());
+        argv.push(pr_number.to_string());
+        argv.push("--json".to_string());
+        argv.push("mergeable,mergeStateStatus".to_string());
+        argv
+    }
+
+    fn plan_checks_cmd(&self, pr_or_ref: &str) -> Vec<String> {
+        let mut argv = vec![self.cli_bin.clone(), "pr".to_string(), "checks".to_string()];
+        argv.extend(self.repo_args());
+        argv.push(pr_or_ref.to_string());
+        argv.push("--json".to_string());
+        argv.push("name,state,bucket,link".to_string());
+        argv
+    }
+
+    fn plan_update_issue_body_cmd(&self, issue_number: u64, body: &str) -> Vec<String> {
+        let scrubbed = Scrubber::enabled().scrub(body);
+        let mut argv = vec![
+            self.cli_bin.clone(),
+            "issue".to_string(),
+            "edit".to_string(),
+        ];
+        argv.extend(self.repo_args());
+        argv.push(issue_number.to_string());
+        argv.push("--body".to_string());
+        argv.push(scrubbed);
+        argv
+    }
+
+    fn plan_issue_comment_cmd(&self, issue_number: u64, body: &str) -> Vec<String> {
+        let scrubbed = Scrubber::enabled().scrub(body);
+        let mut argv = vec![
+            self.cli_bin.clone(),
+            "issue".to_string(),
+            "comment".to_string(),
+        ];
+        argv.extend(self.repo_args());
+        argv.push(issue_number.to_string());
+        argv.push("--body".to_string());
+        argv.push(scrubbed);
+        argv
+    }
+}
+
+// ============================================================================
+// 3. NotifierPlugin
+// ============================================================================
+
+/// Delivery channel and scrubbed payload planned by a [`NotifierPlugin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotifierAction {
+    /// Create or update the rolling owner status issue.
+    OwnerIssue {
+        title: String,
+        body: String,
+        labels: Vec<String>,
+    },
+    /// Post a comment on an issue or pull request.
+    Comment { issue_or_pr: u64, body: String },
+    /// Deliver an alert to an external mail or webhook sink.
+    Sink {
+        sink_kind: String,
+        destination: String,
+        subject: String,
+        body: String,
+        payload: serde_json::Value,
+    },
+}
+
+/// Pluggable notification sink (owner issue, PR/issue comment, mail/webhook sink).
+///
+/// Every helper on `NotifierPlugin` scrubs titles, subjects, bodies, and nested JSON payloads
+/// through [`Scrubber::enabled()`] by default so secrets never leak to external sinks.
+pub trait NotifierPlugin: Send + Sync {
+    /// Scrub arbitrary text using the default enabled [`Scrubber`].
+    fn scrub_text(&self, text: &str) -> String {
+        Scrubber::enabled().scrub(text)
+    }
+
+    /// Recursively scrub a JSON payload using [`redact_json`].
+    fn scrub_json(&self, value: &serde_json::Value) -> serde_json::Value {
+        redact_json(value.clone(), &[])
+    }
+
+    /// Plan an owner issue update with mandatory secret scrubbing.
+    fn notify_owner_issue(&self, title: &str, body: &str, labels: &[String]) -> NotifierAction {
+        NotifierAction::OwnerIssue {
+            title: self.scrub_text(title),
+            body: self.scrub_text(body),
+            labels: labels.iter().map(|l| self.scrub_text(l)).collect(),
+        }
+    }
+
+    /// Plan an issue or PR comment with mandatory secret scrubbing.
+    fn notify_comment(&self, issue_or_pr: u64, body: &str) -> NotifierAction {
+        NotifierAction::Comment {
+            issue_or_pr,
+            body: self.scrub_text(body),
+        }
+    }
+
+    /// Plan a mail or webhook sink notification with mandatory secret scrubbing.
+    fn notify_sink(&self, subject: &str, body: &str, payload: &serde_json::Value)
+        -> NotifierAction;
+}
+
+/// Configurable notifier supporting owner issues, comments, and a mail or webhook sink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigNotifier {
+    pub sink_kind: String,
+    pub destination: String,
+    pub owner_issue_label: String,
+}
+
+impl Default for ConfigNotifier {
+    fn default() -> Self {
+        Self {
+            sink_kind: "webhook".to_string(),
+            destination: "https://hooks.example.invalid/tacho".to_string(),
+            owner_issue_label: "tacho-owner".to_string(),
+        }
+    }
+}
+
+impl NotifierPlugin for ConfigNotifier {
+    fn notify_sink(
+        &self,
+        subject: &str,
+        body: &str,
+        payload: &serde_json::Value,
+    ) -> NotifierAction {
+        NotifierAction::Sink {
+            sink_kind: self.sink_kind.clone(),
+            destination: self.scrub_text(&self.destination),
+            subject: self.scrub_text(subject),
+            body: self.scrub_text(body),
+            payload: self.scrub_json(payload),
+        }
+    }
+}
+
+/// Decorator that wraps any [`NotifierPlugin`] and enforces a second pass of [`Scrubber::enabled()`]
+/// on every outgoing [`NotifierAction`], guaranteeing zero unredacted leaks even if a custom
+/// implementation overrides default trait methods.
+#[derive(Debug, Clone, Default)]
+pub struct ScrubbedNotifier<N> {
+    pub inner: N,
+}
+
+impl<N> ScrubbedNotifier<N> {
+    pub fn new(inner: N) -> Self {
+        Self { inner }
+    }
+}
+
+impl<N: NotifierPlugin> NotifierPlugin for ScrubbedNotifier<N> {
+    fn notify_owner_issue(&self, title: &str, body: &str, labels: &[String]) -> NotifierAction {
+        let scrubber = Scrubber::enabled();
+        match self.inner.notify_owner_issue(title, body, labels) {
+            NotifierAction::OwnerIssue {
+                title,
+                body,
+                labels,
+            } => NotifierAction::OwnerIssue {
+                title: scrubber.scrub(&title),
+                body: scrubber.scrub(&body),
+                labels: labels.iter().map(|l| scrubber.scrub(l)).collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn notify_comment(&self, issue_or_pr: u64, body: &str) -> NotifierAction {
+        let scrubber = Scrubber::enabled();
+        match self.inner.notify_comment(issue_or_pr, body) {
+            NotifierAction::Comment { issue_or_pr, body } => NotifierAction::Comment {
+                issue_or_pr,
+                body: scrubber.scrub(&body),
+            },
+            other => other,
+        }
+    }
+
+    fn notify_sink(
+        &self,
+        subject: &str,
+        body: &str,
+        payload: &serde_json::Value,
+    ) -> NotifierAction {
+        let scrubber = Scrubber::enabled();
+        match self.inner.notify_sink(subject, body, payload) {
+            NotifierAction::Sink {
+                sink_kind,
+                destination,
+                subject,
+                body,
+                payload,
+            } => NotifierAction::Sink {
+                sink_kind,
+                destination: scrubber.scrub(&destination),
+                subject: scrubber.scrub(&subject),
+                body: scrubber.scrub(&body),
+                payload: redact_json(payload, &[]),
+            },
+            other => other,
+        }
+    }
+}
+
+// ============================================================================
+// 4. ProvisionerPlugin
+// ============================================================================
+
+/// Deterministic port block allocated to an isolated worktree slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortBlock {
+    pub slot: u32,
+    pub start_port: u16,
+    pub last_port: u16,
+    pub http_port: u16,
+    pub db_port: u16,
+}
+
+/// Ephemeral database container recipe for a worktree slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisionDbRecipe {
+    pub container_name: String,
+    pub image: String,
+    pub host_port: u16,
+    pub container_port: u16,
+    pub database_url: String,
+    pub docker_run_argv: Vec<String>,
+}
+
+/// Pluggable worktree environment provisioner (port block, DB recipe, deps cache, `.tachoenv`).
+pub trait ProvisionerPlugin: Send + Sync {
+    /// Allocate a deterministic, non-overlapping port block for `slot`.
+    fn allocate_port_block(&self, slot: u32) -> Result<PortBlock, String>;
+
+    /// Build the ephemeral database recipe and `DATABASE_URL` for `worktree_name` at `ports`.
+    fn db_recipe(&self, worktree_name: &str, ports: &PortBlock) -> ProvisionDbRecipe;
+
+    /// Compute dependency and compiler cache environment variables for `slot`.
+    fn deps_cache_env(&self, slot: u32, cache_root: &str) -> BTreeMap<String, String>;
+
+    /// Render the deterministic `.tachoenv` file contents for `worktree_name` and `slot`.
+    fn render_tachoenv(
+        &self,
+        worktree_name: &str,
+        slot: u32,
+        cache_root: &str,
+        extra_vars: &BTreeMap<String, String>,
+    ) -> Result<String, String> {
+        let ports = self.allocate_port_block(slot)?;
+        let db = self.db_recipe(worktree_name, &ports);
+        let cache_env = self.deps_cache_env(slot, cache_root);
+        let target_dir = cache_env.get("CARGO_TARGET_DIR").map(String::as_str);
+        let mut rendered = env_file(
+            worktree_name,
+            "HEAD",
+            None,
+            ports.start_port,
+            ports.last_port,
+            target_dir,
+        );
+        rendered.push_str(&format!(
+            "export TACHO_PORT_BASE='{}'\nexport DATABASE_URL='{}'\n",
+            ports.start_port, db.database_url
+        ));
+        for (k, v) in &cache_env {
+            if k != "CARGO_TARGET_DIR" {
+                rendered.push_str(&format!("export {k}='{v}'\n"));
+            }
+        }
+        for (k, v) in extra_vars {
+            rendered.push_str(&format!("export {k}='{v}'\n"));
+        }
+        Ok(rendered)
+    }
+}
+
+/// Default configurable worktree provisioner backed by [`VerifyConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultProvisioner {
+    pub verify: VerifyConfig,
+    pub db_image: String,
+    pub db_user: String,
+    pub db_password: String,
+    pub db_name: String,
+}
+
+impl Default for DefaultProvisioner {
+    fn default() -> Self {
+        Self {
+            verify: VerifyConfig::default(),
+            db_image: "postgres:16-alpine".to_string(),
+            db_user: "postgres".to_string(),
+            db_password: "postgres".to_string(),
+            db_name: "app_test".to_string(),
+        }
+    }
+}
+
+impl ProvisionerPlugin for DefaultProvisioner {
+    fn allocate_port_block(&self, slot: u32) -> Result<PortBlock, String> {
+        let mut used = BTreeSet::new();
+        for s in 0..slot {
+            let base = 20_000u32
+                .saturating_add(s.saturating_mul(u32::from(PORT_BLOCK_SIZE)))
+                .min(u32::from(u16::MAX)) as u16;
+            used.insert(base);
+        }
+        let (start_port, last_port) = allocate_ports(&used, |_| true)?;
+        Ok(PortBlock {
+            slot,
+            start_port,
+            last_port,
+            http_port: start_port,
+            db_port: start_port + 1,
+        })
+    }
+
+    fn db_recipe(&self, worktree_name: &str, ports: &PortBlock) -> ProvisionDbRecipe {
+        let container_name = format!("tacho-pg-{worktree_name}-{}", ports.slot);
+        let host_port = ports.db_port;
+        let container_port = 5432u16;
+        let database_url = format!(
+            "postgres://{}:{}@127.0.0.1:{}/{}",
+            self.db_user, self.db_password, host_port, self.db_name
+        );
+        let docker_run_argv = vec![
+            "docker".to_string(),
+            "run".to_string(),
+            "-d".to_string(),
+            "--rm".to_string(),
+            "--init".to_string(),
+            "--name".to_string(),
+            container_name.clone(),
+            "-e".to_string(),
+            format!("POSTGRES_USER={}", self.db_user),
+            "-e".to_string(),
+            format!("POSTGRES_PASSWORD={}", self.db_password),
+            "-e".to_string(),
+            format!("POSTGRES_DB={}", self.db_name),
+            "-p".to_string(),
+            format!("127.0.0.1:{host_port}:{container_port}"),
+            "--tmpfs".to_string(),
+            "/var/lib/postgresql/data:rw,noexec,nosuid,size=512m".to_string(),
+            self.db_image.clone(),
+        ];
+        ProvisionDbRecipe {
+            container_name,
+            image: self.db_image.clone(),
+            host_port,
+            container_port,
+            database_url,
+            docker_run_argv,
+        }
+    }
+
+    fn deps_cache_env(&self, slot: u32, cache_root: &str) -> BTreeMap<String, String> {
+        let root = cache_root.trim_end_matches('/');
+        let mut env = BTreeMap::new();
+        env.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            format!("{root}/warm/slot-{slot}/target"),
+        );
+        env.insert("CARGO_HOME".to_string(), format!("{root}/cargo-home"));
+        env.insert("SCCACHE_DIR".to_string(), format!("{root}/sccache"));
+        env.insert("NPM_CONFIG_CACHE".to_string(), format!("{root}/npm"));
+        env
+    }
+}
+
+// ============================================================================
+// 5. WatcherPlugin
+// ============================================================================
+
+/// Input observation for evaluating a custom workflow gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkflowGateInput {
+    pub workflow_name: String,
+    pub branch: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub failed_jobs: Vec<String>,
+}
+
+/// Input observation for evaluating a custom deploy gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DeployGateInput {
+    pub environment: String,
+    pub head_sha: String,
+    pub main_ci_green: bool,
+    pub active_incidents: Vec<String>,
+    pub freeze_active: bool,
+}
+
+/// Decision returned by a [`WatcherPlugin`] workflow or deploy gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateDecision {
+    Allow,
+    Hold { reason: String },
+    Reject { reason: String },
+}
+
+impl GateDecision {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+/// Pluggable workflow, deploy, and runaway-process watcher interface.
+pub trait WatcherPlugin: Send + Sync {
+    /// Evaluate whether a workflow run passes project-specific gating rules.
+    fn evaluate_workflow_gate(&self, input: &WorkflowGateInput) -> GateDecision;
+
+    /// Evaluate whether a deployment is allowed to proceed.
+    fn evaluate_deploy_gate(&self, input: &DeployGateInput) -> GateDecision;
+
+    /// Inspect a host process and return a termination reason if it matches custom burner rules.
+    fn classify_burner(&self, proc: &BurnerProcess) -> Option<String>;
+}
+
+/// Default configurable [`WatcherPlugin`] driven by [`WatchConfig`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DefaultWatcherPlugin {
+    pub config: WatchConfig,
+    pub required_workflows: Vec<String>,
+}
+
+impl WatcherPlugin for DefaultWatcherPlugin {
+    fn evaluate_workflow_gate(&self, input: &WorkflowGateInput) -> GateDecision {
+        if !input.failed_jobs.is_empty() {
+            return GateDecision::Reject {
+                reason: format!(
+                    "workflow {} failed jobs: {}",
+                    input.workflow_name,
+                    input.failed_jobs.join(", ")
+                ),
+            };
+        }
+        let status = input.status.to_ascii_lowercase();
+        if status != "completed" && status != "success" {
+            return GateDecision::Hold {
+                reason: format!("workflow {} is {}", input.workflow_name, input.status),
+            };
+        }
+        if let Some(conclusion) = &input.conclusion {
+            if !conclusion.eq_ignore_ascii_case("success")
+                && !conclusion.eq_ignore_ascii_case("skipped")
+            {
+                return GateDecision::Reject {
+                    reason: format!(
+                        "workflow {} concluded with {}",
+                        input.workflow_name, conclusion
+                    ),
+                };
+            }
+        }
+        GateDecision::Allow
+    }
+
+    fn evaluate_deploy_gate(&self, input: &DeployGateInput) -> GateDecision {
+        if input.freeze_active {
+            return GateDecision::Hold {
+                reason: format!("deploy freeze active for {}", input.environment),
+            };
+        }
+        if !input.active_incidents.is_empty() {
+            return GateDecision::Hold {
+                reason: format!(
+                    "active incidents blocking deploy: {}",
+                    input.active_incidents.join(", ")
+                ),
+            };
+        }
+        if !input.main_ci_green {
+            return GateDecision::Reject {
+                reason: format!("main CI is not green for {}", input.head_sha),
+            };
+        }
+        GateDecision::Allow
+    }
+
+    fn classify_burner(&self, proc: &BurnerProcess) -> Option<String> {
+        let is_named_burner = self
+            .config
+            .burner_names
+            .iter()
+            .any(|name| name == &proc.comm);
+        if !is_named_burner {
+            return None;
+        }
+        if proc.elapsed_secs >= self.config.burner_limit {
+            return Some(format!("burner {} ({}s)", proc.comm, proc.elapsed_secs));
+        }
+        None
+    }
+}
+
+// ============================================================================
+// 6. ProjectPolicy (Unified Repository Policy & Quotas)
+// ============================================================================
+
+/// Summary of concurrency, retry, batch, and janitor quotas across all decision domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyQuotas {
+    pub agent_slots: i32,
+    pub max_cpu_percent: u32,
+    pub resume_limit: u32,
+    pub batch_size: usize,
+    pub max_reruns: u32,
+    pub max_runs: u32,
+    pub build_idle_secs: i64,
+}
+
+/// Unified repository policy aggregating [`DispatchConfig`], [`VerifyConfig`], [`LandConfig`],
+/// [`WatchConfig`], [`OpsConfig`], [`AreaRule`], and [`ProviderSpec`] definitions.
+///
+/// Teams can deserialize `ProjectPolicy` directly from `tacho.toml` (or JSON) to configure:
+/// - Area globs and path rules (`area_rules`, `verify.areas.path_rules`)
+/// - CI job rules (`verify.ci_runner.job_of_area`, `verify.ci_files`, `land.ci_paths`)
+/// - Conflict/generator rules (`land.generated`, `land.generators`, `verify.areas.generated`)
+/// - Screenshot scope (`land.ui_roots`, `land.shot_dirs`, `verify.areas.pixel_files`)
+/// - Burner process names (`watch.burner_names`)
+/// - Pool, batch, retry, and janitor quotas
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectPolicy {
+    #[serde(default)]
+    pub dispatch: DispatchConfig,
+    #[serde(default)]
+    pub verify: VerifyConfig,
+    #[serde(default)]
+    pub land: LandConfig,
+    #[serde(default)]
+    pub watch: WatchConfig,
+    #[serde(default)]
+    pub ops: OpsConfig,
+    #[serde(default = "default_area_rules")]
+    pub area_rules: Vec<AreaRule>,
+    #[serde(default = "builtin_providers")]
+    pub providers: BTreeMap<String, ProviderSpec>,
+}
+
+fn default_area_rules() -> Vec<AreaRule> {
+    vec![
+        AreaRule {
+            area: "core".to_string(),
+            prefixes: vec!["crates/".to_string(), "src/".to_string()],
+            unit_prefixes: BTreeMap::new(),
+            checks: Vec::new(),
+            isolate_batch: false,
+            needs_screenshot: false,
+        },
+        AreaRule {
+            area: "ci".to_string(),
+            prefixes: vec![".github/".to_string(), "scripts/".to_string()],
+            unit_prefixes: BTreeMap::new(),
+            checks: Vec::new(),
+            isolate_batch: true,
+            needs_screenshot: false,
+        },
+    ]
+}
+
+impl Default for ProjectPolicy {
+    fn default() -> Self {
+        let mut verify = VerifyConfig::default();
+        if verify.areas.path_rules.is_empty() {
+            verify.areas.path_rules.push(PathAreaRule {
+                pattern: r"^crates/".to_string(),
+                areas: BTreeSet::from(["core".to_string()]),
+                train_areas: None,
+            });
+        }
+        if verify.areas.pixel_files.is_empty() {
+            verify.areas.pixel_files.push(r"\.png$".to_string());
+        }
+        if verify.areas.generated.is_empty() {
+            verify
+                .areas
+                .generated
+                .insert(r"Cargo\.lock$".to_string(), "core".to_string());
+        }
+        if verify.ci_runner.job_of_area.is_empty() {
+            verify
+                .ci_runner
+                .job_of_area
+                .insert("core".to_string(), "ci".to_string());
+        }
+
+        let mut land = LandConfig::default();
+        if land.generated.is_empty() {
+            land.generated
+                .push(("core".to_string(), r"Cargo\.lock$".to_string()));
+        }
+        if land.generators.is_empty() {
+            land.generators.insert(
+                "Cargo.lock".to_string(),
+                "cargo generate-lockfile".to_string(),
+            );
+        }
+        if land.ui_roots.is_empty() {
+            land.ui_roots.push("web/".to_string());
+        }
+        if land.shot_dirs.is_empty() {
+            land.shot_dirs
+                .push(("docs/screenshots/".to_string(), "ui".to_string()));
+        }
+
+        Self {
+            dispatch: DispatchConfig::default(),
+            verify,
+            land,
+            watch: WatchConfig::default(),
+            ops: OpsConfig::default(),
+            area_rules: default_area_rules(),
+            providers: builtin_providers(),
+        }
+    }
+}
+
+impl ProjectPolicy {
+    /// Configured area rules mapping file path prefixes/globs to verification areas.
+    pub fn area_globs(&self) -> &[AreaRule] {
+        &self.area_rules
+    }
+
+    /// Configured tier path rules (`verify.areas.path_rules`).
+    pub fn path_area_rules(&self) -> &[PathAreaRule] {
+        &self.verify.areas.path_rules
+    }
+
+    /// Required CI job mapping (`verify.ci_runner.job_of_area`) and CI pipeline file regexes (`verify.ci_files`).
+    pub fn ci_job_rules(&self) -> (&BTreeMap<String, String>, &[String]) {
+        (&self.verify.ci_runner.job_of_area, &self.verify.ci_files)
+    }
+
+    /// Conflict generated-file patterns, generator commands, and verify generated area map.
+    #[allow(clippy::type_complexity)]
+    pub fn conflict_generator_rules(
+        &self,
+    ) -> (
+        &[(String, String)],
+        &BTreeMap<String, String>,
+        &BTreeMap<String, String>,
+    ) {
+        (
+            &self.land.generated,
+            &self.land.generators,
+            &self.verify.areas.generated,
+        )
+    }
+
+    /// UI roots, screenshot directories, and pixel file patterns.
+    pub fn screenshot_scope(&self) -> (&[String], &[(String, String)], &[String]) {
+        (
+            &self.land.ui_roots,
+            &self.land.shot_dirs,
+            &self.verify.areas.pixel_files,
+        )
+    }
+
+    /// Process `comm` names monitored for orphan/runaway CPU burner reaping.
+    pub fn burner_names(&self) -> &[String] {
+        &self.watch.burner_names
+    }
+
+    /// Consolidated pool, batch, retry, and janitor quotas.
+    pub fn quotas(&self) -> PolicyQuotas {
+        PolicyQuotas {
+            agent_slots: self.dispatch.slots,
+            max_cpu_percent: self.dispatch.max_cpu_percent,
+            resume_limit: self.dispatch.resume_limit,
+            batch_size: self.verify.batch_size,
+            max_reruns: self.verify.reruns,
+            max_runs: self.watch.max_runs,
+            build_idle_secs: self.ops.tidy.build_idle,
+        }
+    }
+
+    /// Validate policy invariants (positive slots, non-empty batch size, shell-free provider specs).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.dispatch.slots <= 0 {
+            return Err("dispatch.slots must be > 0".to_string());
+        }
+        if self.verify.batch_size == 0 {
+            return Err("verify.batch_size must be > 0".to_string());
+        }
+        for (name, spec) in &self.providers {
+            ensure_no_shell_argv(&spec.binary, &spec.start_args)
+                .map_err(|e| format!("provider '{name}' start_args invalid: {e}"))?;
+            if !spec.resume_args.is_empty() {
+                ensure_no_shell_argv(&spec.binary, &spec.resume_args)
+                    .map_err(|e| format!("provider '{name}' resume_args invalid: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply this `ProjectPolicy` onto a [`DecisionState`](crate::decide::DecisionState).
+    pub fn apply_to_state(&self, state: &mut crate::decide::DecisionState) {
+        if state.max_parallel == 0 && self.dispatch.slots > 0 {
+            state.max_parallel = self.dispatch.slots as usize;
+        }
+        if state.area_rules.is_empty() {
+            state.area_rules = self.area_rules.clone();
+        }
+        if state.tidy_min_age_secs <= 0 {
+            state.tidy_min_age_secs = self.ops.tidy.build_idle;
+        }
+    }
+}

@@ -4,7 +4,9 @@
 //! records positive CPU time and RSS values on agent:<agent>/run:<n>/cpu and rss tracks.
 
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tacho_core::{Input, SessionKey};
 use tacho_daemon::{Config, Daemon, DaemonPaths};
 
@@ -23,7 +25,10 @@ fn test_per_run_process_tree_sampling() {
     // 1. Spawn a real child process with a descendant process doing busy work
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg("python3 -c 'import time; [x*x for x in range(2_000_000)]; time.sleep(1)' & python3 -c 'import time; [x*x for x in range(2_000_000)]; time.sleep(1)'; wait")
+        // Descendants burn some CPU, then block reading stdin until the test closes it, so the
+        // tree stays alive for exactly as long as the test needs samples (no sleeps).
+        .arg("exec 3<&0; python3 -c 'import sys; [x*x for x in range(2_000_000)]; sys.stdin.read()' <&3 & python3 -c 'import sys; [x*x for x in range(2_000_000)]; sys.stdin.read()' <&3 & exec 3<&-; wait")
+        .stdin(Stdio::piped())
         .spawn()
         .expect("failed to spawn child process");
 
@@ -65,7 +70,6 @@ fn test_per_run_process_tree_sampling() {
     assert_eq!(active[0].run_track, "agent:tree-agent/run:1");
 
     // 3. Poll until sampler thread records cpu and rss counters in SQLite log
-    let deadline = Instant::now() + Duration::from_secs(6);
     let mut sampled_cpu = false;
     let mut sampled_rss = false;
     let mut observed_cpu_val = 0i64;
@@ -73,7 +77,11 @@ fn test_per_run_process_tree_sampling() {
 
     let log = tacho_daemon::EventLog::open(&paths.events_db()).unwrap();
 
-    while Instant::now() < deadline {
+    // Every committed batch (including sampler counter samples) republishes LiveState, so
+    // block on state changes between checks instead of polling on a clock.
+    let never = AtomicBool::new(false);
+    let mut seq = daemon.appender.state_seq();
+    loop {
         daemon.appender.flush();
         if let Ok(events) = log.load_all() {
             for ev in events {
@@ -98,9 +106,11 @@ fn test_per_run_process_tree_sampling() {
         if sampled_cpu && sampled_rss {
             break;
         }
-        std::thread::yield_now();
+        seq = daemon.appender.wait_state_change_until(seq, &never);
     }
 
+    // Release the descendants and reap the tree.
+    drop(child.stdin.take());
     let _ = child.wait();
 
     assert!(

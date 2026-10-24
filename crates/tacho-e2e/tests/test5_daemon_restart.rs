@@ -42,9 +42,7 @@ fn test_daemon_restart_lifecycle() {
 
     // 3. SIGKILL daemon mid-session
     assert!(env.kill_daemon_9(), "failed to send SIGKILL to daemon");
-    let dead = env.wait_until(Duration::from_secs(2), Duration::from_millis(10), || {
-        !TestEnv::is_pid_alive(initial_pid)
-    });
+    let dead = TestEnv::wait_pid_exit(initial_pid);
     assert!(dead, "daemon process should be dead after SIGKILL");
 
     // 4. tacho trace while daemon is dead (reads DB read-only directly)
@@ -145,18 +143,15 @@ fn test_daemon_restart_lifecycle() {
 
     // 7. SIGTERM writes last.perfetto-trace
     assert!(env.kill_daemon_term(), "failed to send SIGTERM to daemon");
-    let term_dead = env.wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
-        !TestEnv::is_pid_alive(new_pid)
-    });
+    let term_dead = TestEnv::wait_pid_exit(new_pid);
     assert!(term_dead, "daemon should exit cleanly after SIGTERM");
 
     let last_trace = env.home_dir.join("trace/last.perfetto-trace");
-    let wait_last = env.wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
-        last_trace.exists()
-            && std::fs::metadata(&last_trace)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-    });
+    // The daemon writes last.perfetto-trace during SIGTERM shutdown, before it
+    // exits, so once the pidfd reported exit the file must be complete.
+    let wait_last = std::fs::metadata(&last_trace)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
     assert!(
         wait_last,
         "last.perfetto-trace was not written upon SIGTERM"

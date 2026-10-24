@@ -4,17 +4,18 @@
 //! The SQLite event log is the single source of truth; snapshots stream directly from
 //! SQLite rows to Perfetto TracePackets without buffering the dataset in memory.
 
+mod projector;
+
 use prost::Message;
 use rusqlite::{Connection, OpenFlags};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::SystemTime;
-use tacho_core::{
-    encode_snapshot_header, Encoder, Event, Kind, Recorder, TrackEventType, TrackKind,
-    TrackRegistry,
-};
+use tacho_core::{encode_snapshot_header, Event, Kind, Recorder, TrackKind, TrackRegistry};
 use tacho_proto::tacho;
+
+use projector::{run_prefix_of, task_state_track, Sink, SnapshotProjector, MESSAGES_TRACK};
 
 /// Statistics about an emitted snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -25,15 +26,82 @@ pub struct SnapshotStats {
     pub events: u64,
 }
 
-fn run_prefix_of(track_key: &str) -> Option<String> {
-    let mut parts = track_key.split('/');
-    let first = parts.next()?;
-    let second = parts.next()?;
-    if first.starts_with("agent:") && second.starts_with("run:") {
-        Some(format!("{}/{}", first, second))
-    } else {
-        None
+fn sql_err(e: rusqlite::Error) -> io::Error {
+    io::Error::other(e.to_string())
+}
+
+fn kind_of(kind_int: u32) -> Kind {
+    Kind::ALL
+        .get(kind_int as usize)
+        .copied()
+        .unwrap_or(Kind::Daemon)
+}
+
+/// Columns selected by every event query, in this order.
+const EVENT_COLUMNS: &str =
+    "seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name";
+
+/// Decodes a row selected with [`EVENT_COLUMNS`]. A corrupt body decodes as empty rather
+/// than failing the whole snapshot.
+fn event_from_row(row: &rusqlite::Row<'_>) -> io::Result<Event> {
+    let body_bytes: &[u8] = row
+        .get_ref(6)
+        .map_err(sql_err)?
+        .as_bytes()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let body = tacho::Event::decode(body_bytes).unwrap_or(tacho::Event { body: None });
+    let mut ev = Event::new(
+        row.get(0).map_err(sql_err)?,
+        row.get(1).map_err(sql_err)?,
+        kind_of(row.get(2).map_err(sql_err)?),
+        row.get::<_, String>(3).map_err(sql_err)?,
+        row.get(4).map_err(sql_err)?,
+        row.get(5).map_err(sql_err)?,
+        body,
+    );
+    if let Some(c) = row.get::<_, Option<i64>>(7).map_err(sql_err)? {
+        ev = ev.with_counter(c);
     }
+    if let Some(name) = row.get::<_, Option<String>>(8).map_err(sql_err)? {
+        ev = ev.with_custom_name(name);
+    }
+    Ok(ev)
+}
+
+/// Clock snapshot values for the trace header.
+///
+/// A live snapshot maps REALTIME to the current BOOTTIME. A snapshot bounded by `until`
+/// must be reproducible byte for byte, so it pins REALTIME = BOOTTIME = `until`; without
+/// some BOOTTIME mapping trace processor reports `clock_sync_unrelatable_clock_domains`.
+fn header_clocks(until: Option<u64>) -> (u64, Option<u64>) {
+    match until {
+        Some(u) => (u, Some(u)),
+        None => (
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            get_boottime_ns(),
+        ),
+    }
+}
+
+fn encode_header(registry: &TrackRegistry, until: Option<u64>) -> Vec<u8> {
+    let (now_ns, boottime_ns) = header_clocks(until);
+    let mut header = Vec::with_capacity(8192);
+    encode_snapshot_header(registry, now_ns, boottime_ns, &mut header);
+    header
+}
+
+/// Writes a header-only trace (no events), e.g. for an empty or missing log.
+fn write_empty_snapshot(until: Option<u64>, w: &mut impl Write) -> io::Result<SnapshotStats> {
+    let header = encode_header(&TrackRegistry::new(), until);
+    w.write_all(&header)?;
+    w.flush()?;
+    Ok(SnapshotStats {
+        bytes: header.len() as u64,
+        events: 0,
+    })
 }
 
 fn register_hierarchy(
@@ -118,11 +186,7 @@ fn finalize_snapshot_registry(reg: &mut TrackRegistry, summaries: &[EventTrackSu
                 active_keys.insert("milestones".to_string());
             }
             Kind::TaskQueued => {
-                let st = if track_key.ends_with("/state") {
-                    track_key.clone()
-                } else {
-                    format!("{}/state", track_key)
-                };
+                let st = task_state_track(track_key);
                 register_hierarchy(reg, &rec_helper, &st, TrackKind::State, None);
                 active_keys.insert(st);
             }
@@ -136,7 +200,7 @@ fn finalize_snapshot_registry(reg: &mut TrackRegistry, summaries: &[EventTrackSu
                 active_keys.insert(st);
             }
             Kind::Message if track_key == "tacho" => {
-                let mt = "tacho/messages".to_string();
+                let mt = MESSAGES_TRACK.to_string();
                 register_hierarchy(reg, &rec_helper, &mt, TrackKind::Slices, None);
                 active_keys.insert(mt);
             }
@@ -165,692 +229,38 @@ fn finalize_snapshot_registry(reg: &mut TrackRegistry, summaries: &[EventTrackSu
     }
 
     reg.retain_used(&active_keys);
+    apply_display_names(reg);
 }
 
-#[derive(Debug, Clone)]
-struct OpenSynthSlice {
-    track_key: String,
-    kind: Kind,
-    open_ts: u64,
-    open_seq: u64,
-    agent: Option<String>,
-    target_agent: Option<String>,
-    waiting_for_delivery: bool,
-}
-
-#[derive(Default)]
-struct SnapshotProjector {
-    synth_track_last_ts: HashMap<String, u64>,
-    open_daemon: Option<OpenSynthSlice>,
-    open_stalls: BTreeMap<String, Vec<OpenSynthSlice>>,
-    open_worktree: BTreeMap<String, OpenSynthSlice>,
-    open_reviews: BTreeMap<String, Vec<OpenSynthSlice>>,
-    open_message: Option<OpenSynthSlice>,
-    run_files_edited: HashMap<String, i64>,
-    run_commits: HashMap<String, i64>,
-    max_ts: u64,
-}
-
-impl SnapshotProjector {
-    fn next_track_ts(&mut self, track: &str, candidate_ts: u64) -> u64 {
-        let last = self
-            .synth_track_last_ts
-            .entry(track.to_string())
-            .or_insert(0);
-        let ts = (*last).max(candidate_ts);
-        *last = ts;
-        ts
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn emit_synth_end<W: Write>(
-        &mut self,
-        slice: &OpenSynthSlice,
-        candidate_ts: u64,
-        encoder: &mut Encoder,
-        registry: &TrackRegistry,
-        packet_buf: &mut Vec<u8>,
-        writer: &mut W,
-        total_bytes: &mut u64,
-    ) -> io::Result<u64> {
-        let min_end = slice.open_ts.saturating_add(1_000);
-        let end_ts = self.next_track_ts(&slice.track_key, candidate_ts.max(min_end));
-        let end_ev = Event::new(
-            slice.open_seq,
-            end_ts,
-            slice.kind,
-            &slice.track_key,
-            Some(slice.open_seq),
-            slice.agent.clone(),
-            tacho::Event { body: None },
-        );
-        packet_buf.clear();
-        encoder.encode_event_with_type(
-            &end_ev,
-            Some(TrackEventType::SliceEnd),
-            registry,
-            packet_buf,
-        );
-        writer.write_all(packet_buf)?;
-        *total_bytes += packet_buf.len() as u64;
-        self.max_ts = self.max_ts.max(end_ts);
-        Ok(end_ts)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn process_event<W: Write>(
-        &mut self,
-        mut ev: Event,
-        in_window: bool,
-        encoder: &mut Encoder,
-        registry: &TrackRegistry,
-        packet_buf: &mut Vec<u8>,
-        writer: &mut W,
-        total_bytes: &mut u64,
-        events_count: &mut u64,
-    ) -> io::Result<()> {
-        if !in_window {
-            return Ok(());
+/// Shortens default track names for the UI: under the `agents`, `tasks` and `providers`
+/// groups the `agent:`/`task:`/`provider:` prefix is noise, and `run:2` reads better as
+/// `run 2`. Only names still equal to the key's last segment are touched, so explicit
+/// names from the log are kept.
+fn apply_display_names(reg: &mut TrackRegistry) {
+    let keys: Vec<String> = reg.iter().map(|e| e.key.clone()).collect();
+    for key in keys {
+        let Some(entry) = reg.get_by_key_mut(&key) else {
+            continue;
+        };
+        let leaf = key.rsplit('/').next().unwrap_or(&key);
+        if entry.name != leaf {
+            continue;
         }
-        *events_count += 1;
-        self.max_ts = self.max_ts.max(ev.ts_ns);
-
-        // Close open one-shot message if recipient agent becomes active
-        if ev.kind != Kind::Message {
-            if let Some(ref aid) = ev.agent {
-                let should_close = self.open_message.as_ref().is_some_and(|m| {
-                    !m.waiting_for_delivery && m.target_agent.as_deref() == Some(aid.as_str())
-                });
-                if should_close {
-                    if let Some(msg_slice) = self.open_message.take() {
-                        self.emit_synth_end(
-                            &msg_slice,
-                            ev.ts_ns,
-                            encoder,
-                            registry,
-                            packet_buf,
-                            writer,
-                            total_bytes,
-                        )?;
-                    }
-                }
-            }
+        let pretty = if let Some(rest) = ["agent:", "task:", "provider:"]
+            .iter()
+            .find_map(|p| leaf.strip_prefix(p))
+        {
+            rest.to_string()
+        } else if let Some(n) = leaf.strip_prefix("run:") {
+            format!("run {}", n)
+        } else if let Some(n) = leaf.strip_prefix("lane:") {
+            format!("lane {}", n)
+        } else {
+            continue;
+        };
+        if !pretty.is_empty() {
+            entry.name = pretty;
         }
-
-        match ev.kind {
-            Kind::TrackCreated | Kind::Prompt => Ok(()),
-
-            Kind::FileEdited => {
-                if let Some(run_prefix) = run_prefix_of(&ev.track_key) {
-                    let count_val = {
-                        let count = self.run_files_edited.entry(run_prefix.clone()).or_insert(0);
-                        *count += 1;
-                        *count
-                    };
-                    let ft = format!("{}/files_edited", run_prefix);
-                    let ts = self.next_track_ts(&ft, ev.ts_ns);
-                    let cnt_ev = Event::new(
-                        ev.seq,
-                        ts,
-                        Kind::Custom,
-                        ft,
-                        None,
-                        ev.agent,
-                        tacho::Event { body: None },
-                    )
-                    .with_counter(count_val)
-                    .with_custom_name("files");
-                    packet_buf.clear();
-                    encoder.encode_event(&cnt_ev, registry, packet_buf);
-                    writer.write_all(packet_buf)?;
-                    *total_bytes += packet_buf.len() as u64;
-                }
-                Ok(())
-            }
-
-            Kind::Milestone if ev.track_key.ends_with("/turns") => {
-                let cname = ev.custom_name.clone().unwrap_or_default();
-                let is_commit = cname.starts_with("WorktreeCommit");
-                let is_head_moved = cname.starts_with("HeadMoved");
-                if is_commit || is_head_moved {
-                    if let Some(run_prefix) = run_prefix_of(&ev.track_key) {
-                        if is_commit {
-                            let c_val = {
-                                let c_cnt = self.run_commits.entry(run_prefix.clone()).or_insert(0);
-                                *c_cnt += 1;
-                                *c_cnt
-                            };
-                            let ct = format!("{}/commits", run_prefix);
-                            let c_ts = self.next_track_ts(&ct, ev.ts_ns);
-                            let cnt_ev = Event::new(
-                                ev.seq,
-                                c_ts,
-                                Kind::Custom,
-                                ct,
-                                None,
-                                ev.agent.clone(),
-                                tacho::Event { body: None },
-                            )
-                            .with_counter(c_val)
-                            .with_custom_name("commits");
-                            packet_buf.clear();
-                            encoder.encode_event(&cnt_ev, registry, packet_buf);
-                            writer.write_all(packet_buf)?;
-                            *total_bytes += packet_buf.len() as u64;
-                        }
-
-                        let wt_track = format!("{}/worktree", run_prefix);
-                        if let Some(prev) = self.open_worktree.remove(&run_prefix) {
-                            self.emit_synth_end(
-                                &prev,
-                                ev.ts_ns,
-                                encoder,
-                                registry,
-                                packet_buf,
-                                writer,
-                                total_bytes,
-                            )?;
-                        }
-                        let begin_ts = self.next_track_ts(&wt_track, ev.ts_ns);
-                        ev.ts_ns = begin_ts;
-                        ev.track_key = wt_track.clone();
-                        packet_buf.clear();
-                        encoder.encode_event_with_type(
-                            &ev,
-                            Some(TrackEventType::SliceBegin),
-                            registry,
-                            packet_buf,
-                        );
-                        writer.write_all(packet_buf)?;
-                        *total_bytes += packet_buf.len() as u64;
-                        self.open_worktree.insert(
-                            run_prefix,
-                            OpenSynthSlice {
-                                track_key: wt_track,
-                                kind: Kind::Milestone,
-                                open_ts: begin_ts,
-                                open_seq: ev.seq,
-                                agent: ev.agent,
-                                target_agent: None,
-                                waiting_for_delivery: false,
-                            },
-                        );
-                    }
-                }
-                Ok(())
-            }
-
-            Kind::Milestone if ev.track_key == "milestones" => {
-                let ts = self.next_track_ts("milestones", ev.ts_ns);
-                ev.ts_ns = ts;
-                packet_buf.clear();
-                encoder.encode_event_with_type(
-                    &ev,
-                    Some(TrackEventType::State),
-                    registry,
-                    packet_buf,
-                );
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                Ok(())
-            }
-
-            Kind::TaskQueued => {
-                let st_track = if ev.track_key.ends_with("/state") {
-                    ev.track_key.clone()
-                } else {
-                    format!("{}/state", ev.track_key)
-                };
-                let ts = self.next_track_ts(&st_track, ev.ts_ns);
-                let because = ev.agent.as_ref().map(|a| format!("assigned to {}", a));
-                ev.ts_ns = ts;
-                ev.track_key = st_track;
-                ev.kind = Kind::TaskState;
-                ev.custom_name = Some("Queued".to_string());
-                ev.body = tacho::Event {
-                    body: Some(tacho::event::Body::TaskState(tacho::TaskState {
-                        state: Some(tacho::TaskStatus::TaskQueued as i32),
-                        because,
-                    })),
-                };
-                packet_buf.clear();
-                encoder.encode_event(&ev, registry, packet_buf);
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                Ok(())
-            }
-
-            Kind::TaskState => {
-                let is_review = matches!(
-                    &ev.body.body,
-                    Some(tacho::event::Body::TaskState(ts))
-                        if ts.state == Some(tacho::TaskStatus::TaskReview as i32)
-                );
-                if !is_review {
-                    if let Some(slug) = ev
-                        .track_key
-                        .strip_prefix("task:")
-                        .and_then(|s| s.strip_suffix("/state"))
-                    {
-                        let rev_track = format!("task:{}/review", slug);
-                        if let Some(mut findings) = self.open_reviews.remove(&rev_track) {
-                            while let Some(f) = findings.pop() {
-                                self.emit_synth_end(
-                                    &f,
-                                    ev.ts_ns,
-                                    encoder,
-                                    registry,
-                                    packet_buf,
-                                    writer,
-                                    total_bytes,
-                                )?;
-                            }
-                        }
-                    }
-                }
-                let ts = self.next_track_ts(&ev.track_key, ev.ts_ns);
-                ev.ts_ns = ts;
-                packet_buf.clear();
-                encoder.encode_event(&ev, registry, packet_buf);
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                Ok(())
-            }
-
-            Kind::Stall => {
-                let agent_id = ev.agent.clone().unwrap_or_else(|| {
-                    ev.track_key
-                        .split('/')
-                        .next()
-                        .unwrap_or("unknown")
-                        .strip_prefix("agent:")
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-                let stall_track = if ev.track_key.ends_with("/stalls") {
-                    ev.track_key.clone()
-                } else {
-                    format!("agent:{}/stalls", agent_id)
-                };
-                let begin_ts = self.next_track_ts(&stall_track, ev.ts_ns);
-                ev.ts_ns = begin_ts;
-                ev.track_key = stall_track.clone();
-                packet_buf.clear();
-                encoder.encode_event_with_type(
-                    &ev,
-                    Some(TrackEventType::SliceBegin),
-                    registry,
-                    packet_buf,
-                );
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                self.open_stalls
-                    .entry(agent_id)
-                    .or_default()
-                    .push(OpenSynthSlice {
-                        track_key: stall_track,
-                        kind: Kind::Stall,
-                        open_ts: begin_ts,
-                        open_seq: ev.seq,
-                        agent: ev.agent,
-                        target_agent: None,
-                        waiting_for_delivery: false,
-                    });
-                Ok(())
-            }
-
-            Kind::AgentState => {
-                let is_stalled = ev.custom_name.as_deref() == Some("Stalled")
-                    || matches!(
-                        &ev.body.body,
-                        Some(tacho::event::Body::AgentState(s))
-                            if s.state == Some(tacho::AgentStateType::Stalled as i32)
-                    );
-                if !is_stalled {
-                    let agent_id = ev.agent.clone().unwrap_or_else(|| {
-                        ev.track_key
-                            .split('/')
-                            .next()
-                            .unwrap_or("")
-                            .strip_prefix("agent:")
-                            .unwrap_or("")
-                            .to_string()
-                    });
-                    if let Some(mut stalls) = self.open_stalls.remove(&agent_id) {
-                        while let Some(st) = stalls.pop() {
-                            self.emit_synth_end(
-                                &st,
-                                ev.ts_ns,
-                                encoder,
-                                registry,
-                                packet_buf,
-                                writer,
-                                total_bytes,
-                            )?;
-                        }
-                    }
-                }
-                packet_buf.clear();
-                encoder.encode_event(&ev, registry, packet_buf);
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                Ok(())
-            }
-
-            Kind::RunEnded => {
-                let agent_id = ev.agent.clone().unwrap_or_else(|| {
-                    ev.track_key
-                        .split('/')
-                        .next()
-                        .unwrap_or("")
-                        .strip_prefix("agent:")
-                        .unwrap_or("")
-                        .to_string()
-                });
-                if let Some(mut stalls) = self.open_stalls.remove(&agent_id) {
-                    while let Some(st) = stalls.pop() {
-                        self.emit_synth_end(
-                            &st,
-                            ev.ts_ns,
-                            encoder,
-                            registry,
-                            packet_buf,
-                            writer,
-                            total_bytes,
-                        )?;
-                    }
-                }
-                if let Some(prev_wt) = self.open_worktree.remove(&ev.track_key) {
-                    self.emit_synth_end(
-                        &prev_wt,
-                        ev.ts_ns,
-                        encoder,
-                        registry,
-                        packet_buf,
-                        writer,
-                        total_bytes,
-                    )?;
-                }
-                packet_buf.clear();
-                encoder.encode_event(&ev, registry, packet_buf);
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                Ok(())
-            }
-
-            Kind::Daemon => {
-                if let Some(prev) = self.open_daemon.take() {
-                    self.emit_synth_end(
-                        &prev,
-                        ev.ts_ns,
-                        encoder,
-                        registry,
-                        packet_buf,
-                        writer,
-                        total_bytes,
-                    )?;
-                }
-                let is_stopping = matches!(
-                    &ev.body.body,
-                    Some(tacho::event::Body::Daemon(d))
-                        if d.action == Some(tacho::DaemonAction::DaemonStopping as i32)
-                );
-                if !is_stopping {
-                    let begin_ts = self.next_track_ts(&ev.track_key, ev.ts_ns);
-                    ev.ts_ns = begin_ts;
-                    if ev.custom_name.is_none() {
-                        if let Some(tacho::event::Body::Daemon(d)) = &ev.body.body {
-                            let label = match (d.pid, d.version.as_deref()) {
-                                (Some(pid), Some(ver)) => {
-                                    format!("Daemon [pid {}, v{}]", pid, ver)
-                                }
-                                (Some(pid), None) => format!("Daemon [pid {}]", pid),
-                                _ => "Daemon".to_string(),
-                            };
-                            ev.custom_name = Some(label);
-                        }
-                    }
-                    let track_key = ev.track_key.clone();
-                    let seq = ev.seq;
-                    let agent = ev.agent.clone();
-                    packet_buf.clear();
-                    encoder.encode_event_with_type(
-                        &ev,
-                        Some(TrackEventType::SliceBegin),
-                        registry,
-                        packet_buf,
-                    );
-                    writer.write_all(packet_buf)?;
-                    *total_bytes += packet_buf.len() as u64;
-                    self.open_daemon = Some(OpenSynthSlice {
-                        track_key,
-                        kind: Kind::Daemon,
-                        open_ts: begin_ts,
-                        open_seq: seq,
-                        agent,
-                        target_agent: None,
-                        waiting_for_delivery: false,
-                    });
-                }
-                Ok(())
-            }
-
-            Kind::Message => {
-                let msg_track = if ev.track_key == "tacho" {
-                    "tacho/messages".to_string()
-                } else {
-                    ev.track_key.clone()
-                };
-                let (from, to, dir) = match &ev.body.body {
-                    Some(tacho::event::Body::Message(m)) => (
-                        m.from.clone().unwrap_or_else(|| "?".to_string()),
-                        m.to.clone().unwrap_or_else(|| "?".to_string()),
-                        m.direction,
-                    ),
-                    _ => ("?".to_string(), "?".to_string(), None),
-                };
-                if dir == Some(tacho::MessageDirection::Delivered as i32) {
-                    if let Some(prev) = self.open_message.take() {
-                        self.emit_synth_end(
-                            &prev,
-                            ev.ts_ns,
-                            encoder,
-                            registry,
-                            packet_buf,
-                            writer,
-                            total_bytes,
-                        )?;
-                        return Ok(());
-                    }
-                }
-                if let Some(prev) = self.open_message.take() {
-                    self.emit_synth_end(
-                        &prev,
-                        ev.ts_ns,
-                        encoder,
-                        registry,
-                        packet_buf,
-                        writer,
-                        total_bytes,
-                    )?;
-                }
-                let begin_ts = self.next_track_ts(&msg_track, ev.ts_ns);
-                ev.ts_ns = begin_ts;
-                ev.track_key = msg_track.clone();
-                ev.custom_name = Some(format!("Message: {} -> {}", from, to));
-                if dir == Some(tacho::MessageDirection::Sent as i32) {
-                    ev.flow_ids.clear();
-                }
-                let seq = ev.seq;
-                let agent = ev.agent.clone();
-                packet_buf.clear();
-                encoder.encode_event_with_type(
-                    &ev,
-                    Some(TrackEventType::SliceBegin),
-                    registry,
-                    packet_buf,
-                );
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                self.open_message = Some(OpenSynthSlice {
-                    track_key: msg_track,
-                    kind: Kind::Message,
-                    open_ts: begin_ts,
-                    open_seq: seq,
-                    agent,
-                    target_agent: Some(to),
-                    waiting_for_delivery: dir == Some(tacho::MessageDirection::Sent as i32),
-                });
-                Ok(())
-            }
-
-            Kind::ReviewFinding => {
-                let begin_ts = self.next_track_ts(&ev.track_key, ev.ts_ns);
-                ev.ts_ns = begin_ts;
-                let track_key = ev.track_key.clone();
-                let seq = ev.seq;
-                let agent = ev.agent.clone();
-                packet_buf.clear();
-                encoder.encode_event_with_type(
-                    &ev,
-                    Some(TrackEventType::SliceBegin),
-                    registry,
-                    packet_buf,
-                );
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                self.open_reviews
-                    .entry(track_key.clone())
-                    .or_default()
-                    .push(OpenSynthSlice {
-                        track_key,
-                        kind: Kind::ReviewFinding,
-                        open_ts: begin_ts,
-                        open_seq: seq,
-                        agent,
-                        target_agent: None,
-                        waiting_for_delivery: false,
-                    });
-                Ok(())
-            }
-
-            Kind::ReviewEnded => {
-                let mut end_ts = ev.ts_ns;
-                if let Some(mut findings) = self.open_reviews.remove(&ev.track_key) {
-                    while let Some(f) = findings.pop() {
-                        end_ts = self.emit_synth_end(
-                            &f,
-                            ev.ts_ns,
-                            encoder,
-                            registry,
-                            packet_buf,
-                            writer,
-                            total_bytes,
-                        )?;
-                    }
-                }
-                ev.ts_ns = self.next_track_ts(&ev.track_key, ev.ts_ns.max(end_ts));
-                packet_buf.clear();
-                encoder.encode_event(&ev, registry, packet_buf);
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                Ok(())
-            }
-
-            _ => {
-                packet_buf.clear();
-                encoder.encode_event(&ev, registry, packet_buf);
-                writer.write_all(packet_buf)?;
-                *total_bytes += packet_buf.len() as u64;
-                Ok(())
-            }
-        }
-    }
-
-    fn finish<W: Write>(
-        &mut self,
-        encoder: &mut Encoder,
-        registry: &TrackRegistry,
-        packet_buf: &mut Vec<u8>,
-        writer: &mut W,
-        total_bytes: &mut u64,
-    ) -> io::Result<()> {
-        let final_ts = self.max_ts;
-
-        if let Some(msg) = self.open_message.take() {
-            self.emit_synth_end(
-                &msg,
-                final_ts,
-                encoder,
-                registry,
-                packet_buf,
-                writer,
-                total_bytes,
-            )?;
-        }
-
-        let review_tracks: Vec<String> = self.open_reviews.keys().cloned().collect();
-        for rt in review_tracks {
-            if let Some(mut findings) = self.open_reviews.remove(&rt) {
-                while let Some(f) = findings.pop() {
-                    self.emit_synth_end(
-                        &f,
-                        final_ts,
-                        encoder,
-                        registry,
-                        packet_buf,
-                        writer,
-                        total_bytes,
-                    )?;
-                }
-            }
-        }
-
-        let wt_keys: Vec<String> = self.open_worktree.keys().cloned().collect();
-        for wk in wt_keys {
-            if let Some(wt) = self.open_worktree.remove(&wk) {
-                self.emit_synth_end(
-                    &wt,
-                    final_ts,
-                    encoder,
-                    registry,
-                    packet_buf,
-                    writer,
-                    total_bytes,
-                )?;
-            }
-        }
-
-        let stall_agents: Vec<String> = self.open_stalls.keys().cloned().collect();
-        for aid in stall_agents {
-            if let Some(mut stalls) = self.open_stalls.remove(&aid) {
-                while let Some(st) = stalls.pop() {
-                    self.emit_synth_end(
-                        &st,
-                        final_ts,
-                        encoder,
-                        registry,
-                        packet_buf,
-                        writer,
-                        total_bytes,
-                    )?;
-                }
-            }
-        }
-
-        if let Some(d) = self.open_daemon.take() {
-            self.emit_synth_end(
-                &d,
-                final_ts,
-                encoder,
-                registry,
-                packet_buf,
-                writer,
-                total_bytes,
-            )?;
-        }
-
-        Ok(())
     }
 }
 
@@ -859,41 +269,21 @@ pub fn build_registry_from_conn_up_to(
     conn: &Connection,
     max_seq: Option<u64>,
 ) -> io::Result<TrackRegistry> {
-    let mut reg_stmt = conn
-        .prepare(
-            "SELECT seq, ts_ns, kind, track_key, cause_seq, agent, body
-             FROM events
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events
              WHERE kind = ?1 AND (?2 IS NULL OR seq <= ?2)
-             ORDER BY seq ASC",
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let mut rows = reg_stmt
+             ORDER BY seq ASC"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt
         .query(rusqlite::params![Kind::TrackCreated as u32, max_seq])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
+        .map_err(sql_err)?;
     let mut events = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? {
-        let seq: u64 = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
-        let ts_ns: u64 = row.get(1).map_err(|e| io::Error::other(e.to_string()))?;
-        let kind_int: u32 = row.get(2).map_err(|e| io::Error::other(e.to_string()))?;
-        let track_key: String = row.get(3).map_err(|e| io::Error::other(e.to_string()))?;
-        let cause_seq: Option<u64> = row.get(4).map_err(|e| io::Error::other(e.to_string()))?;
-        let agent: Option<String> = row.get(5).map_err(|e| io::Error::other(e.to_string()))?;
-        let body_bytes: Vec<u8> = row.get(6).map_err(|e| io::Error::other(e.to_string()))?;
-
-        let kind = Kind::ALL
-            .get(kind_int as usize)
-            .copied()
-            .unwrap_or(Kind::Daemon);
-
-        let body = tacho::Event::decode(&body_bytes[..]).unwrap_or(tacho::Event { body: None });
-        let ev = Event::new(seq, ts_ns, kind, track_key, cause_seq, agent, body);
-        events.push(ev);
+    while let Some(row) = rows.next().map_err(sql_err)? {
+        events.push(event_from_row(row)?);
     }
-
-    let rec = Recorder::restore(events.iter());
-    let mut reg = rec.registry().clone();
+    let mut reg = Recorder::restore(events.iter()).registry().clone();
 
     let mut summary_stmt = conn
         .prepare(
@@ -901,37 +291,71 @@ pub fn build_registry_from_conn_up_to(
              FROM events
              WHERE (?1 IS NULL OR seq <= ?1)",
         )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
+        .map_err(sql_err)?;
     let mut summary_rows = summary_stmt
         .query(rusqlite::params![max_seq])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
+        .map_err(sql_err)?;
     let mut summaries = Vec::new();
-    while let Some(row) = summary_rows
-        .next()
-        .map_err(|e| io::Error::other(e.to_string()))?
-    {
-        let kind_int: u32 = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
-        let track_key: String = row.get(1).map_err(|e| io::Error::other(e.to_string()))?;
-        let counter_val: Option<i64> = row.get(2).map_err(|e| io::Error::other(e.to_string()))?;
-        let custom_name: Option<String> =
-            row.get(3).map_err(|e| io::Error::other(e.to_string()))?;
-        let kind = Kind::ALL
-            .get(kind_int as usize)
-            .copied()
-            .unwrap_or(Kind::Daemon);
-        summaries.push((kind, track_key, counter_val, custom_name));
+    while let Some(row) = summary_rows.next().map_err(sql_err)? {
+        summaries.push((
+            kind_of(row.get(0).map_err(sql_err)?),
+            row.get(1).map_err(sql_err)?,
+            row.get(2).map_err(sql_err)?,
+            row.get(3).map_err(sql_err)?,
+        ));
     }
-
     finalize_snapshot_registry(&mut reg, &summaries);
-
     Ok(reg)
 }
 
 /// Rebuilds the `TrackRegistry` by folding all persisted `TrackCreated` rows from the event log.
 pub fn build_registry_from_conn(conn: &Connection) -> io::Result<TrackRegistry> {
     build_registry_from_conn_up_to(conn, None)
+}
+
+fn max_seq_until(conn: &Connection, until: Option<u64>) -> io::Result<Option<u64>> {
+    conn.query_row(
+        "SELECT MAX(seq) FROM events WHERE (?1 IS NULL OR ts_ns <= ?1)",
+        rusqlite::params![until],
+        |r| r.get(0),
+    )
+    .map_err(sql_err)
+}
+
+/// Flow origins (`cause_seq * 256 + ordinal`) for every causal row up to `max_seq`, so a
+/// windowed snapshot still links effects to causes that precede the window.
+fn collect_flow_origins(conn: &Connection, max_seq: u64) -> io::Result<HashMap<u64, Vec<u64>>> {
+    let mut origin_flows: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, cause_seq, body
+             FROM events
+             WHERE (cause_seq IS NOT NULL OR kind = ?1) AND seq <= ?2
+             ORDER BY seq ASC",
+        )
+        .map_err(sql_err)?;
+    let mut rows = stmt
+        .query(rusqlite::params![Kind::Run as u32, max_seq])
+        .map_err(sql_err)?;
+    while let Some(row) = rows.next().map_err(sql_err)? {
+        let kind = kind_of(row.get(0).map_err(sql_err)?);
+        let cause_seq: Option<u64> = row.get(1).map_err(sql_err)?;
+        let parent_run_seq = if kind == Kind::Run {
+            let body: &[u8] = row
+                .get_ref(2)
+                .map_err(sql_err)?
+                .as_bytes()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            tacho::Event::decode(body).ok().and_then(|b| match b.body {
+                Some(tacho::event::Body::Run(r)) => r.parent_run_seq,
+                _ => None,
+            })
+        } else {
+            None
+        };
+        Recorder::record_flow_origin(kind, cause_seq, parent_run_seq, &mut origin_flows);
+    }
+    Ok(origin_flows)
 }
 
 /// Writes a complete flight recorder snapshot to `w`, streaming rows directly from SQLite.
@@ -941,186 +365,55 @@ pub fn write_snapshot_conn(
     until: Option<u64>,
     w: &mut impl Write,
 ) -> io::Result<SnapshotStats> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let max_seq: Option<u64> = tx
-        .query_row(
-            "SELECT MAX(seq) FROM events WHERE (?1 IS NULL OR ts_ns <= ?1)",
-            rusqlite::params![until],
-            |r| r.get(0),
-        )
-        .unwrap_or(None);
-
-    let max_seq = match max_seq {
-        Some(s) => s,
-        None => {
-            let registry = TrackRegistry::new();
-            let (now_ns, boottime_ns) = match until {
-                Some(u) => (u, None),
-                None => (
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64,
-                    get_boottime_ns(),
-                ),
-            };
-            let mut writer = io::BufWriter::with_capacity(8192, w);
-            let mut header_bytes = Vec::with_capacity(8192);
-            encode_snapshot_header(&registry, now_ns, boottime_ns, &mut header_bytes);
-            writer.write_all(&header_bytes)?;
-            writer.flush()?;
-            return Ok(SnapshotStats {
-                bytes: header_bytes.len() as u64,
-                events: 0,
-            });
-        }
+    // One read transaction: every query below sees the same WAL snapshot.
+    let tx = conn.unchecked_transaction().map_err(sql_err)?;
+    let Some(max_seq) = max_seq_until(&tx, until)? else {
+        let mut writer = io::BufWriter::with_capacity(8192, w);
+        return write_empty_snapshot(until, &mut writer);
     };
 
     let registry = build_registry_from_conn_up_to(&tx, Some(max_seq))?;
-
-    let (now_ns, boottime_ns) = match until {
-        Some(u) => (u, None),
-        None => (
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
-            get_boottime_ns(),
-        ),
-    };
+    let origin_flows = collect_flow_origins(&tx, max_seq)?;
 
     let mut writer = io::BufWriter::with_capacity(65536, w);
-
-    // 1-4. Snapshot Header
-    let mut header_bytes = Vec::with_capacity(8192);
-    encode_snapshot_header(&registry, now_ns, boottime_ns, &mut header_bytes);
-    writer.write_all(&header_bytes)?;
-    let mut total_bytes = header_bytes.len() as u64;
-
-    // Pre-collect flow origins (cause_seq * 256 + ordinal) up to max_seq
-    let mut origin_flows: HashMap<u64, Vec<u64>> = HashMap::new();
-    {
-        let mut flow_stmt = tx
-            .prepare(
-                "SELECT kind, cause_seq, body
-                 FROM events
-                 WHERE (cause_seq IS NOT NULL OR kind = ?1) AND seq <= ?2
-                 ORDER BY seq ASC",
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut flow_rows = flow_stmt
-            .query(rusqlite::params![Kind::Run as u32, max_seq])
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        while let Some(row) = flow_rows
-            .next()
-            .map_err(|e| io::Error::other(e.to_string()))?
-        {
-            let kind_int: u32 = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
-            let cause_seq: Option<u64> = row.get(1).map_err(|e| io::Error::other(e.to_string()))?;
-            let kind = Kind::ALL
-                .get(kind_int as usize)
-                .copied()
-                .unwrap_or(Kind::Daemon);
-            let parent_run_seq = if kind == Kind::Run {
-                let slice: &[u8] = row
-                    .get_ref(2)
-                    .map_err(|e| io::Error::other(e.to_string()))?
-                    .as_bytes()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                tacho::Event::decode(slice).ok().and_then(|b| match b.body {
-                    Some(tacho::event::Body::Run(r)) => r.parent_run_seq,
-                    _ => None,
-                })
-            } else {
-                None
-            };
-            Recorder::record_flow_origin(kind, cause_seq, parent_run_seq, &mut origin_flows);
-        }
-    }
-
-    // 5. Query events ordered by seq ASC (streaming, O(1) memory)
-    let mut stmt = tx
-        .prepare(
-            "SELECT seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name
-             FROM events
-             WHERE (?1 IS NULL OR ts_ns >= ?1) AND (?2 IS NULL OR ts_ns <= ?2) AND seq <= ?3
-             ORDER BY seq ASC",
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let mut rows = stmt
-        .query(rusqlite::params![since, until, max_seq])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let mut encoder = Encoder::new();
-    let mut packet_buf = Vec::with_capacity(2048);
-    let mut events_count = 0u64;
+    let header = encode_header(&registry, until);
+    writer.write_all(&header)?;
+    let mut sink = Sink::new(&registry, &mut writer, header.len() as u64);
     let mut projector = SnapshotProjector::default();
 
-    while let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? {
-        let seq: u64 = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
-        let ts_ns: u64 = row.get(1).map_err(|e| io::Error::other(e.to_string()))?;
-        let kind_int: u32 = row.get(2).map_err(|e| io::Error::other(e.to_string()))?;
-        let track_key: String = row.get(3).map_err(|e| io::Error::other(e.to_string()))?;
-        let cause_seq: Option<u64> = row.get(4).map_err(|e| io::Error::other(e.to_string()))?;
-        let agent: Option<String> = row.get(5).map_err(|e| io::Error::other(e.to_string()))?;
-
-        let slice: &[u8] = row
-            .get_ref(6)
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .as_bytes()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let counter_val: Option<i64> = row.get(7).map_err(|e| io::Error::other(e.to_string()))?;
-        let custom_name: Option<String> =
-            row.get(8).map_err(|e| io::Error::other(e.to_string()))?;
-
-        let kind = Kind::ALL
-            .get(kind_int as usize)
-            .copied()
-            .unwrap_or(Kind::Daemon);
-
-        let body = tacho::Event::decode(slice).unwrap_or(tacho::Event { body: None });
-
-        let mut ev = Event::new(seq, ts_ns, kind, track_key, cause_seq, agent, body);
-
-        if let Some(c) = counter_val {
-            ev = ev.with_counter(c);
-        }
-        if let Some(cn) = custom_name {
-            ev = ev.with_custom_name(cn);
-        }
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events
+             WHERE (?1 IS NULL OR ts_ns >= ?1) AND (?2 IS NULL OR ts_ns <= ?2) AND seq <= ?3
+             ORDER BY seq ASC"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt
+        .query(rusqlite::params![since, until, max_seq])
+        .map_err(sql_err)?;
+    while let Some(row) = rows.next().map_err(sql_err)? {
+        let mut ev = event_from_row(row)?;
         Recorder::populate_event_flows(&mut ev, &origin_flows);
-
-        projector.process_event(
-            ev,
-            true,
-            &mut encoder,
-            &registry,
-            &mut packet_buf,
-            &mut writer,
-            &mut total_bytes,
-            &mut events_count,
-        )?;
+        projector.process_event(ev, true, &mut sink)?;
     }
-
-    projector.finish(
-        &mut encoder,
-        &registry,
-        &mut packet_buf,
-        &mut writer,
-        &mut total_bytes,
-    )?;
-
-    writer.flush()?;
-
+    projector.finish(&mut sink)?;
+    sink.flush()?;
     Ok(SnapshotStats {
-        bytes: total_bytes,
-        events: events_count,
+        bytes: sink.bytes,
+        events: projector.events,
     })
+}
+
+fn open_read_only(db_path: &Path) -> io::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| io::Error::other(format!("failed to open sqlite db {:?}: {}", db_path, e)))?;
+    // Best effort: a busy writer checkpointing should delay us briefly, not fail the snapshot.
+    let _ = conn.pragma_update(None, "busy_timeout", 5000);
+    let _ = conn.pragma_update(None, "query_only", true);
+    Ok(conn)
 }
 
 /// Writes a complete flight recorder snapshot directly from `$TACHO_HOME/events.sqlite`.
@@ -1133,41 +426,59 @@ pub fn write_snapshot(
     w: &mut impl Write,
 ) -> io::Result<SnapshotStats> {
     if !db_path.exists() {
-        let registry = TrackRegistry::new();
-        let (now_ns, boottime_ns) = match until {
-            Some(u) => (u, None),
-            None => (
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64,
-                get_boottime_ns(),
-            ),
-        };
-        let mut header_bytes = Vec::with_capacity(8192);
-        encode_snapshot_header(&registry, now_ns, boottime_ns, &mut header_bytes);
-        w.write_all(&header_bytes)?;
-        w.flush()?;
-        return Ok(SnapshotStats {
-            bytes: header_bytes.len() as u64,
-            events: 0,
-        });
+        return write_empty_snapshot(until, w);
     }
+    write_snapshot_conn(&open_read_only(db_path)?, since, until, w)
+}
 
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| io::Error::other(format!("failed to open sqlite db {:?}: {}", db_path, e)))?;
+/// Writes `bytes` to `dest` atomically: a crash leaves either the old file or the new one,
+/// never a truncated mix. The data is fsynced before the rename makes it visible.
+pub fn write_file_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with(dest, |f| f.write_all(bytes))
+}
 
-    let _ = conn.pragma_update(None, "busy_timeout", 5000);
-    let _ = conn.pragma_update(None, "query_only", true);
+/// Writes a full snapshot of `db_path` to `dest` atomically (see [`write_file_atomic`]).
+pub fn write_snapshot_file_atomic(db_path: &Path, dest: &Path) -> io::Result<SnapshotStats> {
+    let mut stats = SnapshotStats::default();
+    write_atomic_with(dest, |f| {
+        stats = write_snapshot(db_path, None, None, f)?;
+        Ok(())
+    })?;
+    Ok(stats)
+}
 
-    write_snapshot_conn(&conn, since, until, w)
+fn write_atomic_with(
+    dest: &Path,
+    fill: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dest.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+    })?;
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        fill(&mut f)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, dest)?;
+        // Persist the rename itself.
+        std::fs::File::open(dir).and_then(|d| d.sync_all())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Rebuilds a Perfetto trace from the durable SQLite event log by restoring a fresh
 /// `Recorder` state machine from the persisted events and encoding through `Encoder`.
+///
+/// Unlike [`write_snapshot`] this loads every event into memory; it exists to verify that
+/// the streaming path and a from-scratch replay agree.
 pub fn rebuild_from_log(
     db_path: &Path,
     since: Option<u64>,
@@ -1177,71 +488,25 @@ pub fn rebuild_from_log(
     if !db_path.exists() {
         return write_snapshot(db_path, since, until, w);
     }
-
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| io::Error::other(format!("failed to open sqlite db {:?}: {}", db_path, e)))?;
-    let _ = conn.pragma_update(None, "busy_timeout", 5000);
-    let _ = conn.pragma_update(None, "query_only", true);
-
-    let max_seq: Option<u64> = conn
-        .query_row(
-            "SELECT MAX(seq) FROM events WHERE (?1 IS NULL OR ts_ns <= ?1)",
-            rusqlite::params![until],
-            |r| r.get(0),
-        )
-        .unwrap_or(None);
-
-    let Some(max_seq) = max_seq else {
-        return write_snapshot_conn(&conn, since, until, w);
+    let conn = open_read_only(db_path)?;
+    let tx = conn.unchecked_transaction().map_err(sql_err)?;
+    let Some(max_seq) = max_seq_until(&tx, until)? else {
+        return write_empty_snapshot(until, w);
     };
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name
-             FROM events
-             WHERE seq <= ?1
-             ORDER BY seq ASC",
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let mut rows = stmt
-        .query(rusqlite::params![max_seq])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE seq <= ?1 ORDER BY seq ASC"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt.query(rusqlite::params![max_seq]).map_err(sql_err)?;
     let mut all_events = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? {
-        let seq: u64 = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
-        let ts_ns: u64 = row.get(1).map_err(|e| io::Error::other(e.to_string()))?;
-        let kind_int: u32 = row.get(2).map_err(|e| io::Error::other(e.to_string()))?;
-        let track_key: String = row.get(3).map_err(|e| io::Error::other(e.to_string()))?;
-        let cause_seq: Option<u64> = row.get(4).map_err(|e| io::Error::other(e.to_string()))?;
-        let agent: Option<String> = row.get(5).map_err(|e| io::Error::other(e.to_string()))?;
-        let body_bytes: Vec<u8> = row.get(6).map_err(|e| io::Error::other(e.to_string()))?;
-        let counter_val: Option<i64> = row.get(7).map_err(|e| io::Error::other(e.to_string()))?;
-        let custom_name: Option<String> =
-            row.get(8).map_err(|e| io::Error::other(e.to_string()))?;
-
-        let kind = Kind::ALL
-            .get(kind_int as usize)
-            .copied()
-            .unwrap_or(Kind::Daemon);
-        let body = tacho::Event::decode(&body_bytes[..]).unwrap_or(tacho::Event { body: None });
-        let mut ev = Event::new(seq, ts_ns, kind, track_key, cause_seq, agent, body);
-        if let Some(c) = counter_val {
-            ev = ev.with_counter(c);
-        }
-        if let Some(cn) = custom_name {
-            ev = ev.with_custom_name(cn);
-        }
-        all_events.push(ev);
+    while let Some(row) = rows.next().map_err(sql_err)? {
+        all_events.push(event_from_row(row)?);
     }
 
     Recorder::populate_flows(&mut all_events);
-    let rec = Recorder::restore(all_events.iter());
-    let mut registry = rec.registry().clone();
+    let mut registry = Recorder::restore(all_events.iter()).registry().clone();
     let summaries: Vec<EventTrackSummary> = all_events
         .iter()
         .map(|ev| {
@@ -1255,54 +520,20 @@ pub fn rebuild_from_log(
         .collect();
     finalize_snapshot_registry(&mut registry, &summaries);
 
-    let (now_ns, boottime_ns) = match until {
-        Some(u) => (u, None),
-        None => (
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
-            get_boottime_ns(),
-        ),
-    };
-
     let mut writer = io::BufWriter::with_capacity(65536, w);
-    let mut header_bytes = Vec::with_capacity(8192);
-    encode_snapshot_header(&registry, now_ns, boottime_ns, &mut header_bytes);
-    writer.write_all(&header_bytes)?;
-    let mut total_bytes = header_bytes.len() as u64;
-
-    let mut encoder = Encoder::new();
-    let mut packet_buf = Vec::with_capacity(2048);
-    let mut events_count = 0u64;
+    let header = encode_header(&registry, until);
+    writer.write_all(&header)?;
+    let mut sink = Sink::new(&registry, &mut writer, header.len() as u64);
     let mut projector = SnapshotProjector::default();
-
     for ev in all_events {
         let in_window = since.is_none_or(|s| ev.ts_ns >= s) && until.is_none_or(|u| ev.ts_ns <= u);
-        projector.process_event(
-            ev,
-            in_window,
-            &mut encoder,
-            &registry,
-            &mut packet_buf,
-            &mut writer,
-            &mut total_bytes,
-            &mut events_count,
-        )?;
+        projector.process_event(ev, in_window, &mut sink)?;
     }
-
-    projector.finish(
-        &mut encoder,
-        &registry,
-        &mut packet_buf,
-        &mut writer,
-        &mut total_bytes,
-    )?;
-
-    writer.flush()?;
+    projector.finish(&mut sink)?;
+    sink.flush()?;
     Ok(SnapshotStats {
-        bytes: total_bytes,
-        events: events_count,
+        bytes: sink.bytes,
+        events: projector.events,
     })
 }
 
@@ -1366,188 +597,4 @@ pub fn extract_framed_packet_timestamp(buf: &[u8]) -> Option<(u64, usize)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::log::EventLog;
-    use tacho_core::{Event, Kind};
-    use tacho_proto::tacho;
-
-    #[test]
-    fn test_extract_packet_timestamp() {
-        let registry = TrackRegistry::new();
-        let mut encoder = Encoder::new();
-        let mut out = Vec::new();
-
-        let ev = Event::new(
-            1,
-            123456789,
-            Kind::Run,
-            "agent:1/run:1",
-            None,
-            None,
-            tacho::Event { body: None },
-        );
-        encoder.encode_event(&ev, &registry, &mut out);
-
-        let (ts, total_len) = extract_framed_packet_timestamp(&out).unwrap();
-        assert_eq!(ts, 123456789);
-        assert_eq!(total_len, out.len());
-    }
-
-    #[test]
-    fn test_write_snapshot_streaming() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("events.sqlite");
-        let mut log = EventLog::open(&db_path).unwrap();
-
-        let ev = Event::new(
-            1,
-            1_000_000,
-            Kind::Daemon,
-            "daemon",
-            None,
-            None,
-            tacho::Event { body: None },
-        );
-        log.insert_batch(&[ev]).unwrap();
-
-        let mut output = Vec::new();
-        let stats = write_snapshot(&db_path, None, None, &mut output).unwrap();
-
-        assert_eq!(stats.events, 1);
-        assert!(stats.bytes > 0);
-        assert!(!output.is_empty());
-    }
-
-    #[test]
-    fn test_write_snapshot_and_rebuild_from_log_byte_identical() {
-        use tacho_core::{Input, MessageDirection, SessionKey, TaskStatus, ToolInput};
-
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("events.sqlite");
-        let mut log = EventLog::open(&db_path).unwrap();
-
-        let mut rec = Recorder::new();
-        let mut events = Vec::new();
-        let t0 = 1_000_000_000u64;
-        let sess = SessionKey::new("claude", "sess-rebuild");
-
-        rec.apply(
-            Input::Task {
-                source_ts_ns: Some(t0),
-                slug: "rebuild-task".into(),
-                brief_digest: None,
-                brief_bytes: Some(128),
-                paths: vec!["src/main.rs".into()],
-                agent: Some("worker-1".into()),
-                base_commit: None,
-                token_budget: None,
-                cost_budget_micros: None,
-            },
-            t0,
-            &mut events,
-        );
-        rec.apply(
-            Input::RunStart {
-                source_ts_ns: Some(t0 + 100),
-                provider: "claude".into(),
-                session_id: "sess-rebuild".into(),
-                agent: Some("worker-1".into()),
-                task: Some("rebuild-task".into()),
-                pid: Some(1234),
-                cwd: Some("/workspace".into()),
-                model: Some("claude-sonnet-4-6".into()),
-                parent_session: None,
-                git_tree: None,
-                role: None,
-            },
-            t0 + 100,
-            &mut events,
-        );
-        rec.apply(
-            Input::Prompt {
-                source_ts_ns: Some(t0 + 200),
-                session: sess.clone(),
-                text_len: 50,
-                digest: None,
-            },
-            t0 + 200,
-            &mut events,
-        );
-        rec.apply(
-            Input::ToolBegin {
-                source_ts_ns: Some(t0 + 300),
-                session: sess.clone(),
-                tool_use_id: "t1".into(),
-                tool_name: "Bash".into(),
-                input: ToolInput::Shell {
-                    argv: "cargo test".into(),
-                    cwd: None,
-                    git_tree: None,
-                },
-            },
-            t0 + 300,
-            &mut events,
-        );
-        rec.apply(
-            Input::ToolEnd {
-                source_ts_ns: Some(t0 + 400),
-                session: sess.clone(),
-                tool_use_id: "t1".into(),
-                error: false,
-                result_bytes: Some(42),
-                exit_code: Some(0),
-            },
-            t0 + 400,
-            &mut events,
-        );
-        rec.apply(
-            Input::Message {
-                source_ts_ns: Some(t0 + 500),
-                from: "orch".into(),
-                to: "worker-1".into(),
-                id: Some("m-1".into()),
-                bytes: Some(16),
-                dir: Some(MessageDirection::Sent),
-            },
-            t0 + 500,
-            &mut events,
-        );
-        rec.apply(
-            Input::Message {
-                source_ts_ns: Some(t0 + 600),
-                from: "orch".into(),
-                to: "worker-1".into(),
-                id: Some("m-1".into()),
-                bytes: Some(16),
-                dir: Some(MessageDirection::Delivered),
-            },
-            t0 + 600,
-            &mut events,
-        );
-        rec.apply(
-            Input::TaskState {
-                source_ts_ns: Some(t0 + 700),
-                slug: "rebuild-task".into(),
-                state: TaskStatus::Done,
-                because: Some("all green".into()),
-            },
-            t0 + 700,
-            &mut events,
-        );
-
-        log.insert_batch(&events).unwrap();
-
-        let until = Some(t0 + 1_000);
-        let mut snap_bytes = Vec::new();
-        let mut rebuild_bytes = Vec::new();
-        let s1 = write_snapshot(&db_path, None, until, &mut snap_bytes).unwrap();
-        let s2 = rebuild_from_log(&db_path, None, until, &mut rebuild_bytes).unwrap();
-
-        assert_eq!(s1, s2);
-        assert_eq!(
-            snap_bytes, rebuild_bytes,
-            "write_snapshot and rebuild_from_log must be byte-for-byte identical at the same until"
-        );
-    }
-}
+mod tests;

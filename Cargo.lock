@@ -1139,10 +1139,12 @@ name = "tacho-e2e"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "prost",
  "rusqlite",
  "serde",
  "serde_json",
  "tacho-core",
+ "tacho-proto",
  "tacho-system",
  "tempfile",
 ]

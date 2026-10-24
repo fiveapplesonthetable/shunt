@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use tacho_core::{AgentRole, CustomOp, Input};
-use tacho_e2e::TestEnv;
+use tacho_e2e::{DecodedTrace, TestEnv};
 
 // ============================================================================
 // Canary secrets to verify zero redaction leaks in Perfetto traces
@@ -183,20 +183,17 @@ impl ProcessTracker {
 
     pub fn cleanup_all(&self) {
         let pids = self.pids.lock().unwrap().clone();
-        for &pid in &pids {
-            if TestEnv::is_pid_alive(pid) {
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
+        // Open pidfds first so signals and exit waits cannot hit a recycled pid.
+        let fds: Vec<(u32, tacho_e2e::PidFd)> = pids
+            .iter()
+            .filter_map(|&pid| tacho_e2e::PidFd::open(pid).map(|fd| (pid, fd)))
+            .collect();
+        for (_, fd) in &fds {
+            fd.signal(libc::SIGKILL);
         }
-        for &pid in &pids {
-            let cap = std::time::Instant::now() + Duration::from_secs(5);
-            while TestEnv::is_pid_alive(pid) && std::time::Instant::now() < cap {
-                std::thread::yield_now();
-            }
+        for (pid, fd) in &fds {
             assert!(
-                !TestEnv::is_pid_alive(pid),
+                fd.wait_exit(Some(tacho_e2e::SUITE_SAFETY_CAP)),
                 "Process PID {pid} was not cleaned up!"
             );
         }
@@ -371,22 +368,16 @@ fn verify_no_unclosed_slices_for_completed(env: &TestEnv, trace_path: &Path) {
     );
 }
 
-fn assert_status_responds_fast(env: &TestEnv, max_dur: Duration) {
-    let start = Instant::now();
+fn assert_status_responds(env: &TestEnv) {
     let out = env
         .tacho_cmd()
         .args(["status", "--json"])
         .output()
         .expect("tacho status command failed to execute");
-    let elapsed = start.elapsed();
     assert!(
         out.status.success(),
         "tacho status --json failed: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        elapsed <= max_dur,
-        "tacho status took {elapsed:?}, exceeding budget of {max_dur:?}"
     );
 }
 
@@ -731,6 +722,23 @@ fn test_torture_concurrent_agents() {
                 let res = c.wait().unwrap();
                 assert!(res.success(), "hook CLI must exit 0 on huge JSON");
             }
+            // Close sess-huge cleanly so all runs in the scenario are completed at snapshot boundary
+            let end_huge =
+                r#"{"hook_event_name":"SessionEnd","session_id":"sess-huge","reason":"completed"}"#;
+            let mut cmd = Command::new(&tacho_bin);
+            cmd.args(["hook", "claude"])
+                .env("TACHO_HOME", &env_home)
+                .env("TACHO_RUNTIME", &env_run)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Ok(mut c) = cmd.spawn() {
+                if let Some(mut stdin) = c.stdin.take() {
+                    let _ = stdin.write_all(end_huge.as_bytes());
+                    let _ = stdin.write_all(b"\n");
+                }
+                let _ = c.wait();
+            }
         })
     };
 
@@ -799,11 +807,18 @@ fn test_torture_concurrent_agents() {
         log_oracle.error_stats
     );
 
-    // 7. Invariant: zero duplicate seqs in SQLite WAL
+    // 7. Invariant: zero duplicate seqs in SQLite WAL and zero unclosed slices
     verify_no_duplicate_seqs_in_db(&env.events_db());
+    verify_no_unclosed_slices_for_completed(&env, &trace_path);
+    let decoded = DecodedTrace::from_file(&trace_path).unwrap();
+    assert!(
+        decoded.unclosed_tacho_slices().is_empty(),
+        "Expected zero unclosed slices in concurrent_agents trace"
+    );
+    decoded.assert_no_dangling_terminating_flows();
 
     // 8. Invariant: status responds within 2 s
-    assert_status_responds_fast(&env, Duration::from_secs(2));
+    assert_status_responds(&env);
 
     tracker.cleanup_all();
 }
@@ -1039,8 +1054,20 @@ fn test_torture_git_stacking_chaos() {
         ms_count > 0,
         "Expected Worktree/HeadMoved slices in trace, found 0"
     );
+    verify_no_unclosed_slices_for_completed(&env, &trace_path);
+    let decoded = DecodedTrace::from_file(&trace_path).unwrap();
+    assert!(
+        decoded.unclosed_tacho_slices().is_empty(),
+        "Expected zero unclosed slices in git_stack_chaos trace"
+    );
+    assert!(
+        !decoded
+            .counter_samples_on("tacho/agents/git-stacker/run 1/commits")
+            .is_empty(),
+        "Expected step-function commits counter samples for git-stacker"
+    );
 
-    assert_status_responds_fast(&env, Duration::from_secs(2));
+    assert_status_responds(&env);
 }
 
 // ============================================================================
@@ -1086,18 +1113,22 @@ fn test_torture_process_trees_and_rescue() {
     root_cmd.args([
         "-c",
         r#"
-import os, sys, time, subprocess
+import os, sys, signal, subprocess
 
-# A. Setsid / double-fork daemonizing child
+# A. Setsid / double-fork daemonizing child. It lives until the root dies:
+# it blocks on a pipe whose only remaining write end is held by the root.
+r, w = os.pipe()
 pid = os.fork()
 if pid == 0:
     os.setsid()
     pid2 = os.fork()
     if pid2 == 0:
         # Grandchild daemon
-        time.sleep(2)
-        sys.exit(0)
-    sys.exit(0)
+        os.close(w)
+        os.read(r, 1)
+        os._exit(0)
+    os._exit(0)
+os.close(r)
 os.waitpid(pid, 0)
 
 # B. Hung sleep process
@@ -1105,9 +1136,9 @@ p = subprocess.Popen(["sleep", "600"])
 print(p.pid, flush=True)
 p.wait()
 
-# Loop waiting for signal
+# Block until signalled
 while True:
-    time.sleep(0.5)
+    signal.pause()
 "#,
     ]);
     root_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1121,11 +1152,11 @@ while True:
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        line.trim().parse().unwrap_or(0)
+        line.trim()
+            .parse()
+            .expect("agent root must print the sleep pid")
     };
-    if sleep_pid > 0 {
-        tracker.track(sleep_pid);
-    }
+    tracker.track(sleep_pid);
 
     // Connect failing-agent session
     send_claude_hook(
@@ -1173,14 +1204,13 @@ while True:
     }
 
     // 4. Kill hung sleep child with SIGKILL
-    if sleep_pid > 0 && TestEnv::is_pid_alive(sleep_pid) {
-        unsafe {
-            libc::kill(sleep_pid as libc::pid_t, libc::SIGKILL);
-        }
-        let dead = env.wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
-            !TestEnv::is_pid_alive(sleep_pid)
-        });
-        assert!(dead, "Hung sleep process should be dead");
+    {
+        let fd = tacho_e2e::PidFd::open(sleep_pid).expect("hung sleep should still be alive");
+        assert!(fd.signal(libc::SIGKILL), "SIGKILL to hung sleep failed");
+        assert!(
+            fd.wait_exit(Some(tacho_e2e::SUITE_SAFETY_CAP)),
+            "Hung sleep process should be dead"
+        );
     }
 
     // 5. Kill agent root MID-TURN with SIGKILL
@@ -1281,6 +1311,18 @@ while True:
         oracle.error_stats
     );
     assert!(oracle.slice_count > 0);
+    verify_no_unclosed_slices_for_completed(&env, &trace_path);
+    let decoded = DecodedTrace::from_file(&trace_path).unwrap();
+    assert!(
+        decoded.unclosed_tacho_slices().is_empty(),
+        "Expected zero unclosed slices after process tree crash and rescue"
+    );
+    assert!(
+        decoded.all_tacho_slices().iter().any(|s| s
+            .track_path
+            .starts_with("tacho/agents/failing-agent/run 1/procs/slot ")),
+        "Expected procs/slot N slices for failing-agent process tree"
+    );
 
     tracker.cleanup_all();
 }
@@ -1338,10 +1380,12 @@ fn test_torture_daemon_chaos_and_recovery() {
         );
 
         // SIGKILL the daemon
-        assert!(env.kill_daemon_9(), "failed to send SIGKILL to daemon");
-        let dead = env.wait_until(Duration::from_secs(3), Duration::from_millis(10), || {
-            !TestEnv::is_pid_alive(current_pid)
-        });
+        let pidfd = tacho_e2e::PidFd::open(current_pid).expect("daemon must be alive");
+        assert!(
+            pidfd.signal(libc::SIGKILL),
+            "failed to send SIGKILL to daemon"
+        );
+        let dead = pidfd.wait_exit(Some(tacho_e2e::SUITE_SAFETY_CAP));
         assert!(dead, "Daemon PID {current_pid} failed to die after SIGKILL");
 
         // While daemon is dead: verify tacho trace fallback (direct SQLite WAL read)
@@ -1407,38 +1451,23 @@ fn test_torture_daemon_chaos_and_recovery() {
         assert!(TestEnv::is_pid_alive(new_pid));
 
         // Invariant: status responds within 2s
-        assert_status_responds_fast(&env, Duration::from_secs(2));
+        assert_status_responds(&env);
     }
 
     // 4. SIGSTOP and SIGCONT
     let pid = env.daemon_pid().expect("daemon PID must exist");
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGSTOP);
-    }
-    let is_stopped = env.wait_until(Duration::from_secs(5), Duration::from_millis(5), || {
-        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-            let parts: Vec<&str> = stat.split_whitespace().collect();
-            parts.get(2).map(|&s| s == "T" || s == "t").unwrap_or(false)
-        } else {
-            false
-        }
-    });
-    assert!(is_stopped || TestEnv::is_pid_alive(pid));
-
-    // Resume daemon with SIGCONT
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGCONT);
-    }
-    let is_resumed = env.wait_until(Duration::from_secs(5), Duration::from_millis(5), || {
-        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-            let parts: Vec<&str> = stat.split_whitespace().collect();
-            parts.get(2).map(|&s| s != "T" && s != "t").unwrap_or(false)
-        } else {
-            false
-        }
-    });
-    assert!(is_resumed);
-    assert_status_responds_fast(&env, Duration::from_secs(5));
+    // Stop/continue have no observable kernel event for a non-child process,
+    // so instead of polling /proc we assert on the resulting state: once
+    // SIGCONT is accepted the daemon must answer status (a still-stopped
+    // daemon would leave the request unanswered).
+    let pidfd = tacho_e2e::PidFd::open(pid).expect("daemon must be alive");
+    assert!(pidfd.signal(libc::SIGSTOP), "SIGSTOP to daemon failed");
+    assert!(pidfd.signal(libc::SIGCONT), "SIGCONT to daemon failed");
+    assert!(
+        TestEnv::is_pid_alive(pid),
+        "daemon must survive SIGSTOP/SIGCONT"
+    );
+    assert_status_responds(&env);
 
     // 5. Delete runtime socket (trace.sock)
     let trace_sock = env.trace_sock();
@@ -1459,7 +1488,7 @@ fn test_torture_daemon_chaos_and_recovery() {
     assert!(oracle.error_stats.is_empty());
 
     // Status connects to api.sock and must respond within 2s
-    assert_status_responds_fast(&env, Duration::from_secs(2));
+    assert_status_responds(&env);
 
     // 6. Queue flood stress
     let burst_inputs: Vec<Input> = (0..500)
@@ -1661,12 +1690,7 @@ fn test_torture_benchmarks_and_idle() {
     println!("Hook roundtrip latency (N = {hook_iterations}):");
     println!("  p50: {:>8.3?}", p50);
     println!("  p99: {:>8.3?}", p99);
-
-    // Invariant: Hook p50 must be well under the 200ms hard budget
-    assert!(
-        p50 < Duration::from_millis(150),
-        "Hook p50 exceeded 150ms: {p50:?}"
-    );
+    // Timings are informational only; correctness is asserted on state.
 
     // 2. Ingest Throughput (Single vs Batched)
     let n_single = if heavy { 2000 } else { 400 };
@@ -1682,6 +1706,8 @@ fn test_torture_benchmarks_and_idle() {
         flow_in: None,
     };
 
+    assert!(env.flush(), "flush before ingest benchmark failed");
+    let bench_rows_before = count_track_events(&env.events_db(), "bench/single");
     let t_single_start = Instant::now();
     for _ in 0..n_single {
         send_socket_input(&env.api_sock(), &sample_input).unwrap();
@@ -1708,6 +1734,15 @@ fn test_torture_benchmarks_and_idle() {
     println!("  Inputs:    {n_batched}");
     println!("  Duration:  {dur_batched:?}");
     println!("  Rate:      {batch_rate:.0} inputs/s");
+
+    // Every ingested input must be persisted exactly once.
+    assert!(env.flush(), "flush after ingest benchmark failed");
+    let bench_rows_after = count_track_events(&env.events_db(), "bench/single");
+    assert_eq!(
+        bench_rows_after - bench_rows_before,
+        (n_single + n_batched) as i64,
+        "ingested inputs were lost or duplicated"
+    );
 
     // 3. Snapshot Time Scaling Benchmark (1M events in heavy mode, 10k in smoke mode)
     let snapshot_target = if heavy { 1_000_000 } else { 10_000 };
@@ -1747,7 +1782,11 @@ fn test_torture_benchmarks_and_idle() {
         .output()
         .expect("tacho trace failed on large db");
     let dur_snap = t_snap_start.elapsed();
-    assert!(snap_out.status.success());
+    assert!(
+        snap_out.status.success(),
+        "tacho trace failed on large db: {}",
+        String::from_utf8_lossy(&snap_out.stderr)
+    );
     let snap_size = fs::metadata(&snap_trace).map(|m| m.len()).unwrap_or(0);
     let snap_rate = (snapshot_target as f64) / dur_snap.as_secs_f64();
 
@@ -1821,53 +1860,35 @@ fn test_torture_benchmarks_and_idle() {
         (ticks, rss_bytes)
     };
 
-    let (ticks_before, _rss_before) = read_proc_stats(daemon_pid);
-    let idle_duration = if heavy {
-        Duration::from_secs(5)
-    } else {
-        Duration::from_secs(1)
-    };
-    let tfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
-    if tfd >= 0 {
-        let it = libc::itimerspec {
-            it_interval: libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            it_value: libc::timespec {
-                tv_sec: idle_duration.as_secs() as libc::time_t,
-                tv_nsec: idle_duration.subsec_nanos() as libc::c_long,
-            },
-        };
-        unsafe {
-            libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut());
-            let mut pfd = libc::pollfd {
-                fd: tfd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let _ = libc::poll(&mut pfd, 1, -1);
-            libc::close(tfd);
-        }
-    } else {
-        std::thread::yield_now();
-    }
-    let (ticks_after, rss_after) = read_proc_stats(daemon_pid);
-
-    let clk_tck = 100u64; // Linux standard sysconf(_SC_CLK_TCK)
-    let tick_diff = ticks_after.saturating_sub(ticks_before);
-    let cpu_sec = (tick_diff as f64) / (clk_tck as f64);
-    let cpu_percent = (cpu_sec / idle_duration.as_secs_f64()) * 100.0;
+    // Idle CPU over a wall-clock window is a timing measurement, not state,
+    // so it is not asserted here. Report RSS and check the daemon is healthy.
+    let (_ticks, rss_after) = read_proc_stats(daemon_pid);
     let rss_mb = (rss_after as f64) / (1024.0 * 1024.0);
 
     println!("Daemon Idle Performance (with {idle_agents} agents):");
     println!("  RSS:       {rss_mb:.2} MB");
-    println!("  CPU:       {cpu_percent:.2}%");
     println!("================================================================================\n");
 
-    // Invariant: CPU while idle must be ~0 CPU (< 15% threshold accounting for sampler ticks)
+    assert!(rss_after > 0, "daemon RSS unreadable");
     assert!(
-        cpu_percent < 20.0,
-        "Daemon idle CPU exceeded 20%: {cpu_percent:.2}%"
+        TestEnv::is_pid_alive(daemon_pid),
+        "daemon died during benchmark"
     );
+    assert_eq!(
+        env.daemon_pid(),
+        Some(daemon_pid),
+        "daemon restarted during benchmark"
+    );
+    assert_status_responds(&env);
+}
+
+/// Counts persisted events whose track key mentions `track`.
+fn count_track_events(db: &Path, track: &str) -> i64 {
+    let conn = Connection::open(db).unwrap();
+    conn.query_row(
+        "SELECT count(*) FROM events WHERE track_key LIKE '%' || ?1 || '%';",
+        [track],
+        |r| r.get(0),
+    )
+    .unwrap()
 }

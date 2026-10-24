@@ -3,26 +3,39 @@
 //! Enforces single-instance locking via flock, handles stale socket cleanup,
 //! serves `api.sock` using a bounded worker pool (8 threads), and serves
 //! `trace.sock` via a dedicated single thread streaming directly from SQLite WAL.
+//!
+//! Nothing here waits on a clock. Acceptors block in `poll(-1)` on their listener plus a
+//! shutdown pipe; workers block on the connection channel, which disconnects when the
+//! acceptor exits; and every live client stream is registered so that stopping the
+//! server can `shutdown(2)` it, unblocking any worker parked in a read or write.
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tacho_core::Input;
 
 use crate::appender::AppenderHandle;
 use crate::paths::DaemonPaths;
 use crate::recorder::{render_report, render_status};
+use crate::sampler::SamplerWaker;
 use crate::snapshot::write_snapshot;
 
 /// Maximum allowed NDJSON line length on `api.sock` (16 MiB) to prevent OOM from unbounded lines.
 const MAX_API_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Number of `api.sock` worker threads.
+const API_WORKERS: usize = 8;
+
+/// A `trace.sock` client that stops reading must not wedge the single trace thread forever.
+const TRACE_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Single-instance advisory lock on `$TACHO_RUNTIME/daemon.lock` (and `$TACHO_HOME/daemon.lock`).
 pub struct DaemonLock {
@@ -69,12 +82,116 @@ impl DaemonLock {
     }
 }
 
+/// A pipe whose read end reports `POLLHUP` once [`ShutdownPipe::trigger`] closes the write end.
+///
+/// Every acceptor polls the same read end, so one trigger wakes all of them, and the
+/// `OwnedFd`s guarantee neither end leaks or is double-closed.
+struct ShutdownPipe {
+    read: OwnedFd,
+    write: Mutex<Option<OwnedFd>>,
+}
+
+impl ShutdownPipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [-1i32; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 succeeded, so both fds are open and exclusively ours.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        Ok(Self {
+            read,
+            write: Mutex::new(Some(write)),
+        })
+    }
+
+    fn read_fd(&self) -> RawFd {
+        self.read.as_raw_fd()
+    }
+
+    fn trigger(&self) {
+        let mut guard = self.write.lock().unwrap_or_else(|p| p.into_inner());
+        drop(guard.take());
+    }
+}
+
+/// Tracks every live client stream so shutdown can unblock workers stuck in I/O.
+#[derive(Default)]
+struct ConnRegistry {
+    next_id: AtomicU64,
+    closed: AtomicBool,
+    conns: Mutex<HashMap<u64, UnixStream>>,
+}
+
+/// Removes a stream from the [`ConnRegistry`] when the connection is done.
+struct ConnGuard<'a> {
+    registry: &'a ConnRegistry,
+    id: u64,
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .conns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
+
+impl ConnRegistry {
+    /// Registers `stream`; returns `None` (and shuts the stream down) once the server is stopping.
+    fn register(&self, stream: &UnixStream) -> Option<ConnGuard<'_>> {
+        let clone = stream.try_clone().ok()?;
+        let mut conns = self.conns.lock().unwrap_or_else(|p| p.into_inner());
+        // Checked under the lock so a concurrent `shutdown_all` cannot miss this stream.
+        if self.closed.load(Ordering::Acquire) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return None;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        conns.insert(id, clone);
+        Some(ConnGuard { registry: self, id })
+    }
+
+    fn shutdown_all(&self) {
+        let conns = self.conns.lock().unwrap_or_else(|p| p.into_inner());
+        self.closed.store(true, Ordering::Release);
+        for stream in conns.values() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// State shared by the acceptors, the trace thread and the API workers.
+struct ServerShared {
+    stop: Arc<AtomicBool>,
+    pipe: ShutdownPipe,
+    conns: ConnRegistry,
+    appender: AppenderHandle,
+    sampler_waker: Mutex<Option<SamplerWaker>>,
+    paths: DaemonPaths,
+}
+
+impl ServerShared {
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Flags shutdown and wakes every thread that might be blocked on it.
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.pipe.trigger();
+        self.conns.shutdown_all();
+        self.appender.wake_state_waiters();
+    }
+}
+
 /// Running server handle managing background socket listener threads.
 pub struct DaemonServer {
     paths: DaemonPaths,
     _lock: DaemonLock,
-    shutdown_flag: Arc<AtomicBool>,
-    shutdown_tx: i32,
+    shared: Arc<ServerShared>,
     api_thread: Option<std::thread::JoinHandle<()>>,
     trace_thread: Option<std::thread::JoinHandle<()>>,
     worker_threads: Vec<std::thread::JoinHandle<()>>,
@@ -98,95 +215,86 @@ impl DaemonServer {
         appender: AppenderHandle,
         shutdown_flag: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        // 1. Clean up any stale socket files from prior unclean shutdown
-        if paths.api_sock().exists() {
-            let _ = fs::remove_file(paths.api_sock());
-        }
-        if paths.trace_sock().exists() {
-            let _ = fs::remove_file(paths.trace_sock());
+        // We hold the lock, so any socket file present is a leftover from an unclean exit.
+        for sock in [paths.api_sock(), paths.trace_sock()] {
+            match fs::remove_file(&sock) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
 
-        // 3. Bind UNIX listeners
         let api_listener = UnixListener::bind(paths.api_sock())?;
         let trace_listener = UnixListener::bind(paths.trace_sock())?;
+        fs::set_permissions(paths.api_sock(), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(paths.trace_sock(), fs::Permissions::from_mode(0o700))?;
+        api_listener.set_nonblocking(true)?;
+        trace_listener.set_nonblocking(true)?;
 
-        // Set mode 0700 on sockets
-        let _ = fs::set_permissions(paths.api_sock(), fs::Permissions::from_mode(0o700));
-        let _ = fs::set_permissions(paths.trace_sock(), fs::Permissions::from_mode(0o700));
+        let shared = Arc::new(ServerShared {
+            stop: shutdown_flag,
+            pipe: ShutdownPipe::new()?,
+            conns: ConnRegistry::default(),
+            appender,
+            sampler_waker: Mutex::new(None),
+            paths: paths.clone(),
+        });
 
-        // 4. Bounded thread pool for api.sock (8 worker threads)
-        const API_WORKERS: usize = 8;
+        // The acceptor owns the only sender; when it exits the channel disconnects and
+        // idle workers return from `recv` without any timeout.
         let (conn_tx, conn_rx) = crossbeam_channel::bounded::<UnixStream>(128);
         let mut worker_threads = Vec::with_capacity(API_WORKERS);
-
         for i in 0..API_WORKERS {
             let rx = conn_rx.clone();
-            let app = appender.clone();
-            let stop = shutdown_flag.clone();
-            let p = paths.clone();
-
-            let worker = std::thread::Builder::new()
-                .name(format!("tacho-api-worker-{}", i + 1))
-                .spawn(move || {
-                    run_api_worker(rx, app, stop, p);
-                })
-                .expect("failed to spawn api worker");
-            worker_threads.push(worker);
-        }
-
-        // 5. Acceptor thread for api.sock and trace.sock using kernel pipe for instant shutdown wakeup
-        let mut shutdown_pipe = [0i32; 2];
-        unsafe {
-            libc::pipe2(
-                shutdown_pipe.as_mut_ptr(),
-                libc::O_CLOEXEC | libc::O_NONBLOCK,
+            let sh = shared.clone();
+            worker_threads.push(
+                std::thread::Builder::new()
+                    .name(format!("tacho-api-worker-{}", i + 1))
+                    .spawn(move || run_api_worker(rx, &sh))?,
             );
         }
-        let shutdown_rx_api = shutdown_pipe[0];
-        let shutdown_tx = shutdown_pipe[1];
-        let shutdown_rx_trace = unsafe { libc::dup(shutdown_rx_api) };
+        drop(conn_rx);
 
-        let stop_api = shutdown_flag.clone();
-        api_listener.set_nonblocking(true)?;
+        let sh = shared.clone();
         let api_thread = std::thread::Builder::new()
             .name("tacho-api-acceptor".to_string())
             .spawn(move || {
-                run_api_acceptor(api_listener, conn_tx, stop_api, shutdown_rx_api);
-            })
-            .expect("failed to spawn api acceptor");
+                accept_loop(&api_listener, &sh, |stream| conn_tx.send(stream).is_ok());
+            })?;
 
-        // 6. Dedicated thread for trace.sock (streaming from SQLite read-only WAL connection)
-        let stop_trace = shutdown_flag.clone();
-        trace_listener.set_nonblocking(true)?;
-        let db_path_trace = paths.events_db();
+        let sh = shared.clone();
         let trace_thread = std::thread::Builder::new()
             .name("tacho-trace-server".to_string())
             .spawn(move || {
-                run_trace_server(trace_listener, db_path_trace, stop_trace, shutdown_rx_trace);
-            })
-            .expect("failed to spawn trace server");
+                accept_loop(&trace_listener, &sh, |stream| {
+                    serve_trace_client(stream, &sh);
+                    true
+                });
+            })?;
 
         Ok(Self {
             paths,
             _lock: lock,
-            shutdown_flag,
-            shutdown_tx,
+            shared,
             api_thread: Some(api_thread),
             trace_thread: Some(trace_thread),
             worker_threads,
         })
     }
 
+    /// Attaches a [`SamplerWaker`] so `{"cmd":"flush"}` triggers a synchronous sampler tick
+    /// before flushing the appender.
+    pub fn set_sampler_waker(&self, waker: SamplerWaker) {
+        *self
+            .shared
+            .sampler_waker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(waker);
+    }
+
     /// Stops servers, joins threads, and removes socket files.
     pub fn stop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Release);
-
-        if self.shutdown_tx >= 0 {
-            unsafe {
-                libc::close(self.shutdown_tx);
-            }
-            self.shutdown_tx = -1;
-        }
+        self.shared.request_stop();
 
         if let Some(t) = self.api_thread.take() {
             let _ = t.join();
@@ -210,116 +318,121 @@ impl Drop for DaemonServer {
     }
 }
 
-/// Acceptor loop for api.sock.
-fn run_api_acceptor(
-    listener: UnixListener,
-    conn_tx: Sender<UnixStream>,
-    stop: Arc<AtomicBool>,
-    shutdown_rx: std::os::unix::io::RawFd,
+/// Accepts connections on a non-blocking `listener` until shutdown, handing each to `on_conn`.
+///
+/// Blocks in `poll(-1)` on the listener and the shutdown pipe, so it neither spins nor
+/// wakes up on a timer. Returns when `on_conn` returns false, on shutdown, or on a fatal
+/// listener error.
+fn accept_loop(
+    listener: &UnixListener,
+    shared: &ServerShared,
+    mut on_conn: impl FnMut(UnixStream) -> bool,
 ) {
-    while !stop.load(Ordering::Acquire) {
+    while !shared.stopping() {
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let _ = conn_tx.send(stream);
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let mut pfds = [
-                    libc::pollfd {
-                        fd: listener.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: shutdown_rx,
-                        events: libc::POLLIN | libc::POLLHUP,
-                        revents: 0,
-                    },
-                ];
-                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-                if ret < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
                 }
-                if (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
-                    break;
+                if !on_conn(stream) {
+                    return;
                 }
             }
-            Err(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if !wait_readable_or_shutdown(listener.as_raw_fd(), shared.pipe.read_fd()) {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // Per-connection failures (peer gone before accept, fd exhaustion) are transient.
+            Err(e) if is_transient_accept_error(&e) => {
+                if !wait_readable_or_shutdown(listener.as_raw_fd(), shared.pipe.read_fd()) {
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("[tacho-daemon] accept failed, listener exiting: {}", e);
+                return;
+            }
         }
-    }
-    if shutdown_rx >= 0 {
-        unsafe { libc::close(shutdown_rx) };
     }
 }
 
-/// Dedicated single-thread server for trace.sock.
+fn is_transient_accept_error(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ECONNABORTED | libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
+/// Blocks until `fd` is readable (true) or the shutdown pipe fires or poll fails (false).
+fn wait_readable_or_shutdown(fd: RawFd, shutdown_fd: RawFd) -> bool {
+    loop {
+        let mut pfds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: shutdown_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if pfds[1].revents != 0 {
+            return false;
+        }
+        return true;
+    }
+}
+
+/// Streams one snapshot to a `trace.sock` client.
 ///
-/// CRITICAL: This thread streams snapshots using its own independent read-only WAL connection.
-/// It never touches the appender channel or locks, ensuring snapshots succeed even if the appender is wedged.
-fn run_trace_server(
-    listener: UnixListener,
-    db_path: std::path::PathBuf,
-    stop: Arc<AtomicBool>,
-    shutdown_rx: std::os::unix::io::RawFd,
-) {
-    while !stop.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let _ = write_snapshot(&db_path, None, None, &mut stream);
-                let _ = stream.flush();
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let mut pfds = [
-                    libc::pollfd {
-                        fd: listener.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: shutdown_rx,
-                        events: libc::POLLIN | libc::POLLHUP,
-                        revents: 0,
-                    },
-                ];
-                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-                if ret < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                if (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
-                    break;
-                }
-            }
-            Err(_) => break,
+/// CRITICAL: snapshots use their own read-only WAL connection and never touch the appender
+/// channel or locks, so they succeed even if the appender is wedged.
+fn serve_trace_client(stream: UnixStream, shared: &ServerShared) {
+    let Some(_guard) = shared.conns.register(&stream) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(TRACE_CLIENT_WRITE_TIMEOUT));
+    let mut writer = &stream;
+    if let Err(e) = write_snapshot(&shared.paths.events_db(), None, None, &mut writer) {
+        if !is_disconnect(&e) {
+            eprintln!("[tacho-daemon] trace.sock snapshot failed: {}", e);
         }
     }
-    if shutdown_rx >= 0 {
-        unsafe { libc::close(shutdown_rx) };
-    }
+    let _ = writer.flush();
 }
 
-/// Worker thread servicing api.sock requests.
-fn run_api_worker(
-    rx: Receiver<UnixStream>,
-    appender: AppenderHandle,
-    stop: Arc<AtomicBool>,
-    paths: DaemonPaths,
-) {
-    while !stop.load(Ordering::Acquire) {
-        let stream = match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+fn is_disconnect(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
+}
 
-        handle_api_connection(stream, &appender, &stop, &paths);
+/// Worker thread servicing api.sock connections until the acceptor hangs up.
+fn run_api_worker(rx: Receiver<UnixStream>, shared: &ServerShared) {
+    while let Ok(stream) = rx.recv() {
+        if shared.stopping() {
+            continue; // Drain and drop queued connections.
+        }
+        let Some(_guard) = shared.conns.register(&stream) else {
+            continue;
+        };
+        handle_api_connection(stream, shared);
     }
 }
 
@@ -331,68 +444,74 @@ fn read_bounded_line(
     max_bytes: usize,
 ) -> io::Result<usize> {
     let mut raw = Vec::new();
-    let mut total = 0usize;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
             break;
         }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            let take_len = pos + 1;
-            if total + take_len > max_bytes {
-                reader.consume(take_len);
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "API request line exceeds maximum allowed byte length",
-                ));
-            }
-            raw.extend_from_slice(&available[..take_len]);
+        let (take_len, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (available.len(), false),
+        };
+        if raw.len() + take_len > max_bytes {
             reader.consume(take_len);
-            total += take_len;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "API request line exceeds maximum allowed byte length",
+            ));
+        }
+        raw.extend_from_slice(&available[..take_len]);
+        reader.consume(take_len);
+        if done {
             break;
-        } else {
-            let take_len = available.len();
-            if total + take_len > max_bytes {
-                reader.consume(take_len);
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "API request line exceeds maximum allowed byte length",
-                ));
-            }
-            raw.extend_from_slice(available);
-            reader.consume(take_len);
-            total += take_len;
         }
     }
-    if total == 0 {
+    if raw.is_empty() {
         return Ok(0);
     }
     let s = std::str::from_utf8(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line_buf.push_str(s);
-    Ok(total)
+    Ok(raw.len())
 }
 
-/// Processes NDJSON requests on a client stream until disconnection.
-fn handle_api_connection(
-    stream: UnixStream,
-    appender: &AppenderHandle,
-    stop: &Arc<AtomicBool>,
-    paths: &DaemonPaths,
-) {
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
+/// What to do after a request has been handled.
+enum Reply {
+    /// Write one NDJSON response line and keep serving.
+    Line(Vec<u8>),
+    /// The handler streamed its own output and the connection is finished.
+    Closed,
+    /// Write the response line, then stop the whole server.
+    LineThenShutdown(Vec<u8>),
+}
+
+/// Builds a JSON error reply; serde escapes the message, so arbitrary text cannot break framing.
+fn error_reply(msg: impl std::fmt::Display) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "status": "error", "error": msg.to_string() }))
+        .unwrap_or_default()
+}
+
+const OK_REPLY: &[u8] = b"{\"status\":\"ok\"}";
+
+/// Processes NDJSON requests on a client stream until disconnection or shutdown.
+fn handle_api_connection(stream: UnixStream, shared: &ServerShared) {
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
     };
     let mut reader = BufReader::with_capacity(65536, reader_stream);
     let mut writer = io::BufWriter::with_capacity(65536, stream);
     let mut line_buf = String::with_capacity(1024);
-    let mut input_batch: Vec<(Input, u64)> = Vec::with_capacity(128);
 
-    while !stop.load(Ordering::Acquire) {
+    while !shared.stopping() {
         line_buf.clear();
         match read_bounded_line(&mut reader, &mut line_buf, MAX_API_LINE_BYTES) {
             Ok(0) => break, // EOF
             Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                // Tell the client why before hanging up; the stream position is unreliable now.
+                let _ = writer.write_all(&error_reply(e));
+                let _ = writer.write_all(b"\n");
+                break;
+            }
             Err(_) => break,
         }
 
@@ -401,481 +520,424 @@ fn handle_api_connection(
             continue;
         }
 
-        // Fast path for batched streaming ingest inputs {"inputs": [...]}
-        if trimmed.starts_with("{\"inputs\"") {
-            if let Ok(batch) = serde_json::from_str::<IngestBatchFastPath>(trimmed) {
-                let now_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                for inp in batch.inputs {
-                    input_batch.push((inp, now_ns));
-                }
-                let mut send_err = false;
-                if !input_batch.is_empty() {
-                    if let Err(e) = appender.send_input_batch(std::mem::take(&mut input_batch)) {
-                        eprintln!("[tacho-daemon] queue full: {}", e);
-                        send_err = true;
-                    }
-                }
-                let reply: &[u8] = if send_err {
-                    b"{\"status\":\"error\",\"error\":\"queue full\"}\n"
-                } else {
-                    b"{\"status\":\"ok\"}\n"
-                };
-                if writer.write_all(reply).is_err() {
-                    break;
-                }
-                if reader.buffer().is_empty() && writer.flush().is_err() {
-                    break;
-                }
-                continue;
-            }
-        }
-
-        // Fast path for streaming ingest inputs
-        if trimmed.starts_with("{\"input\"") || trimmed.contains("\"input\"") {
-            if let Ok(ingest) = serde_json::from_str::<IngestFastPath>(trimmed) {
-                let now_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                input_batch.push((ingest.input, now_ns));
-
-                // Dispatch any pending batch before writing each ack
-                let mut send_err = false;
-                if !input_batch.is_empty() {
-                    if let Err(e) = appender.send_input_batch(std::mem::take(&mut input_batch)) {
-                        eprintln!("[tacho-daemon] queue full: {}", e);
-                        send_err = true;
-                    }
-                }
-                let reply: &[u8] = if send_err {
-                    b"{\"status\":\"error\",\"error\":\"queue full\"}\n"
-                } else {
-                    b"{\"status\":\"ok\"}\n"
-                };
-                if writer.write_all(reply).is_err() {
-                    break;
-                }
-                if reader.buffer().is_empty() && writer.flush().is_err() {
-                    break;
-                }
-                continue;
-            }
-        }
-
-        // Drain any pending input batch before servicing control commands
-        if !input_batch.is_empty() {
-            let _ = appender.send_input_batch(std::mem::take(&mut input_batch));
-        }
-
-        let resp = process_ndjson_line(trimmed, appender, stop, writer.get_mut(), paths);
-        if let Some(resp_bytes) = resp {
-            if writer.write_all(&resp_bytes).is_err() || writer.write_all(b"\n").is_err() {
-                break;
-            }
-        }
-
-        // Flush writer when incoming buffer has been drained
-        if reader.buffer().is_empty() && writer.flush().is_err() {
+        let reply = process_ndjson_line(trimmed, shared, writer.get_mut());
+        let (bytes, shutdown_after) = match reply {
+            Reply::Line(b) => (b, false),
+            Reply::LineThenShutdown(b) => (b, true),
+            Reply::Closed => return,
+        };
+        if writer.write_all(&bytes).is_err() || writer.write_all(b"\n").is_err() {
             break;
         }
-    }
-
-    if !input_batch.is_empty() {
-        let _ = appender.send_input_batch(input_batch);
+        // Batch acks for pipelined requests: only flush once the client's input is drained.
+        if (shutdown_after || reader.buffer().is_empty()) && writer.flush().is_err() {
+            break;
+        }
+        if shutdown_after {
+            shared.request_stop();
+            break;
+        }
     }
     let _ = writer.flush();
 }
 
-/// Helper struct for zero-overhead direct deserialization of ingest inputs.
+/// `{"input": ...}` or `{"inputs": [...]}` decoded without building a `Value` tree.
 #[derive(serde::Deserialize)]
-struct IngestFastPath {
-    input: Input,
+struct IngestLine {
+    #[serde(default)]
+    input: Option<Input>,
+    #[serde(default)]
+    inputs: Option<Vec<Input>>,
 }
 
-/// Helper struct for batched ingest inputs over a single request line.
-#[derive(serde::Deserialize)]
-struct IngestBatchFastPath {
-    inputs: Vec<Input>,
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Queues inputs on the appender and returns the client-facing ack.
+fn ingest(appender: &AppenderHandle, inputs: Vec<Input>) -> Vec<u8> {
+    let ts = now_ns();
+    let batch: Vec<(Input, u64)> = inputs.into_iter().map(|i| (i, ts)).collect();
+    match appender.send_input_batch(batch) {
+        Ok(()) => OK_REPLY.to_vec(),
+        Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+            eprintln!("[tacho-daemon] appender queue full; rejecting ingest");
+            error_reply("queue full")
+        }
+        Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+            error_reply("appender stopped")
+        }
+    }
 }
 
 /// Handles a single line of NDJSON input.
-fn process_ndjson_line(
-    line: &str,
-    appender: &AppenderHandle,
-    stop: &Arc<AtomicBool>,
-    stream: &mut UnixStream,
-    paths: &DaemonPaths,
-) -> Option<Vec<u8>> {
-    // Fast path: Ingest input {"input": ...} bypasses Value AST creation
-    if line.contains("\"input\"") {
-        if let Ok(ingest) = serde_json::from_str::<IngestFastPath>(line) {
-            let now_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            if let Err(e) = appender.send_input(ingest.input, now_ns) {
-                return Some(format!(r#"{{"error":"queue full: {}"}}"#, e).into_bytes());
+fn process_ndjson_line(line: &str, shared: &ServerShared, stream: &mut UnixStream) -> Reply {
+    // Fast path: hot ingest traffic skips the generic `Value` parse.
+    if line.contains("\"input") {
+        if let Ok(req) = serde_json::from_str::<IngestLine>(line) {
+            match (req.input, req.inputs) {
+                (Some(one), None) => return Reply::Line(ingest(&shared.appender, vec![one])),
+                (None, Some(many)) => return Reply::Line(ingest(&shared.appender, many)),
+                (Some(one), Some(mut many)) => {
+                    many.insert(0, one);
+                    return Reply::Line(ingest(&shared.appender, many));
+                }
+                (None, None) => {} // e.g. a command whose payload mentions "input"
             }
-            return Some(b"{\"status\":\"ok\"}".to_vec());
         }
     }
 
     let val: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(e) => {
-            return Some(format!(r#"{{"error":"invalid JSON: {}"}}"#, e).into_bytes());
-        }
+        Err(e) => return Reply::Line(error_reply(format!("invalid JSON: {}", e))),
     };
 
-    // Case 1: Ingest input {"input": { ... }}
-    if let Some(input_val) = val.get("input") {
-        match serde_json::from_value::<Input>(input_val.clone()) {
-            Ok(input) => {
-                let now_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                if let Err(e) = appender.send_input(input, now_ns) {
-                    return Some(format!(r#"{{"error":"queue full: {}"}}"#, e).into_bytes());
-                }
-                return Some(b"{\"status\":\"ok\"}".to_vec());
-            }
-            Err(e) => {
-                return Some(format!(r#"{{"error":"invalid Input schema: {}"}}"#, e).into_bytes());
-            }
+    // The fast path failed to decode an ingest line: report which schema is wrong.
+    for key in ["input", "inputs"] {
+        if let Some(v) = val.get(key) {
+            let err = if key == "input" {
+                serde_json::from_value::<Input>(v.clone()).err()
+            } else {
+                serde_json::from_value::<Vec<Input>>(v.clone()).err()
+            };
+            return Reply::Line(error_reply(format!(
+                "invalid Input schema: {}",
+                err.map(|e| e.to_string()).unwrap_or_default()
+            )));
         }
     }
 
-    // Case 2: Control command {"cmd": "..."}
-    if let Some(cmd) = val.get("cmd").and_then(|v| v.as_str()) {
-        match cmd {
-            "ping" => Some(b"{\"pong\":true}".to_vec()),
-
-            "flush" => {
-                appender.flush();
-                Some(b"{\"status\":\"ok\",\"flushed\":true}".to_vec())
+    let Some(cmd) = val.get("cmd").and_then(|v| v.as_str()) else {
+        return Reply::Line(error_reply("missing 'input' or 'cmd' in request"));
+    };
+    let appender = &shared.appender;
+    match cmd {
+        "ping" => Reply::Line(b"{\"pong\":true}".to_vec()),
+        "flush" => {
+            let waker = shared
+                .sampler_waker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if let Some(w) = waker {
+                w.sample_now();
             }
-
-            "tick" | "decide" => {
-                let dry_run = val
-                    .get("dry_run")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if let Ok(store) = crate::fleet::FleetStore::open(&paths.events_db()) {
-                    if let Ok(state) = store.load() {
-                        let live = appender.live_state();
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
-                        let decision_state = tacho_core::decide::DecisionState {
-                            max_parallel: state.max_workers,
-                            todo: state.todo.clone(),
-                            agents: state.agents.clone(),
-                            retired: state.retired.clone(),
-                            holds: state.holds.clone(),
-                            passed: state.passed.clone(),
-                            failed: state.failed.clone(),
-                            merged_prs: state.merged_prs.clone(),
-                            closed_prs: state.closed_prs.clone(),
-                            batches: state.batches.clone(),
-                            flakes: state.flakes.clone(),
-                            samples: state.samples.clone(),
-                            nudged: state.nudged.clone(),
-                            rebase_attempts: state.rebase_attempts.clone(),
-                            fix_notified: state.fix_notified.clone(),
-                            notified_keys: state.notified_failures.clone(),
-                            area_rules: state.area_rules.clone(),
-                            refused_self_update_sha: state.refused_self_update_sha.clone(),
-                            last_tick_ts: state.last_tick_ts,
-                            inbox: state.inbox.clone(),
-                            last_watchdog_alert_ts: state.last_watchdog_alert_ts,
-                            tidy_min_age_secs: 3_600,
-                        };
-                        let live_keys: std::collections::BTreeSet<String> =
-                            live.agents.keys().cloned().collect();
-
-                        let prev_tick_ts = state.last_tick_ts.unwrap_or(0);
-                        let mut batch_outcomes = Vec::new();
-                        for b in &state.batches {
-                            if let Some(finished_ts) = b.finished_at {
-                                if finished_ts > prev_tick_ts
-                                    && (b.status == "passed" || b.status == "failed")
-                                {
-                                    batch_outcomes.push(tacho_core::decide::BatchOutcomeObs {
-                                        batch_id: b.id.clone(),
-                                        passed: b.status == "passed",
-                                        failed_area: b.areas.first().cloned(),
-                                        log_output: b.log.clone(),
-                                        tree_sha: b.tree.clone().unwrap_or_default(),
-                                    });
-                                }
-                            }
-                        }
-
-                        let main_sha = std::process::Command::new("git")
-                            .args(["rev-parse", "HEAD"])
-                            .current_dir(&paths.home)
-                            .output()
-                            .ok()
-                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_default();
-
-                        let world_obs = tacho_core::decide::WorldObservation {
-                            now,
-                            main_sha,
-                            open_prs: state.open_prs_cache.clone(),
-                            merged_prs: state.merged_prs.clone(),
-                            closed_prs: state.closed_prs.clone(),
-                            live_keys,
-                            batch_outcomes,
-                            ..Default::default()
-                        };
-                        let plan = tacho_core::decide::decide(&decision_state, &world_obs);
-                        if !dry_run {
-                            let _ =
-                                store.record_decision_tick(now, &decision_state, &world_obs, &plan);
-                        }
-                        let resp = serde_json::json!({
-                            "status": "ok",
-                            "plan": plan,
-                        });
-                        return Some(serde_json::to_vec(&resp).unwrap_or_default());
-                    }
-                }
-                Some(b"{\"status\":\"error\",\"message\":\"failed to evaluate decision\"}".to_vec())
+            if appender.flush() {
+                Reply::Line(b"{\"flushed\":true,\"status\":\"ok\"}".to_vec())
+            } else {
+                Reply::Line(error_reply(
+                    "flush did not complete: appender busy or stopped",
+                ))
             }
-
-            "status" => {
-                let json = val.get("json").and_then(|v| v.as_bool()).unwrap_or(false);
-                let state = appender.live_state();
-                let now_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                let mut text = render_status(&state, json, now_ns);
-                let db_size = fs::metadata(paths.events_db())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if !json {
-                    text.push_str(&format!("\nevents.sqlite: {} bytes\n", db_size));
-                }
-                let resp = serde_json::json!({
-                    "status": "ok",
-                    "output": text,
-                    "events_sqlite_bytes": db_size,
-                    "events_sqlite_size_bytes": db_size,
-                });
-                Some(serde_json::to_vec(&resp).unwrap_or_default())
-            }
-
-            "report" => {
-                let agent = val.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-                let since = val.get("since").and_then(|v| v.as_u64());
-                let state = appender.live_state();
-                let now_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                let text = render_report(&state, agent, since, now_ns);
-                let agent_state = state.agents.get(agent);
-                let resp = serde_json::json!({
-                    "status": "ok",
-                    "output": text,
-                    "agent_state": agent_state,
-                });
-                Some(serde_json::to_vec(&resp).unwrap_or_default())
-            }
-
-            "watch" => {
-                // Streaming watch updates
-                let until = val.get("until").and_then(|v| v.as_str());
-                let _ = stream.write_all(b"{\"status\":\"watching\"}\n");
-                let _ = stream.flush();
-
-                let mut last_rendered = String::new();
-                let mut last_seq = appender.state_seq();
-                for _ in 0..500 {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let state = appender.live_state();
-                    let now_ns = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    let current = render_status(&state, false, now_ns);
-
-                    if current != last_rendered {
-                        last_rendered = current.clone();
-                        let event_line = serde_json::json!({
-                            "event": "state_change",
-                            "state": current,
-                        });
-                        let _ =
-                            stream.write_all(&serde_json::to_vec(&event_line).unwrap_or_default());
-                        let _ = stream.write_all(b"\n");
-                        let _ = stream.flush();
-                    }
-
-                    if let Some(target) = until {
-                        let is_match = state.agents.values().any(|a| {
-                            a.state.eq_ignore_ascii_case(target)
-                                || (target.eq_ignore_ascii_case("stalled")
-                                    && (!a.flags.is_empty()
-                                        || a.state.eq_ignore_ascii_case("stalled")
-                                        || a.timeline.iter().any(|t| t.kind == "Stall")))
-                        });
-                        if is_match {
-                            let match_line = serde_json::json!({"matched": target});
-                            let _ = stream
-                                .write_all(&serde_json::to_vec(&match_line).unwrap_or_default());
-                            let _ = stream.write_all(b"\n");
-                            let _ = stream.flush();
-                            break;
-                        }
-                    }
-
-                    let mut pfd = libc::pollfd {
-                        fd: stream.as_raw_fd(),
-                        events: libc::POLLERR | libc::POLLHUP,
-                        revents: 0,
-                    };
-                    let poll_res = unsafe { libc::poll(&mut pfd, 1, 0) };
-                    if poll_res > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
-                        break;
-                    }
-
-                    last_seq = appender.wait_state_change(last_seq, Duration::from_millis(250));
-                }
-                let _ = stream.flush();
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-                None
-            }
-
-            "trace" => {
-                let since = val.get("since").and_then(|v| v.as_u64());
-                let until = val.get("until").and_then(|v| v.as_u64());
-                let from_log = val
-                    .get("from_log")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if from_log {
-                    let _ =
-                        crate::snapshot::rebuild_from_log(&paths.events_db(), since, until, stream);
-                } else {
-                    let _ = write_snapshot(&paths.events_db(), since, until, stream);
-                }
-                let _ = stream.flush();
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-                None
-            }
-
-            "shutdown" => {
-                stop.store(true, Ordering::Release);
-                appender.shutdown();
-                Some(b"{\"status\":\"ok\",\"message\":\"shutting down\"}".to_vec())
-            }
-
-            _ => Some(format!(r#"{{"error":"unknown command '{}'"}}"#, cmd).into_bytes()),
         }
+        "tick" | "decide" => Reply::Line(handle_decide(&val, shared)),
+        "status" => Reply::Line(handle_status(&val, shared)),
+        "report" => Reply::Line(handle_report(&val, appender)),
+        "watch" => {
+            handle_watch(&val, shared, stream);
+            Reply::Closed
+        }
+        "trace" => {
+            handle_trace(&val, &shared.paths, stream);
+            Reply::Closed
+        }
+        "shutdown" => {
+            appender.shutdown();
+            Reply::LineThenShutdown(b"{\"message\":\"shutting down\",\"status\":\"ok\"}".to_vec())
+        }
+        _ => Reply::Line(error_reply(format!("unknown command '{}'", cmd))),
+    }
+}
+
+fn handle_status(val: &serde_json::Value, shared: &ServerShared) -> Vec<u8> {
+    let json = val.get("json").and_then(|v| v.as_bool()).unwrap_or(false);
+    let state = shared.appender.live_state();
+    let mut text = render_status(&state, json, now_ns());
+    let db_size = fs::metadata(shared.paths.events_db())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if !json {
+        text.push_str(&format!("\nevents.sqlite: {} bytes\n", db_size));
+    }
+    let resp = serde_json::json!({
+        "status": "ok",
+        "output": text,
+        "events_sqlite_bytes": db_size,
+        "events_sqlite_size_bytes": db_size,
+    });
+    serde_json::to_vec(&resp).unwrap_or_default()
+}
+
+fn handle_report(val: &serde_json::Value, appender: &AppenderHandle) -> Vec<u8> {
+    let agent = val.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+    let since = val.get("since").and_then(|v| v.as_u64());
+    let state = appender.live_state();
+    let text = render_report(&state, agent, since, now_ns());
+    let resp = serde_json::json!({
+        "status": "ok",
+        "output": text,
+        "agent_state": state.agents.get(agent),
+    });
+    serde_json::to_vec(&resp).unwrap_or_default()
+}
+
+fn handle_trace(val: &serde_json::Value, paths: &DaemonPaths, stream: &mut UnixStream) {
+    let since = val.get("since").and_then(|v| v.as_u64());
+    let until = val.get("until").and_then(|v| v.as_u64());
+    let from_log = val
+        .get("from_log")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let res = if from_log {
+        crate::snapshot::rebuild_from_log(&paths.events_db(), since, until, stream)
     } else {
-        Some(b"{\"error\":\"missing 'input' or 'cmd' in request\"}".to_vec())
+        write_snapshot(&paths.events_db(), since, until, stream)
+    };
+    if let Err(e) = res {
+        if !is_disconnect(&e) {
+            eprintln!("[tacho-daemon] trace command failed: {}", e);
+        }
     }
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// True when any agent is in the state named by `until` (`stalled` also matches flags).
+fn watch_target_matched(state: &crate::recorder::LiveState, target: &str) -> bool {
+    state.agents.values().any(|a| {
+        a.state.eq_ignore_ascii_case(target)
+            || (target.eq_ignore_ascii_case("stalled")
+                && (!a.flags.is_empty() || a.timeline.iter().any(|t| t.kind == "Stall")))
+    })
+}
+
+fn write_json_line(stream: &mut UnixStream, v: &serde_json::Value) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(v).unwrap_or_default();
+    bytes.push(b'\n');
+    stream.write_all(&bytes)?;
+    stream.flush()
+}
+
+/// Streams rendered status whenever live state changes, until the client hangs up,
+/// the `until` target matches, or the server stops.
+///
+/// A helper thread blocks in `poll(-1)` for the peer's hangup and the shutdown pipe, then
+/// wakes the state condvar, so the loop below waits only on real events.
+fn handle_watch(val: &serde_json::Value, shared: &ServerShared, stream: &mut UnixStream) {
+    let until = val.get("until").and_then(|v| v.as_str());
+    let appender = &shared.appender;
+    let hung_up = Arc::new(AtomicBool::new(false));
+
+    let hangup_watcher = {
+        let fd = stream.as_raw_fd();
+        let shutdown_fd = shared.pipe.read_fd();
+        let hung_up = hung_up.clone();
+        let appender = appender.clone();
+        // The fds outlive the thread: it is joined below before `stream` can be dropped,
+        // and the shutdown pipe lives as long as `shared`.
+        std::thread::Builder::new()
+            .name("tacho-watch-hup".to_string())
+            .spawn(move || {
+                wait_peer_hangup(fd, shutdown_fd);
+                hung_up.store(true, Ordering::Release);
+                appender.wake_state_waiters();
+            })
+    };
+
+    let mut seq = appender.state_seq();
+    let mut last_rendered = String::new();
+    if write_json_line(stream, &serde_json::json!({"status": "watching"})).is_ok() {
+        while !shared.stopping() && !hung_up.load(Ordering::Acquire) {
+            let state = appender.live_state();
+            let current = render_status(&state, false, now_ns());
+            if current != last_rendered {
+                let line = serde_json::json!({"event": "state_change", "state": current});
+                if write_json_line(stream, &line).is_err() {
+                    break;
+                }
+                last_rendered = current;
+            }
+            if let Some(target) = until {
+                if watch_target_matched(&state, target) {
+                    let _ = write_json_line(stream, &serde_json::json!({"matched": target}));
+                    break;
+                }
+            }
+            seq = appender.wait_state_change_until(seq, &hung_up);
+        }
+    }
+
+    // Shutting the socket down raises POLLHUP for the helper, so the join cannot hang.
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    if let Ok(t) = hangup_watcher {
+        let _ = t.join();
+    }
+}
+
+/// Blocks until the peer of `fd` hangs up (or the socket is shut down) or `shutdown_fd` fires.
+fn wait_peer_hangup(fd: RawFd, shutdown_fd: RawFd) {
+    let hup = libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR | libc::POLLNVAL;
+    loop {
+        let mut pfds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLRDHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: shutdown_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if pfds[1].revents != 0 || pfds[0].revents & hup != 0 {
+            return;
+        }
+        // Only POLLRDHUP was requested, so bytes a watch client sends do not wake us.
+    }
+}
+
+/// Runs one `decide` pass over the stored fleet state and, unless `dry_run`, records it.
+///
+/// A recorded tick must be replayable, so it needs the real main SHA: taken from the
+/// request's `main_sha`, else resolved with git in the request's `repo`. Without one the
+/// tick is refused instead of logging an empty SHA.
+fn handle_decide(val: &serde_json::Value, shared: &ServerShared) -> Vec<u8> {
+    let dry_run = val
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let store = match crate::fleet::FleetStore::open(&shared.paths.events_db()) {
+        Ok(s) => s,
+        Err(e) => return error_reply(format!("failed to open fleet store: {}", e)),
+    };
+    let state = match store.load() {
+        Ok(s) => s,
+        Err(e) => return error_reply(format!("failed to load fleet state: {}", e)),
+    };
+
+    let main_sha = val
+        .get("main_sha")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            val.get("repo")
+                .and_then(|v| v.as_str())
+                .and_then(|repo| git_head_sha(Path::new(repo)))
+        })
+        .unwrap_or_default();
+    if main_sha.is_empty() && !dry_run {
+        return error_reply(
+            "refusing to record a decision tick without main_sha: pass \"main_sha\" or \"repo\"",
+        );
+    }
+
+    let now = (now_ns() / 1_000_000_000) as i64;
+    let decision_state = decision_state_of(&state);
+    let world_obs = tacho_core::decide::WorldObservation {
+        now,
+        main_sha,
+        open_prs: state.open_prs_cache.clone(),
+        merged_prs: state.merged_prs.clone(),
+        closed_prs: state.closed_prs.clone(),
+        live_keys: shared
+            .appender
+            .live_state()
+            .agents
+            .keys()
+            .cloned()
+            .collect(),
+        batch_outcomes: new_batch_outcomes(&state),
+        ..Default::default()
+    };
+    let plan = tacho_core::decide::decide(&decision_state, &world_obs);
+    let mut resp = serde_json::json!({ "status": "ok", "plan": plan });
+    if !dry_run {
+        match store.record_decision_tick(now, &decision_state, &world_obs, &plan) {
+            Ok(id) => resp["tick_id"] = serde_json::json!(id),
+            Err(e) => return error_reply(format!("failed to record decision tick: {}", e)),
+        }
+    }
+    serde_json::to_vec(&resp).unwrap_or_default()
+}
+
+fn decision_state_of(state: &crate::fleet::FleetState) -> tacho_core::decide::DecisionState {
+    tacho_core::decide::DecisionState {
+        max_parallel: state.max_workers,
+        todo: state.todo.clone(),
+        agents: state.agents.clone(),
+        retired: state.retired.clone(),
+        holds: state.holds.clone(),
+        passed: state.passed.clone(),
+        failed: state.failed.clone(),
+        merged_prs: state.merged_prs.clone(),
+        closed_prs: state.closed_prs.clone(),
+        batches: state.batches.clone(),
+        flakes: state.flakes.clone(),
+        samples: state.samples.clone(),
+        nudged: state.nudged.clone(),
+        rebase_attempts: state.rebase_attempts.clone(),
+        fix_notified: state.fix_notified.clone(),
+        notified_keys: state.notified_failures.clone(),
+        area_rules: state.area_rules.clone(),
+        refused_self_update_sha: state.refused_self_update_sha.clone(),
+        last_tick_ts: state.last_tick_ts,
+        inbox: state.inbox.clone(),
+        last_watchdog_alert_ts: state.last_watchdog_alert_ts,
+        tidy_min_age_secs: 3_600,
+    }
+}
+
+/// Batches that finished as a definite pass or fail since the previous tick.
+///
+/// Flakes and still-running batches are excluded so a flake is never fed back as a pass,
+/// and older outcomes are not replayed on every tick.
+fn new_batch_outcomes(
+    state: &crate::fleet::FleetState,
+) -> Vec<tacho_core::decide::BatchOutcomeObs> {
+    let prev_tick_ts = state.last_tick_ts.unwrap_or(0);
+    state
+        .batches
+        .iter()
+        .filter(|b| b.finished_at.is_some_and(|t| t > prev_tick_ts))
+        .filter(|b| b.status == "passed" || b.status == "failed")
+        .map(|b| tacho_core::decide::BatchOutcomeObs {
+            batch_id: b.id.clone(),
+            passed: b.status == "passed",
+            failed_area: b.areas.first().cloned(),
+            log_output: b.log.clone(),
+            tree_sha: b.tree.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn git_head_sha(repo: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::appender::spawn_appender;
-    use crate::log::EventLog;
-    use tacho_core::Recorder;
-
-    #[test]
-    fn test_batch_and_single_fast_path_queue_full_error_response() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("server_test.sqlite");
-        let log = EventLog::open(&db_path).unwrap();
-        let recorder = Recorder::new();
-
-        // Capacity 1 so channel fills up immediately
-        let (appender, _thread) = spawn_appender(recorder, log, 1);
-        let stop = Arc::new(AtomicBool::new(false));
-        let paths = DaemonPaths::custom(temp.path(), temp.path()).unwrap();
-
-        // Create a connected pair of UnixStream for testing handle_api_connection
-        let (mut client, server_stream) = UnixStream::pair().unwrap();
-
-        let appender_clone = appender.clone();
-        let stop_clone = stop.clone();
-        let paths_clone = paths.clone();
-        let worker_handle = std::thread::spawn(move || {
-            handle_api_connection(server_stream, &appender_clone, &stop_clone, &paths_clone);
-        });
-
-        let test_input = Input::RunStart {
-            source_ts_ns: Some(100),
-            provider: "test".into(),
-            session_id: "s1".into(),
-            agent: Some("a1".into()),
-            task: None,
-            pid: None,
-            cwd: None,
-            model: None,
-            parent_session: None,
-            git_tree: None,
-            role: None,
-        };
-
-        // 1. Shutdown the appender thread so send_input_batch fails (channel disconnected)
-        appender.shutdown();
-        let _ = _thread.join();
-
-        // 2. Send batch fast path: {"inputs": [...]} over client socket
-        let batch_req = serde_json::json!({
-            "inputs": [test_input.clone()]
-        });
-        client
-            .write_all(serde_json::to_string(&batch_req).unwrap().as_bytes())
-            .unwrap();
-        client.write_all(b"\n").unwrap();
-        client.flush().unwrap();
-
-        let mut reader = BufReader::new(client.try_clone().unwrap());
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        assert!(
-            line.contains("\"error\":\"queue full\""),
-            "batch fast path must return queue full error: {}",
-            line
-        );
-
-        // 3. Send single input fast path: {"input": ...} over client socket
-        let single_req = serde_json::json!({
-            "input": test_input
-        });
-        client
-            .write_all(serde_json::to_string(&single_req).unwrap().as_bytes())
-            .unwrap();
-        client.write_all(b"\n").unwrap();
-        client.flush().unwrap();
-
-        line.clear();
-        reader.read_line(&mut line).unwrap();
-        assert!(
-            line.contains("\"error\":\"queue full\""),
-            "single input fast path must return queue full error: {}",
-            line
-        );
-
-        stop.store(true, Ordering::Release);
-        let _ = client.shutdown(std::net::Shutdown::Both);
-        drop(reader);
-        drop(client);
-        let _ = worker_handle.join();
-    }
-}
+mod tests;

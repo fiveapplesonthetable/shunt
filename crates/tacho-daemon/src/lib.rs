@@ -11,6 +11,8 @@ pub mod recorder;
 pub mod sampler;
 pub mod server;
 pub mod snapshot;
+#[cfg(test)]
+pub(crate) mod test_util;
 
 pub use appender::{spawn_appender, ActiveRun, AppenderCommand, AppenderHandle, AppenderHooks};
 pub use config::{Config, DetectorConfig, RingConfig, SamplerConfig};

@@ -82,8 +82,10 @@ impl OtlpDecoder {
                             let is_error = get_attr_string(&record.attributes, "is_error")
                                 .map(|s| s == "true")
                                 .unwrap_or(false);
-                            let exit_code =
-                                get_attr_i64(&record.attributes, "exit_code").map(|c| c as i32);
+                            // Out-of-range codes are dropped rather than truncated: a
+                            // wrapped `as i32` could turn 1<<32 into a fake success (0).
+                            let exit_code = get_attr_i64(&record.attributes, "exit_code")
+                                .and_then(|c| i32::try_from(c).ok());
 
                             out.push(Input::ToolEnd {
                                 source_ts_ns: ts,
@@ -695,6 +697,20 @@ fn get_json_attr_string(key: &'static str) -> impl Fn(&serde_json::Value) -> Opt
                         }
                         if let Some(s) = v.get("stringValue").and_then(|x| x.as_str()) {
                             return Some(s.to_string());
+                        }
+                        // OTLP/JSON encodes booleans as `boolValue` and 64-bit ints as
+                        // `intValue` (string or number); without these an `is_error`
+                        // sent as a real bool was silently read as false.
+                        if let Some(b) = v.get("boolValue").and_then(|x| x.as_bool()) {
+                            return Some(b.to_string());
+                        }
+                        if let Some(i) = v.get("intValue") {
+                            if let Some(s) = i.as_str() {
+                                return Some(s.to_string());
+                            }
+                            if let Some(n) = i.as_i64() {
+                                return Some(n.to_string());
+                            }
                         }
                     }
                 }

@@ -5,7 +5,7 @@ fn run_stream_fixture(env: &TestEnv, fixture_name: &str) {
     let fixture_path = fixtures_dir().join(format!("streams/{fixture_name}"));
     let fixture_bytes = fs::read(&fixture_path).expect("failed to read stream fixture");
 
-    // Create a helper shell script that prints the fixture lines with small sleeps
+    // Create a helper shell script that prints the fixture lines one by one
     let script_path = env
         .temp_dir
         .path()
@@ -14,7 +14,6 @@ fn run_stream_fixture(env: &TestEnv, fixture_name: &str) {
         r#"#!/usr/bin/env bash
 while IFS= read -r line || [ -n "$line" ]; do
     printf "%s\n" "$line"
-    sleep 0.005
 done < "{}"
 "#,
         fixture_path.display()

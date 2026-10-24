@@ -302,7 +302,11 @@ impl TestEnv {
         }
     }
 
-    /// Waits deterministically for a condition to become true within `timeout`.
+    /// Spins on `f` until it holds or `timeout` passes.
+    ///
+    /// Prefer the event-driven waits below (`wait_pid_exit`, `wait_for_path`,
+    /// `wait_for_api_sock`, `flush`); this exists for state that has no kernel
+    /// event to wait on, and its timeout is only a safety cap.
     pub fn wait_until<F>(&self, timeout: Duration, _step: Duration, mut f: F) -> bool
     where
         F: FnMut() -> bool,
@@ -317,61 +321,34 @@ impl TestEnv {
         f()
     }
 
-    /// Waits for `api.sock` to become available and responding using kernel inotify and connect checks.
-    pub fn wait_for_api_sock(&self, timeout: Duration) -> bool {
-        let effective_timeout = timeout.max(Duration::from_secs(30));
+    /// Blocks until process `pid` exits, woken by its pidfd. Returns `true`
+    /// once it is gone (including if it was already gone), `false` only if
+    /// the safety cap [`SUITE_SAFETY_CAP`] expires first.
+    pub fn wait_pid_exit(pid: u32) -> bool {
+        match PidFd::open(pid) {
+            Some(fd) => fd.wait_exit(Some(SUITE_SAFETY_CAP)),
+            None => true,
+        }
+    }
+
+    /// Blocks until `path` exists, woken by inotify on its parent directory.
+    /// Returns `false` only if the safety cap expires first.
+    pub fn wait_for_path(path: &Path) -> bool {
+        wait_for_path_until(path, Instant::now() + SUITE_SAFETY_CAP, || true)
+    }
+
+    /// Waits for `api.sock` to appear (inotify) and accept a connection.
+    ///
+    /// `timeout` is kept for API compatibility; the wait is event-driven and
+    /// bounded only by the suite-wide safety cap, so a slow machine cannot
+    /// turn it into a spurious failure.
+    pub fn wait_for_api_sock(&self, _timeout: Duration) -> bool {
         let sock = self.api_sock();
-        if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-            return true;
+        if let Some(parent) = sock.parent() {
+            let _ = fs::create_dir_all(parent);
         }
-        let parent = match sock.parent() {
-            Some(p) => p,
-            None => return false,
-        };
-        let _ = std::fs::create_dir_all(parent);
-        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if inotify_fd >= 0 {
-            if let Ok(path_c) = std::ffi::CString::new(parent.to_str().unwrap_or_default()) {
-                let wd = unsafe {
-                    libc::inotify_add_watch(
-                        inotify_fd,
-                        path_c.as_ptr(),
-                        libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB,
-                    )
-                };
-                let start = Instant::now();
-                while start.elapsed() < effective_timeout {
-                    if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-                        if wd >= 0 {
-                            unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
-                        }
-                        unsafe { libc::close(inotify_fd) };
-                        return true;
-                    }
-                    let remaining = effective_timeout
-                        .saturating_sub(start.elapsed())
-                        .as_millis()
-                        .min(i32::MAX as u128) as i32;
-                    let mut pfd = libc::pollfd {
-                        fd: inotify_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let rc = unsafe { libc::poll(&mut pfd, 1, remaining.max(10)) };
-                    if rc > 0 {
-                        let mut buf = [0u8; 1024];
-                        let _ = unsafe {
-                            libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                        };
-                    }
-                }
-                if wd >= 0 {
-                    unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
-                }
-            }
-            unsafe { libc::close(inotify_fd) };
-        }
-        sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        let connectable = || std::os::unix::net::UnixStream::connect(&sock).is_ok();
+        wait_for_path_until(&sock, Instant::now() + SUITE_SAFETY_CAP, connectable)
     }
 
     /// Queries the trace via `trace_processor_shell` using standard SQL through stdin.
@@ -446,40 +423,19 @@ impl TestEnv {
             }
         }
 
-        let slice_rows = self.query_trace(trace_path, "SELECT count(*) FROM slice;")?;
-        let slice_count = slice_rows
-            .into_iter()
-            .find(|r| !r.is_empty() && r[0].trim_matches('"') != "count(*)")
-            .and_then(|r| r[0].trim_matches('"').parse().ok())
-            .unwrap_or(0);
-
-        let track_rows = self.query_trace(trace_path, "SELECT count(*) FROM track;")?;
-        let track_count = track_rows
-            .into_iter()
-            .find(|r| !r.is_empty() && r[0].trim_matches('"') != "count(*)")
-            .and_then(|r| r[0].trim_matches('"').parse().ok())
-            .unwrap_or(0);
-
-        let counter_rows = self.query_trace(trace_path, "SELECT count(*) FROM counter;")?;
-        let counter_count = counter_rows
-            .into_iter()
-            .find(|r| !r.is_empty() && r[0].trim_matches('"') != "count(*)")
-            .and_then(|r| r[0].trim_matches('"').parse().ok())
-            .unwrap_or(0);
-
-        let flow_rows = self.query_trace(trace_path, "SELECT count(*) FROM flow;")?;
-        let flow_count = flow_rows
-            .into_iter()
-            .find(|r| !r.is_empty() && r[0].trim_matches('"') != "count(*)")
-            .and_then(|r| r[0].trim_matches('"').parse().ok())
-            .unwrap_or(0);
-
-        let args_rows = self.query_trace(trace_path, "SELECT count(*) FROM args;")?;
-        let args_count = args_rows
-            .into_iter()
-            .find(|r| !r.is_empty() && r[0].trim_matches('"') != "count(*)")
-            .and_then(|r| r[0].trim_matches('"').parse().ok())
-            .unwrap_or(0);
+        let count = |table: &str| -> io::Result<usize> {
+            let rows = self.query_trace(trace_path, &format!("SELECT count(*) FROM {table};"))?;
+            Ok(rows
+                .into_iter()
+                .find(|r| !r.is_empty() && r[0].trim_matches('"') != "count(*)")
+                .and_then(|r| r[0].trim_matches('"').parse().ok())
+                .unwrap_or(0))
+        };
+        let slice_count = count("slice")?;
+        let track_count = count("track")?;
+        let counter_count = count("counter")?;
+        let flow_count = count("flow")?;
+        let args_count = count("args")?;
 
         Ok(OracleStats {
             slice_count,
@@ -492,21 +448,413 @@ impl TestEnv {
     }
 }
 
+/// Upper bound on any single event-driven wait. It is a hang guard, not a
+/// correctness timeout: events normally arrive in milliseconds.
+pub const SUITE_SAFETY_CAP: Duration = Duration::from_secs(300);
+
+/// An owned pidfd: signals and exit waits that cannot hit a recycled pid.
+pub struct PidFd(std::os::fd::OwnedFd);
+
+impl PidFd {
+    /// Opens a pidfd for `pid`; `None` if the process no longer exists.
+    pub fn open(pid: u32) -> Option<Self> {
+        use std::os::fd::FromRawFd;
+        let pid = libc::pid_t::try_from(pid).ok().filter(|&p| p > 0)?;
+        // SAFETY: plain syscall; a non-negative result is a fresh fd we own.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` was just returned by pidfd_open.
+        Some(Self(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(fd as i32)
+        }))
+    }
+
+    /// Sends `sig`; returns whether the kernel accepted it.
+    pub fn signal(&self, sig: libc::c_int) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: valid pidfd, null siginfo.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        }
+    }
+
+    /// Blocks until the process exits (pidfd readable). `cap` of `None`
+    /// waits forever. Returns `false` if the cap expired first.
+    pub fn wait_exit(&self, cap: Option<Duration>) -> bool {
+        use std::os::fd::AsRawFd;
+        poll_readable(self.0.as_raw_fd(), cap.map(|c| Instant::now() + c))
+    }
+}
+
+/// Polls `fd` for readability, retrying on EINTR, until `deadline`.
+fn poll_readable(fd: libc::c_int, deadline: Option<Instant>) -> bool {
+    loop {
+        let timeout_ms = match deadline {
+            None => -1,
+            Some(d) => d
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as libc::c_int,
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc > 0 {
+            return true;
+        }
+        if rc == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+/// Blocks until `path` exists and `ready()` holds, re-checking on every
+/// inotify event in the parent directory. The watch is installed before the
+/// first check, so a creation in between cannot be missed.
+fn wait_for_path_until(path: &Path, deadline: Instant, mut ready: impl FnMut() -> bool) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let check = |ready: &mut dyn FnMut() -> bool| path.exists() && ready();
+    let Some(parent) = path.parent() else {
+        return check(&mut ready);
+    };
+    // SAFETY: plain syscall.
+    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if raw < 0 {
+        return check(&mut ready);
+    }
+    // SAFETY: `raw` is a fresh fd we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let Ok(c_parent) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
+        return check(&mut ready);
+    };
+    // SAFETY: valid fd and NUL-terminated path.
+    let wd = unsafe {
+        libc::inotify_add_watch(
+            fd.as_raw_fd(),
+            c_parent.as_ptr(),
+            libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB | libc::IN_CLOSE_WRITE,
+        )
+    };
+    if wd < 0 {
+        return check(&mut ready);
+    }
+    loop {
+        if check(&mut ready) {
+            return true;
+        }
+        // The path can exist before the listener is accepting (bind then
+        // listen); no further inotify event will come for that, so yield and
+        // re-check rather than block.
+        if path.exists() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+            continue;
+        }
+        if !poll_readable(fd.as_raw_fd(), Some(deadline)) {
+            return check(&mut ready);
+        }
+        let mut buf = [0u8; 4096];
+        // SAFETY: valid fd and buffer; drains pending events.
+        while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    }
+}
+
 impl Drop for TestEnv {
     fn drop(&mut self) {
         // Stop daemon if running
-        if let Some(pid) = self.daemon_pid() {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        // Signal through a pidfd so a recycled pid is never hit, and wait on
+        // the pidfd instead of spinning on kill(pid, 0).
+        if let Some(fd) = self.daemon_pid().and_then(PidFd::open) {
+            fd.signal(libc::SIGTERM);
+            if !fd.wait_exit(Some(Duration::from_secs(5))) {
+                fd.signal(libc::SIGKILL);
+                fd.wait_exit(Some(Duration::from_secs(5)));
             }
-            let cap = std::time::Instant::now() + Duration::from_secs(2);
-            while Self::is_pid_alive(pid) && std::time::Instant::now() < cap {
-                std::thread::yield_now();
-            }
-            if Self::is_pid_alive(pid) {
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Perfetto `TrackEvent::Type` wire values.
+pub const TE_SLICE_BEGIN: i32 = 1;
+pub const TE_SLICE_END: i32 = 2;
+pub const TE_INSTANT: i32 = 3;
+pub const TE_COUNTER: i32 = 4;
+pub const TE_STATE: i32 = 5;
+
+/// Flow ordinal used by `SnapshotProjector` for inter-agent message delivery (`seq * 256 + 200`).
+pub const FLOW_ORD_MESSAGE_DELIVERY: u64 = 200;
+
+/// One decoded `TrackEvent` packet from a `.perfetto-trace` file.
+#[derive(Debug, Clone)]
+pub struct DecodedTrackEvent {
+    pub track_uuid: u64,
+    pub ty: i32,
+    pub ts: u64,
+    pub name: String,
+    pub counter_value: Option<i64>,
+    pub flow_ids: Vec<u64>,
+    pub terminating_flow_ids: Vec<u64>,
+}
+
+/// A matched (or unclosed) slice on a track.
+#[derive(Debug, Clone)]
+pub struct DecodedSlice {
+    pub track_path: String,
+    pub name: String,
+    pub begin_ts: u64,
+    pub end_ts: Option<u64>,
+    pub flow_ids: Vec<u64>,
+    pub terminating_flow_ids: Vec<u64>,
+}
+
+/// Decoded Perfetto trace model for structural assertions on tracks, state events,
+/// step-function counters, flow arrows, and slice boundaries.
+pub struct DecodedTrace {
+    /// `uuid -> (name, parent_uuid)`
+    pub tracks: std::collections::HashMap<u64, (String, Option<u64>)>,
+    pub events: Vec<DecodedTrackEvent>,
+}
+
+impl DecodedTrace {
+    /// Reads and decodes a `.perfetto-trace` file from disk.
+    pub fn from_file(path: &Path) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        Ok(Self::from_bytes(&bytes))
+    }
+
+    /// Decodes a `.perfetto-trace` byte slice.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        use prost::Message;
+        use std::collections::HashMap;
+        use tacho_proto::perfetto::protos::{self as pb, trace_packet::Data, track_event};
+
+        let trace = pb::Trace::decode(bytes).expect("Perfetto trace bytes must decode cleanly");
+        let mut tracks = HashMap::new();
+        let mut names: HashMap<u64, String> = HashMap::new();
+        let mut events = Vec::new();
+
+        for packet in trace.packet {
+            if let Some(interned) = &packet.interned_data {
+                for n in &interned.event_names {
+                    names.insert(n.iid.unwrap_or(0), n.name.clone().unwrap_or_default());
                 }
+            }
+            match packet.data {
+                Some(Data::TrackDescriptor(d)) => {
+                    let name = match d.static_or_dynamic_name {
+                        Some(pb::track_descriptor::StaticOrDynamicName::Name(n))
+                        | Some(pb::track_descriptor::StaticOrDynamicName::StaticName(n)) => n,
+                        _ => String::new(),
+                    };
+                    tracks.insert(d.uuid.unwrap_or(0), (name, d.parent_uuid));
+                }
+                Some(Data::TrackEvent(te)) => {
+                    let name = match te.name_field {
+                        Some(track_event::NameField::Name(n)) => n,
+                        Some(track_event::NameField::NameIid(i)) => {
+                            names.get(&i).cloned().unwrap_or_default()
+                        }
+                        None => String::new(),
+                    };
+                    let counter_value = match te.counter_value_field {
+                        Some(track_event::CounterValueField::CounterValue(v)) => Some(v),
+                        Some(track_event::CounterValueField::DoubleCounterValue(d)) => {
+                            Some(d as i64)
+                        }
+                        None => None,
+                    };
+                    events.push(DecodedTrackEvent {
+                        track_uuid: te.track_uuid.unwrap_or(0),
+                        ty: te.r#type.unwrap_or(0),
+                        ts: packet.timestamp.unwrap_or(0),
+                        name,
+                        counter_value,
+                        flow_ids: te.flow_ids,
+                        terminating_flow_ids: te.terminating_flow_ids,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Self { tracks, events }
+    }
+
+    /// Slash-joined display path of a track UUID, e.g. `tacho/agents/worker-auth/run 1/turns`.
+    pub fn path(&self, uuid: u64) -> String {
+        let mut parts = Vec::new();
+        let mut cur = Some(uuid);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(u) = cur {
+            if !visited.insert(u) {
+                break;
+            }
+            let Some((name, parent)) = self.tracks.get(&u) else {
+                break;
+            };
+            parts.push(name.clone());
+            cur = *parent;
+        }
+        parts.reverse();
+        parts.join("/")
+    }
+
+    /// Finds a track UUID by its exact display path.
+    pub fn track_by_path(&self, path: &str) -> Option<u64> {
+        self.tracks.keys().copied().find(|&u| self.path(u) == path)
+    }
+
+    /// Returns all track display paths rooted under `tacho`.
+    pub fn tacho_track_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .tracks
+            .keys()
+            .map(|&u| self.path(u))
+            .filter(|p| p == "tacho" || p.starts_with("tacho/"))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Returns all `TYPE_STATE` (`ty == 5`) events on `track_path`.
+    pub fn state_events_on(&self, track_path: &str) -> Vec<&DecodedTrackEvent> {
+        let Some(uuid) = self.track_by_path(track_path) else {
+            return Vec::new();
+        };
+        self.events
+            .iter()
+            .filter(|e| e.track_uuid == uuid && e.ty == TE_STATE)
+            .collect()
+    }
+
+    /// Returns all `(ts, counter_value)` samples (`ty == 4`) on `track_path`.
+    pub fn counter_samples_on(&self, track_path: &str) -> Vec<(u64, i64)> {
+        let Some(uuid) = self.track_by_path(track_path) else {
+            return Vec::new();
+        };
+        self.events
+            .iter()
+            .filter(|e| e.track_uuid == uuid && e.ty == TE_COUNTER)
+            .filter_map(|e| e.counter_value.map(|v| (e.ts, v)))
+            .collect()
+    }
+
+    /// Reconstructs all slices on `tacho` tracks by matching `SLICE_BEGIN` and `SLICE_END`.
+    /// Panics if any `SLICE_END` has no matching `SLICE_BEGIN`.
+    pub fn all_tacho_slices(&self) -> Vec<DecodedSlice> {
+        use std::collections::HashMap;
+        let mut stacks: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut out: Vec<DecodedSlice> = Vec::new();
+
+        for ev in &self.events {
+            let path = self.path(ev.track_uuid);
+            if !(path == "tacho" || path.starts_with("tacho/")) {
+                continue;
+            }
+            match ev.ty {
+                TE_SLICE_BEGIN => {
+                    stacks.entry(ev.track_uuid).or_default().push(out.len());
+                    out.push(DecodedSlice {
+                        track_path: path,
+                        name: ev.name.clone(),
+                        begin_ts: ev.ts,
+                        end_ts: None,
+                        flow_ids: ev.flow_ids.clone(),
+                        terminating_flow_ids: ev.terminating_flow_ids.clone(),
+                    });
+                }
+                TE_SLICE_END => {
+                    let idx = stacks
+                        .get_mut(&ev.track_uuid)
+                        .and_then(|s| s.pop())
+                        .unwrap_or_else(|| {
+                            panic!("unmatched SLICE_END on track {} at ts={}", path, ev.ts)
+                        });
+                    out[idx].end_ts = Some(ev.ts);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Returns all slices on a specific `track_path`.
+    pub fn slices_on(&self, track_path: &str) -> Vec<DecodedSlice> {
+        self.all_tacho_slices()
+            .into_iter()
+            .filter(|s| s.track_path == track_path)
+            .collect()
+    }
+
+    /// Returns any slices on `tacho` tracks that were left unclosed at the end of the trace.
+    pub fn unclosed_tacho_slices(&self) -> Vec<DecodedSlice> {
+        self.all_tacho_slices()
+            .into_iter()
+            .filter(|s| s.end_ts.is_none())
+            .collect()
+    }
+
+    /// Returns all `(origin_track::origin_name, dest_track::dest_name, flow_id)` links
+    /// for `FLOW_MESSAGE_DELIVERY` (`(flow_id & 0xFF) == 200`).
+    pub fn message_delivery_links(&self) -> Vec<(String, String, u64)> {
+        use std::collections::HashMap;
+        let label = |e: &DecodedTrackEvent| format!("{}::{}", self.path(e.track_uuid), e.name);
+        let mut origins: HashMap<u64, String> = HashMap::new();
+        for e in &self.events {
+            for &f in &e.flow_ids {
+                if (f & 0xFF) == FLOW_ORD_MESSAGE_DELIVERY {
+                    origins.insert(f, label(e));
+                }
+            }
+        }
+        let mut links = Vec::new();
+        for e in &self.events {
+            for &f in &e.terminating_flow_ids {
+                if let Some(from) = origins.get(&f) {
+                    links.push((from.clone(), label(e), f));
+                }
+            }
+        }
+        links
+    }
+
+    /// Asserts that no `terminating_flow_ids` on `tacho` tracks reference an unknown `flow_id`.
+    pub fn assert_no_dangling_terminating_flows(&self) {
+        use std::collections::HashSet;
+        let origins: HashSet<u64> = self
+            .events
+            .iter()
+            .flat_map(|e| e.flow_ids.iter().copied())
+            .collect();
+        for e in &self.events {
+            let path = self.path(e.track_uuid);
+            if !(path == "tacho" || path.starts_with("tacho/")) {
+                continue;
+            }
+            for &f in &e.terminating_flow_ids {
+                assert!(
+                    origins.contains(&f),
+                    "dangling terminating_flow_id {} on {}::{}",
+                    f,
+                    path,
+                    e.name
+                );
             }
         }
     }
@@ -515,6 +863,39 @@ impl Drop for TestEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pidfd_wait_exit_observes_child_exit() {
+        let mut child = Command::new("cat").stdin(Stdio::piped()).spawn().unwrap();
+        let fd = PidFd::open(child.id()).unwrap();
+        // Closing stdin is the event that makes `cat` exit.
+        drop(child.stdin.take());
+        assert!(fd.wait_exit(None));
+        assert!(child.wait().unwrap().success());
+        assert!(PidFd::open(0).is_none());
+        assert!(PidFd::open(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn wait_for_path_wakes_on_creation_from_another_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("late");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = target.clone();
+        let writer = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            fs::write(&t, b"x").unwrap();
+        });
+        let waiter = {
+            let target = target.clone();
+            std::thread::spawn(move || TestEnv::wait_for_path(&target))
+        };
+        tx.send(()).unwrap();
+        assert!(waiter.join().unwrap());
+        writer.join().unwrap();
+        // Already-existing path returns immediately.
+        assert!(TestEnv::wait_for_path(&target));
+    }
 
     #[test]
     fn test_find_binary_env_and_path() {

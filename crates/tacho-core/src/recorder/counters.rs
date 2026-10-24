@@ -231,7 +231,7 @@ impl Recorder {
             let short_hex = |s: Option<&String>| {
                 s.map(|s| s.trim())
                     .filter(|s| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-                    .map(|s| s[..s.len().min(8)].to_string())
+                    .map(|s| crate::char_prefix(s, 8).to_string())
             };
 
             // Checkout, reset, rebase and pull move HEAD without the agent making progress:
@@ -261,7 +261,7 @@ impl Recorder {
             let raw_sha = args.get("sha").map(|s| s.trim());
             let short_sha = raw_sha.map(|s| {
                 if s.len() >= 7 && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    s[..s.len().min(8)].to_string()
+                    crate::char_prefix(s, 8).to_string()
                 } else {
                     let scrubbed = self.scrubber.scrub(s);
                     truncate_utf8(&scrubbed, 16)

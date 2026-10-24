@@ -127,3 +127,28 @@ pub fn find_trace_processor() -> Option<std::path::PathBuf> {
 
     None
 }
+
+/// Return at most the first `max_chars` characters of `s`.
+///
+/// SHAs and ids come from untrusted sources (git output, logs, API payloads); byte slicing
+/// like `&s[..8]` panics when a multi-byte character straddles the cut, this never does.
+pub(crate) fn char_prefix(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+#[cfg(test)]
+mod char_prefix_tests {
+    use super::char_prefix;
+
+    #[test]
+    fn test_char_prefix_never_splits_multibyte_chars() {
+        assert_eq!(char_prefix("abcdef0123", 8), "abcdef01");
+        assert_eq!(char_prefix("abc", 8), "abc");
+        assert_eq!(char_prefix("", 8), "");
+        assert_eq!(char_prefix("ééééééééé", 8), "éééééééé");
+        assert_eq!(char_prefix("abcdefg🦀xyz", 8), "abcdefg🦀");
+    }
+}

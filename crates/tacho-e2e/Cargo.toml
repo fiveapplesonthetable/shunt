@@ -16,6 +16,8 @@ serde_json = { version = "1.0" }
 libc = "0.2"
 tacho-system = { path = "../tacho-system" }
 tacho-core = { path = "../tacho-core" }
+tacho-proto = { path = "../tacho-proto" }
+prost = "0.14"
 
 [dev-dependencies]
 tempfile = "3"

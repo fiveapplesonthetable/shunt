@@ -38,6 +38,8 @@ impl AgentCgroup {
     ///
     /// Uses a 2s timeout and kills the busctl process on timeout.
     pub fn attach(unit: &str, pids: &[u32]) -> io::Result<()> {
+        use std::os::unix::process::CommandExt;
+
         if pids.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -70,10 +72,21 @@ impl AgentCgroup {
             .arg("tacho agent")
             .arg("0");
 
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
 
         let mut child = cmd.spawn()?;
+        let exited = crate::sampler::wait_child_exit(&child, std::time::Duration::from_secs(2))?;
+        if !exited {
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "busctl StartTransientUnit timed out",
+            ));
+        }
         match child.wait()? {
             status if status.success() => Ok(()),
             status => {

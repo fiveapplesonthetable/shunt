@@ -19,8 +19,12 @@
 
 pub mod dispatch;
 pub mod land;
+pub mod ops;
+pub mod plugin;
 pub mod verify;
 pub mod watch;
+
+pub use plugin::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -250,10 +254,21 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
 
     // 4. Resolve completed batch outcomes (including head-movement refusal and bisection).
     let mut batch_resolutions = Vec::new();
+    let mut resolved_this_tick = BTreeSet::new();
     for outcome in &obs.batch_outcomes {
         let Some(b_idx) = next.batches.iter().position(|b| b.id == outcome.batch_id) else {
             continue;
         };
+        // Outcomes are idempotent: callers may re-send finished batches (or the same one twice),
+        // and re-applying would double-count flakes or re-bisect. A batch that finished at or
+        // before the previous tick, or was already resolved in this tick, has been handled.
+        let already_resolved = next.batches[b_idx]
+            .finished_at
+            .zip(state.last_tick_ts)
+            .is_some_and(|(finished, last_tick)| finished <= last_tick);
+        if already_resolved || !resolved_this_tick.insert(outcome.batch_id.clone()) {
+            continue;
+        }
         let batch_prs = next.batches[b_idx].prs.clone();
         let expected_shas = next.batches[b_idx].shas.clone();
         let batch_areas = next.batches[b_idx].areas.clone();
@@ -272,7 +287,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
             continue;
         }
 
-        if outcome.passed {
+        if outcome.passed && next.batches[b_idx].flakes.is_empty() {
             next.batches[b_idx].status = "passed".to_string();
             next.batches[b_idx].finished_at = Some(obs.now);
             next.batches[b_idx].tree = Some(outcome.tree_sha.clone());
@@ -299,6 +314,24 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
                 batch_id: outcome.batch_id.clone(),
                 prs: batch_prs,
             });
+        } else if outcome.passed {
+            // A batch that recorded flakes is never accepted as a clean pass.
+            let reason = format!("flake batch ({})", next.batches[b_idx].flakes.join(", "));
+            next.batches[b_idx].status = "flake".to_string();
+            next.batches[b_idx].finished_at = Some(obs.now);
+            for &pr in &batch_prs {
+                if next
+                    .passed
+                    .get(&pr)
+                    .is_some_and(|rec| rec.batch_id == outcome.batch_id)
+                {
+                    next.passed.remove(&pr);
+                }
+            }
+            batch_resolutions.push(BatchResolution::InfraRetry {
+                batch_id: outcome.batch_id.clone(),
+                reason,
+            });
         } else {
             let kind = classify(&outcome.log_output).to_string();
             let sum = summary_line(&outcome.log_output);
@@ -308,7 +341,10 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
             next.batches[b_idx].finished_at = Some(obs.now);
             next.batches[b_idx].log = outcome.log_output.clone();
 
-            if kind == "infra" {
+            if kind == "infrastructure" {
+                // Never leave an infra failure as plain "failed": a `flake` batch proves nothing
+                // and must not be reused as a pass or as a red verdict against its PRs.
+                next.batches[b_idx].status = "flake".to_string();
                 let area_hint = outcome
                     .failed_area
                     .as_deref()
@@ -319,6 +355,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
                 } else {
                     f_tests
                 };
+                next.batches[b_idx].flakes = flake_names.clone();
                 let updated = record_flakes(
                     &next.flakes,
                     &flake_names,
@@ -568,6 +605,17 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         burner_kills,
         tell_actions,
     }
+}
+
+/// Evaluate [`decide`] after applying a unified [`ProjectPolicy`] to the state.
+pub fn decide_with_policy(
+    state: &DecisionState,
+    obs: &WorldObservation,
+    policy: &ProjectPolicy,
+) -> DecisionPlan {
+    let mut configured = state.clone();
+    policy.apply_to_state(&mut configured);
+    decide(&configured, obs)
 }
 
 #[cfg(test)]

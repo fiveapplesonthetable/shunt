@@ -8,7 +8,6 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use tacho_core::{Input, SessionKey, ToolInput};
 use tacho_daemon::{Config, Daemon, DaemonPaths};
 
@@ -41,7 +40,8 @@ fn test_snapshots_under_load() {
 
         let handle = std::thread::spawn(move || {
             let mut iter = 0;
-            while !stop.load(Ordering::Acquire) {
+            // Each reader completes at least one snapshot, then keeps going until the writer is done.
+            loop {
                 if let Ok(mut stream) = UnixStream::connect(&trace_sock) {
                     let mut trace_bytes = Vec::new();
                     if stream.read_to_end(&mut trace_bytes).is_ok() && !trace_bytes.is_empty() {
@@ -80,7 +80,9 @@ fn test_snapshots_under_load() {
                         }
                     }
                 }
-                std::thread::yield_now();
+                if iter > 0 && stop.load(Ordering::Acquire) {
+                    break;
+                }
             }
         });
         reader_handles.push(handle);
@@ -110,7 +112,6 @@ fn test_snapshots_under_load() {
         )
         .unwrap();
 
-    let start = Instant::now();
     for i in 0..total_inputs {
         let ts = 1_000_000_000 + (i as u64) * 10_000;
         let input = if i % 2 == 0 {
@@ -138,13 +139,12 @@ fn test_snapshots_under_load() {
         daemon.appender.send_input(input, ts).unwrap();
     }
 
-    daemon.appender.flush();
-    let elapsed = start.elapsed();
+    // flush() gives up confirming after a bounded wait while 200k inputs drain; each retry
+    // queues another flush behind the backlog, so loop until one is confirmed.
+    while !daemon.appender.flush() {}
     println!(
-        "Streamed {} inputs under 4 concurrent snapshot readers in {:.2?} ({:.0} inputs/s)",
-        total_inputs,
-        elapsed,
-        (total_inputs as f64) / elapsed.as_secs_f64()
+        "Streamed {} inputs under 4 concurrent snapshot readers",
+        total_inputs
     );
 
     stop_readers.store(true, Ordering::Release);

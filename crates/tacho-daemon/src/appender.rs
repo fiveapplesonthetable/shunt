@@ -7,28 +7,62 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tacho_core::{AgentRole, Event, Input, LiveState, Recorder, SessionKey, TrackRegistry};
 
 use crate::log::EventLog;
+
+/// How long a producer waits for queue space before the input is rejected as "queue full".
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long [`AppenderHandle::flush`] waits for the appender to confirm a commit.
+const FLUSH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Group commit window: inputs arriving within this window share one SQLite transaction.
+/// It also paces the idle detector tick (silence detection needs time to advance).
+const COMMIT_INTERVAL: Duration = Duration::from_millis(50);
+/// Detector tick cadence while the queue is continuously busy.
+const TICK_INTERVAL: Duration = Duration::from_millis(200);
+/// Events per SQLite transaction before committing early.
+const MAX_BATCH_SIZE: usize = 256;
+/// Bound on queued `on_stall` hook jobs; further stalls are dropped (and logged once).
+const STALL_HOOK_QUEUE: usize = 64;
+/// Stalls older than this (e.g. replayed history) never fire `on_stall`.
+const STALL_HOOK_FRESHNESS_NS: u64 = 10 * 60 * 1_000_000_000;
+
+fn wall_clock_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
 
 /// Test hooks to simulate a wedged or paused appender thread.
 #[derive(Debug, Default)]
 pub struct AppenderHooks {
     /// When true, causes the appender thread to block until cleared.
     pub wedged: AtomicBool,
-    pub condvar: std::sync::Condvar,
-    pub mutex: std::sync::Mutex<()>,
+    pub condvar: Condvar,
+    pub mutex: Mutex<()>,
 }
 
 impl AppenderHooks {
     pub fn set_wedged(&self, wedged: bool) {
-        let _guard = self.mutex.lock().unwrap();
+        let _guard = self.mutex.lock().unwrap_or_else(|p| p.into_inner());
         self.wedged.store(wedged, Ordering::Release);
         if !wedged {
             self.condvar.notify_all();
         }
+    }
+
+    /// Blocks while the wedge is set.
+    fn block_while_wedged(&self) {
+        if !self.wedged.load(Ordering::Acquire) {
+            return;
+        }
+        let guard = self.mutex.lock().unwrap_or_else(|p| p.into_inner());
+        let _unused = self
+            .condvar
+            .wait_while(guard, |_| self.wedged.load(Ordering::Acquire));
     }
 }
 
@@ -55,6 +89,25 @@ pub struct ActiveRun {
     pub role: AgentRole,
 }
 
+/// Sequence number bumped on every published `LiveState`, plus the condvar readers wait on.
+#[derive(Default)]
+struct StateNotify {
+    seq: Mutex<u64>,
+    cvar: Condvar,
+}
+
+impl StateNotify {
+    fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.seq.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn bump(&self) {
+        let mut seq = self.lock();
+        *seq += 1;
+        self.cvar.notify_all();
+    }
+}
+
 /// Handle to communicate with the running appender thread.
 #[derive(Clone)]
 pub struct AppenderHandle {
@@ -64,26 +117,49 @@ pub struct AppenderHandle {
     active_runs: Arc<ArcSwap<Vec<ActiveRun>>>,
     hooks: Arc<AppenderHooks>,
     write_errors: Arc<AtomicUsize>,
-    state_notify: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    state_notify: Arc<StateNotify>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl AppenderHandle {
     /// Waits for `LiveState` to update beyond `last_seq` within `timeout`, returning the new sequence.
     pub fn wait_state_change(&self, last_seq: u64, timeout: Duration) -> u64 {
-        let (lock, cvar) = &*self.state_notify;
-        let seq = lock.lock().unwrap();
-        if *seq != last_seq {
-            return *seq;
-        }
-        let (res, _) = cvar.wait_timeout(seq, timeout).unwrap();
-        *res
+        let guard = self.state_notify.lock();
+        let (guard, _) = self
+            .state_notify
+            .cvar
+            .wait_timeout_while(guard, timeout, |seq| *seq == last_seq)
+            .unwrap_or_else(|p| p.into_inner());
+        *guard
+    }
+
+    /// Blocks until `LiveState` moves past `last_seq` or `cancel` is set, with no timeout.
+    ///
+    /// Whoever sets `cancel` must then call [`AppenderHandle::wake_state_waiters`]; the flag
+    /// is re-checked under the state mutex, so that wakeup cannot be lost.
+    pub fn wait_state_change_until(&self, last_seq: u64, cancel: &AtomicBool) -> u64 {
+        let guard = self.state_notify.lock();
+        let guard = self
+            .state_notify
+            .cvar
+            .wait_while(guard, |seq| {
+                *seq == last_seq && !cancel.load(Ordering::Acquire)
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        *guard
+    }
+
+    /// Wakes every thread blocked in a state wait so it can re-check its cancel flag.
+    pub fn wake_state_waiters(&self) {
+        let _guard = self.state_notify.lock();
+        self.state_notify.cvar.notify_all();
     }
 
     /// Returns current state sequence number.
     pub fn state_seq(&self) -> u64 {
-        let (lock, _) = &*self.state_notify;
-        *lock.lock().unwrap()
+        *self.state_notify.lock()
     }
+
     /// Sends an input event into the flight recorder pipeline with a bounded timeout
     /// so high-throughput streams get backpressure without hanging indefinitely if wedged.
     #[allow(clippy::result_large_err)]
@@ -94,7 +170,7 @@ impl AppenderHandle {
     ) -> Result<(), crossbeam_channel::SendTimeoutError<AppenderCommand>> {
         self.sender.send_timeout(
             AppenderCommand::Input(Box::new(input), received_at_ns),
-            Duration::from_secs(2),
+            SEND_TIMEOUT,
         )
     }
 
@@ -109,26 +185,26 @@ impl AppenderHandle {
             return Ok(());
         }
         self.sender
-            .send_timeout(AppenderCommand::InputBatch(batch), Duration::from_secs(2))
+            .send_timeout(AppenderCommand::InputBatch(batch), SEND_TIMEOUT)
     }
 
-    /// Flushes all pending batches in the appender thread.
-    pub fn flush(&self) {
+    /// Commits everything queued before this call. Returns true once the appender confirms;
+    /// false if it is stopped, wedged or too busy to confirm in time.
+    pub fn flush(&self) -> bool {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        if self
-            .sender
-            .send_timeout(AppenderCommand::Flush(tx), Duration::from_secs(2))
+        self.sender
+            .send_timeout(AppenderCommand::Flush(tx), SEND_TIMEOUT)
             .is_ok()
-        {
-            let _ = rx.recv_timeout(Duration::from_secs(5));
-        }
+            && rx.recv_timeout(FLUSH_CONFIRM_TIMEOUT).is_ok()
     }
 
-    /// Signals the appender thread to terminate cleanly.
+    /// Signals the appender thread to terminate cleanly after committing what is queued.
+    ///
+    /// Reliable even when the queue is full: the flag is checked on every loop iteration,
+    /// and the command only exists to wake an idle loop promptly.
     pub fn shutdown(&self) {
-        let _ = self
-            .sender
-            .send_timeout(AppenderCommand::Shutdown, Duration::from_millis(200));
+        self.shutdown_requested.store(true, Ordering::Release);
+        let _ = self.sender.try_send(AppenderCommand::Shutdown);
     }
 
     /// Returns a shared, atomic reference to the latest published LiveState.
@@ -171,11 +247,40 @@ struct StallJob {
     ts_ns: u64,
 }
 
+impl StallJob {
+    /// Builds a job for a fresh, committed stall event; `None` for anything else.
+    fn from_event(ev: &Event, min_fresh_ts_ns: u64) -> Option<Self> {
+        use tacho_proto::tacho::StallKind;
+        if ev.kind != tacho_core::Kind::Stall || ev.ts_ns < min_fresh_ts_ns {
+            return None;
+        }
+        let Some(tacho_proto::tacho::event::Body::Stall(ref st)) = ev.body.body else {
+            return None;
+        };
+        let stall_kind = match st.kind.and_then(|k| StallKind::try_from(k).ok()) {
+            Some(StallKind::Silent) => "SILENT",
+            Some(StallKind::Loop) => "LOOP",
+            Some(StallKind::Spin) => "SPIN",
+            Some(StallKind::Burn) => "BURN",
+            Some(StallKind::Failing) => "FAILING",
+            Some(StallKind::OffBrief) => "OFF_BRIEF",
+            Some(StallKind::StallClaim) => "CLAIM",
+            _ => "STALL",
+        };
+        Some(Self {
+            agent: ev.agent.clone().unwrap_or_default(),
+            stall_kind,
+            reason: st.evidence.clone().unwrap_or_default(),
+            seq: ev.seq,
+            ts_ns: ev.ts_ns,
+        })
+    }
+}
+
 /// Dedicated sender for the bounded on_stall effect hook worker.
 struct StallHookSender {
     tx: std::sync::mpsc::SyncSender<StallJob>,
     dropped_count: usize,
-    logged_drop: bool,
 }
 
 impl StallHookSender {
@@ -184,10 +289,10 @@ impl StallHookSender {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.dropped_count += 1;
-                if !self.logged_drop {
-                    self.logged_drop = true;
+                if self.dropped_count == 1 {
                     eprintln!(
-                        "[tacho-daemon] on_stall hook queue full (64 items); dropping stall hooks"
+                        "[tacho-daemon] on_stall hook queue full ({} items); dropping stall hooks",
+                        STALL_HOOK_QUEUE
                     );
                 }
             }
@@ -196,79 +301,111 @@ impl StallHookSender {
     }
 }
 
-/// Runs the dedicated worker thread servicing on_stall hook commands.
+/// Runs the dedicated worker thread servicing on_stall hook commands, one at a time.
 fn run_stall_worker(
     receiver: std::sync::mpsc::Receiver<StallJob>,
     cmd_str: String,
     timeout: Duration,
 ) {
+    while let Ok(job) = receiver.recv() {
+        run_stall_hook(&cmd_str, &job, timeout);
+    }
+}
+
+/// Runs one hook in its own process group and makes sure nothing it started outlives it.
+///
+/// The leader stays unreaped (a zombie at worst) until after `kill(-pgid)`, so the group id
+/// cannot have been recycled by an unrelated process when we signal it.
+fn run_stall_hook(cmd_str: &str, job: &StallJob, timeout: Duration) {
     use std::os::unix::process::CommandExt;
 
-    while let Ok(job) = receiver.recv() {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(&cmd_str);
-        cmd.env("TACHO_AGENT", &job.agent);
-        cmd.env("TACHO_STALL_KIND", job.stall_kind);
-        cmd.env("TACHO_STALL_REASON", &job.reason);
-        cmd.env("TACHO_SEQ", job.seq.to_string());
-        cmd.env("TACHO_TS_NS", job.ts_ns.to_string());
-        cmd.process_group(0);
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(cmd_str)
+        .env("TACHO_AGENT", &job.agent)
+        .env("TACHO_STALL_KIND", job.stall_kind)
+        .env("TACHO_STALL_REASON", &job.reason)
+        .env("TACHO_SEQ", job.seq.to_string())
+        .env("TACHO_TS_NS", job.ts_ns.to_string())
+        .stdin(std::process::Stdio::null())
+        .process_group(0);
 
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!("[tacho-daemon] failed to spawn on_stall hook: {}", e);
-                continue;
-            }
-        };
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("[tacho-daemon] failed to spawn on_stall hook: {}", e);
+            return;
+        }
+    };
+    let pgid = child.id() as libc::pid_t;
 
-        let child_pid = child.id() as libc::pid_t;
-        let mut exited = false;
+    match wait_exit_without_reaping(pgid, timeout) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "[tacho-daemon] on_stall hook for {} exceeded {:?}; killing its process group",
+            job.agent, timeout
+        ),
+        Err(e) => eprintln!("[tacho-daemon] on_stall hook wait failed: {}", e),
+    }
+    // Kill the timed-out hook, or any background stragglers of a hook that exited.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
 
-        let pid_fd =
-            unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid as libc::c_int, 0) as i32 };
-        if pid_fd >= 0 {
-            let mut pfd = libc::pollfd {
-                fd: pid_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-            let poll_rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-            unsafe {
-                let _ = libc::close(pid_fd);
-            }
-            if poll_rc > 0 {
-                exited = true;
-                let _ = child.wait();
-            }
-        } else {
-            // pidfd not supported: poll non-blocking with child.try_wait() up to timeout
-            let start = Instant::now();
-            while start.elapsed() < timeout {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        exited = true;
-                        break;
-                    }
-                    Ok(None) => {
-                        std::thread::yield_now();
-                    }
-                    Err(e) => {
-                        eprintln!("[tacho-daemon] on_stall wait error: {}", e);
-                        exited = true;
+/// Waits up to `timeout` for `pid` (our unreaped child) to exit, leaving it unreaped.
+///
+/// Uses a pidfd when available; otherwise `waitid(WNOWAIT)` on a helper thread.
+/// Returns Ok(true) if it exited, Ok(false) on timeout.
+fn wait_exit_without_reaping(pid: libc::pid_t, timeout: Duration) -> std::io::Result<bool> {
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    if pidfd < 0 {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("tacho-on-stall-wait".to_string())
+            .spawn(move || {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                loop {
+                    let rc = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT,
+                        )
+                    };
+                    if rc == 0
+                        || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
                         break;
                     }
                 }
-            }
+                let _ = tx.send(());
+            })?;
+        return Ok(rx.recv_timeout(timeout).is_ok());
+    }
+    // SAFETY: pidfd_open returned a fresh fd that we own.
+    let pidfd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(pidfd) };
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut pfd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&pidfd),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc > 0 {
+            return Ok(true);
         }
-
-        if !exited {
-            // Process timed out: kill the process group and reap the child process.
-            unsafe {
-                libc::kill(-child_pid, libc::SIGKILL);
-            }
-            let _ = child.wait();
+        if rc == 0 {
+            return Ok(false);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
         }
     }
 }
@@ -304,758 +441,317 @@ pub fn spawn_appender_with_hook(
     )
 }
 
+/// Active runs restored from a recovered `LiveState`; their pids are unknown (0) until the
+/// agent's next `RunStart`, so they are sampled for worktree progress only.
+fn restored_active_runs(state: &LiveState) -> HashMap<SessionKey, ActiveRun> {
+    state
+        .agents
+        .iter()
+        .filter(|(_, a)| a.state != "Exited" && a.cwd.is_some())
+        .map(|(agent_id, a)| {
+            let session = SessionKey::new(&a.provider, &a.session_id);
+            let run = ActiveRun {
+                session: session.clone(),
+                agent_id: agent_id.clone(),
+                run_track: run_track_key(agent_id, a.run_n),
+                pid: 0,
+                cwd: a.cwd.clone(),
+                role: AgentRole::infer(agent_id, a.task.as_deref()),
+            };
+            (session, run)
+        })
+        .collect()
+}
+
+fn sorted_runs(map: &HashMap<SessionKey, ActiveRun>) -> Vec<ActiveRun> {
+    let mut runs: Vec<ActiveRun> = map.values().cloned().collect();
+    runs.sort_by(|a, b| {
+        a.agent_id
+            .cmp(&b.agent_id)
+            .then_with(|| a.run_track.cmp(&b.run_track))
+    });
+    runs
+}
+
 /// Spawns the dedicated appender thread with an optional `on_stall` shell hook and custom timeout.
 pub fn spawn_appender_with_hook_timeout(
-    mut recorder: Recorder,
-    mut log: EventLog,
+    recorder: Recorder,
+    log: EventLog,
     channel_capacity: usize,
     on_stall: Option<String>,
     on_stall_timeout: Duration,
 ) -> (AppenderHandle, std::thread::JoinHandle<()>) {
     let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
 
-    let initial_state = Arc::new(recorder.live_state().clone());
-    let initial_reg = Arc::new(recorder.registry().clone());
-
-    let mut initial_runs_map = HashMap::new();
-    for (agent_id, a) in &initial_state.agents {
-        if a.state != "Exited" && a.cwd.is_some() {
-            let sess = SessionKey::new(&a.provider, &a.session_id);
-            initial_runs_map.insert(
-                sess.clone(),
-                ActiveRun {
-                    session: sess,
-                    agent_id: agent_id.clone(),
-                    run_track: run_track_key(agent_id, a.run_n),
-                    pid: 0,
-                    cwd: a.cwd.clone(),
-                    role: AgentRole::infer(agent_id, a.task.as_deref()),
-                },
-            );
-        }
-    }
-    let active_runs = Arc::new(ArcSwap::new(Arc::new(
-        initial_runs_map.values().cloned().collect(),
-    )));
-
-    let live_state = Arc::new(ArcSwap::new(initial_state));
-    let published_registry = Arc::new(ArcSwap::new(initial_reg));
-    let hooks = Arc::new(AppenderHooks::default());
-    let write_errors = Arc::new(AtomicUsize::new(0));
-    let state_notify = Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
-
+    let active_runs_map = restored_active_runs(recorder.live_state());
     let handle = AppenderHandle {
         sender,
-        live_state: live_state.clone(),
-        published_registry: published_registry.clone(),
-        active_runs: active_runs.clone(),
-        hooks: hooks.clone(),
-        write_errors: write_errors.clone(),
-        state_notify: state_notify.clone(),
+        live_state: Arc::new(ArcSwap::from_pointee(recorder.live_state().clone())),
+        published_registry: Arc::new(ArcSwap::from_pointee(recorder.registry().clone())),
+        active_runs: Arc::new(ArcSwap::from_pointee(sorted_runs(&active_runs_map))),
+        hooks: Arc::new(AppenderHooks::default()),
+        write_errors: Arc::new(AtomicUsize::new(0)),
+        state_notify: Arc::new(StateNotify::default()),
+        shutdown_requested: Arc::new(AtomicBool::new(false)),
     };
 
-    let (stall_hook_sender, stall_worker_handle) = match on_stall {
+    let (stall_hooks, stall_worker) = match on_stall {
         Some(cmd_str) if !cmd_str.trim().is_empty() => {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<StallJob>(64);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<StallJob>(STALL_HOOK_QUEUE);
             let worker = std::thread::Builder::new()
                 .name("tacho-on-stall".to_string())
-                .spawn(move || {
-                    run_stall_worker(rx, cmd_str, on_stall_timeout);
-                })
+                .spawn(move || run_stall_worker(rx, cmd_str, on_stall_timeout))
                 .expect("failed to spawn on-stall worker thread");
-            (
-                Some(StallHookSender {
-                    tx,
-                    dropped_count: 0,
-                    logged_drop: false,
-                }),
-                Some(worker),
-            )
+            let sender = StallHookSender {
+                tx,
+                dropped_count: 0,
+            };
+            (Some(sender), Some(worker))
         }
         _ => (None, None),
     };
 
-    let state_notify_loop = state_notify.clone();
+    let last_published_reg_len = recorder.registry().len();
+    let appender = Appender {
+        receiver,
+        recorder,
+        log,
+        shared: handle.clone(),
+        active_runs_map,
+        stall_hooks,
+        batch: Vec::with_capacity(MAX_BATCH_SIZE),
+        flush_notifiers: Vec::new(),
+        last_published_reg_len,
+        last_tick: Instant::now(),
+    };
     let join_handle = std::thread::Builder::new()
         .name("tacho-appender".to_string())
         .spawn(move || {
-            run_appender_loop(
-                receiver,
-                &mut recorder,
-                &mut log,
-                live_state,
-                published_registry,
-                active_runs,
-                initial_runs_map,
-                hooks,
-                write_errors,
-                stall_hook_sender,
-                stall_worker_handle,
-                state_notify_loop,
-            );
+            appender.run();
+            // Dropping the hook sender (inside `run`) lets the worker finish queued hooks.
+            if let Some(worker) = stall_worker {
+                let _ = worker.join();
+            }
         })
         .expect("failed to spawn appender thread");
 
     (handle, join_handle)
 }
 
-/// Main execution loop of the sole appender thread.
-#[allow(clippy::too_many_arguments)]
-fn run_appender_loop(
+/// State owned by the appender thread.
+struct Appender {
     receiver: Receiver<AppenderCommand>,
-    recorder: &mut Recorder,
-    log: &mut EventLog,
-    live_state: Arc<ArcSwap<LiveState>>,
-    published_registry: Arc<ArcSwap<TrackRegistry>>,
-    active_runs: Arc<ArcSwap<Vec<ActiveRun>>>,
-    mut active_runs_map: HashMap<SessionKey, ActiveRun>,
-    hooks: Arc<AppenderHooks>,
-    write_errors: Arc<AtomicUsize>,
-    mut stall_hook_sender: Option<StallHookSender>,
-    stall_worker_handle: Option<std::thread::JoinHandle<()>>,
-    state_notify: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
-) {
-    let mut batch_events = Vec::with_capacity(256);
-    let mut flush_notifiers = Vec::new();
-    let mut last_live_publish = Instant::now();
-    let mut last_published_reg_len = recorder.registry().len();
-    let mut last_tick = Instant::now();
-    let tick_interval = Duration::from_millis(200);
-
-    let commit_interval = Duration::from_millis(50);
-    const MAX_BATCH_SIZE: usize = 256;
-
-    'outer: loop {
-        // Chaos injection hook: intentionally wedges the appender thread to simulate SQLite lock contention
-        // and verify daemon degrades cleanly without blocking hook clients (test14_wedged_appender).
-        if hooks.wedged.load(Ordering::Acquire) {
-            let guard = hooks.mutex.lock().unwrap();
-            if let Ok(guard) = hooks
-                .condvar
-                .wait_while(guard, |_| hooks.wedged.load(Ordering::Acquire))
-            {
-                drop(guard);
-            }
-        }
-
-        // 1. Wait for the first item with timeout
-        let first_cmd = match receiver.recv_timeout(commit_interval) {
-            Ok(cmd) => cmd,
-            Err(RecvTimeoutError::Timeout) => {
-                // Time-based periodic maintenance (detectors tick)
-                let now_ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                recorder.tick(now_ns, &mut batch_events);
-                last_tick = Instant::now();
-                if !batch_events.is_empty() {
-                    commit_batch(
-                        &mut batch_events,
-                        &mut flush_notifiers,
-                        recorder,
-                        log,
-                        &live_state,
-                        &published_registry,
-                        &mut last_live_publish,
-                        &mut last_published_reg_len,
-                        &write_errors,
-                        &mut stall_hook_sender,
-                        &state_notify,
-                    );
-                }
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => break 'outer,
-        };
-
-        let batch_start = Instant::now();
-
-        // Process first command
-        match first_cmd {
-            AppenderCommand::Input(input, rx_ts) => {
-                apply_input_with_tracking(
-                    *input,
-                    rx_ts,
-                    recorder,
-                    &mut batch_events,
-                    &mut active_runs_map,
-                    &active_runs,
-                );
-            }
-            AppenderCommand::InputBatch(inputs) => {
-                for (input, rx_ts) in inputs {
-                    apply_input_with_tracking(
-                        input,
-                        rx_ts,
-                        recorder,
-                        &mut batch_events,
-                        &mut active_runs_map,
-                        &active_runs,
-                    );
-                    if batch_events.len() >= MAX_BATCH_SIZE {
-                        commit_batch(
-                            &mut batch_events,
-                            &mut flush_notifiers,
-                            recorder,
-                            log,
-                            &live_state,
-                            &published_registry,
-                            &mut last_live_publish,
-                            &mut last_published_reg_len,
-                            &write_errors,
-                            &mut stall_hook_sender,
-                            &state_notify,
-                        );
-                    }
-                }
-            }
-            AppenderCommand::Flush(tx) => flush_notifiers.push(tx),
-            AppenderCommand::Shutdown => break 'outer,
-        }
-
-        // 2. Drain channel non-blocking up to MAX_BATCH_SIZE or commit_interval
-        while batch_events.len() < MAX_BATCH_SIZE && batch_start.elapsed() < commit_interval {
-            match receiver.try_recv() {
-                Ok(AppenderCommand::Input(input, rx_ts)) => {
-                    apply_input_with_tracking(
-                        *input,
-                        rx_ts,
-                        recorder,
-                        &mut batch_events,
-                        &mut active_runs_map,
-                        &active_runs,
-                    );
-                }
-                Ok(AppenderCommand::InputBatch(inputs)) => {
-                    for (input, rx_ts) in inputs {
-                        apply_input_with_tracking(
-                            input,
-                            rx_ts,
-                            recorder,
-                            &mut batch_events,
-                            &mut active_runs_map,
-                            &active_runs,
-                        );
-                        if batch_events.len() >= MAX_BATCH_SIZE {
-                            commit_batch(
-                                &mut batch_events,
-                                &mut flush_notifiers,
-                                recorder,
-                                log,
-                                &live_state,
-                                &published_registry,
-                                &mut last_live_publish,
-                                &mut last_published_reg_len,
-                                &write_errors,
-                                &mut stall_hook_sender,
-                                &state_notify,
-                            );
-                        }
-                    }
-                }
-                Ok(AppenderCommand::Flush(tx)) => flush_notifiers.push(tx),
-                Ok(AppenderCommand::Shutdown) => break 'outer,
-                Err(_) => break, // Channel empty
-            }
-        }
-
-        // 3. Periodic detector tick under continuous load
-        if last_tick.elapsed() >= tick_interval {
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            recorder.tick(now_ns, &mut batch_events);
-            last_tick = Instant::now();
-        }
-
-        // 4. Commit batch if events or flushes are pending
-        if !batch_events.is_empty() || !flush_notifiers.is_empty() {
-            commit_batch(
-                &mut batch_events,
-                &mut flush_notifiers,
-                recorder,
-                log,
-                &live_state,
-                &published_registry,
-                &mut last_live_publish,
-                &mut last_published_reg_len,
-                &write_errors,
-                &mut stall_hook_sender,
-                &state_notify,
-            );
-        }
-    }
-
-    // Final clean drain on shutdown
-    while let Ok(cmd) = receiver.try_recv() {
-        match cmd {
-            AppenderCommand::Input(input, rx_ts) => {
-                apply_input_with_tracking(
-                    *input,
-                    rx_ts,
-                    recorder,
-                    &mut batch_events,
-                    &mut active_runs_map,
-                    &active_runs,
-                );
-            }
-            AppenderCommand::InputBatch(inputs) => {
-                for (input, rx_ts) in inputs {
-                    apply_input_with_tracking(
-                        input,
-                        rx_ts,
-                        recorder,
-                        &mut batch_events,
-                        &mut active_runs_map,
-                        &active_runs,
-                    );
-                }
-            }
-            AppenderCommand::Flush(tx) => flush_notifiers.push(tx),
-            AppenderCommand::Shutdown => {}
-        }
-    }
-
-    if !batch_events.is_empty() || !flush_notifiers.is_empty() {
-        commit_batch(
-            &mut batch_events,
-            &mut flush_notifiers,
-            recorder,
-            log,
-            &live_state,
-            &published_registry,
-            &mut last_live_publish,
-            &mut last_published_reg_len,
-            &write_errors,
-            &mut stall_hook_sender,
-            &state_notify,
-        );
-    }
-
-    drop(stall_hook_sender);
-    if let Some(worker) = stall_worker_handle {
-        let _ = worker.join();
-    }
+    recorder: Recorder,
+    log: EventLog,
+    /// The publishing side of the handle (live state, registry, runs, counters).
+    shared: AppenderHandle,
+    active_runs_map: HashMap<SessionKey, ActiveRun>,
+    stall_hooks: Option<StallHookSender>,
+    batch: Vec<Event>,
+    flush_notifiers: Vec<Sender<()>>,
+    last_published_reg_len: usize,
+    last_tick: Instant,
 }
 
-/// Helper to apply inputs and track active session runs for process-tree and worktree sampling.
-fn apply_input_with_tracking(
-    input: Input,
-    rx_ts: u64,
-    recorder: &mut Recorder,
-    batch_events: &mut Vec<Event>,
-    active_runs_map: &mut HashMap<SessionKey, ActiveRun>,
-    active_runs: &Arc<ArcSwap<Vec<ActiveRun>>>,
-) {
-    let mut run_start_info = None;
-    let mut run_ended_session = None;
+/// Whether the loop should keep going after a command.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Stop,
+}
 
-    match &input {
-        Input::RunStart {
-            provider,
-            session_id,
-            agent,
-            pid,
-            cwd,
-            role,
-            task,
-            ..
-        } if pid.is_some() || cwd.is_some() => {
-            let session_key = SessionKey::new(provider, session_id);
-            let agent_id = agent.clone().unwrap_or_else(|| provider.clone());
-            let agent_role = role.unwrap_or_else(|| AgentRole::infer(&agent_id, task.as_deref()));
-            run_start_info = Some((
-                session_key,
-                agent_id,
-                pid.unwrap_or(0),
-                cwd.clone(),
-                agent_role,
-            ));
-        }
-        Input::RunEnd { session, .. } => {
-            run_ended_session = Some(session.clone());
-        }
-        _ => {}
+impl Appender {
+    fn shutdown_requested(&self) -> bool {
+        self.shared.shutdown_requested.load(Ordering::Acquire)
     }
 
-    recorder.apply(input, rx_ts, batch_events);
+    /// Main loop: wait for the first command, gather more for up to one commit window,
+    /// then commit them in one transaction.
+    fn run(mut self) {
+        while !self.shutdown_requested() {
+            // Chaos injection hook: intentionally wedges the appender thread to simulate SQLite
+            // lock contention and verify the daemon degrades cleanly (test14_wedged_appender).
+            self.shared.hooks.block_while_wedged();
 
-    let mut changed = false;
-    if let Some((session_key, agent_id, pid, cwd, role)) = run_start_info {
-        let run_n = recorder
-            .live_state()
-            .agents
-            .get(&agent_id)
-            .map(|a| a.run_n)
-            .unwrap_or(1);
-        let run_track = run_track_key(&agent_id, run_n);
-        active_runs_map.insert(
-            session_key.clone(),
-            ActiveRun {
-                session: session_key,
-                agent_id,
-                run_track,
+            let first = match self.receiver.recv_timeout(COMMIT_INTERVAL) {
+                Ok(cmd) => cmd,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.tick();
+                    if !self.batch.is_empty() {
+                        self.commit();
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+
+            let window_start = Instant::now();
+            let mut flow = self.handle(first);
+            while flow == Flow::Continue
+                && self.batch.len() < MAX_BATCH_SIZE
+                && window_start.elapsed() < COMMIT_INTERVAL
+            {
+                match self.receiver.try_recv() {
+                    Ok(cmd) => flow = self.handle(cmd),
+                    Err(_) => break,
+                }
+            }
+            if flow == Flow::Stop {
+                break;
+            }
+
+            if self.last_tick.elapsed() >= TICK_INTERVAL {
+                self.tick();
+            }
+            if !self.batch.is_empty() || !self.flush_notifiers.is_empty() {
+                self.commit();
+            }
+        }
+
+        // Final drain: everything accepted before shutdown is committed.
+        while let Ok(cmd) = self.receiver.try_recv() {
+            self.handle(cmd);
+        }
+        if !self.batch.is_empty() || !self.flush_notifiers.is_empty() {
+            self.commit();
+        }
+    }
+
+    fn handle(&mut self, cmd: AppenderCommand) -> Flow {
+        match cmd {
+            AppenderCommand::Input(input, rx_ts) => self.apply(*input, rx_ts),
+            AppenderCommand::InputBatch(inputs) => {
+                for (input, rx_ts) in inputs {
+                    self.apply(input, rx_ts);
+                }
+            }
+            AppenderCommand::Flush(tx) => self.flush_notifiers.push(tx),
+            AppenderCommand::Shutdown => return Flow::Stop,
+        }
+        Flow::Continue
+    }
+
+    /// Runs time-based detectors (silence, etc.).
+    fn tick(&mut self) {
+        self.recorder.tick(wall_clock_ns(), &mut self.batch);
+        self.last_tick = Instant::now();
+    }
+
+    /// Applies one input, tracking run starts/ends for the sampler, and commits early
+    /// when a huge batch fills the transaction.
+    fn apply(&mut self, input: Input, rx_ts: u64) {
+        let started = match &input {
+            Input::RunStart {
+                provider,
+                session_id,
+                agent,
                 pid,
                 cwd,
                 role,
-            },
-        );
-        changed = true;
-    }
-    if let Some(session) = run_ended_session {
-        if active_runs_map.remove(&session).is_some() {
+                task,
+                ..
+            } if pid.is_some() || cwd.is_some() => {
+                let agent_id = agent.clone().unwrap_or_else(|| provider.clone());
+                let role = role.unwrap_or_else(|| AgentRole::infer(&agent_id, task.as_deref()));
+                Some((
+                    SessionKey::new(provider, session_id),
+                    agent_id,
+                    pid.unwrap_or(0),
+                    cwd.clone(),
+                    role,
+                ))
+            }
+            _ => None,
+        };
+        let ended = match &input {
+            Input::RunEnd { session, .. } => Some(session.clone()),
+            _ => None,
+        };
+
+        self.recorder.apply(input, rx_ts, &mut self.batch);
+
+        let mut changed = false;
+        if let Some((session, agent_id, pid, cwd, role)) = started {
+            let run_n = self
+                .recorder
+                .live_state()
+                .agents
+                .get(&agent_id)
+                .map(|a| a.run_n)
+                .unwrap_or(1);
+            let run = ActiveRun {
+                session: session.clone(),
+                run_track: run_track_key(&agent_id, run_n),
+                agent_id,
+                pid,
+                cwd,
+                role,
+            };
+            self.active_runs_map.insert(session, run);
             changed = true;
         }
-    }
-    if changed {
-        let mut runs_vec: Vec<ActiveRun> = active_runs_map.values().cloned().collect();
-        runs_vec.sort_by(|a, b| {
-            a.agent_id
-                .cmp(&b.agent_id)
-                .then_with(|| a.run_track.cmp(&b.run_track))
-        });
-        active_runs.store(Arc::new(runs_vec));
-    }
-}
-
-/// Commits a batch of events: SQLite log row first, then publish state, then fire stall hooks.
-#[allow(clippy::too_many_arguments)]
-fn commit_batch(
-    batch_events: &mut Vec<Event>,
-    flush_notifiers: &mut Vec<Sender<()>>,
-    recorder: &Recorder,
-    log: &mut EventLog,
-    live_state: &Arc<ArcSwap<LiveState>>,
-    published_registry: &Arc<ArcSwap<TrackRegistry>>,
-    last_live_publish: &mut Instant,
-    last_published_reg_len: &mut usize,
-    write_errors: &AtomicUsize,
-    stall_hook_sender: &mut Option<StallHookSender>,
-    state_notify: &Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
-) {
-    if !batch_events.is_empty() {
-        // SQLite write: insert all events (sampled machine/run counters logged at sample interval)
-        if let Err(e) = log.insert_batch(batch_events.iter()) {
-            write_errors.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "[tacho-daemon] failed to insert batch into SQLite WAL (graceful degradation): {}",
-                e
-            );
+        if let Some(session) = ended {
+            changed |= self.active_runs_map.remove(&session).is_some();
+        }
+        if changed {
+            self.shared
+                .active_runs
+                .store(Arc::new(sorted_runs(&self.active_runs_map)));
         }
 
-        // Fire `on_stall` effect hook asynchronously for any newly committed Stall event (if fresh)
-        if let Some(ref mut sender) = stall_hook_sender {
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            const TEN_MINUTES_NS: u64 = 10 * 60 * 1_000_000_000;
-            let min_fresh_ts_ns = now_ns.saturating_sub(TEN_MINUTES_NS);
+        if self.batch.len() >= MAX_BATCH_SIZE {
+            self.commit();
+        }
+    }
 
-            for ev in batch_events.iter() {
-                if ev.kind == tacho_core::Kind::Stall {
-                    if ev.ts_ns < min_fresh_ts_ns {
-                        continue;
-                    }
-                    if let Some(tacho_proto::tacho::event::Body::Stall(ref st)) = ev.body.body {
-                        let stall_kind = match st
-                            .kind
-                            .and_then(|k| tacho_proto::tacho::StallKind::try_from(k).ok())
-                        {
-                            Some(tacho_proto::tacho::StallKind::Silent) => "SILENT",
-                            Some(tacho_proto::tacho::StallKind::Loop) => "LOOP",
-                            Some(tacho_proto::tacho::StallKind::Spin) => "SPIN",
-                            Some(tacho_proto::tacho::StallKind::Burn) => "BURN",
-                            Some(tacho_proto::tacho::StallKind::Failing) => "FAILING",
-                            Some(tacho_proto::tacho::StallKind::OffBrief) => "OFF_BRIEF",
-                            Some(tacho_proto::tacho::StallKind::StallClaim) => "CLAIM",
-                            _ => "STALL",
-                        };
-                        let agent = ev.agent.clone().unwrap_or_default();
-                        let reason = st.evidence.clone().unwrap_or_default();
-                        sender.send(StallJob {
-                            agent,
-                            stall_kind,
-                            reason,
-                            seq: ev.seq,
-                            ts_ns: ev.ts_ns,
-                        });
-                    }
+    /// Commits the batch: SQLite rows first, then stall hooks, then published state,
+    /// then flush confirmations.
+    fn commit(&mut self) {
+        if !self.batch.is_empty() {
+            match self.log.insert_batch(self.batch.iter()) {
+                Ok(_) => self.fire_stall_hooks(),
+                Err(e) => {
+                    self.shared.write_errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[tacho-daemon] failed to insert batch into SQLite WAL (graceful degradation): {}",
+                        e
+                    );
+                    // Still run hooks: a stall is actionable even if it could not be logged.
+                    self.fire_stall_hooks();
                 }
             }
+
+            let reg_len = self.recorder.registry().len();
+            if reg_len != self.last_published_reg_len || !self.flush_notifiers.is_empty() {
+                self.shared
+                    .published_registry
+                    .store(Arc::new(self.recorder.registry().clone()));
+                self.last_published_reg_len = reg_len;
+            }
+            self.shared
+                .live_state
+                .store(Arc::new(self.recorder.live_state().clone()));
+            self.shared.state_notify.bump();
+            self.batch.clear();
         }
 
-        // Publish TrackRegistry immediately if new tracks were registered
-        let current_reg_len = recorder.registry().len();
-        if current_reg_len != *last_published_reg_len || !flush_notifiers.is_empty() {
-            published_registry.store(Arc::new(recorder.registry().clone()));
-            *last_published_reg_len = current_reg_len;
+        for notifier in self.flush_notifiers.drain(..) {
+            let _ = notifier.send(());
         }
-
-        // Publish updated LiveState on every committed batch
-        live_state.store(Arc::new(recorder.live_state().clone()));
-        *last_live_publish = Instant::now();
-        {
-            let (lock, cvar) = &**state_notify;
-            let mut seq = lock.lock().unwrap();
-            *seq += 1;
-            cvar.notify_all();
-        }
-
-        batch_events.clear();
     }
 
-    // Notify any flush waiters
-    for notifier in flush_notifiers.drain(..) {
-        let _ = notifier.send(());
+    fn fire_stall_hooks(&mut self) {
+        let Some(sender) = self.stall_hooks.as_mut() else {
+            return;
+        };
+        let min_fresh_ts_ns = wall_clock_ns().saturating_sub(STALL_HOOK_FRESHNESS_NS);
+        for ev in &self.batch {
+            if let Some(job) = StallJob::from_event(ev, min_fresh_ts_ns) {
+                sender.send(job);
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tacho_core::{SessionKey, ToolInput};
-
-    #[test]
-    fn test_run_track_key_helper() {
-        assert_eq!(run_track_key("worker", 0), "agent:worker/run:1");
-        assert_eq!(run_track_key("worker", 1), "agent:worker/run:1");
-        assert_eq!(run_track_key("worker", 5), "agent:worker/run:5");
-    }
-
-    #[test]
-    fn test_on_stall_hook_timeout_kills_process_group_and_unblocks_second_hook() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("hook_timeout_test.sqlite");
-        let second_marker = temp.path().join("second_fired.txt");
-        let log = EventLog::open(&db_path).unwrap();
-        let recorder = Recorder::new();
-
-        // The hook script sleeps forever if TACHO_AGENT is "stuck-worker",
-        // but writes to second_marker if TACHO_AGENT is "second-worker".
-        let hook_cmd = format!(
-            r#"if [ "$TACHO_AGENT" = "stuck-worker" ]; then
-    sleep 300
-else
-    printf '%s:%s' "$TACHO_AGENT" "$TACHO_STALL_KIND" > {}
-fi"#,
-            second_marker.display()
-        );
-
-        let timeout = Duration::from_millis(300);
-        let (appender, _thread) =
-            spawn_appender_with_hook_timeout(recorder, log, 256, Some(hook_cmd), timeout);
-
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-
-        // 1. Trigger stall on stuck-worker (will sleep in worker thread)
-        let sess_stuck = SessionKey::new("claude", "sess-stuck");
-        appender
-            .send_input(
-                Input::RunStart {
-                    source_ts_ns: Some(now_ns),
-                    provider: "claude".into(),
-                    session_id: "sess-stuck".into(),
-                    agent: Some("stuck-worker".into()),
-                    task: Some("hang".into()),
-                    pid: None,
-                    cwd: None,
-                    model: None,
-                    parent_session: None,
-                    git_tree: None,
-                    role: None,
-                },
-                now_ns,
-            )
-            .unwrap();
-
-        for i in 0..4 {
-            let ts = now_ns + 10_000 + i * 100_000;
-            appender
-                .send_input(
-                    Input::ToolBegin {
-                        source_ts_ns: Some(ts),
-                        session: sess_stuck.clone(),
-                        tool_use_id: format!("t-stuck-{}", i),
-                        tool_name: "Bash".into(),
-                        input: ToolInput::Shell {
-                            argv: "cat stuck.txt".into(),
-                            cwd: None,
-                            git_tree: None,
-                        },
-                    },
-                    ts,
-                )
-                .unwrap();
-        }
-        appender.flush();
-
-        // 2. Trigger stall on second-worker (should be queued and execute after stuck-worker is killed)
-        let sess_second = SessionKey::new("claude", "sess-second");
-        appender
-            .send_input(
-                Input::RunStart {
-                    source_ts_ns: Some(now_ns + 1_000_000),
-                    provider: "claude".into(),
-                    session_id: "sess-second".into(),
-                    agent: Some("second-worker".into()),
-                    task: Some("work".into()),
-                    pid: None,
-                    cwd: None,
-                    model: None,
-                    parent_session: None,
-                    git_tree: None,
-                    role: None,
-                },
-                now_ns + 1_000_000,
-            )
-            .unwrap();
-
-        for i in 0..4 {
-            let ts = now_ns + 1_000_000 + 10_000 + i * 100_000;
-            appender
-                .send_input(
-                    Input::ToolBegin {
-                        source_ts_ns: Some(ts),
-                        session: sess_second.clone(),
-                        tool_use_id: format!("t-sec-{}", i),
-                        tool_name: "Bash".into(),
-                        input: ToolInput::Shell {
-                            argv: "cat second.txt".into(),
-                            cwd: None,
-                            git_tree: None,
-                        },
-                    },
-                    ts,
-                )
-                .unwrap();
-        }
-        appender.flush();
-
-        // 3. Wait for second_marker to appear using inotify event waiting (no sleep loop)
-        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if inotify_fd >= 0 {
-            if let Ok(path_c) = std::ffi::CString::new(temp.path().to_str().unwrap_or_default()) {
-                let wd = unsafe {
-                    libc::inotify_add_watch(
-                        inotify_fd,
-                        path_c.as_ptr(),
-                        libc::IN_CREATE | libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO,
-                    )
-                };
-                let cap = Instant::now() + Duration::from_secs(60);
-                while !second_marker.exists() && Instant::now() < cap {
-                    let mut pfd = libc::pollfd {
-                        fd: inotify_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let rc = unsafe { libc::poll(&mut pfd, 1, 1_000) };
-                    if rc > 0 {
-                        let mut buf = [0u8; 1024];
-                        let _ = unsafe {
-                            libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                        };
-                    }
-                }
-                if wd >= 0 {
-                    unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
-                }
-            }
-            unsafe { libc::close(inotify_fd) };
-        }
-
-        let content = std::fs::read_to_string(&second_marker)
-            .expect("second hook must complete after stuck hook is killed");
-        assert_eq!(content, "second-worker:LOOP");
-    }
-
-    #[test]
-    fn test_on_stall_hook_ignores_historical_replay() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("hook_hist_test.sqlite");
-        let marker = temp.path().join("hist_fired.txt");
-        let log = EventLog::open(&db_path).unwrap();
-        let recorder = Recorder::new();
-
-        let hook_cmd = format!("touch {}", marker.display());
-        let (appender, _thread) = spawn_appender_with_hook_timeout(
-            recorder,
-            log,
-            256,
-            Some(hook_cmd),
-            Duration::from_secs(5),
-        );
-
-        // Timestamps 1 hour ago (> 10 minutes)
-        let old_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
-            - 3600 * 1_000_000_000;
-
-        let sess = SessionKey::new("claude", "sess-old");
-        appender
-            .send_input(
-                Input::RunStart {
-                    source_ts_ns: Some(old_ts),
-                    provider: "claude".into(),
-                    session_id: "sess-old".into(),
-                    agent: Some("old-worker".into()),
-                    task: Some("replay".into()),
-                    pid: None,
-                    cwd: None,
-                    model: None,
-                    parent_session: None,
-                    git_tree: None,
-                    role: None,
-                },
-                old_ts,
-            )
-            .unwrap();
-
-        for i in 0..4 {
-            let ts = old_ts + 10_000 + i * 100_000;
-            appender
-                .send_input(
-                    Input::ToolBegin {
-                        source_ts_ns: Some(ts),
-                        session: sess.clone(),
-                        tool_use_id: format!("t-old-{}", i),
-                        tool_name: "Bash".into(),
-                        input: ToolInput::Shell {
-                            argv: "cat old.txt".into(),
-                            cwd: None,
-                            git_tree: None,
-                        },
-                    },
-                    ts,
-                )
-                .unwrap();
-        }
-        appender
-            .send_input(
-                Input::RunEnd {
-                    source_ts_ns: Some(old_ts + 500_000),
-                    session: sess.clone(),
-                    exit_code: Some(0),
-                    reason: None,
-                },
-                old_ts + 500_000,
-            )
-            .unwrap();
-        appender.flush();
-
-        std::thread::yield_now();
-        assert!(
-            !marker.exists(),
-            "historical replay stall must not fire on_stall hook"
-        );
-    }
-}
+mod tests;

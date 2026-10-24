@@ -76,73 +76,35 @@ impl DaemonClient {
         // 2. Daemon not responding; spawn it detached
         let mut spawned_child = self.spawn_daemon_detached()?;
 
-        // 3. Wait on kernel inotify event for api.sock to appear and accept connections
-        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        let mut watched = false;
-        let mut wd = -1;
-        if inotify_fd >= 0 {
-            if let Ok(path_c) =
-                std::ffi::CString::new(self.runtime_dir.to_str().unwrap_or_default())
-            {
-                wd = unsafe {
-                    libc::inotify_add_watch(
-                        inotify_fd,
-                        path_c.as_ptr(),
-                        libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB,
-                    )
-                };
-                watched = wd >= 0;
-            }
-        }
-
+        // 3. Wait on a kernel inotify event for api.sock to appear and accept connections.
+        // The fd is owned so every return path closes it. The poll timeout is only a backstop
+        // re-check (e.g. if inotify is unavailable); correctness comes from the events.
+        let inotify = watch_dir(&self.runtime_dir);
         let cap = Instant::now() + Duration::from_secs(30);
         while Instant::now() < cap {
             if let Ok(stream) = UnixStream::connect(&sock) {
-                if watched {
-                    unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
-                }
-                if inotify_fd >= 0 {
-                    unsafe { libc::close(inotify_fd) };
-                }
                 return Ok(stream);
             }
-
             if let Some(ref mut child) = spawned_child {
                 if let Ok(Some(status)) = child.try_wait() {
-                    if watched {
-                        unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
-                    }
-                    if inotify_fd >= 0 {
-                        unsafe { libc::close(inotify_fd) };
-                    }
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         format!("tachograph daemon process exited prematurely with {status}"),
                     ));
                 }
             }
-
-            if watched {
-                let mut pfd = libc::pollfd {
-                    fd: inotify_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let _ = unsafe { libc::poll(&mut pfd, 1, 250) };
-                let mut buf = [0u8; 1024];
-                let _ = unsafe {
-                    libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                };
-            } else {
-                std::thread::yield_now();
+            let mut pfd = libc::pollfd {
+                fd: inotify.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd (a negative fd is ignored by poll).
+            unsafe { libc::poll(&mut pfd, 1, 250) };
+            if let Some(ref fd) = inotify {
+                let mut buf = [0u8; 4096];
+                // SAFETY: reading into a local buffer from a non-blocking fd we own.
+                unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             }
-        }
-
-        if watched {
-            unsafe { libc::inotify_rm_watch(inotify_fd, wd) };
-        }
-        if inotify_fd >= 0 {
-            unsafe { libc::close(inotify_fd) };
         }
 
         Err(io::Error::new(
@@ -333,4 +295,22 @@ impl DaemonClient {
         let bytes_copied = io::copy(&mut stream, w)?;
         Ok(bytes_copied)
     }
+}
+
+/// Opens a non-blocking inotify fd watching `dir` for new entries, or `None` if unavailable.
+pub(crate) fn watch_dir(dir: &std::path::Path) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let path_c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: plain syscall; the result is checked before being wrapped.
+    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a fresh fd we exclusively own.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let mask = libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB;
+    // SAFETY: valid fd and NUL-terminated path.
+    let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path_c.as_ptr(), mask) };
+    (wd >= 0).then_some(fd)
 }

@@ -20,10 +20,10 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tacho_core::{CustomOp, Input, SessionKey, ToolInput};
 use tacho_daemon::{write_snapshot, Config, Daemon, DaemonPaths};
 
@@ -77,6 +77,52 @@ fn verify_trace_oracle_clean(tp_path: &str, trace_path: &Path) {
     );
 }
 
+const NUM_THREADS: usize = 16;
+
+/// Operation counter the main thread can block on (instead of spinning on an atomic).
+///
+/// Tracks the total op count plus the number of completed iterations per chaos thread.
+struct OpCounter {
+    state: Mutex<(usize, [usize; NUM_THREADS])>,
+    cvar: Condvar,
+}
+
+impl OpCounter {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((0, [0; NUM_THREADS])),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn add(&self, thread_idx: usize, n: usize) {
+        let mut st = self.state.lock().unwrap();
+        st.0 += n;
+        st.1[thread_idx] += 1;
+        self.cvar.notify_all();
+    }
+
+    fn snapshot(&self) -> (usize, [usize; NUM_THREADS]) {
+        *self.state.lock().unwrap()
+    }
+
+    /// Blocks until at least `min_total` ops and every thread completed more iterations
+    /// than in `since`.
+    fn wait_for(&self, min_total: usize, since: &[usize; NUM_THREADS]) {
+        let guard = self.state.lock().unwrap();
+        let _guard = self
+            .cvar
+            .wait_while(guard, |st| {
+                st.0 < min_total || st.1.iter().zip(since).any(|(now, then)| now <= then)
+            })
+            .unwrap();
+    }
+
+    fn total(&self) -> usize {
+        self.state.lock().unwrap().0
+    }
+}
+
 /// Helper to send single input over api.sock with retry on disconnect.
 fn send_input_resilient(sock_path: &Path, input: &Input) -> bool {
     let fast_path = serde_json::json!({ "input": input });
@@ -85,8 +131,6 @@ fn send_input_resilient(sock_path: &Path, input: &Input) -> bool {
 
     for _ in 0..10 {
         if let Ok(mut stream) = UnixStream::connect(sock_path) {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
             if stream.write_all(&bytes).is_ok() && stream.flush().is_ok() {
                 let mut reader = BufReader::new(stream);
                 let mut resp = String::new();
@@ -95,7 +139,6 @@ fn send_input_resilient(sock_path: &Path, input: &Input) -> bool {
                 }
             }
         }
-        std::thread::yield_now();
     }
     false
 }
@@ -127,7 +170,7 @@ fn test_chaos_and_torture() {
         Some(Daemon::start(paths.clone(), config.clone()).expect("failed to start daemon"));
 
     let running = Arc::new(AtomicBool::new(true));
-    let total_ops = Arc::new(AtomicUsize::new(0));
+    let total_ops = Arc::new(OpCounter::new());
     let mut handles = Vec::new();
 
     // 1. Threads 0..3: Multi-agent lifecycle hook sessions (claude, gemini, jetski)
@@ -227,8 +270,7 @@ fn test_chaos_and_torture() {
                             },
                         );
 
-                        ops.fetch_add(6, Ordering::Relaxed);
-                        std::thread::yield_now();
+                        ops.add(worker_idx, 6);
                     }
                 })
                 .unwrap(),
@@ -299,8 +341,7 @@ fn test_chaos_and_torture() {
                             );
                         }
 
-                        ops.fetch_add(201, Ordering::Relaxed);
-                        std::thread::yield_now();
+                        ops.add(worker_idx, 201);
                     }
                 })
                 .unwrap(),
@@ -347,8 +388,7 @@ fn test_chaos_and_torture() {
                                 unit: Some("bytes".to_string()),
                             },
                         );
-                        ops.fetch_add(3, Ordering::Relaxed);
-                        std::thread::yield_now();
+                        ops.add(worker_idx, 3);
                     }
                 })
                 .unwrap(),
@@ -390,8 +430,6 @@ fn test_chaos_and_torture() {
                     let _ = encoder.write_all(json_body.as_bytes());
                     if let Ok(compressed) = encoder.finish() {
                         if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
 
                             let req = format!(
                                 "POST /v1/logs HTTP/1.1\r\n\
@@ -410,12 +448,11 @@ fn test_chaos_and_torture() {
                                 let mut resp = String::new();
                                 let _ = stream.read_to_string(&mut resp);
                                 if resp.starts_with("HTTP/1.1 200 OK") {
-                                    ops.fetch_add(1, Ordering::Relaxed);
+                                    ops.add(worker_idx, 1);
                                 }
                             }
                         }
                     }
-                    std::thread::yield_now();
                 }
             })
             .unwrap());
@@ -451,7 +488,7 @@ fn test_chaos_and_torture() {
                                     let _ = fs::write(&snap_file, &buf);
                                     verify_trace_oracle_clean(&tp, &snap_file);
                                     let _ = fs::remove_file(&snap_file);
-                                    ops.fetch_add(1, Ordering::Relaxed);
+                                    ops.add(worker_idx, 1);
                                 }
                             }
                         } else {
@@ -463,10 +500,9 @@ fn test_chaos_and_torture() {
                                 let _ = fs::write(&snap_file, &buf);
                                 verify_trace_oracle_clean(&tp, &snap_file);
                                 let _ = fs::remove_file(&snap_file);
-                                ops.fetch_add(1, Ordering::Relaxed);
+                                ops.add(worker_idx, 1);
                             }
                         }
-                        std::thread::yield_now();
                     }
                 })
                 .unwrap(),
@@ -505,8 +541,7 @@ fn test_chaos_and_torture() {
                         drop(stream); // abrupt drop while server is streaming
                     }
 
-                    ops.fetch_add(3, Ordering::Relaxed);
-                    std::thread::yield_now();
+                    ops.add(worker_idx, 3);
                 }
             })
             .unwrap());
@@ -626,8 +661,7 @@ fn test_chaos_and_torture() {
                             },
                         );
 
-                        ops.fetch_add(104, Ordering::Relaxed);
-                        std::thread::yield_now();
+                        ops.add(14, 104);
                     }
                 })
                 .unwrap(),
@@ -709,8 +743,7 @@ fn test_chaos_and_torture() {
                             },
                         );
 
-                        ops.fetch_add(4, Ordering::Relaxed);
-                        std::thread::yield_now();
+                        ops.add(15, 4);
                     }
                 })
                 .unwrap(),
@@ -719,14 +752,13 @@ fn test_chaos_and_torture() {
 
     assert_eq!(
         handles.len(),
-        16,
+        NUM_THREADS,
         "Must have exactly 16 concurrent chaos threads"
     );
 
     println!("All 16 chaos threads running. Hammering until 500 ops...");
-    while total_ops.load(Ordering::Relaxed) < 500 {
-        std::thread::yield_now();
-    }
+    // Wait for 500 ops and at least one completed iteration of every chaos thread.
+    total_ops.wait_for(500, &[0; NUM_THREADS]);
 
     // Mid-storm chaos: Simulate abrupt daemon restart while threads are actively hammering!
     println!("=== INJECTING CHAOS: Abrupt daemon restart ===");
@@ -742,10 +774,9 @@ fn test_chaos_and_torture() {
     println!("=== Daemon restarted successfully on existing DB ===");
 
     // Hammer for another 500 ops against the restarted daemon
-    let target_ops = total_ops.load(Ordering::Relaxed) + 500;
-    while total_ops.load(Ordering::Relaxed) < target_ops {
-        std::thread::yield_now();
-    }
+    // (and at least one more completed iteration of every thread after the restart).
+    let (ops_before, iters_before) = total_ops.snapshot();
+    total_ops.wait_for(ops_before + 500, &iters_before);
 
     // Stop all chaos threads
     println!("Stopping chaos threads...");
@@ -755,7 +786,7 @@ fn test_chaos_and_torture() {
         h.join().expect("chaos thread panicked!");
     }
 
-    let final_ops = total_ops.load(Ordering::Acquire);
+    let final_ops = total_ops.total();
     println!(
         "Chaos campaign finished. Total operations executed: {}",
         final_ops
@@ -868,6 +899,18 @@ fn test_chaos_and_torture() {
     assert!(
         clock_steps > 0,
         "Expected daemon track events from backward clock jumps"
+    );
+
+    // Verify zero unclosed/orphaned slices at snapshot boundary
+    let unclosed_slices = query_oracle_scalar(
+        &tp_path,
+        &final_trace_file,
+        "SELECT count(*) FROM slice WHERE dur < 0;",
+    );
+    assert_eq!(
+        unclosed_slices, 0,
+        "Expected 0 unclosed slices at snapshot boundary, got {}",
+        unclosed_slices
     );
 
     println!("All chaos & torture validations PASSED with 0 errors!");

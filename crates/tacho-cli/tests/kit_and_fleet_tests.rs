@@ -780,3 +780,553 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
         .iter()
         .any(|b| b.prs == vec![77] && b.status == "head-moved"));
 }
+
+#[test]
+fn test_status_sections_staleness_needs_and_scrubber() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tacho_home = tmp.path().join("tacho-home");
+    let repo_dir = tmp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let main_sha = init_git_repo(&repo_dir);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Seed FleetStore with rich fleet state, including a GitHub token secret in status_note to test Scrubber
+    let secret_token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
+    store
+        .mutate(None, |st| {
+            st.agents.insert(
+                "worker-alpha".to_string(),
+                tacho_core::decide::dispatch::AgentRun {
+                    key: "worker-alpha".to_string(),
+                    pid: Some(std::process::id()),
+                    area: "core".to_string(),
+                    brief: format!("Investigate auth header {secret_token}"),
+                    status_note: format!("read: checking token {secret_token}"),
+                    started_at: now - 120,
+                    provider: "claude".to_string(),
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+            );
+            st.agents.insert(
+                "worker-no-pr".to_string(),
+                tacho_core::decide::dispatch::AgentRun {
+                    key: "worker-no-pr".to_string(),
+                    pid: None,
+                    area: "api".to_string(),
+                    brief: "Fix endpoint timeout".to_string(),
+                    status_note: "exited".to_string(),
+                    started_at: now - 600,
+                    finished_at: Some(now - 300),
+                    exit_code: Some(1),
+                    provider: "claude".to_string(),
+                    ..Default::default()
+                },
+            );
+            st.holds.insert(
+                "pr:55".to_string(),
+                tacho_core::decide::dispatch::Hold {
+                    reason: "waiting on schema review".to_string(),
+                    since: now - 30 * 3600, // > 24h -> stale hold
+                },
+            );
+            st.flakes = tacho_core::decide::verify::record_flakes(
+                &st.flakes,
+                &["core::wal::flaky_checkpoint".to_string()],
+                "core",
+                "b001",
+                "assertion failed",
+                now - 60,
+            );
+        })
+        .unwrap();
+
+    // 1. Full JSON status (`tacho status --json`) includes version=1, all sections, and scrubs secrets
+    let status_json_out = Command::new(tacho_bin())
+        .args(["status", "--json"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(
+        status_json_out.status.success(),
+        "status --json failed: {}",
+        String::from_utf8_lossy(&status_json_out.stderr)
+    );
+    let json_str = String::from_utf8_lossy(&status_json_out.stdout);
+    assert!(
+        !json_str.contains(secret_token),
+        "Scrubber must redact secret token from status --json"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(parsed["version"], 1);
+    for section_key in [
+        "headline",
+        "needs",
+        "needs_you",
+        "attention",
+        "pipeline",
+        "agents",
+        "machine",
+        "cost",
+        "held",
+        "stale",
+        "progress",
+        "flakes",
+    ] {
+        assert!(
+            parsed.get(section_key).is_some(),
+            "missing section '{section_key}' in status --json"
+        );
+    }
+    assert!(parsed["machine"]["quota_cores"].as_f64().unwrap_or(0.0) > 0.0);
+    assert_eq!(parsed["held"]["holds"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["stale"]["stale_holds"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["flakes"].as_array().unwrap().len(), 1);
+
+    // 2. Filtered `--section` JSON and human output
+    let sec_json_out = Command::new(tacho_bin())
+        .args([
+            "status",
+            "--json",
+            "--section",
+            "headline",
+            "--section",
+            "machine",
+            "--section",
+            "held",
+        ])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(sec_json_out.status.success());
+    let sec_parsed: serde_json::Value = serde_json::from_slice(&sec_json_out.stdout).unwrap();
+    assert!(sec_parsed.get("headline").is_some());
+    assert!(sec_parsed.get("machine").is_some());
+    assert!(sec_parsed.get("held").is_some());
+    assert!(sec_parsed.get("pipeline").is_none());
+
+    // 3. `tacho needs` subcommand alias and human text status
+    let needs_out = Command::new(tacho_bin())
+        .args(["needs"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(needs_out.status.success());
+    let needs_txt = String::from_utf8_lossy(&needs_out.stdout);
+    assert!(
+        needs_txt.to_ascii_lowercase().contains("needs you"),
+        "stdout: {needs_txt}"
+    );
+    assert!(needs_txt.contains("worker-no-pr"), "stdout: {needs_txt}");
+
+    let status_txt_out = Command::new(tacho_bin())
+        .args(["status"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(status_txt_out.status.success());
+    let status_txt = String::from_utf8_lossy(&status_txt_out.stdout);
+    assert!(
+        !status_txt.contains(secret_token),
+        "Scrubber must redact secret token from human status text"
+    );
+    assert!(status_txt.contains("tacho:"));
+    assert!(status_txt.to_ascii_lowercase().contains("machine:"));
+
+    // 4. Unknown `--section` exits with code 2
+    let bad_sec = Command::new(tacho_bin())
+        .args(["status", "--section", "nonexistent_section"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert_eq!(bad_sec.status.code(), Some(2));
+
+    // 5. Stale snapshot (> 300s old) is refused with exact fix command (`run: tacho tick`)
+    let stale_snap = serde_json::json!({
+        "version": 1,
+        "at": now - 600,
+    });
+    fs::write(
+        tacho_home.join("snapshot.json"),
+        serde_json::to_string(&stale_snap).unwrap(),
+    )
+    .unwrap();
+    let stale_out = Command::new(tacho_bin())
+        .args(["status"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(!stale_out.status.success());
+    let stale_err = String::from_utf8_lossy(&stale_out.stderr);
+    assert!(
+        stale_err.contains("the snapshot is 10 min old") && stale_err.contains("run: tacho tick"),
+        "expected staleness refusal in stderr, got: {stale_err}"
+    );
+    let _ = main_sha;
+}
+
+#[test]
+fn test_hook_guard_subcommand_and_cpu_burners() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tacho_home = tmp.path().join("tacho-home");
+
+    let run_guard = |payload: serde_json::Value| -> (Option<i32>, String) {
+        let mut child = Command::new(tacho_bin())
+            .args(["hook", "guard"])
+            .env("TACHO_HOME", &tacho_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // 1. Standalone `yes` and `stress-ng` CPU burners are refused with exit code 2
+    let (code_yes, err_yes) = run_guard(serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "yes" }
+    }));
+    assert_eq!(code_yes, Some(2), "stderr: {err_yes}");
+    assert!(err_yes.contains("tacho starve"));
+
+    let (code_stress, err_stress) = run_guard(serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "stress-ng --cpu 4" }
+    }));
+    assert_eq!(code_stress, Some(2), "stderr: {err_stress}");
+
+    // 2. `run_in_background: true` and `git stash` are refused with exit code 2
+    let (code_bg, _) = run_guard(serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "cargo test", "run_in_background": true }
+    }));
+    assert_eq!(code_bg, Some(2));
+
+    let (code_stash, _) = run_guard(serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "git stash" }
+    }));
+    assert_eq!(code_stash, Some(2));
+
+    // 3. Piped `yes | head -n 1` and `tacho starve -- yes` are allowed (exit 0)
+    let (code_piped, _) = run_guard(serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "yes | head -n 1" }
+    }));
+    assert_eq!(code_piped, Some(0));
+
+    let (code_starve, _) = run_guard(serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "tacho starve -- yes" }
+    }));
+    assert_eq!(code_starve, Some(0));
+}
+
+#[test]
+fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tacho_home = tmp.path().join("tacho-home");
+    let repo_dir = tmp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    let main_sha = init_git_repo(&repo_dir);
+
+    // 1. `tacho version` and `tacho version --json`
+    let ver_out = Command::new(tacho_bin())
+        .args(["version", "--json"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(ver_out.status.success());
+    let ver_json: serde_json::Value = serde_json::from_slice(&ver_out.stdout).unwrap();
+    assert_eq!(ver_json["running_commit"], main_sha);
+    assert!(ver_json["rule"].as_str().unwrap().contains("Auto-updates"));
+
+    // 2. `tacho setup --dry-run` and `tacho setup`
+    let setup_dry = Command::new(tacho_bin())
+        .args(["setup", "--dry-run"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(setup_dry.status.success());
+    assert!(!tacho_home.join("fleet.env").exists());
+
+    let setup_real = Command::new(tacho_bin())
+        .args(["setup"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(setup_real.status.success());
+    assert!(tacho_home.join("fleet.env").is_file());
+
+    // 3. `tacho db <name> [checkout]` and `tacho db <name> --rm`
+    let db_up = Command::new(tacho_bin())
+        .args(["db", "feat-db", repo_dir.to_str().unwrap()])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(db_up.status.success());
+    let env_txt = fs::read_to_string(repo_dir.join(".tachoenv")).unwrap();
+    assert!(env_txt.contains("DATABASE_URL=postgres://"));
+
+    let db_rm = Command::new(tacho_bin())
+        .args(["db", "feat-db", repo_dir.to_str().unwrap(), "--rm"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(db_rm.status.success());
+    let env_after_rm = fs::read_to_string(repo_dir.join(".tachoenv")).unwrap();
+    assert!(!env_after_rm.contains("DATABASE_URL="));
+
+    // 4. `tacho session` fleet-wide default configuration and `--clear`
+    let sess_set = Command::new(tacho_bin())
+        .args([
+            "session",
+            "--provider",
+            "gemini",
+            "--model",
+            "gemini-pro",
+            "--effort",
+            "high",
+        ])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(sess_set.status.success());
+    let store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
+    let st_sess = store.load().unwrap();
+    assert_eq!(st_sess.default_provider, "gemini");
+    assert_eq!(
+        st_sess.default_model.as_deref(),
+        Some("gemini-3.1-pro-preview")
+    );
+    assert_eq!(st_sess.default_effort.as_deref(), Some("high"));
+
+    let sess_clear = Command::new(tacho_bin())
+        .args(["session", "--clear"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(sess_clear.status.success());
+    let st_cleared = store.load().unwrap();
+    assert_eq!(st_cleared.default_provider, "claude");
+    assert!(st_cleared.default_model.is_none());
+
+    // 5. `tacho todo`, `tacho hold --why`, `tacho retire --why`, and `tacho todo --retired`
+    let todo_add = Command::new(tacho_bin())
+        .args(["todo", "task-retire", "Refactor metrics"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(todo_add.status.success());
+
+    let hold_why = Command::new(tacho_bin())
+        .args(["hold", "task-retire", "--why", "waiting on upstream API"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(hold_why.status.success());
+    assert_eq!(
+        store.load().unwrap().holds["task-retire"].reason,
+        "waiting on upstream API"
+    );
+
+    let retire_why = Command::new(tacho_bin())
+        .args(["retire", "task-retire", "--why", "obsolete"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(retire_why.status.success());
+
+    let todo_retired = Command::new(tacho_bin())
+        .args(["todo", "--retired", "--json"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(todo_retired.status.success());
+    let retired_list: Vec<String> = serde_json::from_slice(&todo_retired.stdout).unwrap();
+    assert!(retired_list.contains(&"task-retire".to_string()));
+
+    // 6. `tacho events --since 1h -n 5` and invalid `--since` exit code 2
+    let ev_ok = Command::new(tacho_bin())
+        .args(["events", "--since", "1h", "-n", "5", "--json"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(ev_ok.status.success());
+    let ev_arr: Vec<serde_json::Value> = serde_json::from_slice(&ev_ok.stdout).unwrap();
+    assert!(!ev_arr.is_empty() && ev_arr.len() <= 5);
+
+    let ev_bad = Command::new(tacho_bin())
+        .args(["events", "--since", "not-a-duration"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert_eq!(ev_bad.status.code(), Some(2));
+
+    // 7. `tacho tidy --stale-runs` validation (`0` -> exit 2) and retiring old abandoned runs
+    let tidy_bad = Command::new(tacho_bin())
+        .args(["tidy", "--stale-runs", "0"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert_eq!(tidy_bad.status.code(), Some(2));
+
+    let mut store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    store
+        .mutate(None, |st| {
+            st.agents.insert(
+                "ancient-run".to_string(),
+                tacho_core::decide::dispatch::AgentRun {
+                    key: "ancient-run".to_string(),
+                    pid: None,
+                    started_at: now - 10 * 86_400,
+                    finished_at: Some(now - 10 * 86_400 + 60),
+                    exit_code: Some(1),
+                    ..Default::default()
+                },
+            );
+            st.passed.insert(
+                88,
+                tacho_core::decide::verify::PassedRecord {
+                    pr: 88,
+                    sha: main_sha.clone(),
+                    main_sha: main_sha.clone(),
+                    batch_id: "b088".to_string(),
+                    passed_at: now,
+                    tree: main_sha.clone(),
+                    areas: vec!["core".to_string()],
+                },
+            );
+            st.batches.push(tacho_core::decide::verify::BatchRun {
+                id: "b088".to_string(),
+                group: "core".to_string(),
+                prs: vec![88],
+                shas: std::collections::BTreeMap::from([(88, main_sha.clone())]),
+                main_sha: main_sha.clone(),
+                areas: vec!["core".to_string()],
+                checks: Vec::new(),
+                mode: tacho_core::decide::verify::BatchMode::Presubmit,
+                status: "passed".to_string(),
+                started_at: now - 30,
+                finished_at: Some(now),
+                tree: Some(main_sha.clone()),
+                pid: None,
+                log: String::new(),
+                culprit: None,
+                skipped: Vec::new(),
+                flakes: Vec::new(),
+            });
+            st.open_prs_cache = vec![PullFacts {
+                number: 88,
+                branch: "feat-88".to_string(),
+                head: main_sha.clone(),
+                base: "main".to_string(),
+                state: "OPEN".to_string(),
+                mergeable: "MERGEABLE".to_string(),
+                files: vec!["README.md".to_string()],
+                title: "Feature 88".to_string(),
+                ..Default::default()
+            }];
+        })
+        .unwrap();
+
+    let tidy_stale = Command::new(tacho_bin())
+        .args(["tidy", "--stale-runs", "7"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(tidy_stale.status.success());
+    assert!(store.load().unwrap().retired.contains("ancient-run"));
+
+    // 8. `tacho train [prs]... --max`, `tacho land [train] --dry-run`, `tacho release-train [pr] --approve`, and `tacho decide-replay`
+    let train_pos = Command::new(tacho_bin())
+        .args(["train", "88", "--max", "1"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(
+        train_pos.status.success(),
+        "train 88 --max 1 failed: {}",
+        String::from_utf8_lossy(&train_pos.stderr)
+    );
+
+    let land_pos = Command::new(tacho_bin())
+        .args(["land", "t001", "--dry-run"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(
+        land_pos.status.success(),
+        "land t001 --dry-run failed: {}",
+        String::from_utf8_lossy(&land_pos.stderr)
+    );
+
+    let rel_train = Command::new(tacho_bin())
+        .args(["release-train", "88", "--approve"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .env("TACHO_COMPILE_CMD", "true")
+        .output()
+        .unwrap();
+    assert!(
+        rel_train.status.success(),
+        "release-train 88 --approve failed: {}",
+        String::from_utf8_lossy(&rel_train.stderr)
+    );
+    assert_eq!(store.load().unwrap().train_pr.unwrap().number, Some(88));
+
+    let decide_replay = Command::new(tacho_bin())
+        .args(["decide-replay", "b088", "--cmd", "true", "--dry-run"])
+        .current_dir(&repo_dir)
+        .env("TACHO_HOME", &tacho_home)
+        .output()
+        .unwrap();
+    assert!(
+        decide_replay.status.success(),
+        "decide-replay failed: {}",
+        String::from_utf8_lossy(&decide_replay.stderr)
+    );
+}

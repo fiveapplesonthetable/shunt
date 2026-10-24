@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tacho_core::Input;
 use tacho_ingest::otlp_server::{
     serve_otlp_with_config, OtlpServerConfig, DEFAULT_MAX_CONCURRENT_CONNECTIONS,
@@ -27,14 +27,11 @@ struct TestServer {
 impl TestServer {
     fn wait_collected(&self, min_len: usize) -> Vec<Input> {
         let (lock, cvar) = &*self.collected;
-        let mut inputs = lock.lock().unwrap();
-        let cap = Instant::now() + Duration::from_secs(5);
-        while inputs.len() < min_len && Instant::now() < cap {
-            let (next, _) = cvar
-                .wait_timeout(inputs, Duration::from_millis(50))
-                .unwrap();
-            inputs = next;
-        }
+        // The server invokes `on_inputs` before writing its response, so by the
+        // time a test has read a 200 this returns at once; no timeout needed.
+        let inputs = cvar
+            .wait_while(lock.lock().unwrap(), |v| v.len() < min_len)
+            .unwrap();
         inputs.clone()
     }
 
@@ -57,6 +54,10 @@ impl Drop for TestServer {
 }
 
 fn start_test_server() -> TestServer {
+    start_test_server_with(OtlpServerConfig::default())
+}
+
+fn start_test_server_with(base: OtlpServerConfig) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
     let port = listener.local_addr().unwrap().port();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -77,7 +78,7 @@ fn start_test_server() -> TestServer {
 
     let config = OtlpServerConfig {
         shutdown_fd: Some(shutdown_rx),
-        ..Default::default()
+        ..base
     };
 
     let handle = thread::spawn(move || {
@@ -92,11 +93,8 @@ fn start_test_server() -> TestServer {
         }
     });
 
-    let cap = Instant::now() + Duration::from_secs(5);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() && Instant::now() < cap {
-        thread::yield_now();
-    }
-
+    // The listener is bound before the server thread starts, so connects queue
+    // in the backlog immediately; no readiness wait is needed.
     TestServer {
         port,
         shutdown,
@@ -404,7 +402,11 @@ fn test_otlp_server_oversized_body() {
 
 #[test]
 fn test_otlp_server_slow_loris_timeout() {
-    let mut server = start_test_server();
+    // The server's own idle timeout is the event under test; keep it short.
+    let mut server = start_test_server_with(OtlpServerConfig {
+        io_timeout: Duration::from_millis(200),
+        ..Default::default()
+    });
 
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
     // Send partial header and stop
@@ -414,7 +416,7 @@ fn test_otlp_server_slow_loris_timeout() {
 
     let mut resp = String::new();
     let _ = stream.read_to_string(&mut resp);
-    assert!(resp.starts_with("HTTP/1.1 400 Bad Request"));
+    assert!(resp.starts_with("HTTP/1.1 408 Request Timeout"), "{resp}");
 
     server.stop();
 }
@@ -490,28 +492,26 @@ fn test_otlp_server_connection_cap_503_retry_after() {
     // Now close stream1 so active connection count drops back below 2
     drop(stream1);
 
-    // 4th client connects now that a slot is free -> should succeed
-    let cap = Instant::now() + Duration::from_secs(5);
-    let mut stream4_succeeded = false;
+    // 4th client: the slot frees when stream1's handler observes EOF, which
+    // races with this connect. Each attempt ends in a real response (503 while
+    // the slot is held, then 200), so retry on 503 only; any other reply fails.
     let req4 = "POST /v1/logs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
-    while Instant::now() < cap {
-        if let Ok(mut stream4) = TcpStream::connect(("127.0.0.1", port)) {
-            if stream4.write_all(req4.as_bytes()).is_ok() {
-                let mut resp4 = String::new();
-                if stream4.read_to_string(&mut resp4).is_ok()
-                    && resp4.starts_with("HTTP/1.1 200 OK")
-                {
-                    stream4_succeeded = true;
-                    break;
-                }
-            }
+    loop {
+        let mut stream4 = TcpStream::connect(("127.0.0.1", port)).expect("connect 4");
+        let _ = stream4.write_all(req4.as_bytes());
+        let mut resp4 = String::new();
+        let _ = stream4.read_to_string(&mut resp4);
+        if resp4.starts_with("HTTP/1.1 200 OK") {
+            break;
         }
+        // An empty read means the 503 was lost to an RST (we wrote a request the
+        // rejecting server never read), which is still a rejection event.
+        assert!(
+            resp4.is_empty() || resp4.starts_with("HTTP/1.1 503"),
+            "unexpected reply: {resp4}"
+        );
         thread::yield_now();
     }
-    assert!(
-        stream4_succeeded,
-        "stream4 must succeed once stream1 is dropped"
-    );
 
     drop(stream2);
     shutdown.store(true, Ordering::Relaxed);
@@ -519,4 +519,285 @@ fn test_otlp_server_connection_cap_503_retry_after() {
         unsafe { libc::close(shutdown_tx) };
     }
     let _ = handle.join();
+}
+
+/// Sends raw bytes on a fresh connection and returns everything the server
+/// writes before closing.
+fn raw_exchange(port: u16, bytes: &[u8]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let _ = stream.write_all(bytes);
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+fn prompt_json(session: &str) -> String {
+    serde_json::json!({
+        "resourceLogs": [{"scopeLogs": [{"logRecords": [{
+            "attributes": [
+                {"key": "event.name", "value": {"stringValue": "claude_code.user_prompt"}},
+                {"key": "session_id", "value": {"stringValue": session}}
+            ],
+            "body": {"stringValue": "hi"}
+        }]}]}]
+    })
+    .to_string()
+}
+
+#[test]
+fn test_otlp_server_rejects_request_smuggling() {
+    let server = start_test_server();
+    let body = prompt_json("smuggled");
+    // CL+TE: framing is ambiguous; must refuse and close, not guess.
+    let req = format!(
+        "POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nTransfer-Encoding: chunked\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let resp = raw_exchange(server.port, req.as_bytes());
+    assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+    assert!(resp.contains("Connection: close"), "{resp}");
+    assert_eq!(resp.matches("HTTP/1.1").count(), 1, "{resp}");
+
+    // Conflicting Content-Length values.
+    let req = "POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{}";
+    assert!(raw_exchange(server.port, req.as_bytes()).starts_with("HTTP/1.1 400"));
+}
+
+#[test]
+fn test_otlp_server_error_before_body_closes_instead_of_desyncing() {
+    // Before the fix a 415 kept the connection alive without consuming the
+    // body, so the body bytes were parsed as the next request.
+    let server = start_test_server();
+    let inner =
+        "POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+    let req = format!(
+        "POST /v1/logs HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        inner.len(),
+        inner
+    );
+    let resp = raw_exchange(server.port, req.as_bytes());
+    assert!(resp.starts_with("HTTP/1.1 415"), "{resp}");
+    assert_eq!(resp.matches("HTTP/1.1").count(), 1, "{resp}");
+}
+
+#[test]
+fn test_otlp_server_pipelined_keep_alive_with_bad_json_in_middle() {
+    let server = start_test_server();
+    let a = prompt_json("pipe-a");
+    let b = prompt_json("pipe-b");
+    let req = format!(
+        "POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}\
+         POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 3\r\n\r\n{{{{x\
+         POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        a.len(),
+        a,
+        b.len(),
+        b
+    );
+    let resp = raw_exchange(server.port, req.as_bytes());
+    let statuses: Vec<&str> = resp
+        .match_indices("HTTP/1.1 ")
+        .map(|(i, _)| &resp[i + 9..i + 12])
+        .collect();
+    assert_eq!(statuses, ["200", "400", "200"], "{resp}");
+    let ids: Vec<String> = server
+        .wait_collected(2)
+        .iter()
+        .filter_map(|i| match i {
+            Input::Prompt { session, .. } => Some(session.session_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["pipe-a", "pipe-b"]);
+}
+
+#[test]
+fn test_otlp_server_gzip_bomb_is_413() {
+    let server = start_test_server_with(OtlpServerConfig {
+        max_body_size: 64 * 1024,
+        ..Default::default()
+    });
+    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(&vec![b' '; 4 * 1024 * 1024]).unwrap();
+    let gz = enc.finish().unwrap();
+    assert!(gz.len() < 64 * 1024);
+    let mut req = format!(
+        "POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+        gz.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(&gz);
+    let resp = raw_exchange(server.port, &req);
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+}
+
+#[test]
+fn test_otlp_server_hostile_chunked_bodies() {
+    let server = start_test_server();
+    let head = "POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let cases: &[(&str, &str)] = &[
+        // usize overflow in the size line used to panic (debug) / wrap.
+        ("ffffffffffffffffffff\r\n", "413"),
+        ("ffffffffffffffff\r\n", "413"),
+        // Negative / garbage sizes.
+        ("-1\r\n", "400"),
+        ("zz\r\n\r\n", "400"),
+        // Chunk data not followed by CRLF.
+        ("2\r\n{}XX0\r\n\r\n", "400"),
+        // Endless size line with no newline.
+        (&"1".repeat(10_000), "400"),
+        // Truncated: EOF in chunk data (we shut down the write side).
+        ("10\r\nabc", "400"),
+    ];
+    for (body, want) in cases {
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp = String::new();
+        let _ = stream.read_to_string(&mut resp);
+        assert!(
+            resp.starts_with(&format!("HTTP/1.1 {want}")),
+            "body {:?}: {resp}",
+            &body[..body.len().min(40)]
+        );
+    }
+}
+
+#[test]
+fn test_otlp_server_oversized_and_garbage_heads() {
+    let server = start_test_server();
+    let mut huge = b"POST /v1/logs HTTP/1.1\r\nX-Pad: ".to_vec();
+    huge.extend(std::iter::repeat_n(b'a', 128 * 1024));
+    let resp = raw_exchange(server.port, &huge);
+    assert!(
+        resp.starts_with("HTTP/1.1 400"),
+        "{}",
+        &resp[..resp.len().min(80)]
+    );
+
+    for garbage in [
+        &b"\xff\xfe\r\n\r\n"[..],
+        b"POST /v1/logs\r\n\r\n",
+        b"POST /v1/logs HTTP/1.1 extra\r\n\r\n",
+        b"POST /v1/logs SPDY/3\r\n\r\n",
+        b"POST /v1/logs HTTP/1.1\r\nno-colon-here\r\n\r\n",
+        b"\r\n\r\n",
+    ] {
+        let resp = raw_exchange(server.port, garbage);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{garbage:?}: {resp}");
+    }
+}
+
+#[test]
+fn test_otlp_server_panicking_callback_frees_slot() {
+    // With one slot, a handler panic that leaked the slot would make every
+    // later client get 503.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    let config = OtlpServerConfig {
+        max_concurrent_connections: 1,
+        shutdown_fd: Some(fds[0]),
+        ..Default::default()
+    };
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls2 = Arc::clone(&calls);
+    let sd = Arc::clone(&shutdown);
+    let handle = thread::spawn(move || {
+        serve_otlp_with_config(listener, sd, config, move |_| {
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("callback panic (expected in test)");
+            }
+        })
+    });
+
+    let body = prompt_json("boom");
+    let req = format!(
+        "POST /v1/logs HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    // First request: handler panics, socket closes with no response.
+    assert_eq!(raw_exchange(port, req.as_bytes()), "");
+    // The slot is freed by the guard's Drop during unwinding, which may race
+    // with this connect; retry only on 503 / RST.
+    loop {
+        let resp = raw_exchange(port, req.as_bytes());
+        if resp.starts_with("HTTP/1.1 200") {
+            break;
+        }
+        assert!(
+            resp.is_empty() || resp.starts_with("HTTP/1.1 503"),
+            "{resp}"
+        );
+        thread::yield_now();
+    }
+
+    unsafe { libc::close(fds[1]) };
+    handle.join().unwrap().unwrap();
+    unsafe { libc::close(fds[0]) };
+}
+
+#[test]
+fn test_otlp_json_bool_is_error_and_huge_exit_code() {
+    use tacho_ingest::otlp::OtlpDecoder;
+    let v = serde_json::json!({
+        "resourceLogs": [{"scopeLogs": [{"logRecords": [{
+            "attributes": [
+                {"key": "event.name", "value": {"stringValue": "claude_code.tool_result"}},
+                {"key": "is_error", "value": {"boolValue": true}}
+            ]
+        }]}]}]
+    });
+    let inputs = OtlpDecoder::new().decode_logs_json(&v);
+    assert!(
+        matches!(&inputs[..], [Input::ToolEnd { error: true, .. }]),
+        "{inputs:?}"
+    );
+
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    attributes: vec![
+                        KeyValue {
+                            key: "event.name".into(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(
+                                    "claude_code.tool_result".into(),
+                                )),
+                            }),
+                            ..Default::default()
+                        },
+                        KeyValue {
+                            key: "exit_code".into(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::IntValue(1 << 32)),
+                            }),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let inputs = OtlpDecoder::new().decode_logs_proto(&req.encode_to_vec());
+    // 1<<32 used to wrap to exit code 0 (a fake success).
+    assert!(
+        matches!(
+            &inputs[..],
+            [Input::ToolEnd {
+                exit_code: None,
+                ..
+            }]
+        ),
+        "{inputs:?}"
+    );
 }

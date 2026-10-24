@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tacho_e2e::{perfetto_bin_path, traced_bin_path, traced_probes_bin_path, TestEnv};
+use tacho_e2e::{
+    perfetto_bin_path, traced_bin_path, traced_probes_bin_path, DecodedTrace, TestEnv,
+};
 
 struct TracedDaemons {
     traced: Option<Child>,
@@ -183,9 +185,8 @@ edition = "2021"
             .stderr(Stdio::null());
         let traced_child = traced_cmd.spawn().expect("failed to spawn traced");
 
-        let ready = env.wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
-            producer_sock.exists() && consumer_sock.exists()
-        });
+        let ready =
+            TestEnv::wait_for_path(&producer_sock) && TestEnv::wait_for_path(&consumer_sock);
         assert!(ready, "traced private sockets failed to bind");
 
         let mut probes_cmd = Command::new(&probes_bin);
@@ -310,7 +311,10 @@ edition = "2021"
     // worker in the example trace.
     let spawn_worker_tree = |label: &str, tool_cmd: &str| -> Child {
         let script = format!(
-            "import subprocess, time; [(subprocess.run(['bash', '-c', 'exec -a {} sleep 0.35']), time.sleep(0.5)) for _ in range(12)]; time.sleep(60)",
+            // A long-lived parent with a long-lived tool child (no pacing
+            // sleeps): the tree exists until the test kills the parent, and
+            // PR_SET_PDEATHSIG takes the child down with it.
+            "import ctypes, subprocess; subprocess.run(['bash', '-c', 'exec -a {} sleep 600'], preexec_fn=lambda: ctypes.CDLL(None).prctl(1, 9))",
             tool_cmd
         );
         Command::new("python3")
@@ -398,7 +402,7 @@ edition = "2021"
         assert!(out.status.success());
     }
 
-    // 5. worker-auth edits src/schema.rs and builds cleanly
+    // 5. worker-auth edits src/schema.rs and executes overlapping tools (populating lane 1)
     send_claude_hook(
         &env,
         "worker-auth",
@@ -410,6 +414,30 @@ edition = "2021"
             "tool_input": {
                 "file_path": "src/schema.rs",
             },
+        }),
+    );
+    // Overlapping second tool call while tool-auth-edit is still open -> allocated to lane 1
+    send_claude_hook(
+        &env,
+        "worker-auth",
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-worker-auth",
+            "tool_use_id": "tool-auth-parallel-read",
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": "src/auth.rs",
+            },
+        }),
+    );
+    send_claude_hook(
+        &env,
+        "worker-auth",
+        serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-worker-auth",
+            "tool_use_id": "tool-auth-parallel-read",
+            "tool_response": { "exit_code": 0 },
         }),
     );
     send_claude_hook(
@@ -447,7 +475,7 @@ edition = "2021"
     );
 
     // 6. Launch supervisor watch process: `tacho watch --until stalled`
-    let mut watch_child = env
+    let watch_child = env
         .tacho_cmd()
         .args(["watch", "--until", "stalled"])
         .stdout(Stdio::piped())
@@ -488,14 +516,15 @@ edition = "2021"
     }
 
     // 8. supervisor watch catches worker-db's stall and terminates cleanly
-    let watch_exited = env.wait_until(Duration::from_secs(10), Duration::from_millis(10), || {
-        watch_child.try_wait().unwrap().is_some()
-    });
+    // Drain its pipes on a thread while the pidfd tells us when it exits.
+    let watch_fd = tacho_e2e::PidFd::open(watch_child.id());
+    let watch_reader = std::thread::spawn(move || watch_child.wait_with_output().unwrap());
+    let watch_exited = watch_fd.is_none_or(|fd| fd.wait_exit(Some(tacho_e2e::SUITE_SAFETY_CAP)));
     assert!(
         watch_exited,
         "tacho watch --until stalled did not terminate on worker-db stall"
     );
-    let watch_output = watch_child.wait_with_output().unwrap();
+    let watch_output = watch_reader.join().unwrap();
     assert!(watch_output.status.success());
 
     // Verify status output reports worker-db as stalled
@@ -546,7 +575,20 @@ edition = "2021"
         .expect("tacho query failing-commands failed");
     assert!(fail_out.status.success());
 
-    // 9. Supervisor messages worker-db to unblock it, which aborts rebase, edits schema, and tests
+    // 9. worker-db ends its stalled turn, supervisor messages worker-db to unblock it,
+    // and worker-db starts a new turn (linked via FLOW_MESSAGE_DELIVERY) to abort rebase, edit schema, and test.
+    send_claude_hook(
+        &env,
+        "worker-db",
+        serde_json::json!({
+            "hook_event_name": "TurnEnd",
+            "session_id": "sess-worker-db",
+            "input_tokens": 3_100,
+            "output_tokens": 950,
+            "cached_tokens": 1_200,
+            "cost_micros": 14_500,
+        }),
+    );
     let msg_out = env
         .tacho_cmd()
         .args([
@@ -567,6 +609,15 @@ edition = "2021"
         msg_out.status.success(),
         "emit message failed: {}",
         String::from_utf8_lossy(&msg_out.stderr)
+    );
+    send_claude_hook(
+        &env,
+        "worker-db",
+        serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-worker-db",
+            "prompt": "Supervisor unblocked db-task: abort rebase and update schema",
+        }),
     );
     send_claude_hook(
         &env,
@@ -832,6 +883,8 @@ edition = "2021"
             &repo_dir,
             &["commit", "-m", &format!("feat: implement {pr_slug}")],
         );
+        // Deterministically run a sampler tick so WorktreeCommit is recorded for this PR
+        env.flush();
 
         send_claude_hook(
             &env,
@@ -1138,6 +1191,11 @@ edition = "2021"
     if !ok {
         let _ = run_git(&repo_dir, &["checkout", "feature/pr-07"]);
     }
+    // Also check out an earlier commit and return to feature/pr-07 so HeadMoved is recorded
+    let _ = run_git(&repo_dir, &["checkout", "main"]);
+    env.flush();
+    let _ = run_git(&repo_dir, &["checkout", "feature/pr-07"]);
+    env.flush();
 
     send_claude_hook(
         &env,
@@ -1226,6 +1284,7 @@ edition = "2021"
         &repo_dir,
         &["commit", "-m", "feat: worker-rescue finishes pr-07"],
     );
+    env.flush();
 
     send_claude_hook(
         &env,
@@ -1340,12 +1399,28 @@ edition = "2021"
         "worker-rogue not found in tacho status"
     );
 
+    // Close supervisor's initial turn before daemon crash so Turn 1 and Turn 2 are cleanly paired
+    send_claude_hook(
+        &env,
+        "supervisor",
+        serde_json::json!({
+            "hook_event_name": "TurnEnd",
+            "session_id": "sess-supervisor",
+            "input_tokens": 1_800,
+            "output_tokens": 450,
+            "cached_tokens": 900,
+            "cost_micros": 8_500,
+        }),
+    );
+
     // 12. Mid-scenario chaos: SIGKILL daemon, verify tacho trace fallback, auto-spawn recovery
     let orig_pid = env.daemon_pid().expect("daemon PID should be present");
-    assert!(env.kill_daemon_9(), "failed to send SIGKILL to daemon");
-    let killed = env.wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
-        !TestEnv::is_pid_alive(orig_pid)
-    });
+    let daemon_fd = tacho_e2e::PidFd::open(orig_pid).expect("daemon must be alive");
+    assert!(
+        daemon_fd.signal(libc::SIGKILL),
+        "failed to send SIGKILL to daemon"
+    );
+    let killed = daemon_fd.wait_exit(Some(tacho_e2e::SUITE_SAFETY_CAP));
     assert!(killed, "daemon did not die after SIGKILL");
 
     // Verify tacho trace succeeds directly from SQLite read-only DB fallback
@@ -1497,7 +1572,7 @@ edition = "2021"
     );
     assert!(fleet_trace_path.exists(), "fleet trace file does not exist");
 
-    // 14. Oracle verification
+    // 14. Oracle + DecodedTrace verification
     let oracle = env
         .run_oracle(&fleet_trace_path)
         .expect("oracle verification failed");
@@ -1508,6 +1583,134 @@ edition = "2021"
     );
     assert!(oracle.slice_count > 0, "expected slice rows");
     assert!(oracle.track_count > 0, "expected track rows");
+
+    // Verify zero unclosed slices in Perfetto SQLite slice table
+    let unclosed_rows = env
+        .query_trace(
+            &fleet_trace_path,
+            "SELECT count(*) FROM slice WHERE dur < 0;",
+        )
+        .expect("query unclosed slices failed");
+    let unclosed_sql: i64 = unclosed_rows
+        .into_iter()
+        .find(|r| !r.is_empty() && r[0] != "count(*)")
+        .and_then(|r| r[0].parse().ok())
+        .unwrap_or(-1);
+    assert_eq!(
+        unclosed_sql, 0,
+        "Expected 0 unclosed slices (dur < 0) in fleet trace, got {unclosed_sql}"
+    );
+
+    // Deep structural assertions on decoded Perfetto protobuf trace
+    let decoded = DecodedTrace::from_file(&fleet_trace_path).unwrap();
+
+    // (a) Top-level `tacho/milestones` state track progression (`TYPE_STATE`)
+    let milestone_states = decoded.state_events_on("tacho/milestones");
+    let milestone_names: Vec<&str> = milestone_states.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        milestone_names,
+        vec![
+            "Milestone: Foundation Stack Merged",
+            "Milestone: Core Services Ready",
+            "Milestone: Release v1.0.0-rc1 Stack Ready",
+        ],
+        "tacho/milestones state track must record all 3 milestones in order"
+    );
+    for pair in milestone_states.windows(2) {
+        assert!(
+            pair[1].ts >= pair[0].ts,
+            "tacho/milestones timestamps must be monotonic: {:?} vs {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // (b) Agent `turns`, `lane:N` (`lane 1`), `stalls`, `worktree` commits/head moves,
+    //     `procs/slot N`, and step-function counters (`cpu`, `rss`, `commits`, `files_edited`)
+    assert!(
+        !decoded
+            .slices_on("tacho/agents/worker-auth/run 1/turns")
+            .is_empty(),
+        "worker-auth must have turn slices on turns track"
+    );
+    let lane1_slices = decoded.slices_on("tacho/agents/worker-auth/run 1/lane 1");
+    assert!(
+        !lane1_slices.is_empty(),
+        "worker-auth overlapping tool call must be projected onto lane 1 (`lane:1`)"
+    );
+    let db_stalls = decoded.slices_on("tacho/agents/worker-db/stalls");
+    assert!(
+        db_stalls.iter().any(|s| s.name.starts_with("Stall [LOOP]")),
+        "worker-db stalls track must contain Stall [LOOP] slice, got: {db_stalls:?}"
+    );
+    let rogue_stalls = decoded.slices_on("tacho/agents/worker-rogue/stalls");
+    assert!(
+        rogue_stalls
+            .iter()
+            .any(|s| s.name.starts_with("Stall [OFF_BRIEF]")),
+        "worker-rogue stalls track must contain Stall [OFF_BRIEF] slice, got: {rogue_stalls:?}"
+    );
+    assert!(
+        rogue_stalls
+            .iter()
+            .any(|s| s.name.starts_with("Stall [BURN]")),
+        "worker-rogue stalls track must contain Stall [BURN] slice, got: {rogue_stalls:?}"
+    );
+
+    // Worktree commits and head moves across active agents
+    let all_slices = decoded.all_tacho_slices();
+    assert!(
+        all_slices
+            .iter()
+            .any(|s| s.track_path.ends_with("/worktree") && s.name.starts_with("WorktreeCommit:")),
+        "Fleet trace must contain WorktreeCommit slices on agent worktree tracks"
+    );
+    assert!(
+        all_slices
+            .iter()
+            .any(|s| s.track_path.ends_with("/worktree") && s.name.starts_with("HeadMoved:")),
+        "Fleet trace must contain HeadMoved slices on agent worktree tracks"
+    );
+
+    // Process tree slots (`procs/slot N`)
+    assert!(
+        all_slices
+            .iter()
+            .any(|s| s.track_path.contains("/procs/slot ")),
+        "Fleet trace must contain process tree slices on procs/slot N tracks"
+    );
+
+    // Step-function counters (`cpu`, `rss`, `commits`, `files_edited`)
+    for suffix in ["/cpu", "/rss", "/commits", "/files_edited"] {
+        let has_counter = decoded.tracks.keys().any(|&u| {
+            let p = decoded.path(u);
+            p.starts_with("tacho/agents/")
+                && p.ends_with(suffix)
+                && !decoded.counter_samples_on(&p).is_empty()
+        });
+        assert!(
+            has_counter,
+            "Expected non-empty step-function counter samples on an agent *{suffix} track"
+        );
+    }
+
+    // (c) `FLOW_MESSAGE_DELIVERY` flow events connecting inter-agent messages to recipient turns
+    let msg_links = decoded.message_delivery_links();
+    assert!(
+        msg_links.iter().any(|(from, to, _)| {
+            from == "tacho/messages::Message: supervisor -> worker-db"
+                && to.starts_with("tacho/agents/worker-db/run 1/turns::Turn 2")
+        }),
+        "Expected FLOW_MESSAGE_DELIVERY linking supervisor -> worker-db message to worker-db Turn 2, got: {msg_links:#?}"
+    );
+    decoded.assert_no_dangling_terminating_flows();
+
+    // (d) Zero orphaned/unclosed slices at trace snapshot boundary
+    let unclosed_tacho = decoded.unclosed_tacho_slices();
+    assert!(
+        unclosed_tacho.is_empty(),
+        "Expected zero unclosed tacho slices at trace snapshot boundary, found: {unclosed_tacho:#?}"
+    );
 
     // 15. Verify all 9 PerfettoSQL queries run cleanly on /tmp/tacho-realistic-fleet.perfetto-trace
     let queries = [
