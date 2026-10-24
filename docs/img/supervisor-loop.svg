@@ -112,8 +112,8 @@
     <!-- Sub-boxes for reduction features -->
     <g transform="translate(12, 42)">
       <rect width="256" height="50" fill="#ffffff" stroke="#dadce0" rx="3"/>
-      <text x="10" y="20" class="text-body" font-weight="600">Content Firewall &amp; Opt-in Scrubber</text>
-      <text x="10" y="36" class="text-desc">0 prose/diffs stored; opt-in secret redaction</text>
+      <text x="10" y="20" class="text-body" font-weight="600">Content Firewall &amp; Default-On Scrubber</text>
+      <text x="10" y="36" class="text-desc">0 prose/diffs stored; default-on secret redaction</text>
     </g>
 
     <g transform="translate(12, 102)">

@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::process::Stdio;
-use std::time::Duration;
 use tacho_e2e::TestEnv;
 
 #[test]
@@ -9,7 +8,7 @@ fn test_daemon_restart_lifecycle() {
 
     // 1. Ensure daemon is running
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     let initial_pid = env.daemon_pid().expect("daemon PID must be discoverable");
     assert!(TestEnv::is_pid_alive(initial_pid));
@@ -96,7 +95,7 @@ fn test_daemon_restart_lifecycle() {
 
     // Wait for auto-spawned daemon to be responding on api.sock
     assert!(
-        env.wait_for_api_sock(Duration::from_secs(4)),
+        env.wait_for_api_sock(),
         "auto-spawned daemon failed to start"
     );
 

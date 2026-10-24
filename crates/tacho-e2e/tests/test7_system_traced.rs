@@ -1,5 +1,4 @@
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 use tacho_e2e::{perfetto_bin_path, traced_bin_path, traced_probes_bin_path, TestEnv};
 
 struct TracedDaemons {
@@ -68,7 +67,7 @@ fn test_system_tracing_with_traced() {
 
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     // 3. Start system tracing via `tacho system start`
     let mut start_cmd = env.tacho_cmd();

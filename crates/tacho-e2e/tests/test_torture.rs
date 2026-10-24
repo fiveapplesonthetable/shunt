@@ -261,8 +261,6 @@ fn send_raw_hook_bytes(env: &TestEnv, agent: &str, bytes: &[u8]) -> bool {
 
 fn send_socket_input(sock_path: &Path, input: &Input) -> io::Result<()> {
     let mut stream = UnixStream::connect(sock_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let req = serde_json::json!({ "input": input });
     let mut bytes = serde_json::to_vec(&req)?;
     bytes.push(b'\n');
@@ -280,8 +278,6 @@ fn send_socket_input(sock_path: &Path, input: &Input) -> io::Result<()> {
 
 fn send_socket_batch(sock_path: &Path, inputs: &[Input]) -> io::Result<()> {
     let mut stream = UnixStream::connect(sock_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let req = serde_json::json!({ "inputs": inputs });
     let mut bytes = serde_json::to_vec(&req)?;
     bytes.push(b'\n');
@@ -402,7 +398,7 @@ fn test_torture_concurrent_agents() {
 
     // Ensure daemon is started
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(4)));
+    assert!(env.wait_for_api_sock());
 
     let tracker = Arc::new(ProcessTracker::new());
 
@@ -870,7 +866,7 @@ fn test_torture_git_stacking_chaos() {
 
     // Ensure daemon is running
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     let repo_str = repo_dir.to_str().unwrap();
 
@@ -1090,7 +1086,7 @@ fn test_torture_process_trees_and_rescue() {
     .unwrap();
 
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     // 1. Declare task
     let out = env
@@ -1340,7 +1336,7 @@ fn test_torture_daemon_chaos_and_recovery() {
 
     // 1. Initial status ensures daemon is up
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(4)));
+    assert!(env.wait_for_api_sock());
 
     // 2. Test Lock Refusal: starting a second daemon must fail
     let second_daemon = env
@@ -1443,7 +1439,7 @@ fn test_torture_daemon_chaos_and_recovery() {
         );
 
         assert!(
-            env.wait_for_api_sock(Duration::from_secs(4)),
+            env.wait_for_api_sock(),
             "auto-spawned daemon failed to bind api.sock after kill {iter}"
         );
         let new_pid = env.daemon_pid().expect("new daemon PID should be found");
@@ -1542,7 +1538,7 @@ fn test_torture_tail_concurrency() {
     let tracker = Arc::new(ProcessTracker::new());
 
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     let proj_dir = env.home_dir.join(".claude/projects/test-project");
     fs::create_dir_all(&proj_dir).unwrap();
@@ -1575,7 +1571,6 @@ fn test_torture_tail_concurrency() {
             };
             writeln!(f, "{line}").unwrap();
             f.flush().unwrap();
-            std::thread::yield_now();
         }
         stop_clone.store(true, Ordering::Release);
     });
@@ -1587,9 +1582,6 @@ fn test_torture_tail_concurrency() {
         .spawn()
         .expect("failed to spawn tacho tail");
     tracker.track(tail_child.id());
-
-    // Allow some lines to be ingested
-    std::thread::yield_now();
 
     // Abruptly SIGKILL the tailer
     let _ = tail_child.kill();
@@ -1659,7 +1651,7 @@ fn test_torture_benchmarks_and_idle() {
     let env = TestEnv::new().unwrap();
 
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     println!("\n================================================================================");
     println!("TACHO TORTURE BENCHMARKS:");

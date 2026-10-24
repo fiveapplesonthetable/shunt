@@ -415,13 +415,13 @@ pub fn run_self_update(
         store.mutate(Some(("watch", "self_update", target_sha, &because)), |st| {
             st.refused_self_update_sha = None;
         })?;
-        let _ = mutate_fleet_meta(|m| {
+        mutate_fleet_meta(|m| {
             m.last_code_moved = Some(CodeMoveRecord {
                 from_sha: from_sha.clone(),
                 to_sha: target_sha.to_string(),
                 at: now,
             });
-        });
+        })?;
         Ok(SelfUpdateOutcome::Updated {
             from_sha,
             to_sha: target_sha.to_string(),

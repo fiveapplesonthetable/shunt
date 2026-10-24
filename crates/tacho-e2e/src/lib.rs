@@ -302,23 +302,51 @@ impl TestEnv {
         }
     }
 
-    /// Spins on `f` until it holds or `timeout` passes.
-    ///
-    /// Prefer the event-driven waits below (`wait_pid_exit`, `wait_for_path`,
-    /// `wait_for_api_sock`, `flush`); this exists for state that has no kernel
-    /// event to wait on, and its timeout is only a safety cap.
-    pub fn wait_until<F>(&self, timeout: Duration, _step: Duration, mut f: F) -> bool
+    /// Blocks until `f()` holds, woken by inotify events on the sandbox
+    /// directories (`home_dir` and `runtime_dir`), bounded only by
+    /// [`SUITE_SAFETY_CAP`].
+    pub fn wait_until<F>(&self, mut f: F) -> bool
     where
         F: FnMut() -> bool,
     {
-        let start = Instant::now();
-        while start.elapsed() < timeout {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        if f() {
+            return true;
+        }
+        let deadline = Instant::now() + SUITE_SAFETY_CAP;
+        // SAFETY: plain syscall.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if raw < 0 {
+            return f();
+        }
+        // SAFETY: `raw` is a fresh fd we own.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mask = libc::IN_MODIFY
+            | libc::IN_CREATE
+            | libc::IN_MOVED_TO
+            | libc::IN_ATTRIB
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_DELETE;
+        for dir in [&self.home_dir, &self.runtime_dir] {
+            if let Ok(c_dir) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+                // SAFETY: valid fd and NUL-terminated path.
+                unsafe {
+                    libc::inotify_add_watch(fd.as_raw_fd(), c_dir.as_ptr(), mask);
+                }
+            }
+        }
+        loop {
             if f() {
                 return true;
             }
-            std::thread::yield_now();
+            if !poll_readable(fd.as_raw_fd(), Some(deadline)) {
+                return f();
+            }
+            let mut buf = [0u8; 4096];
+            // SAFETY: valid fd and buffer; drains pending events.
+            while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
         }
-        f()
     }
 
     /// Blocks until process `pid` exits, woken by its pidfd. Returns `true`
@@ -339,10 +367,9 @@ impl TestEnv {
 
     /// Waits for `api.sock` to appear (inotify) and accept a connection.
     ///
-    /// `timeout` is kept for API compatibility; the wait is event-driven and
-    /// bounded only by the suite-wide safety cap, so a slow machine cannot
-    /// turn it into a spurious failure.
-    pub fn wait_for_api_sock(&self, _timeout: Duration) -> bool {
+    /// The wait is event-driven and bounded only by [`SUITE_SAFETY_CAP`], so a
+    /// slow machine cannot turn it into a spurious failure.
+    pub fn wait_for_api_sock(&self) -> bool {
         let sock = self.api_sock();
         if let Some(parent) = sock.parent() {
             let _ = fs::create_dir_all(parent);
@@ -555,16 +582,6 @@ fn wait_for_path_until(path: &Path, deadline: Instant, mut ready: impl FnMut() -
         if check(&mut ready) {
             return true;
         }
-        // The path can exist before the listener is accepting (bind then
-        // listen); no further inotify event will come for that, so yield and
-        // re-check rather than block.
-        if path.exists() {
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::yield_now();
-            continue;
-        }
         if !poll_readable(fd.as_raw_fd(), Some(deadline)) {
             return check(&mut ready);
         }
@@ -581,9 +598,10 @@ impl Drop for TestEnv {
         // the pidfd instead of spinning on kill(pid, 0).
         if let Some(fd) = self.daemon_pid().and_then(PidFd::open) {
             fd.signal(libc::SIGTERM);
-            if !fd.wait_exit(Some(Duration::from_secs(5))) {
+            fd.signal(libc::SIGCONT);
+            if !fd.wait_exit(Some(SUITE_SAFETY_CAP)) {
                 fd.signal(libc::SIGKILL);
-                fd.wait_exit(Some(Duration::from_secs(5)));
+                fd.wait_exit(Some(SUITE_SAFETY_CAP));
             }
         }
     }

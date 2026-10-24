@@ -170,23 +170,27 @@ fn execute_db(args: DbArgs) -> io::Result<()> {
     if args.rm {
         if let Ok(down_cmd) = std::env::var("TACHO_DB_DOWN_CMD") {
             if !down_cmd.trim().is_empty() {
-                let _ = Command::new("bash")
+                let status = Command::new("bash")
                     .args(["-c", &down_cmd])
                     .current_dir(&checkout)
                     .env("SLUG", &args.name)
                     .env("DB_PORT", port.to_string())
-                    .status();
+                    .status()?;
+                if !status.success() {
+                    return Err(io::Error::other(format!(
+                        "TACHO_DB_DOWN_CMD failed with {status}"
+                    )));
+                }
             }
         }
         let env_path = checkout.join(".tachoenv");
         if env_path.is_file() {
-            if let Ok(txt) = fs::read_to_string(&env_path) {
-                let mut map = parse_env(&txt);
-                map.remove("DATABASE_URL");
-                fleet::write_atomic(&env_path, format_env_map(&map).as_bytes())?;
-            }
+            let txt = fs::read_to_string(&env_path)?;
+            let mut map = parse_env(&txt);
+            map.remove("DATABASE_URL");
+            fleet::write_atomic(&env_path, format_env_map(&map).as_bytes())?;
         }
-        let _ = store.record_decision("kit", "db_rm", &args.name, "removed per-worktree database");
+        store.record_decision("kit", "db_rm", &args.name, "removed per-worktree database")?;
         println!("Removed database for {}", args.name);
         return Ok(());
     }
@@ -309,9 +313,8 @@ fn handle_retire(args: RetireArgs) -> io::Result<()> {
     let key = args.key.clone();
     fleet::execute_retire(args)?;
     if let Some(why) = custom_reason {
-        if let Ok(store) = fleet::open_fleet_store() {
-            let _ = store.record_decision("dispatch", "retire_why", &key, &why);
-        }
+        let store = fleet::open_fleet_store()?;
+        store.record_decision("dispatch", "retire_why", &key, &why)?;
     }
     Ok(())
 }
@@ -327,22 +330,18 @@ fn handle_batch(cli_args: BatchCliArgs) -> io::Result<()> {
             .map(String::from)
             .collect();
         if !requested_areas.is_empty() && inner.prs.is_empty() {
-            if let Ok(store) = fleet::open_fleet_store() {
-                if let Ok(state) = store.load() {
-                    let mut matched_prs = Vec::new();
-                    for pr in &state.open_prs_cache {
-                        let pr_areas = tacho_core::decide::verify::areas_for_files(
-                            &pr.files,
-                            &state.area_rules,
-                        );
-                        if pr_areas.iter().any(|a| requested_areas.contains(a)) {
-                            matched_prs.push(pr.number);
-                        }
-                    }
-                    if !matched_prs.is_empty() {
-                        inner.prs = matched_prs;
-                    }
+            let store = fleet::open_fleet_store()?;
+            let state = store.load()?;
+            let mut matched_prs = Vec::new();
+            for pr in &state.open_prs_cache {
+                let pr_areas =
+                    tacho_core::decide::verify::areas_for_files(&pr.files, &state.area_rules);
+                if pr_areas.iter().any(|a| requested_areas.contains(a)) {
+                    matched_prs.push(pr.number);
                 }
+            }
+            if !matched_prs.is_empty() {
+                inner.prs = matched_prs;
             }
         }
     }
@@ -421,15 +420,14 @@ fn handle_train(mut args: TrainArgs) -> io::Result<()> {
     let max_cap = args.max.take();
     fleet::execute_train(args)?;
     if let Some(max_n) = max_cap {
-        if let Ok(mut store) = fleet::open_fleet_store() {
-            let _ = store.mutate(None, |st| {
-                if let Some(last) = st.trains.last_mut() {
-                    if last.status == "open" && last.prs.len() > max_n {
-                        last.prs.truncate(max_n);
-                    }
+        let mut store = fleet::open_fleet_store()?;
+        store.mutate(None, |st| {
+            if let Some(last) = st.trains.last_mut() {
+                if last.status == "open" && last.prs.len() > max_n {
+                    last.prs.truncate(max_n);
                 }
-            });
-        }
+            }
+        })?;
     }
     Ok(())
 }
@@ -439,13 +437,12 @@ fn handle_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
     let pr_num = args.pr;
     fleet::execute_release_train(args)?;
     if let Some(num) = pr_num {
-        if let Ok(mut store) = fleet::open_fleet_store() {
-            let _ = store.mutate(None, |st| {
-                if let Some(ref mut tpr) = st.train_pr {
-                    tpr.number = Some(num);
-                }
-            });
-        }
+        let mut store = fleet::open_fleet_store()?;
+        store.mutate(None, |st| {
+            if let Some(ref mut tpr) = st.train_pr {
+                tpr.number = Some(num);
+            }
+        })?;
     }
     Ok(())
 }

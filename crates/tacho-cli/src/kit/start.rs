@@ -84,12 +84,14 @@ pub fn resolve_pinned_base_sha(
                 return Ok((sha, Some(pr_num)));
             }
             if is_full_hex_sha(&pr.head) {
-                let _ = Command::new("git")
+                let fetch_out = Command::new("git")
                     .args(["fetch", "origin", &pr.head])
                     .current_dir(repo_root)
-                    .output();
-                if let Some(sha) = git_rev_parse_commit(repo_root, &pr.head) {
-                    return Ok((sha, Some(pr_num)));
+                    .output()?;
+                if fetch_out.status.success() {
+                    if let Some(sha) = git_rev_parse_commit(repo_root, &pr.head) {
+                        return Ok((sha, Some(pr_num)));
+                    }
                 }
             }
         }
@@ -127,12 +129,14 @@ pub fn resolve_pinned_base_sha(
             if gh_out.status.success() {
                 let oid = String::from_utf8_lossy(&gh_out.stdout).trim().to_string();
                 if !oid.is_empty() {
-                    let _ = Command::new("git")
+                    let fetch_out = Command::new("git")
                         .args(["fetch", "-q", "origin", &oid])
                         .current_dir(repo_root)
-                        .output();
-                    if let Some(sha) = git_rev_parse_commit(repo_root, &oid) {
-                        return Ok((sha, Some(pr_num)));
+                        .output()?;
+                    if fetch_out.status.success() {
+                        if let Some(sha) = git_rev_parse_commit(repo_root, &oid) {
+                            return Ok((sha, Some(pr_num)));
+                        }
                     }
                 }
             }
@@ -525,14 +529,21 @@ pub fn start_worktree_with_code(args: StartArgs) -> io::Result<i32> {
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
-        let _ = Command::new("git")
-            .args(["config", "--unset", &format!("branch.{}.remote", args.slug)])
-            .current_dir(&wt_path)
-            .output();
-        let _ = Command::new("git")
-            .args(["config", "--unset", &format!("branch.{}.merge", args.slug)])
-            .current_dir(&wt_path)
-            .output();
+        for key in [
+            format!("branch.{}.remote", args.slug),
+            format!("branch.{}.merge", args.slug),
+        ] {
+            let cfg_out = Command::new("git")
+                .args(["config", "--unset", &key])
+                .current_dir(&wt_path)
+                .output()?;
+            if !cfg_out.status.success() && cfg_out.status.code() != Some(5) {
+                return Err(io::Error::other(format!(
+                    "git config --unset {key} failed: {}",
+                    String::from_utf8_lossy(&cfg_out.stderr).trim()
+                )));
+            }
+        }
     }
 
     let created_at = state
@@ -572,7 +583,7 @@ pub fn start_worktree_with_code(args: StartArgs) -> io::Result<i32> {
     let cargo_target_dir = std::env::var("TACHO_CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| wt_root.join(".cargo-target"));
-    let _ = fs::create_dir_all(&cargo_target_dir);
+    fs::create_dir_all(&cargo_target_dir)?;
 
     let current_path = std::env::var("PATH").unwrap_or_default();
     let merged_path = merge_path(&default_toolchain_dirs(), &current_path);
@@ -630,13 +641,13 @@ pub fn start_worktree_with_code(args: StartArgs) -> io::Result<i32> {
     );
     write_atomic(&wt_path.join(".tachoenv"), final_env_content.as_bytes())?;
 
-    let _ = store.emit_state_band(
+    store.emit_state_band(
         &format!("task:{}/state", args.slug),
         "InProgress",
         TaskStatus::InProgress,
         &because,
         now_ns(),
-    );
+    )?;
     emit_decision_event(&format!("agent:{}", args.slug), "verify:start", &because);
 
     println!("Worktree: {}", wt_path.display());

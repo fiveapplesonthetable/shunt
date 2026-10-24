@@ -350,6 +350,61 @@ pub fn execute_status(args: StatusArgs) -> io::Result<()> {
     let snap = load_status_snapshot(&home, now).map_err(io::Error::other)?;
 
     if args.json {
+        let has_fleet_data = !sections.is_empty()
+            || home.join("snapshot.json").is_file()
+            || !snap.agents.is_empty()
+            || !snap.needs.is_empty()
+            || !snap.held.holds.is_empty()
+            || !snap.flakes.is_empty()
+            || !snap.pipeline.queue.is_empty()
+            || !snap.pipeline.batches.is_empty()
+            || !snap.pipeline.trains.is_empty()
+            || !snap.pipeline.ready.is_empty()
+            || snap.headline.open_prs > 0;
+
+        if !has_fleet_data {
+            let client = DaemonClient::new();
+            let recorder_json = match client.send_request(&serde_json::json!({
+                "cmd": "status",
+                "json": true,
+            })) {
+                Ok(resp) => resp
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                Err(_) => {
+                    let db_path = resolve_events_db();
+                    if db_path.exists() {
+                        let events = EventLog::open(&db_path)
+                            .and_then(|log| log.load_all())
+                            .unwrap_or_default();
+                        if !events.is_empty() {
+                            let recorder = Recorder::restore(events.iter());
+                            let now_ns = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64;
+                            Some(render_status(recorder.live_state(), true, now_ns))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(rec_json) = recorder_json {
+                let has_rec_agents = serde_json::from_str::<serde_json::Value>(&rec_json)
+                    .ok()
+                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+                    .unwrap_or(false);
+                if has_rec_agents {
+                    println!("{}", Scrubber::new().scrub(&rec_json));
+                    return Ok(());
+                }
+            }
+        }
+
         let out = render_snapshot_json(&snap, &sections);
         println!("{out}");
         return Ok(());

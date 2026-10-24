@@ -37,12 +37,37 @@ fn wall_clock_ns() -> u64 {
 }
 
 /// Test hooks to simulate a wedged or paused appender thread.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AppenderHooks {
     /// When true, causes the appender thread to block until cleared.
     pub wedged: AtomicBool,
     pub condvar: Condvar,
     pub mutex: Mutex<()>,
+    hook_expire_pipe: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+}
+
+impl Default for AppenderHooks {
+    fn default() -> Self {
+        use std::os::fd::FromRawFd;
+        let mut fds = [-1i32; 2];
+        let pipe =
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0 {
+                Some(unsafe {
+                    (
+                        std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                        std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+                    )
+                })
+            } else {
+                None
+            };
+        Self {
+            wedged: AtomicBool::new(false),
+            condvar: Condvar::new(),
+            mutex: Mutex::new(()),
+            hook_expire_pipe: pipe,
+        }
+    }
 }
 
 impl AppenderHooks {
@@ -51,6 +76,32 @@ impl AppenderHooks {
         self.wedged.store(wedged, Ordering::Release);
         if !wedged {
             self.condvar.notify_all();
+        }
+    }
+
+    /// Deterministically expires the currently running `on_stall` hook wait via its wakeup pipe.
+    pub fn expire_active_hook(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some((_, ref write_fd)) = self.hook_expire_pipe {
+            let byte = [1u8];
+            let _ = unsafe { libc::write(write_fd.as_raw_fd(), byte.as_ptr().cast(), 1) };
+        }
+    }
+
+    fn hook_expire_read_fd(&self) -> Option<libc::c_int> {
+        use std::os::fd::AsRawFd;
+        self.hook_expire_pipe
+            .as_ref()
+            .map(|(read_fd, _)| read_fd.as_raw_fd())
+    }
+
+    fn drain_hook_expire(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some((ref read_fd, _)) = self.hook_expire_pipe {
+            let mut buf = [0u8; 64];
+            while unsafe { libc::read(read_fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0
+            {
+            }
         }
     }
 
@@ -119,9 +170,16 @@ pub struct AppenderHandle {
     write_errors: Arc<AtomicUsize>,
     state_notify: Arc<StateNotify>,
     shutdown_requested: Arc<AtomicBool>,
+    sampler_waker: Arc<Mutex<Option<crate::sampler::SamplerWaker>>>,
 }
 
 impl AppenderHandle {
+    /// Attaches the sampler waker so committed lifecycle/stall/task events immediately wake
+    /// the sampler/decide loop.
+    pub fn set_sampler_waker(&self, waker: crate::sampler::SamplerWaker) {
+        *self.sampler_waker.lock().unwrap_or_else(|p| p.into_inner()) = Some(waker);
+    }
+
     /// Waits for `LiveState` to update beyond `last_seq` within `timeout`, returning the new sequence.
     pub fn wait_state_change(&self, last_seq: u64, timeout: Duration) -> u64 {
         let guard = self.state_notify.lock();
@@ -306,9 +364,10 @@ fn run_stall_worker(
     receiver: std::sync::mpsc::Receiver<StallJob>,
     cmd_str: String,
     timeout: Duration,
+    hooks: Arc<AppenderHooks>,
 ) {
     while let Ok(job) = receiver.recv() {
-        run_stall_hook(&cmd_str, &job, timeout);
+        run_stall_hook(&cmd_str, &job, timeout, &hooks);
     }
 }
 
@@ -316,7 +375,7 @@ fn run_stall_worker(
 ///
 /// The leader stays unreaped (a zombie at worst) until after `kill(-pgid)`, so the group id
 /// cannot have been recycled by an unrelated process when we signal it.
-fn run_stall_hook(cmd_str: &str, job: &StallJob, timeout: Duration) {
+fn run_stall_hook(cmd_str: &str, job: &StallJob, timeout: Duration, hooks: &AppenderHooks) {
     use std::os::unix::process::CommandExt;
 
     let mut cmd = std::process::Command::new("sh");
@@ -339,7 +398,7 @@ fn run_stall_hook(cmd_str: &str, job: &StallJob, timeout: Duration) {
     };
     let pgid = child.id() as libc::pid_t;
 
-    match wait_exit_without_reaping(pgid, timeout) {
+    match wait_exit_without_reaping(pgid, timeout, hooks) {
         Ok(true) => {}
         Ok(false) => eprintln!(
             "[tacho-daemon] on_stall hook for {} exceeded {:?}; killing its process group",
@@ -358,7 +417,11 @@ fn run_stall_hook(cmd_str: &str, job: &StallJob, timeout: Duration) {
 ///
 /// Uses a pidfd when available; otherwise `waitid(WNOWAIT)` on a helper thread.
 /// Returns Ok(true) if it exited, Ok(false) on timeout.
-fn wait_exit_without_reaping(pid: libc::pid_t, timeout: Duration) -> std::io::Result<bool> {
+fn wait_exit_without_reaping(
+    pid: libc::pid_t,
+    timeout: Duration,
+    hooks: &AppenderHooks,
+) -> std::io::Result<bool> {
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
     if pidfd < 0 {
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -388,17 +451,32 @@ fn wait_exit_without_reaping(pid: libc::pid_t, timeout: Duration) -> std::io::Re
     // SAFETY: pidfd_open returned a fresh fd that we own.
     let pidfd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(pidfd) };
     let deadline = Instant::now() + timeout;
+    let expire_fd = hooks.hook_expire_read_fd().unwrap_or(-1);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let mut pfd = libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(&pidfd),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut pfds = [
+            libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&pidfd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: expire_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds: libc::nfds_t = if expire_fd >= 0 { 2 } else { 1 };
         let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, ms) };
         if rc > 0 {
-            return Ok(true);
+            if pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(true);
+            }
+            if nfds == 2 && pfds[1].revents & libc::POLLIN != 0 {
+                hooks.drain_hook_expire();
+                return Ok(false);
+            }
         }
         if rc == 0 {
             return Ok(false);
@@ -493,14 +571,16 @@ pub fn spawn_appender_with_hook_timeout(
         write_errors: Arc::new(AtomicUsize::new(0)),
         state_notify: Arc::new(StateNotify::default()),
         shutdown_requested: Arc::new(AtomicBool::new(false)),
+        sampler_waker: Arc::new(Mutex::new(None)),
     };
 
     let (stall_hooks, stall_worker) = match on_stall {
         Some(cmd_str) if !cmd_str.trim().is_empty() => {
             let (tx, rx) = std::sync::mpsc::sync_channel::<StallJob>(STALL_HOOK_QUEUE);
+            let worker_hooks = handle.hooks.clone();
             let worker = std::thread::Builder::new()
                 .name("tacho-on-stall".to_string())
-                .spawn(move || run_stall_worker(rx, cmd_str, on_stall_timeout))
+                .spawn(move || run_stall_worker(rx, cmd_str, on_stall_timeout, worker_hooks))
                 .expect("failed to spawn on-stall worker thread");
             let sender = StallHookSender {
                 tx,

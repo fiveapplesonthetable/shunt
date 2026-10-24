@@ -18,9 +18,9 @@ use tacho_core::decide::watch::{
 use tacho_core::decide::{decide, BatchOutcomeObs, BurnerProcess, DecisionState, WorldObservation};
 use tacho_core::{Scrubber, TaskStatus};
 
-use crate::cli::{ProgressArgs, TellArgs, TickArgs, WatchdogArgs};
+use crate::cli::{ProgressArgs, TickArgs, WatchdogArgs};
 
-use super::dispatch::{execute_tell, spawn_worker_for_item};
+use super::dispatch::{deliver_tell_action, spawn_worker_for_item};
 use super::ops::write_scrubbed_snapshot;
 use super::store::{
     emit_decision_event, live_agent_keys, load_fleet_meta, mutate_fleet_meta, now_ns, now_secs,
@@ -28,6 +28,7 @@ use super::store::{
     WatchdogIssueState,
 };
 use super::tidy::{apply_tidy_decisions, build_tidy_snapshot};
+use tacho_daemon::FleetStore;
 
 /// Executes `tacho progress`.
 pub fn execute_progress(args: ProgressArgs) -> io::Result<()> {
@@ -235,9 +236,34 @@ fn observe_git_and_deploys(
     )
 }
 
+/// Kills a duplicate batch PID only when its recorded `starttime` or `cgroup` identity is verified.
+pub(crate) fn kill_duplicate_batch(
+    pid: u32,
+    dup_id: &str,
+    starttime: Option<u64>,
+    cgroup: Option<&str>,
+) -> bool {
+    if starttime.filter(|&st| st > 0).is_none() && cgroup.filter(|s| !s.is_empty()).is_none() {
+        return false;
+    }
+    if verify_agent_pid(pid, dup_id, cgroup, starttime) {
+        unsafe {
+            let _ = libc::kill(pid as i32, libc::SIGTERM);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Executes a single orchestrator & supervisor pass (`tacho tick`) driven entirely by `tacho_core::decide::decide`.
 pub fn execute_tick(args: TickArgs) -> io::Result<()> {
     let mut store = open_fleet_store()?;
+    execute_tick_with(&mut store, args)
+}
+
+/// Executes a single orchestrator & supervisor pass against an open [`FleetStore`].
+pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<()> {
     let state = store.load()?;
     let now = now_secs();
     let tick_start_ns = now_ns();
@@ -245,38 +271,7 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
     let live = live_agent_keys(&state);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // 1. Abort duplicate batches. Runaway burners are observed below and killed only through
-    // `plan.burner_kills`, after their recorded start time is re-checked (PID reuse safety).
-    let dup_batch_ids = duplicate_batches(&state.batches);
-    if !dup_batch_ids.is_empty() {
-        for dup_id in &dup_batch_ids {
-            let because = format!("aborted duplicate batch {dup_id}");
-            if !args.dry_run {
-                store.mutate(
-                    Some(("watch", "kill_duplicate_batch", dup_id, &because)),
-                    |st| {
-                        for b in &mut st.batches {
-                            if &b.id == dup_id {
-                                if let Some(pid) = b.pid {
-                                    if verify_agent_pid(pid, dup_id, None, None) {
-                                        unsafe {
-                                            let _ = libc::kill(pid as i32, libc::SIGTERM);
-                                        }
-                                    }
-                                }
-                                b.status = "aborted".to_string();
-                                b.finished_at = Some(now);
-                            }
-                        }
-                    },
-                )?;
-            }
-            println!("{because}");
-        }
-    }
-
-    // 2. Gather WorldObservation (agent log tails, progress samples, git/main/deploy state, tidy snapshot)
-    let state = store.load()?;
+    // 1. Gather WorldObservation (agent log tails, progress samples, git/main/deploy state, tidy snapshot)
     let mut agent_log_tails = BTreeMap::new();
     for (k, a) in &state.agents {
         if a.finished_at.is_none() && !live.contains(k) {
@@ -439,12 +434,43 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
 
     // Record decision tick inputs and output plan for deterministic replay
     if !args.dry_run {
-        if let Err(e) = store.record_decision_tick(now, &decision_state, &world_obs, &plan) {
-            eprintln!("[tacho-fleet] failed to record decision tick: {e}");
-        }
+        store
+            .record_decision_tick(now, &decision_state, &world_obs, &plan)
+            .map_err(|e| io::Error::other(e.to_string()))?;
     }
 
     // 4. Execute side-effects prescribed by `plan`
+    let dup_batch_ids = duplicate_batches(&state.batches);
+    if !dup_batch_ids.is_empty() {
+        let meta = load_fleet_meta().unwrap_or_default();
+        for dup_id in &dup_batch_ids {
+            let because = format!("aborted duplicate batch {dup_id}");
+            if !args.dry_run {
+                let batch_id_rec = meta.batch_identities.get(dup_id).cloned();
+                store.mutate(
+                    Some(("watch", "kill_duplicate_batch", dup_id, &because)),
+                    |st| {
+                        for b in &mut st.batches {
+                            if &b.id == dup_id {
+                                if let Some(pid) = b.pid {
+                                    let (rec_st, rec_cg) = batch_id_rec
+                                        .as_ref()
+                                        .filter(|id| id.pid == pid)
+                                        .map(|id| (id.starttime, id.cgroup.as_deref()))
+                                        .unwrap_or((None, None));
+                                    let _ = kill_duplicate_batch(pid, dup_id, rec_st, rec_cg);
+                                }
+                                b.status = "aborted".to_string();
+                                b.finished_at = Some(now);
+                            }
+                        }
+                    },
+                )?;
+            }
+            println!("{because}");
+        }
+    }
+
     for b in &plan.burner_kills {
         let because = format!(
             "killed runaway burner pid={} ({}) elapsed={}s",
@@ -452,11 +478,11 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         );
         if !args.dry_run {
             let actual_st = proc_pid_starttime(b.pid);
-            if actual_st.is_some() && actual_st == b.starttime {
+            if b.starttime.filter(|&st| st > 0).is_some() && actual_st == b.starttime {
                 unsafe {
                     let _ = libc::kill(b.pid as i32, libc::SIGKILL);
                 }
-                let _ = store.record_decision("watch", "kill_burner", &b.pid.to_string(), &because);
+                store.record_decision("watch", "kill_burner", &b.pid.to_string(), &because)?;
                 emit_decision_event("system", "watch:kill_burner", &because);
             } else {
                 eprintln!(
@@ -470,12 +496,7 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
 
     for (agent_key, msg) in &plan.tell_actions {
         if !args.dry_run {
-            if let Err(e) = execute_tell(TellArgs {
-                key: agent_key.clone(),
-                message: msg.clone(),
-            }) {
-                eprintln!("[tacho-fleet] tell {agent_key} failed: {e}");
-            }
+            deliver_tell_action(store, agent_key, msg)?;
         }
     }
 
@@ -514,13 +535,13 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
                     format!("{k} exited without PR"),
                 )
             };
-            let _ = store.emit_state_band(
+            store.emit_state_band(
                 &format!("task:{}/state", base_key(k)),
                 label,
                 status,
                 &because,
                 now_ns(),
-            );
+            )?;
         }
     }
 
@@ -532,7 +553,7 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
                 if !args.dry_run {
                     if let Some(a) = state.agents.get(key) {
                         if let Some(pid) = a.pid {
-                            if verify_agent_pid(pid, key, a.session_id.as_deref(), a.starttime) {
+                            if verify_agent_pid(pid, key, a.cgroup.as_deref(), a.starttime) {
                                 unsafe {
                                     let _ = libc::kill(-(pid as i32), libc::SIGTERM);
                                 }
@@ -562,7 +583,7 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
             SuperviseAction::Escalate { key, because } => {
                 println!("Supervise: {because}");
                 if !args.dry_run {
-                    let _ = store.record_decision("watch", "supervise", key, because);
+                    store.record_decision("watch", "supervise", key, because)?;
                     emit_decision_event(&format!("agent:{key}"), "watch:supervise", because);
                 }
             }
@@ -573,7 +594,7 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         let because = format!("auto-queued resume {} after backoff", item.key);
         println!("{because}");
         if !args.dry_run {
-            let _ = store.record_decision("dispatch", "auto_resume", &item.key, &because);
+            store.record_decision("dispatch", "auto_resume", &item.key, &because)?;
         }
     }
 
@@ -614,20 +635,20 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         }
 
         if !plan.fix_decisions.dispatch.is_empty() || !plan.fix_decisions.notify.is_empty() {
-            let _ = store.record_decision(
+            store.record_decision(
                 "verify",
                 "decide_fixes",
                 "failed_prs",
                 "processed red PR fix actions",
-            );
+            )?;
         }
         if !plan.rebase_handoffs.is_empty() {
-            let _ = store.record_decision(
+            store.record_decision(
                 "dispatch",
                 "next_hands",
                 "open_prs",
                 "processed conflict rebase actions",
-            );
+            )?;
         }
 
         // Persist updated state from `decide` (keeping `dispatched_tasks` in `st.todo` until `spawn_worker_for_item` pops them)
@@ -650,34 +671,34 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
         if args.dry_run {
             println!("[dry-run] Would dispatch {}", item.key);
         } else {
-            let pid = spawn_worker_for_item(&mut store, item)?;
+            let pid = spawn_worker_for_item(store, item)?;
             println!("Dispatched {} (pid {pid})", item.key);
         }
     }
 
     // 5. Run automatic janitor (`tidy_decisions`), self-update, and owner notifications from `decide`
     if !plan.tidy_decisions.is_empty() {
-        apply_tidy_decisions(&mut store, &plan.tidy_decisions, now, args.dry_run);
+        apply_tidy_decisions(store, &plan.tidy_decisions, now, args.dry_run)?;
     }
 
     if let Some(ref target_sha) = plan.self_update.target_sha {
         println!("Self-update: {}", plan.self_update.because);
         if !args.dry_run {
-            let _ = store.record_decision(
+            store.record_decision(
                 "watch",
                 "self_update",
                 target_sha,
                 &plan.self_update.because,
-            );
+            )?;
         }
     }
 
     if !args.dry_run {
         for n in &plan.owner_notifications {
-            let _ = store.record_decision("watch", "notify_owner", &n.key, &n.because);
+            store.record_decision("watch", "notify_owner", &n.key, &n.because)?;
         }
         if let Some(ref alert) = plan.watchdog_alert {
-            let _ = store.record_decision("watch", "watchdog_alert", "tick", alert);
+            store.record_decision("watch", "watchdog_alert", "tick", alert)?;
         }
     }
 
@@ -689,20 +710,18 @@ pub fn execute_tick(args: TickArgs) -> io::Result<()> {
     );
 
     if !args.dry_run {
-        let _ = store.emit_duration_slice(
+        store.emit_duration_slice(
             "fleet/ticks",
             "tick",
             tick_start_ns,
             now_ns(),
             &tick_summary,
-        );
+        )?;
         // Write atomic scrubbed snapshot.json via .tmp + rename for fast dashboard reads
         let st = store.load()?;
         let home = crate::paths::resolve_home();
         let val = serde_json::to_value(&st).map_err(io::Error::other)?;
-        if let Err(e) = write_scrubbed_snapshot(&home.join("snapshot.json"), &val) {
-            eprintln!("[tacho-fleet] failed to write snapshot.json: {e}");
-        }
+        write_scrubbed_snapshot(&home.join("snapshot.json"), &val)?;
     }
 
     println!("Tick complete at {} ({})", now, tick_summary);
@@ -784,11 +803,11 @@ pub fn execute_watchdog(args: WatchdogArgs) -> io::Result<()> {
     let meta = load_fleet_meta().unwrap_or_default();
     let (step, next_issue) =
         run_watchdog_lifecycle(reason.as_deref(), meta.watchdog_issue, now, cooldown);
-    let _ = mutate_fleet_meta(|m| {
+    mutate_fleet_meta(|m| {
         m.watchdog_issue = next_issue;
-    });
+    })?;
     if let WatchdogStep::Close { number, ref body } = step {
-        let _ = store.record_decision("watch", "watchdog_close", &number.to_string(), body);
+        store.record_decision("watch", "watchdog_close", &number.to_string(), body)?;
     }
 
     let alert = down_alert(

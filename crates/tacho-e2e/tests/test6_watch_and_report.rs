@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 use tacho_e2e::TestEnv;
 
 #[test]
@@ -9,7 +8,7 @@ fn test_watch_until_stalled_and_report() {
 
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     // 1. Launch `tacho watch --until stalled` in a separate process
     let watch_child = env
@@ -131,7 +130,7 @@ fn test_report_diff_claims() {
 
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     let send_hook = |payload: serde_json::Value| {
         let mut child = env

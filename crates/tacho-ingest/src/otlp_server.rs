@@ -43,6 +43,8 @@ pub struct OtlpServerConfig {
     /// When provided, the accept loop blocks indefinitely on poll until a connection
     /// arrives or shutdown_fd is signaled/closed, eliminating timed poll loops.
     pub shutdown_fd: Option<std::os::unix::io::RawFd>,
+    /// Optional file descriptor that deterministically signals per-read I/O timeout expiration.
+    pub timeout_fd: Option<std::os::unix::io::RawFd>,
 }
 
 impl Default for OtlpServerConfig {
@@ -54,6 +56,7 @@ impl Default for OtlpServerConfig {
             io_timeout: DEFAULT_IO_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             shutdown_fd: None,
+            timeout_fd: None,
         }
     }
 }
@@ -248,6 +251,7 @@ struct Conn {
     stream: TcpStream,
     buf: Vec<u8>,
     io_timeout: Duration,
+    timeout_fd: Option<std::os::unix::io::RawFd>,
     deadline: Instant,
 }
 
@@ -259,8 +263,42 @@ impl Conn {
         if remaining.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        self.stream
-            .set_read_timeout(Some(remaining.min(self.io_timeout)))?;
+        let timeout = remaining.min(self.io_timeout);
+        if let Some(tfd) = self.timeout_fd {
+            let mut pfds = [
+                libc::pollfd {
+                    fd: self.stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: tfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            loop {
+                let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, ms) };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if rc == 0 {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                if (pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                    break;
+                }
+                if (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+            }
+        }
+        self.stream.set_read_timeout(Some(timeout))?;
         let mut temp = [0u8; 8192];
         let n = loop {
             match self.stream.read(&mut temp) {
@@ -660,6 +698,7 @@ fn handle_client(
         stream,
         buf: Vec::new(),
         io_timeout: config.io_timeout,
+        timeout_fd: config.timeout_fd,
         deadline: Instant::now(),
     };
 
@@ -696,6 +735,9 @@ fn handle_client(
 fn lingering_close(conn: &mut Conn) {
     const MAX_DRAIN: usize = 1024 * 1024;
     let _ = conn.stream.shutdown(std::net::Shutdown::Write);
+    if conn.timeout_fd.is_some() {
+        return;
+    }
     let _ = conn.stream.set_read_timeout(Some(conn.io_timeout));
     let mut sink = [0u8; 8192];
     let mut drained = 0;

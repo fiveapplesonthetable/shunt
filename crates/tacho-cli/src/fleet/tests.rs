@@ -76,7 +76,7 @@ fn rescue_fails_loudly_outside_a_repo_so_tidy_keeps_the_tree() {
         rescue: true,
         because: "test".into(),
     };
-    apply_tidy_decisions(&mut store, &[decision], 1, false);
+    apply_tidy_decisions(&mut store, &[decision], 1, false).unwrap();
     assert_eq!(
         fs::read_to_string(plain.join("precious.txt")).unwrap(),
         "keep me"

@@ -126,14 +126,14 @@ impl FdEventWatcher {
 
 pub(crate) fn open_fleet_store() -> io::Result<FleetStore> {
     let home = crate::paths::resolve_home();
-    let _ = crate::paths::ensure_dir_0700(&home);
+    crate::paths::ensure_dir_0700(&home)?;
     let db = home.join("events.sqlite");
     FleetStore::open(&db).map_err(|e| io::Error::other(e.to_string()))
 }
 
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let _ = fs::create_dir_all(dir);
+    fs::create_dir_all(dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(data)?;
     tmp.as_file().sync_all()?;
@@ -271,11 +271,17 @@ pub fn tree_of_worktree(root: &Path) -> io::Result<String> {
             .trim()
             .to_string();
         if !head_tree.is_empty() {
-            let _ = Command::new("git")
+            let rt_out = Command::new("git")
                 .args(["read-tree", &head_tree])
                 .current_dir(root)
                 .env("GIT_INDEX_FILE", &tmp_index)
-                .output();
+                .output()?;
+            if !rt_out.status.success() {
+                return Err(io::Error::other(format!(
+                    "git read-tree {head_tree} in temp index failed: {}",
+                    String::from_utf8_lossy(&rt_out.stderr).trim()
+                )));
+            }
         }
     }
 
@@ -292,7 +298,7 @@ pub fn tree_of_worktree(root: &Path) -> io::Result<String> {
     }
 
     // Remove internal kit files from temporary index so writing `.tachoproof` never invalidates the proof tree
-    let _ = Command::new("git")
+    let rm_out = Command::new("git")
         .args([
             "rm",
             "-r",
@@ -309,7 +315,13 @@ pub fn tree_of_worktree(root: &Path) -> io::Result<String> {
         ])
         .current_dir(root)
         .env("GIT_INDEX_FILE", &tmp_index)
-        .output();
+        .output()?;
+    if !rm_out.status.success() {
+        return Err(io::Error::other(format!(
+            "git rm --cached in temp index failed: {}",
+            String::from_utf8_lossy(&rm_out.stderr).trim()
+        )));
+    }
 
     let wt_out = Command::new("git")
         .args(["write-tree"])

@@ -25,7 +25,7 @@ pub fn spawn_sampler(
     let control = Arc::new(SamplerControl::new(None));
     std::thread::Builder::new()
         .name("tacho-sampler".to_string())
-        .spawn(move || run_sampler_loop(config, appender, stop_flag, None, control))
+        .spawn(move || run_sampler_loop(config, appender, stop_flag, None, control, None))
         .expect("failed to spawn sampler thread")
 }
 
@@ -77,6 +77,13 @@ impl SamplerWaker {
         self.control.tick_cvar.notify_all();
     }
 
+    /// Asynchronously wakes the sampler loop to run an immediate tick without blocking the caller.
+    pub fn trigger_tick(&self) {
+        if self.control.running.load(Ordering::Acquire) {
+            self.control.wake_pipe();
+        }
+    }
+
     /// Triggers an immediate sampling tick and blocks until a full tick that started after
     /// this call has completed (or the sampler stops).
     pub fn sample_now(&self) {
@@ -112,6 +119,16 @@ pub fn spawn_sampler_with_waker(
     appender: AppenderHandle,
     stop_flag: Arc<AtomicBool>,
 ) -> io::Result<(std::thread::JoinHandle<()>, SamplerWaker)> {
+    spawn_sampler_with_home(config, appender, stop_flag, None)
+}
+
+/// Spawns the sampler thread configured with `$TACHO_HOME` so sampler ticks also run autonomous `decide`.
+pub fn spawn_sampler_with_home(
+    config: SamplerConfig,
+    appender: AppenderHandle,
+    stop_flag: Arc<AtomicBool>,
+    home_dir: Option<std::path::PathBuf>,
+) -> io::Result<(std::thread::JoinHandle<()>, SamplerWaker)> {
     use std::os::fd::FromRawFd;
     let mut fds = [-1i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
@@ -130,7 +147,9 @@ pub fn spawn_sampler_with_waker(
     };
     let handle = std::thread::Builder::new()
         .name("tacho-sampler".to_string())
-        .spawn(move || run_sampler_loop(config, appender, stop_flag, Some(read), control))?;
+        .spawn(move || {
+            run_sampler_loop(config, appender, stop_flag, Some(read), control, home_dir)
+        })?;
     Ok((handle, waker))
 }
 
@@ -140,11 +159,15 @@ fn run_sampler_loop(
     stop_flag: Arc<AtomicBool>,
     wake: Option<std::os::fd::OwnedFd>,
     control: Arc<SamplerControl>,
+    home_dir: Option<std::path::PathBuf>,
 ) {
     let interval = Duration::from_millis(config.interval_ms.max(100));
     let mut proc_sampler = ProcSampler::new(&config.mounts);
     proc_sampler.set_cgroup_enabled(config.cgroup);
     proc_sampler.set_worktree_scan_secs(config.worktree_scan_secs);
+    if let Some(home) = home_dir {
+        proc_sampler.set_home_dir(home);
+    }
     let mut run_track_buf = String::with_capacity(64);
     let ticker = IntervalTimer::new(interval);
 

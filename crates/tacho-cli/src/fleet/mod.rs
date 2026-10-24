@@ -42,11 +42,12 @@ pub use batch::{
     launch_detached_batch, select_batch_checks, BatchOptions, BatchOrigin,
 };
 pub use dispatch::{
-    build_session_argv, compute_next_instruction, detect_brief_source, execute_attach,
-    execute_hold, execute_next, execute_release, execute_retire, execute_retire_with,
-    execute_session, execute_session_with, execute_stop, execute_tell, execute_todo,
-    execute_todo_with, format_retired_lines, infer_provider_from_model, spawn_worker_for_item,
-    validate_retire_reason, ResolvedBrief, RetireOptions, SessionOptions, TodoOptions,
+    build_session_argv, compute_next_instruction, deliver_tell_action, detect_brief_source,
+    execute_attach, execute_hold, execute_next, execute_release, execute_retire,
+    execute_retire_with, execute_session, execute_session_with, execute_stop, execute_tell,
+    execute_tell_with, execute_todo, execute_todo_with, format_retired_lines,
+    infer_provider_from_model, spawn_worker_for_item, validate_retire_reason, ResolvedBrief,
+    RetireOptions, SessionOptions, TodoOptions,
 };
 pub use land::{execute_land, execute_land_with, verify_train_land_integrity, LandOptions};
 pub use ops::{
@@ -61,9 +62,9 @@ pub(crate) use store::verify_agent_pid;
 pub use store::{
     emit_decision_event, fleet_meta_path, git_stdout, live_agent_keys, load_fleet_env,
     load_fleet_meta, mutate_fleet_meta, now_ns, now_secs, open_fleet_store, parse_systemd_env_file,
-    pid_alive, pid_alive_matching, proc_pid_starttime, resolve_live_main_sha,
-    resolve_live_pr_heads, save_fleet_meta, wait_for_pid_exit, write_atomic, CodeMoveRecord,
-    FleetMeta, NoticeState, RetiredMeta, WatchdogIssueState,
+    pid_alive, pid_alive_matching, proc_pid_cgroup, proc_pid_starttime, record_batch_pid_identity,
+    resolve_live_main_sha, resolve_live_pr_heads, save_fleet_meta, wait_for_pid_exit, write_atomic,
+    BatchPidIdentity, CodeMoveRecord, FleetMeta, NoticeState, RetiredMeta, WatchdogIssueState,
 };
 pub use tidy::{
     apply_tidy_decisions, build_tidy_snapshot, execute_tidy, execute_tidy_with, rescue_worktree,
@@ -76,6 +77,6 @@ pub use train::{
     ReleaseTrainOptions, TrainConflictResolution, TrainOptions,
 };
 pub use watch::{
-    execute_progress, execute_tick, execute_watchdog, run_watchdog_lifecycle, scan_procs,
-    WatchdogStep,
+    execute_progress, execute_tick, execute_tick_with, execute_watchdog, run_watchdog_lifecycle,
+    scan_procs, WatchdogStep,
 };

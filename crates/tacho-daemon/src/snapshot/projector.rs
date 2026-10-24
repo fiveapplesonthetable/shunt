@@ -261,15 +261,19 @@ impl SnapshotProjector {
                 let mut ev = ev;
                 let findings = self.open_reviews.remove(&ev.track_key).unwrap_or_default();
                 let end_ts = self.end_all(findings, ev.ts_ns, out)?;
+                if !self.record_raw_slice(&ev) {
+                    return Ok(());
+                }
                 ev.ts_ns = self.next_track_ts(&ev.track_key, ev.ts_ns.max(end_ts));
-                self.record_raw_slice(&ev);
                 out.emit(&ev, None)
             }
             _ => {
                 let mut ev = ev;
+                if !self.record_raw_slice(&ev) {
+                    return Ok(());
+                }
                 ev.ts_ns = self.next_track_ts(&ev.track_key, ev.ts_ns);
                 self.attach_pending_delivery(&mut ev);
-                self.record_raw_slice(&ev);
                 out.emit(&ev, None)
             }
         }
@@ -423,9 +427,9 @@ impl SnapshotProjector {
         out.emit(&ev, None)
     }
 
-    fn record_raw_slice(&mut self, ev: &Event) {
+    fn record_raw_slice(&mut self, ev: &Event) -> bool {
         if ev.counter_value.is_some() {
-            return;
+            return true;
         }
         match ev.kind.track_event_type() {
             TrackEventType::SliceBegin => {
@@ -442,13 +446,14 @@ impl SnapshotProjector {
                         target_agent: None,
                         waiting_for_delivery: false,
                     });
+                true
             }
-            TrackEventType::SliceEnd => {
-                if let Some(stack) = self.open_raw_slices.get_mut(&ev.track_key) {
-                    stack.pop();
-                }
-            }
-            _ => {}
+            TrackEventType::SliceEnd => self
+                .open_raw_slices
+                .get_mut(&ev.track_key)
+                .and_then(|stack| stack.pop())
+                .is_some(),
+            _ => true,
         }
     }
 
@@ -458,8 +463,10 @@ impl SnapshotProjector {
         if let Some(wt) = self.open_worktree.remove(&ev.track_key) {
             self.end_slice(&wt, ev.ts_ns, out)?;
         }
+        if !self.record_raw_slice(&ev) {
+            return Ok(());
+        }
         ev.ts_ns = self.next_track_ts(&ev.track_key, ev.ts_ns);
-        self.record_raw_slice(&ev);
         out.emit(&ev, None)
     }
 

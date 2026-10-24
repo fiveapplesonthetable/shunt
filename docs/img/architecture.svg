@@ -139,11 +139,11 @@
       <text x="10" y="35" class="text-muted">CLOCK_REALTIME + CLOCK_BOOTTIME</text>
     </g>
 
-    <!-- Step 2: Opt-in Privacy Scrubber -->
+    <!-- Step 2: Default-On Privacy Scrubber -->
     <g transform="translate(14, 110)">
       <rect width="222" height="52" class="box-step"/>
-      <text x="10" y="19" class="text-title">2. Opt-in Privacy Scrubber</text>
-      <text x="10" y="33" class="text-muted">scrub=true / TACHO_SCRUB=1</text>
+      <text x="10" y="19" class="text-title">2. Privacy Scrubber (Default On)</text>
+      <text x="10" y="33" class="text-muted">scrub=true by default (opt-out: false)</text>
       <text x="10" y="46" class="text-muted">Always drops raw prose &amp; diffs</text>
     </g>
 

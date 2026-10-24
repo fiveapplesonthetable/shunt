@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use dispatch::{
-    base_keys, find_pr, latest, needs_resume, next_hands, next_work, resume_task, AgentRun, Hold,
-    PullFacts, TodoItem,
+    base_key, base_keys, find_pr, latest, needs_resume, next_hands, next_work, resume_task,
+    AgentRun, Hold, PullFacts, TodoItem,
 };
 use land::{queue, ReadyItem};
 use verify::{
@@ -505,7 +505,46 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     } else {
         3_600
     };
-    let tidy_decisions = decide_tidy(&obs.tidy_snapshot, tidy_min_age);
+    let mut tidy_decisions = decide_tidy(&obs.tidy_snapshot, tidy_min_age);
+    for a in next.agents.values() {
+        if a.worktree.is_empty()
+            || obs.live_keys.contains(&a.key)
+            || obs.tidy_snapshot.live_agent_worktrees.contains(&a.worktree)
+            || obs.tidy_snapshot.live_batch_worktrees.contains(&a.worktree)
+            || obs.tidy_snapshot.held_paths.contains(&a.worktree)
+            || next
+                .agents
+                .values()
+                .any(|other| obs.live_keys.contains(&other.key) && other.worktree == a.worktree)
+        {
+            continue;
+        }
+        let reason = if next.retired.contains(&a.key) || next.retired.contains(base_key(&a.key)) {
+            Some(format!("retired agent {}", a.key))
+        } else if let Some(pr) = a.pr {
+            if next.merged_prs.contains(&pr) {
+                Some(format!("merged PR #{pr} for {}", a.key))
+            } else if next.closed_prs.contains(&pr) {
+                Some(format!("closed PR #{pr} for {}", a.key))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(because) = reason {
+            let already_queued = tidy_decisions
+                .iter()
+                .any(|d| matches!(d, TidyDecision::RemoveTree { path, .. } if path == &a.worktree));
+            if !already_queued {
+                tidy_decisions.push(TidyDecision::RemoveTree {
+                    path: a.worktree.clone(),
+                    rescue: false,
+                    because,
+                });
+            }
+        }
+    }
 
     // 8. Human attention items (`needs_you`), tell-once owner notifications, self-update, and watchdog.
     let mut attention_items = needs_you(
@@ -575,7 +614,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
 
     let mut tell_actions = Vec::new();
     for (agent_key, msgs) in &state.inbox {
-        if obs.live_keys.contains(agent_key) {
+        if obs.live_keys.contains(agent_key) || next.agents.contains_key(agent_key) {
             for msg in msgs {
                 tell_actions.push((agent_key.clone(), msg.clone()));
             }
@@ -583,6 +622,18 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     }
     for (k, _) in &tell_actions {
         next.inbox.remove(k);
+    }
+    for act in &supervision_actions {
+        if let SuperviseAction::Nudge { key, because } = act {
+            let nudge_msg =
+                format!("Stall nudge ({because}): please commit progress or explain status.");
+            if !tell_actions
+                .iter()
+                .any(|(k, m)| k == key && m == &nudge_msg)
+            {
+                tell_actions.push((key.clone(), nudge_msg));
+            }
+        }
     }
 
     DecisionPlan {

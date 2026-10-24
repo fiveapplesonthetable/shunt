@@ -78,22 +78,26 @@ fn test_run_track_key_helper() {
 fn test_on_stall_hook_timeout_kills_process_group_and_unblocks_second_hook() {
     let temp = tempfile::tempdir().unwrap();
     // The stuck agent's hook never finishes on its own; the worker must kill it after the
-    // timeout and move on to the next queued hook.
+    // timeout expiration signal and move on to the next queued hook.
     let hook = hook_script(
         temp.path(),
-        r#"if [ "$TACHO_AGENT" = "stuck-worker" ]; then exec sleep 100000; fi"#,
+        &format!(
+            r#"if [ "$TACHO_AGENT" = "stuck-worker" ]; then
+  : > "{d}/stuck-worker.started"
+  exec sleep 100000
+fi"#,
+            d = temp.path().display()
+        ),
     );
-    let (appender, thread) = spawn_appender_with_hook_timeout(
-        Recorder::new(),
-        open_log(temp.path()),
-        256,
-        Some(hook),
-        Duration::from_millis(300),
-    );
+    let (appender, thread) =
+        spawn_appender_with_hook(Recorder::new(), open_log(temp.path()), 256, Some(hook));
 
     let t0 = now_ns();
     trigger_loop_stall(&appender, "sess-stuck", "stuck-worker", t0);
     trigger_loop_stall(&appender, "sess-second", "second-worker", t0 + 1_000_000);
+
+    wait_for_file(&temp.path().join("stuck-worker.started"));
+    appender.hooks().expire_active_hook();
 
     let marker = temp.path().join("second-worker.done");
     wait_for_file(&marker);

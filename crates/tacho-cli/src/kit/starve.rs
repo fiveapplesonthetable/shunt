@@ -174,11 +174,10 @@ pub fn stop_registered_burner(burner: &RegisteredBurner) -> bool {
 
 /// Persist the active starve burners to `$TACHO_HOME/starve-burners.json` so a starting batch
 /// or external supervisor can stop them if needed.
-fn save_registered_burners(home: &Path, burners: &[RegisteredBurner]) {
-    let _ = crate::paths::ensure_dir_0700(home);
-    if let Ok(bytes) = serde_json::to_vec_pretty(burners) {
-        let _ = write_atomic(&home.join("starve-burners.json"), &bytes);
-    }
+fn save_registered_burners(home: &Path, burners: &[RegisteredBurner]) -> io::Result<()> {
+    crate::paths::ensure_dir_0700(home)?;
+    let bytes = serde_json::to_vec_pretty(burners).map_err(io::Error::other)?;
+    write_atomic(&home.join("starve-burners.json"), &bytes)
 }
 
 fn clear_registered_burners(home: &Path) {
@@ -312,7 +311,7 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
     }
 
     let reg_list: Vec<RegisteredBurner> = guard.children.iter().map(|(_, r)| r.clone()).collect();
-    save_registered_burners(&home, &reg_list);
+    save_registered_burners(&home, &reg_list)?;
 
     // 3. Spawn the target command pinned to the same CPU slice in its own process group
     let mut target_cmd = Command::new(&wrap[0]);
@@ -388,16 +387,15 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
         eprintln!("stopped starve burners: merge-check batch started");
     }
 
-    if let Ok(store) = open_fleet_store() {
-        let because = format!(
-            "starve cpus={} burners={} rc={exit_code} preempted={preempted_by_batch}: {}",
-            plan.cpus,
-            plan.burners,
-            args.cmd.join(" ")
-        );
-        let _ = store.record_decision("watch", "starve", &plan.cpus, &because);
-        emit_decision_event("system", "watch:starve", &because);
-    }
+    let store = open_fleet_store()?;
+    let because = format!(
+        "starve cpus={} burners={} rc={exit_code} preempted={preempted_by_batch}: {}",
+        plan.cpus,
+        plan.burners,
+        args.cmd.join(" ")
+    );
+    store.record_decision("watch", "starve", &plan.cpus, &because)?;
+    emit_decision_event("system", "watch:starve", &because);
 
     Ok(exit_code)
 }

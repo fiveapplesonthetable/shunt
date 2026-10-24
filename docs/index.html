@@ -153,7 +153,7 @@
   <a href="#ingestion">6. Ingestion modes</a>
   <a href="#system">7. System &amp; cgroup v2</a>
   <a href="#queries">8. PerfettoSQL queries</a>
-  <a href="#privacy">9. Privacy &amp; opt-in scrub</a>
+  <a href="#privacy">9. Privacy &amp; default-on scrub</a>
   <a href="#performance">10. Performance numbers</a>
 </nav>
 
@@ -199,7 +199,7 @@
   <text x="376" y="58" class="tb">tachograph daemon</text>
   <text x="376" y="78" class="tms">Single source of truth (events.sqlite)</text>
   <rect x="376" y="96" width="248" height="38" class="b2" rx="3"/>
-  <text x="386" y="114" class="tm">Classifier &amp; Opt-in Scrubber</text>
+  <text x="386" y="114" class="tm">Classifier &amp; Default-On Scrubber</text>
   <text x="386" y="126" class="ts">12 command classes, git_tree, digest</text>
   <rect x="376" y="144" width="248" height="38" class="b2" rx="3"/>
   <text x="386" y="162" class="tm">Deterministic LaneAllocator</text>
@@ -274,7 +274,7 @@
   <text x="356" y="56" class="tb">Appender Thread</text>
   <text x="356" y="74" class="tms">Sole writer to events.sqlite</text>
   <rect x="354" y="90" width="192" height="34" class="b0" rx="3"/><text x="364" y="111" class="tm">1. Stamp &amp; clamp clock</text>
-  <rect x="354" y="132" width="192" height="34" class="b0" rx="3"/><text x="364" y="153" class="tm">2. Opt-in scrubber</text>
+  <rect x="354" y="132" width="192" height="34" class="b0" rx="3"/><text x="364" y="153" class="tm">2. Privacy scrubber</text>
   <rect x="354" y="174" width="192" height="34" class="b0" rx="3"/><text x="364" y="195" class="tm">3. Command classifier</text>
   <rect x="354" y="216" width="192" height="34" class="b0" rx="3"/><text x="364" y="237" class="tm">4. Lane &amp; slot allocator</text>
   <rect x="354" y="258" width="192" height="34" class="b0" rx="3"/><text x="364" y="279" class="tm">5. 7 Detectors &amp; fold</text>
@@ -698,14 +698,14 @@ tacho query verified-trees</code></pre>
 
 <!-- ───────────── Section 9 ───────────── -->
 <div class="part">Part 9 &mdash; Privacy</div>
-<h2 id="privacy"><span class="n">9</span>Content firewall &amp; opt-in secret scrubber</h2>
+<h2 id="privacy"><span class="n">9</span>Content firewall &amp; default-on secret scrubber</h2>
 
-<p>tachograph separates structural telemetry from raw content and provides an opt-in regex/shape scrubber for environments that require command-line redaction:</p>
+<p>tachograph separates structural telemetry from raw content and runs a default-on regex/shape scrubber on everything that leaves the process or enters the log:</p>
 
 <ul>
   <li><b>Always Dropped (Content Firewall):</b> Model prose, user prompts, tool stdout/stderr, file diff contents, raw environment variables, and message bodies are never stored. They are represented solely by 8-byte BLAKE3 digests and byte lengths.</li>
   <li><b>Path Relativization:</b> Absolute file paths inside the workspace are converted to relative paths (<code>src/main.rs</code>). Paths outside the workspace are masked to <code>&lt;outside&gt;/...</code>.</li>
-  <li><b>Opt-in Secret Scrubber (<code>scrub = true</code> or <code>TACHO_SCRUB=1</code>):</b> By default, command-line arguments (<code>argv</code>), custom args, and finding titles are recorded unmodified for local debugging clarity. When <code>scrub = true</code> is set in <code>$TACHO_HOME/config.toml</code> (or <code>TACHO_SCRUB=1</code> in the environment), the appender redacts:
+  <li><b>Default-On Secret Scrubber (<code>scrub = true</code> by default; opt-out via <code>scrub = false</code> or <code>TACHO_SCRUB=0</code>):</b> By default, command-line arguments (<code>argv</code>), custom args, finding titles, status outputs, issues, emails, and log tails are scrubbed before leaving the process or persisting to disk:
     <ul>
       <li>Sensitive flags: <code>--token</code>, <code>--password</code>, <code>-p</code>, <code>--api-key</code>, <code>--secret</code> replaced with <code>&lt;redacted&gt;</code>.</li>
       <li>Sensitive headers &amp; URL userinfo: <code>Authorization: Bearer &lt;redacted&gt;</code>, <code>https://user:&lt;redacted&gt;@host</code>.</li>

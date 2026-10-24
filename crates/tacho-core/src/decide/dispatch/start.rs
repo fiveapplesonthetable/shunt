@@ -186,7 +186,7 @@ impl Default for StartRequest {
         StartRequest {
             key: String::new(),
             task: String::new(),
-            model: "sonnet".to_string(),
+            model: String::new(),
             dry_run: false,
             area: String::new(),
             worktree: String::new(),

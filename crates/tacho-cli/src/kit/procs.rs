@@ -251,7 +251,7 @@ pub fn execute_job(args: JobArgs) -> io::Result<()> {
 
     let job_tmp_dir = run_dir.join(format!("tmp-{}", args.name));
     fs::create_dir_all(&job_tmp_dir)?;
-    let _ = fs::set_permissions(&job_tmp_dir, fs::Permissions::from_mode(0o700));
+    fs::set_permissions(&job_tmp_dir, fs::Permissions::from_mode(0o700))?;
 
     let env_vars = load_worktree_env(&root);
 
@@ -296,15 +296,14 @@ pub fn execute_job(args: JobArgs) -> io::Result<()> {
         format!("{}\n", root.to_string_lossy()).as_bytes(),
     )?;
 
-    if let Ok(store) = open_fleet_store() {
-        let because = format!(
-            "started background job '{}' (pid {pid}, starttime={starttime:?}): {}",
-            args.name,
-            args.cmd.join(" ")
-        );
-        let _ = store.record_decision("watch", "job_start", &args.name, &because);
-        emit_decision_event("system", "watch:job_start", &because);
-    }
+    let store = open_fleet_store()?;
+    let because = format!(
+        "started background job '{}' (pid {pid}, starttime={starttime:?}): {}",
+        args.name,
+        args.cmd.join(" ")
+    );
+    store.record_decision("watch", "job_start", &args.name, &because)?;
+    emit_decision_event("system", "watch:job_start", &because);
 
     println!(
         "Started job '{}' (pid {pid}) -> {}",
@@ -439,7 +438,7 @@ pub fn execute_wait(args: WaitArgs) -> io::Result<i32> {
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
                 .unwrap_or(0);
-            let _ = write_atomic(&exit_file, format!("{code}\n").as_bytes());
+            write_atomic(&exit_file, format!("{code}\n").as_bytes())?;
             return Ok(code);
         }
 
@@ -550,13 +549,12 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
     }
 
     let exit_code = if escalated { 137 } else { 143 };
-    let _ = write_atomic(&exit_file, format!("{exit_code}\n").as_bytes());
+    write_atomic(&exit_file, format!("{exit_code}\n").as_bytes())?;
 
-    if let Ok(store) = open_fleet_store() {
-        let because = format!("killed job '{}' (pid {pid}, now={})", args.name, args.now);
-        let _ = store.record_decision("watch", "job_kill", &args.name, &because);
-        emit_decision_event("system", "watch:job_kill", &because);
-    }
+    let store = open_fleet_store()?;
+    let because = format!("killed job '{}' (pid {pid}, now={})", args.name, args.now);
+    store.record_decision("watch", "job_kill", &args.name, &because)?;
+    emit_decision_event("system", "watch:job_kill", &because);
 
     println!("Stopped job '{}' (pid {pid}).", args.name);
     Ok(())

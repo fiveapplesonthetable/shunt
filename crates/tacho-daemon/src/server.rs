@@ -818,14 +818,6 @@ fn handle_decide(val: &serde_json::Value, shared: &ServerShared) -> Vec<u8> {
         .get("dry_run")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let store = match crate::fleet::FleetStore::open(&shared.paths.events_db()) {
-        Ok(s) => s,
-        Err(e) => return error_reply(format!("failed to open fleet store: {}", e)),
-    };
-    let state = match store.load() {
-        Ok(s) => s,
-        Err(e) => return error_reply(format!("failed to load fleet state: {}", e)),
-    };
 
     let main_sha = val
         .get("main_sha")
@@ -836,7 +828,7 @@ fn handle_decide(val: &serde_json::Value, shared: &ServerShared) -> Vec<u8> {
         .or_else(|| {
             val.get("repo")
                 .and_then(|v| v.as_str())
-                .and_then(|repo| git_head_sha(Path::new(repo)))
+                .and_then(|repo| crate::fleet::git_head_sha(Path::new(repo)))
         })
         .unwrap_or_default();
     if main_sha.is_empty() && !dry_run {
@@ -845,98 +837,19 @@ fn handle_decide(val: &serde_json::Value, shared: &ServerShared) -> Vec<u8> {
         );
     }
 
-    let now = (now_ns() / 1_000_000_000) as i64;
-    let decision_state = decision_state_of(&state);
-    let world_obs = tacho_core::decide::WorldObservation {
-        now,
-        main_sha,
-        open_prs: state.open_prs_cache.clone(),
-        merged_prs: state.merged_prs.clone(),
-        closed_prs: state.closed_prs.clone(),
-        live_keys: shared
-            .appender
-            .live_state()
-            .agents
-            .keys()
-            .cloned()
-            .collect(),
-        batch_outcomes: new_batch_outcomes(&state),
-        ..Default::default()
-    };
-    let plan = tacho_core::decide::decide(&decision_state, &world_obs);
-    let mut resp = serde_json::json!({ "status": "ok", "plan": plan });
-    if !dry_run {
-        match store.record_decision_tick(now, &decision_state, &world_obs, &plan) {
-            Ok(id) => resp["tick_id"] = serde_json::json!(id),
-            Err(e) => return error_reply(format!("failed to record decision tick: {}", e)),
+    let live_state = shared.appender.live_state();
+    let explicit_sha = (!main_sha.is_empty()).then_some(main_sha);
+    match crate::fleet::execute_decide_tick(&shared.paths.home, &live_state, explicit_sha, dry_run)
+    {
+        Ok((tick_id, _decision_state, _world_obs, plan)) => {
+            let mut resp = serde_json::json!({ "status": "ok", "plan": plan });
+            if let Some(id) = tick_id {
+                resp["tick_id"] = serde_json::json!(id);
+            }
+            serde_json::to_vec(&resp).unwrap_or_default()
         }
+        Err(e) => error_reply(format!("failed to execute decision tick: {}", e)),
     }
-    serde_json::to_vec(&resp).unwrap_or_default()
-}
-
-fn decision_state_of(state: &crate::fleet::FleetState) -> tacho_core::decide::DecisionState {
-    tacho_core::decide::DecisionState {
-        max_parallel: state.max_workers,
-        todo: state.todo.clone(),
-        agents: state.agents.clone(),
-        retired: state.retired.clone(),
-        holds: state.holds.clone(),
-        passed: state.passed.clone(),
-        failed: state.failed.clone(),
-        merged_prs: state.merged_prs.clone(),
-        closed_prs: state.closed_prs.clone(),
-        batches: state.batches.clone(),
-        flakes: state.flakes.clone(),
-        samples: state.samples.clone(),
-        nudged: state.nudged.clone(),
-        rebase_attempts: state.rebase_attempts.clone(),
-        fix_notified: state.fix_notified.clone(),
-        notified_keys: state.notified_failures.clone(),
-        area_rules: state.area_rules.clone(),
-        refused_self_update_sha: state.refused_self_update_sha.clone(),
-        last_tick_ts: state.last_tick_ts,
-        inbox: state.inbox.clone(),
-        last_watchdog_alert_ts: state.last_watchdog_alert_ts,
-        tidy_min_age_secs: 3_600,
-    }
-}
-
-/// Batches that finished as a definite pass or fail since the previous tick.
-///
-/// Flakes and still-running batches are excluded so a flake is never fed back as a pass,
-/// and older outcomes are not replayed on every tick.
-fn new_batch_outcomes(
-    state: &crate::fleet::FleetState,
-) -> Vec<tacho_core::decide::BatchOutcomeObs> {
-    let prev_tick_ts = state.last_tick_ts.unwrap_or(0);
-    state
-        .batches
-        .iter()
-        .filter(|b| b.finished_at.is_some_and(|t| t > prev_tick_ts))
-        .filter(|b| b.status == "passed" || b.status == "failed")
-        .map(|b| tacho_core::decide::BatchOutcomeObs {
-            batch_id: b.id.clone(),
-            passed: b.status == "passed",
-            failed_area: b.areas.first().cloned(),
-            log_output: b.log.clone(),
-            tree_sha: b.tree.clone().unwrap_or_default(),
-        })
-        .collect()
-}
-
-fn git_head_sha(repo: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
 }
 
 #[cfg(test)]

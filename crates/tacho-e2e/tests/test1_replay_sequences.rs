@@ -87,7 +87,7 @@ fn test_replay_claude_sequential() {
 
     // Pre-start daemon or let hook autospawn it
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     replay_jsonl_sequential(&env, "claude", &claude_fixture);
     assert!(env.flush());
@@ -131,7 +131,7 @@ fn test_replay_jetski_parallel() {
 
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     replay_jsonl_parallel(&env, "jetski", &jetski_fixture);
     assert!(env.flush());

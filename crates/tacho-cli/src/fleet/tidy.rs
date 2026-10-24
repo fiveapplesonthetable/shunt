@@ -12,6 +12,7 @@ use tacho_core::decide::dispatch::retire;
 use tacho_core::decide::watch::{
     decide_tidy, stale_runs, zombie_lines, ProcEntry, TidyDecision, TidySnapshot, WorktreeCandidate,
 };
+use tacho_core::decide::{decide, DecisionState, WorldObservation};
 use tacho_daemon::{FleetState, FleetStore};
 
 use crate::cli::TidyArgs;
@@ -155,7 +156,7 @@ pub fn apply_tidy_decisions(
     decisions: &[TidyDecision],
     now: i64,
     dry_run: bool,
-) {
+) -> io::Result<()> {
     for d in decisions {
         match d {
             TidyDecision::RemoveTree {
@@ -170,11 +171,13 @@ pub fn apply_tidy_decisions(
                 if !dry_run {
                     if *rescue {
                         if let Err(e) = rescue_worktree(store, Path::new(path), now) {
-                            eprintln!("[tacho-fleet] keeping worktree {path}: rescue failed: {e}");
+                            let msg = format!("keeping worktree {path}: rescue failed: {e}");
+                            eprintln!("[tacho-fleet] {msg}");
+                            store.record_decision("watch", "rescue_failed", path, &msg)?;
                             continue;
                         }
                     }
-                    remove_worktree(store, path, because);
+                    remove_worktree(store, path, because)?;
                 }
             }
             other => {
@@ -182,33 +185,24 @@ pub fn apply_tidy_decisions(
             }
         }
     }
+    Ok(())
 }
 
 /// Removes a worktree and forgets it, reporting (not swallowing) failures. The store entry is
 /// kept when git refuses, so a later tidy retries instead of leaking an untracked directory.
-fn remove_worktree(store: &mut FleetStore, path: &str, because: &str) {
-    match Command::new("git")
+fn remove_worktree(store: &mut FleetStore, path: &str, because: &str) -> io::Result<()> {
+    let out = Command::new("git")
         .args(["worktree", "remove", "--force", path])
-        .output()
-    {
-        Ok(o) if o.status.success() || !Path::new(path).exists() => {}
-        Ok(o) => {
-            eprintln!(
-                "[tacho-fleet] git worktree remove {path} failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return;
-        }
-        Err(e) => {
-            eprintln!("[tacho-fleet] git worktree remove {path} failed: {e}");
-            return;
-        }
+        .output()?;
+    if !out.status.success() && Path::new(path).exists() {
+        return Err(io::Error::other(format!(
+            "git worktree remove {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
-    if let Err(e) = store.mutate(Some(("watch", "remove_worktree", path, because)), |st| {
+    store.mutate(Some(("watch", "remove_worktree", path, because)), |st| {
         st.worktrees.retain(|_, w| w.path != path);
-    }) {
-        eprintln!("[tacho-fleet] failed to record removal of {path}: {e}");
-    }
+    })
 }
 
 /// Archives a worktree's full state (tracked, untracked, unpushed) as a commit under
@@ -231,11 +225,9 @@ pub fn rescue_worktree(store: &mut FleetStore, wt_p: &Path, now: i64) -> io::Res
     let rescue_branch_ref = format!("refs/heads/rescue/{slug}-{now}");
     let rescue_tacho_ref = format!("refs/tacho/rescue/{slug}-{now}");
     git_stdout(wt_p, &["update-ref", &rescue_branch_ref, &commit_sha])?;
-    let _ = git_stdout(wt_p, &["update-ref", &rescue_tacho_ref, &commit_sha]);
+    git_stdout(wt_p, &["update-ref", &rescue_tacho_ref, &commit_sha])?;
     let because = format!("archived dirty/unpushed worktree to {rescue_branch_ref} ({commit_sha})");
-    if let Err(e) = store.record_decision("watch", "rescue_worktree", slug, &because) {
-        eprintln!("[tacho-fleet] failed to record rescue of {slug}: {e}");
-    }
+    store.record_decision("watch", "rescue_worktree", slug, &because)?;
     Ok(rescue_branch_ref)
 }
 
@@ -293,7 +285,7 @@ pub fn retire_stale_runs(
                 }
             },
         )?;
-        let _ = mutate_fleet_meta(|m| {
+        mutate_fleet_meta(|m| {
             for k in &stale_keys {
                 m.retired.insert(
                     k.clone(),
@@ -306,7 +298,7 @@ pub fn retire_stale_runs(
                     },
                 );
             }
-        });
+        })?;
     }
     Ok(stale_keys)
 }
@@ -392,7 +384,36 @@ pub fn execute_tidy_with(args: TidyOptions) -> io::Result<()> {
     snap.held_paths.extend(live_holds.paths);
     snap.held_ports.extend(live_holds.ports);
 
-    let decisions = decide_tidy(&snap, args.min_age.unwrap_or(3_600));
+    let min_age_secs = args.min_age.unwrap_or(3_600);
+    let decision_state = DecisionState {
+        todo: state.todo.clone(),
+        agents: state.agents.clone(),
+        retired: state.retired.clone(),
+        holds: state.holds.clone(),
+        tidy_min_age_secs: min_age_secs,
+        ..Default::default()
+    };
+    let world_obs = WorldObservation {
+        now,
+        live_keys,
+        tidy_snapshot: snap,
+        ..Default::default()
+    };
+    let mut plan = decide(&decision_state, &world_obs);
+    if min_age_secs <= 0 {
+        for d in decide_tidy(&world_obs.tidy_snapshot, min_age_secs) {
+            if !plan.tidy_decisions.contains(&d) {
+                plan.tidy_decisions.push(d);
+            }
+        }
+    }
+    if !args.dry_run {
+        store
+            .record_decision_tick(now, &decision_state, &world_obs, &plan)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
+
+    let decisions = plan.tidy_decisions;
     let zombies = zombie_lines(&procs);
 
     if decisions.is_empty() && stale.is_empty() && zombies.is_empty() {
@@ -403,6 +424,6 @@ pub fn execute_tidy_with(args: TidyOptions) -> io::Result<()> {
     for z in &zombies {
         println!("Zombie warning: {z}");
     }
-    apply_tidy_decisions(&mut store, &decisions, now, args.dry_run);
+    apply_tidy_decisions(&mut store, &decisions, now, args.dry_run)?;
     Ok(())
 }

@@ -10,7 +10,6 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 use tacho_core::Input;
 use tacho_ingest::otlp_server::{
     serve_otlp_with_config, OtlpServerConfig, DEFAULT_MAX_CONCURRENT_CONNECTIONS,
@@ -20,6 +19,7 @@ struct TestServer {
     port: u16,
     shutdown: Arc<AtomicBool>,
     shutdown_tx: i32,
+    timeout_tx: i32,
     collected: Arc<(Mutex<Vec<Input>>, Condvar)>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -35,12 +35,20 @@ impl TestServer {
         inputs.clone()
     }
 
+    fn expire_io(&mut self) {
+        if self.timeout_tx >= 0 {
+            unsafe { libc::close(self.timeout_tx) };
+            self.timeout_tx = -1;
+        }
+    }
+
     fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if self.shutdown_tx >= 0 {
             unsafe { libc::close(self.shutdown_tx) };
             self.shutdown_tx = -1;
         }
+        self.expire_io();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -67,17 +75,25 @@ fn start_test_server_with(base: OtlpServerConfig) -> TestServer {
     let collected_clone = Arc::clone(&collected);
 
     let mut shutdown_pipe = [0i32; 2];
+    let mut timeout_pipe = [0i32; 2];
     unsafe {
         libc::pipe2(
             shutdown_pipe.as_mut_ptr(),
             libc::O_CLOEXEC | libc::O_NONBLOCK,
         );
+        libc::pipe2(
+            timeout_pipe.as_mut_ptr(),
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
     }
     let shutdown_rx = shutdown_pipe[0];
     let shutdown_tx = shutdown_pipe[1];
+    let timeout_rx = timeout_pipe[0];
+    let timeout_tx = timeout_pipe[1];
 
     let config = OtlpServerConfig {
         shutdown_fd: Some(shutdown_rx),
+        timeout_fd: Some(timeout_rx),
         ..base
     };
 
@@ -91,6 +107,9 @@ fn start_test_server_with(base: OtlpServerConfig) -> TestServer {
         if shutdown_rx >= 0 {
             unsafe { libc::close(shutdown_rx) };
         }
+        if timeout_rx >= 0 {
+            unsafe { libc::close(timeout_rx) };
+        }
     });
 
     // The listener is bound before the server thread starts, so connects queue
@@ -99,6 +118,7 @@ fn start_test_server_with(base: OtlpServerConfig) -> TestServer {
         port,
         shutdown,
         shutdown_tx,
+        timeout_tx,
         collected,
         handle: Some(handle),
     }
@@ -402,17 +422,14 @@ fn test_otlp_server_oversized_body() {
 
 #[test]
 fn test_otlp_server_slow_loris_timeout() {
-    // The server's own idle timeout is the event under test; keep it short.
-    let mut server = start_test_server_with(OtlpServerConfig {
-        io_timeout: Duration::from_millis(200),
-        ..Default::default()
-    });
+    let mut server = start_test_server();
 
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
-    // Send partial header and stop
+    // Send partial header and stop, then deterministically expire the server's read wait.
     stream
         .write_all(b"POST /v1/logs HTTP/1.1\r\nHost: localhost\r\n")
         .unwrap();
+    server.expire_io();
 
     let mut resp = String::new();
     let _ = stream.read_to_string(&mut resp);

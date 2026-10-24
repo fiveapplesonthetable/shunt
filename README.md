@@ -23,7 +23,7 @@ One lightweight daemon records what every coding agent does into a single SQLite
 - **Git Tree Verification:** Every build, test, and run records `git_tree` hash (`git rev-parse HEAD^{tree}`), queryable via `tacho query verified-trees` for CI reuse and merge trains.
 - **Pure Decision Engine & Worker Kit (`decide` + CLI):** Built-in pure functional decision engine (`decide::dispatch`, `decide::verify`, `decide::land`, `decide::watch`) where every decision records its explicit `because` reason into `$TACHO_HOME/events.sqlite`. Includes the complete worker kit (`start`, `prove`, `job`, `wait`, `kill`, `pr`, `note`, `starve`) and fleet orchestrator (`todo`, `session`, `hold`, `release`, `retire`, `attach`, `stop`, `tell`, `next`, `progress`, `flakes`, `batch`, `replay`, `train`, `release-train`, `land`, `queue`, `tidy`, `tick`, `events`, `top`, `serve`, `watchdog`).
 - **Process Tree & cgroup v2 Tracking:** Tracks child process lifetimes (`procs/slot 0..k`) and unified `/proc` + cgroup v2 CPU/RSS metrics alongside optional Perfetto `traced` kernel scheduling slices.
-- **Content Firewall & Opt-In Secret Scrubber:** Never stores raw prompts, model prose, tool stdout/stderr, or file diffs (only 8-byte BLAKE3 digests and byte counts). Secret pattern redaction on `argv` and custom strings is opt-in via `scrub = true` in `config.toml` or `TACHO_SCRUB=1`.
+- **Content Firewall & Secret Scrubber:** Never stores raw prompts, model prose, tool stdout/stderr, or file diffs (only 8-byte BLAKE3 digests and byte counts). Secret pattern redaction on `argv` and custom strings is enabled by default (`scrub = true`; opt-out via `scrub = false` in `$TACHO_HOME/config.toml` or `TACHO_SCRUB=0`).
 
 ---
 
@@ -256,13 +256,13 @@ Execute pre-packaged analytics queries directly using `tacho query <name>`:
 
 ---
 
-## Content Firewall & Opt-In Secret Scrubber
+## Content Firewall & Secret Scrubber
 
-tachograph separates structural telemetry from raw content and supports opt-in secret scrubbing:
+tachograph separates structural telemetry from raw content and scrubs secrets by default:
 
 - **Dropped Always (Content Firewall):** Prompts, model prose, tool outputs, file diffs, and raw message bodies are never stored. Only 8-byte BLAKE3 digests and byte sizes are retained.
 - **Relative Paths:** Workspace paths are made relative to the project root. External paths are masked as `<outside>/...`.
-- **Opt-In Pattern Redaction (`scrub = true` or `TACHO_SCRUB=1`):** Disabled by default (`scrub = false`) so local command lines remain unredacted during debugging. When enabled in `$TACHO_HOME/config.toml` (`scrub = true`) or via `TACHO_SCRUB=1`, flags (`--token`, `--password`, `-p`), headers (`Authorization: Bearer`), URL userinfo, and key shapes (AWS `AKIA`, GCP `ya29`, GitHub `ghp_`, Anthropic `sk-ant-`, OpenAI `sk-`, JWTs, PEM blocks, 32+ char hex/base64 runs) are replaced with `<redacted>`, while 40-character Git commit SHAs are preserved.
+- **Pattern Redaction (`scrub = true` by default):** Enabled by default (`scrub = true`; opt-out via `scrub = false` in `$TACHO_HOME/config.toml` or `TACHO_SCRUB=0`). Flags (`--token`, `--password`, `-p`), headers (`Authorization: Bearer`), URL userinfo, and key shapes (AWS `AKIA`, GCP `ya29`, GitHub `ghp_`, Anthropic `sk-ant-`, OpenAI `sk-`, JWTs, PEM blocks, 32+ char hex/base64 runs) are replaced with `<redacted>`, while 40-character Git commit SHAs are preserved.
 
 ---
 

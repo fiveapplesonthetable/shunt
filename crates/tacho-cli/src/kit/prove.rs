@@ -504,13 +504,13 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         )?;
         let end_ns = now_ns();
         let ok = exit_code == 0;
-        let _ = store.emit_duration_slice(
+        store.emit_duration_slice(
             &format!("prove:{}", item.area),
             &item.name,
             start_ns,
             end_ns,
             &format!("cmd=`{}` ok={ok}", item.cmd),
-        );
+        )?;
 
         executed_checks.push(ProofCheck {
             name: item.name.clone(),
@@ -571,7 +571,7 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
     write_atomic(&summary_path, &json_bytes)?;
 
     let because = format!("prove ok={all_ok} tree={}", &tree[..tree.len().min(12)]);
-    let _ = store.record_decision("verify", "prove", &root.to_string_lossy(), &because);
+    store.record_decision("verify", "prove", &root.to_string_lossy(), &because)?;
     emit_decision_event("system", "verify:prove", &because);
 
     if !all_ok {

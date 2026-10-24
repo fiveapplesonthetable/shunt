@@ -16,17 +16,21 @@ SELECT max(ts) AS end_ts FROM (
 
 CREATE PERFETTO TABLE _latest_states AS
 SELECT
-  SUBSTR(p.name, 7) AS agent,
+  CASE
+    WHEN p.name LIKE 'agent:%' THEN SUBSTR(p.name, 7)
+    ELSE p.name
+  END AS agent,
   s.value AS state,
   CASE
     WHEN s.dur >= 0 THEN s.dur
     ELSE (SELECT end_ts FROM _trace_end) - s.ts
   END AS dur,
-  ROW_NUMBER() OVER (PARTITION BY p.name ORDER BY s.ts DESC) AS rn
+  ROW_NUMBER() OVER (PARTITION BY p.id ORDER BY s.ts DESC) AS rn
 FROM state s
 JOIN track t ON s.track_id = t.id
 JOIN track p ON t.parent_id = p.id
-WHERE t.name = 'state' AND p.name LIKE 'agent:%';
+LEFT JOIN track gp ON p.parent_id = gp.id
+WHERE t.name = 'state' AND (p.name LIKE 'agent:%' OR gp.name = 'agents');
 
 FROM (
   SELECT agent, state, dur

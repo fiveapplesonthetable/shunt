@@ -23,7 +23,7 @@ pub use proc_tree::{
     read_process_ppid, read_process_rss_bytes, read_process_stat_and_comm,
     read_process_stat_and_comm_slice, read_process_stat_fields, sample_pid_tree, ProcStat,
 };
-pub use timer::{spawn_sampler, spawn_sampler_with_waker, SamplerWaker};
+pub use timer::{spawn_sampler, spawn_sampler_with_home, spawn_sampler_with_waker, SamplerWaker};
 pub(crate) use worktree::wait_child_exit;
 pub use worktree::{run_git, scan_worktree_files, scan_worktree_latest_mtime_ns};
 
@@ -104,6 +104,9 @@ pub struct ProcSampler {
     worktree_states: HashMap<String, WorktreeSnapshot>,
     cgroup_enabled: bool,
     worktree_scan_secs: u64,
+    home_dir: Option<std::path::PathBuf>,
+    last_decide_state_seq: u64,
+    last_decide_ns: u64,
 }
 
 impl ProcSampler {
@@ -135,6 +138,9 @@ impl ProcSampler {
             worktree_states: HashMap::new(),
             cgroup_enabled: true,
             worktree_scan_secs: 30,
+            home_dir: None,
+            last_decide_state_seq: 0,
+            last_decide_ns: 0,
         }
     }
 
@@ -146,6 +152,11 @@ impl ProcSampler {
     /// Sets the minimum interval between worktree file-change scans in seconds.
     pub fn set_worktree_scan_secs(&mut self, secs: u64) {
         self.worktree_scan_secs = secs;
+    }
+
+    /// Sets `$TACHO_HOME` so each sampling tick also runs an autonomous `decide` pass.
+    pub fn set_home_dir(&mut self, home_dir: std::path::PathBuf) {
+        self.home_dir = Some(home_dir);
     }
 
     /// Reads `/proc/loadavg` using `pread` at offset 0 into a stack buffer.
@@ -448,6 +459,22 @@ impl ProcSampler {
                         appender,
                         now_ns,
                     );
+                }
+            }
+        }
+
+        if let Some(ref home_dir) = self.home_dir {
+            let cur_seq = appender.state_seq();
+            if cur_seq != self.last_decide_state_seq
+                || now_ns.saturating_sub(self.last_decide_ns) >= 1_000_000_000
+            {
+                self.last_decide_state_seq = cur_seq;
+                self.last_decide_ns = now_ns;
+                let latest_live = appender.live_state();
+                if let Err(e) =
+                    crate::fleet::run_autonomous_decide_tick_with_live(home_dir, &latest_live)
+                {
+                    eprintln!("[tacho-daemon] autonomous decide tick failed: {}", e);
                 }
             }
         }

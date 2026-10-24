@@ -39,17 +39,53 @@ impl TestSandbox {
 
 impl Drop for TestSandbox {
     fn drop(&mut self) {
+        use std::os::unix::ffi::OsStrExt;
         let pid_file = self.runtime.join("daemon.pid");
         if let Ok(s) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = s.trim().parse::<i32>() {
                 if pid > 0 {
                     unsafe {
-                        let _ = libc::kill(pid, libc::SIGTERM);
-                        let cap = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                        while libc::kill(pid, 0) == 0 && std::time::Instant::now() < cap {
-                            std::thread::yield_now();
+                        let inotify_fd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
+                        if inotify_fd >= 0 {
+                            if let Ok(c_dir) =
+                                std::ffi::CString::new(self.runtime.as_os_str().as_bytes())
+                            {
+                                libc::inotify_add_watch(
+                                    inotify_fd,
+                                    c_dir.as_ptr(),
+                                    libc::IN_DELETE | libc::IN_MODIFY | libc::IN_CLOSE_WRITE,
+                                );
+                            }
                         }
-                        let _ = libc::kill(pid, libc::SIGKILL);
+                        let pidfd = libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int;
+                        let _ = libc::kill(pid, libc::SIGTERM);
+                        if pidfd >= 0 {
+                            let mut pfd = libc::pollfd {
+                                fd: pidfd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let _ = libc::poll(&mut pfd, 1, -1);
+                            libc::close(pidfd);
+                        } else if inotify_fd >= 0 {
+                            while libc::kill(pid, 0) == 0 && pid_file.exists() {
+                                let mut pfd = libc::pollfd {
+                                    fd: inotify_fd,
+                                    events: libc::POLLIN,
+                                    revents: 0,
+                                };
+                                if libc::poll(&mut pfd, 1, -1) <= 0 {
+                                    break;
+                                }
+                                let mut buf = [0u8; 512];
+                                while libc::read(inotify_fd, buf.as_mut_ptr().cast(), buf.len()) > 0
+                                {
+                                }
+                            }
+                        }
+                        if inotify_fd >= 0 {
+                            libc::close(inotify_fd);
+                        }
                     }
                 }
             }

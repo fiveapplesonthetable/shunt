@@ -16,7 +16,7 @@ use crate::client::DaemonClient;
 /// Opens the persistent [`FleetStore`] in `$TACHO_HOME/events.sqlite`.
 pub fn open_fleet_store() -> io::Result<FleetStore> {
     let home = crate::paths::resolve_home();
-    let _ = crate::paths::ensure_dir_0700(&home);
+    crate::paths::ensure_dir_0700(&home)?;
     let db = home.join("events.sqlite");
     FleetStore::open(&db).map_err(|e| io::Error::other(e.to_string()))
 }
@@ -51,18 +51,20 @@ pub fn now_ns() -> u64 {
 /// Best-effort emission of an instant decision event to the running daemon socket.
 pub fn emit_decision_event(track: &str, name: &str, because: &str) {
     let client = DaemonClient::new();
-    let _ = client.send_request(&serde_json::json!({
-        "input": {
-            "type": "custom",
-            "source_ts_ns": now_ns(),
-            "track": track,
-            "name": name,
-            "op": "instant",
-            "args": {
-                "because": because,
+    if client.try_connect_api_fast().is_ok() {
+        let _ = client.send_request(&serde_json::json!({
+            "input": {
+                "type": "custom",
+                "source_ts_ns": now_ns(),
+                "track": track,
+                "name": name,
+                "op": "instant",
+                "args": {
+                    "because": because,
+                }
             }
-        }
-    }));
+        }));
+    }
 }
 
 /// Returns `true` if `pid` exists, `/proc/<pid>/stat` is readable, and the process is not a zombie (`Z`).
@@ -86,22 +88,20 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 /// Returns `true` if `pid` is alive in `/proc/<pid>/stat`, not a zombie, and matches
-/// `expected_starttime` when `expected_starttime` is `Some`.
+/// `expected_starttime` (which must be `Some(st)` with `st > 0`).
 ///
-/// Fails closed (`false`) if `/proc/<pid>/stat` cannot be read or parsed.
+/// Fails closed (`false`) if `expected_starttime` is missing/zero or `/proc/<pid>/stat` cannot be read.
 pub fn pid_alive_matching(pid: u32, expected_starttime: Option<u64>) -> bool {
+    let Some(expected_st) = expected_starttime.filter(|&st| st > 0) else {
+        return false;
+    };
     if !pid_alive(pid) {
         return false;
     }
     let Some(actual_st) = proc_pid_starttime(pid) else {
         return false;
     };
-    if let Some(expected_st) = expected_starttime {
-        if actual_st != expected_st {
-            return false;
-        }
-    }
-    true
+    actual_st == expected_st
 }
 
 /// Reads field 22 (`starttime` in clock ticks since boot) of `/proc/<pid>/stat`.
@@ -114,72 +114,68 @@ pub fn proc_pid_starttime(pid: u32) -> Option<u64> {
     fields.get(19).and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Verify that a PID on the system actually belongs to the agent before signalling.
+/// Reads `/proc/<pid>/cgroup` for strong process identity verification.
+pub fn proc_pid_cgroup(pid: u32) -> Option<String> {
+    let cgroup_path = format!("/proc/{pid}/cgroup");
+    let content = fs::read_to_string(&cgroup_path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Verify that a PID on the system actually belongs to the target process before signalling.
 ///
-/// Prevents signalling or killing a reused PID if the agent process previously exited
-/// and its PID was recycled by the OS for an unrelated system process.
+/// Requires at least one strong identity (`expected_starttime` > 0 or non-empty `expected_cgroup`)
+/// recorded at spawn time. Never falls back to `/proc/<pid>/environ` or `/proc/<pid>/cmdline`.
 pub(crate) fn verify_agent_pid(
     pid: u32,
     agent_key: &str,
-    session_id: Option<&str>,
-    recorded_starttime: Option<u64>,
+    expected_cgroup: Option<&str>,
+    expected_starttime: Option<u64>,
 ) -> bool {
+    let has_valid_st = expected_starttime.is_some_and(|st| st > 0);
+    let has_valid_cg = expected_cgroup.is_some_and(|cg| !cg.is_empty());
+    if !has_valid_st && !has_valid_cg {
+        eprintln!(
+            "[tacho-safety] PID {pid} for '{agent_key}' has neither recorded starttime nor cgroup; refusing signal without identity"
+        );
+        return false;
+    }
+
     if !pid_alive(pid) {
         return false;
     }
 
-    let actual_st = proc_pid_starttime(pid);
-    if actual_st.is_none() {
-        // If /proc/<pid>/stat cannot be read, the process is unverified or dead. Refuse!
+    let Some(actual_st) = proc_pid_starttime(pid) else {
         return false;
-    }
+    };
 
-    // 1. If starttime was recorded, it MUST match the running process's starttime!
-    if let Some(expected_st) = recorded_starttime {
-        if actual_st != Some(expected_st) {
+    if let Some(expected_st) = expected_starttime {
+        if expected_st == 0 || actual_st != expected_st {
             eprintln!(
-                "[tacho-safety] PID {pid} starttime ({:?}) does not match recorded ({expected_st}); refusing signal to reused PID",
-                actual_st
+                "[tacho-safety] PID {pid} starttime ({actual_st}) does not match recorded ({expected_st}); refusing signal to reused PID"
             );
             return false;
         }
-        return true;
     }
 
-    // 2. Check cgroup for agent attribution
-    let cgroup_path = format!("/proc/{pid}/cgroup");
-    if let Ok(cg) = fs::read_to_string(&cgroup_path) {
-        if cg.contains(agent_key) || session_id.map(|s| cg.contains(s)).unwrap_or(false) {
-            return true;
+    if let Some(cg) = expected_cgroup.filter(|s| !s.is_empty()) {
+        let cgroup_path = format!("/proc/{pid}/cgroup");
+        let Ok(actual_cg) = fs::read_to_string(&cgroup_path) else {
+            return false;
+        };
+        if !actual_cg.contains(cg) {
+            eprintln!(
+                "[tacho-safety] PID {pid} cgroup does not contain expected '{cg}' for '{agent_key}'; refusing signal"
+            );
+            return false;
         }
     }
 
-    // 3. Check environment for agent attribution
-    let env_path = format!("/proc/{pid}/environ");
-    if let Ok(env_bytes) = fs::read(&env_path) {
-        let env_str = String::from_utf8_lossy(&env_bytes);
-        if env_str.contains(&format!("TACHO_AGENT={agent_key}"))
-            || env_str.contains(&format!("TACHO_TASK={agent_key}"))
-            || env_str.contains(&format!("TACHO_JOB_NAME={agent_key}"))
-            || session_id.map(|s| env_str.contains(s)).unwrap_or(false)
-        {
-            return true;
-        }
-    }
-
-    // 4. Check cmdline for exact agent/session attribution
-    let cmdline_path = format!("/proc/{pid}/cmdline");
-    if let Ok(cmd) = fs::read(&cmdline_path) {
-        let cmd_str = String::from_utf8_lossy(&cmd);
-        if cmd_str.contains(agent_key) || session_id.map(|s| cmd_str.contains(s)).unwrap_or(false) {
-            return true;
-        }
-    }
-
-    eprintln!(
-        "[tacho-safety] PID {pid} has no matching cgroup, cmdline, or environment for agent '{agent_key}'; refusing signal"
-    );
-    false
+    true
 }
 
 /// Wait up to `timeout` for `pid` to exit using Linux `pidfd_open` + `libc::poll`
@@ -293,6 +289,16 @@ pub struct CodeMoveRecord {
     pub at: i64,
 }
 
+/// Recorded process identity (`pid`, `starttime`, `cgroup`) for a batch run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BatchPidIdentity {
+    pub pid: u32,
+    #[serde(default)]
+    pub starttime: Option<u64>,
+    #[serde(default)]
+    pub cgroup: Option<String>,
+}
+
 /// Extended fleet metadata persisted atomically in `$TACHO_HOME/fleet_meta.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FleetMeta {
@@ -304,16 +310,32 @@ pub struct FleetMeta {
     pub watchdog_issue: Option<WatchdogIssueState>,
     #[serde(default)]
     pub last_code_moved: Option<CodeMoveRecord>,
+    #[serde(default)]
+    pub batch_identities: BTreeMap<String, BatchPidIdentity>,
 }
 
-pub fn fleet_meta_path() -> PathBuf {
+pub fn record_batch_pid_identity(batch_id: &str, pid: u32) -> io::Result<BatchPidIdentity> {
+    let identity = BatchPidIdentity {
+        pid,
+        starttime: proc_pid_starttime(pid),
+        cgroup: proc_pid_cgroup(pid),
+    };
+    let id_clone = identity.clone();
+    let batch_key = batch_id.to_string();
+    mutate_fleet_meta(move |m| {
+        m.batch_identities.insert(batch_key, id_clone);
+    })?;
+    Ok(identity)
+}
+
+pub fn fleet_meta_path() -> io::Result<PathBuf> {
     let home = crate::paths::resolve_home();
-    let _ = crate::paths::ensure_dir_0700(&home);
-    home.join("fleet_meta.json")
+    crate::paths::ensure_dir_0700(&home)?;
+    Ok(home.join("fleet_meta.json"))
 }
 
 pub fn load_fleet_meta() -> io::Result<FleetMeta> {
-    let path = fleet_meta_path();
+    let path = fleet_meta_path()?;
     if !path.is_file() {
         return Ok(FleetMeta::default());
     }
@@ -322,9 +344,9 @@ pub fn load_fleet_meta() -> io::Result<FleetMeta> {
 }
 
 pub fn save_fleet_meta(meta: &FleetMeta) -> io::Result<()> {
-    let path = fleet_meta_path();
+    let path = fleet_meta_path()?;
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(meta).map_err(io::Error::other)?;
     write_atomic(&path, &bytes)

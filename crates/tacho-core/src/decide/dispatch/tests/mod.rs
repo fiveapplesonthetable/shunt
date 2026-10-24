@@ -27,7 +27,7 @@ pub(super) fn test_cfg() -> DispatchConfig {
     cfg.claude_command = "claude -p --model {model} {brief}".to_string();
     cfg.codex_command = "codex exec --model {model} {brief}".to_string();
     cfg.providers.claude_default = "sonnet".to_string();
-    cfg.providers.codex_default = "gpt-6-luna".to_string();
+    cfg.providers.codex_default = "gpt-5.4".to_string();
     cfg.slots = 4;
     cfg.owner_issue = 42;
     cfg.fork_owner = "fork".to_string();

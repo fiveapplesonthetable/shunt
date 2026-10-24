@@ -408,3 +408,34 @@ fn test_daemon_send_error_keeps_offsets_unadvanced() {
         "in-memory state must not retain partial progress when send fails"
     );
 }
+
+#[test]
+fn test_follow_handle_stop_wakes_inotify_poll_and_add_dir_fails_loudly() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut watcher = InotifyWatcher::new().expect("inotify init must succeed");
+    watcher
+        .add_dir(temp.path())
+        .expect("watching existing dir must succeed");
+
+    let missing_dir = temp.path().join("does-not-exist");
+    let err = watcher
+        .add_dir(&missing_dir)
+        .expect_err("add_dir on nonexistent path must fail loudly");
+    assert!(
+        err.contains("inotify_add_watch failed"),
+        "expected loud inotify_add_watch failure, got: {err}"
+    );
+
+    let handle = FollowHandle::new().expect("FollowHandle::new must succeed");
+    let handle_for_thread = handle.clone();
+    let join = std::thread::spawn(move || {
+        watcher
+            .read_events(handle_for_thread.wake_read_fd())
+            .expect("read_events must unblock cleanly on FollowHandle::stop()")
+    });
+
+    handle.stop();
+    let evs = join.join().expect("reader thread panicked");
+    assert!(evs.is_empty());
+    assert!(handle.is_stopped());
+}

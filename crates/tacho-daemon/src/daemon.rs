@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::log::EventLog;
 use crate::paths::DaemonPaths;
 use crate::recorder::Recorder;
-use crate::sampler::{spawn_sampler_with_waker, SamplerWaker};
+use crate::sampler::{spawn_sampler_with_home, SamplerWaker};
 use crate::server::{DaemonLock, DaemonServer};
 use crate::snapshot::{write_snapshot, write_snapshot_file_atomic, SnapshotStats};
 
@@ -52,9 +52,10 @@ impl Daemon {
             eprintln!("[tacho-daemon] failed to write daemon.pid: {}", e);
         }
 
-        // 1. Open SQLite WAL event log
+        // 1. Open SQLite WAL event log and initialize fleet / decision_ticks tables
         let log =
             EventLog::open(&paths.events_db()).map_err(|e| io::Error::other(e.to_string()))?;
+        crate::fleet::FleetStore::open(&paths.events_db())?;
 
         // 2. Restart recovery: load all logged events and restore recorder state (design test 7)
         let logged_events = log
@@ -88,11 +89,12 @@ impl Daemon {
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-        // 4. Spawn sampler thread
-        let (sampler_thread, sampler_waker) = match spawn_sampler_with_waker(
+        // 4. Spawn sampler thread (also runs autonomous `decide` ticks on $TACHO_HOME)
+        let (sampler_thread, sampler_waker) = match spawn_sampler_with_home(
             config.sampler.clone(),
             appender.clone(),
             shutdown_flag.clone(),
+            Some(paths.home.clone()),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -101,6 +103,7 @@ impl Daemon {
                 return Err(e);
             }
         };
+        appender.set_sampler_waker(sampler_waker.clone());
 
         // 5. Start UNIX domain socket servers (api.sock, trace.sock) using the acquired lock
         let server = match DaemonServer::start_with_lock(
@@ -121,6 +124,12 @@ impl Daemon {
             }
         };
         server.set_sampler_waker(sampler_waker.clone());
+        if let Err(e) = crate::snapshot::write_file_atomic(
+            &paths.runtime.join("daemon.pid"),
+            std::process::id().to_string().as_bytes(),
+        ) {
+            eprintln!("[tacho-daemon] failed to update daemon.pid: {}", e);
+        }
 
         // 6. Spawn retention maintenance thread (hourly small-batch prune)
         let (retention_wake_tx, retention_wake_rx) = crossbeam_channel::bounded::<()>(1);
@@ -154,14 +163,18 @@ impl Daemon {
                                 .as_nanos() as u64;
                             let batch: Vec<(tacho_core::Input, u64)> =
                                 inputs.into_iter().map(|inp| (inp, now_ns)).collect();
-                            let _ = appender_clone.send_input_batch(batch);
+                            if let Err(e) = appender_clone.send_input_batch(batch) {
+                                eprintln!("[tacho-daemon] failed to enqueue OTLP batch: {}", e);
+                            }
                         };
-                        let _ = tacho_ingest::otlp_server::serve_otlp_with_config(
+                        if let Err(e) = tacho_ingest::otlp_server::serve_otlp_with_config(
                             listener,
                             shutdown_clone,
                             otlp_cfg,
                             on_inputs,
-                        );
+                        ) {
+                            eprintln!("[tacho-daemon] OTLP server stopped with error: {}", e);
+                        }
                         if otlp_rx >= 0 {
                             unsafe { libc::close(otlp_rx) };
                         }
@@ -301,30 +314,49 @@ fn spawn_retention_thread(
 
                 let cutoff_ns = now_ns.saturating_sub(retention_ns);
                 let cutoff_secs = (cutoff_ns / 1_000_000_000) as i64;
-                if let Ok(mut store) = crate::fleet::FleetStore::open(&paths.events_db()) {
-                    let _ = store.prune_decision_ticks_older_than(cutoff_secs);
+                match crate::fleet::FleetStore::open(&paths.events_db()) {
+                    Ok(mut store) => {
+                        if let Err(e) = store.prune_decision_ticks_older_than(cutoff_secs) {
+                            eprintln!("[tacho-daemon] decision tick prune error: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[tacho-daemon] failed to open fleet store for tick prune: {}",
+                            e
+                        );
+                    }
                 }
 
-                if let Ok(mut log) = EventLog::open(&paths.events_db()) {
-                    // Small-batch pruning: 1000 rows per batch, yielding between transactions
-                    const BATCH_SIZE: usize = 1000;
-                    loop {
-                        if stop_flag.load(Ordering::Acquire) {
-                            break;
-                        }
-                        match log.prune_older_than(cutoff_ns, BATCH_SIZE) {
-                            Ok(0) => break, // Done
-                            Ok(_) => match wake_rx.recv_timeout(Duration::from_millis(50)) {
-                                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                    return;
-                                }
-                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                            },
-                            Err(e) => {
-                                eprintln!("[tacho-daemon] retention prune error: {}", e);
+                match EventLog::open(&paths.events_db()) {
+                    Ok(mut log) => {
+                        // Small-batch pruning: 1000 rows per batch, yielding between transactions
+                        const BATCH_SIZE: usize = 1000;
+                        loop {
+                            if stop_flag.load(Ordering::Acquire) {
                                 break;
                             }
+                            match log.prune_older_than(cutoff_ns, BATCH_SIZE) {
+                                Ok(0) => break, // Done
+                                Ok(_) => match wake_rx.recv_timeout(Duration::from_millis(50)) {
+                                    Ok(())
+                                    | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                        return;
+                                    }
+                                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                                },
+                                Err(e) => {
+                                    eprintln!("[tacho-daemon] retention prune error: {}", e);
+                                    break;
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[tacho-daemon] failed to open event log for retention prune: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -368,4 +400,76 @@ fn spawn_signal_handler(
         })
         .expect("failed to spawn signal thread");
     (Some(handle), Some(thread))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_daemon_autonomously_runs_decide_without_api_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths =
+            DaemonPaths::custom(dir.path().join("home"), dir.path().join("runtime")).unwrap();
+        paths.ensure_dirs().unwrap();
+
+        let mut store = crate::fleet::FleetStore::open(&paths.events_db()).unwrap();
+        store
+            .mutate(None, |st| {
+                st.inbox
+                    .entry("worker-1".to_string())
+                    .or_default()
+                    .push("Ship the autonomous decide loop".to_string());
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::start(paths.clone(), Config::default()).unwrap();
+        daemon
+            .appender
+            .send_input(
+                tacho_core::Input::RunStart {
+                    source_ts_ns: Some(1_000_000_000),
+                    provider: "claude".to_string(),
+                    session_id: "sess-auto".to_string(),
+                    agent: Some("worker-1".to_string()),
+                    model: Some("claude-sonnet".to_string()),
+                    task: Some("Autonomous decide".to_string()),
+                    cwd: None,
+                    pid: Some(std::process::id()),
+                    role: None,
+                    parent_session: None,
+                    git_tree: None,
+                },
+                1_000_000_000,
+            )
+            .unwrap();
+        assert!(daemon.appender.flush());
+        // Wait for the sampler tick woken by `RunStart` commit to complete without any API call.
+        daemon.sampler_waker.sample_now();
+
+        let latest = store.load_latest_decision_tick().unwrap();
+        assert!(
+            latest.is_some(),
+            "daemon must autonomously record a decision_ticks row without API tick/decide"
+        );
+        let (_id, _state, obs, plan) = latest.unwrap();
+        assert!(
+            !obs.main_sha.is_empty(),
+            "recorded main_sha must never be empty"
+        );
+        assert!(
+            plan.tell_actions.contains(&(
+                "worker-1".to_string(),
+                "Ship the autonomous decide loop".to_string()
+            )),
+            "expected tell_actions in autonomous decision tick, got: {:?}",
+            plan.tell_actions
+        );
+        assert!(
+            paths.home.join("inbox/worker-1.jsonl").exists(),
+            "expected autonomous decide tick to deliver inbox message"
+        );
+
+        daemon.stop();
+    }
 }

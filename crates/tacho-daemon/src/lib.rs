@@ -17,7 +17,10 @@ pub(crate) mod test_util;
 pub use appender::{spawn_appender, ActiveRun, AppenderCommand, AppenderHandle, AppenderHooks};
 pub use config::{Config, DetectorConfig, RingConfig, SamplerConfig};
 pub use daemon::Daemon;
-pub use fleet::{DecisionRecord, FleetState, FleetStore, WorktreeEntry};
+pub use fleet::{
+    execute_decide_tick, run_autonomous_decide_tick, run_autonomous_decide_tick_with_live,
+    DecisionRecord, FleetDb, FleetState, FleetStore, WorktreeEntry,
+};
 pub use log::EventLog;
 pub use paths::DaemonPaths;
 pub use recorder::{render_report, render_status, AgentLiveState, LiveState, Recorder};

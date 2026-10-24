@@ -78,13 +78,13 @@ LEFT JOIN track gp ON p.parent_id = gp.id
 JOIN agent_pids ap ON pr.pid = ap.pid 
   OR pr.parent_upid IN (SELECT upid FROM process WHERE pid = ap.pid)
   OR ct.name LIKE 'agent:' || ap.agent || '%cpu%'
-  OR (ct.name = 'cpu' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent))
+  OR (ct.name = 'cpu' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent OR p.name = ap.agent OR gp.name = ap.agent))
 WHERE (
   pct.name IN ('cpu.user_ns', 'cpu.kernel_ns', 'runtime')
   OR pct.name LIKE '%cpu%'
   OR pct.name LIKE '%runtime%'
   OR ct.name LIKE '%cpu%'
-  OR (ct.name = 'cpu' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent))
+  OR (ct.name = 'cpu' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent OR p.name = ap.agent OR gp.name = ap.agent))
 );
 
 CREATE PERFETTO TABLE counter_cpu_totals AS
@@ -121,11 +121,11 @@ LEFT JOIN track gp ON p.parent_id = gp.id
 JOIN agent_pids ap ON pr.pid = ap.pid 
   OR pr.parent_upid IN (SELECT upid FROM process WHERE pid = ap.pid)
   OR ct.name LIKE 'agent:' || ap.agent || '%rss%'
-  OR (ct.name = 'rss' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent))
+  OR (ct.name = 'rss' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent OR p.name = ap.agent OR gp.name = ap.agent))
 WHERE (
   pct.name LIKE '%rss%'
   OR ct.name LIKE '%rss%'
-  OR (ct.name = 'rss' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent))
+  OR (ct.name = 'rss' AND (p.name = 'agent:' || ap.agent OR gp.name = 'agent:' || ap.agent OR p.name = ap.agent OR gp.name = ap.agent))
 );
 
 CREATE PERFETTO TABLE rss_intervals AS

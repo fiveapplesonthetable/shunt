@@ -13,6 +13,7 @@ use tacho_core::decide::dispatch::{
     Provider, ProviderSpec, TellPlan, TodoItem,
 };
 use tacho_core::decide::watch::{verdict, Verdict};
+use tacho_core::decide::{decide, DecisionState, WorldObservation};
 use tacho_core::TaskStatus;
 use tacho_daemon::FleetStore;
 
@@ -20,8 +21,8 @@ use crate::cli::{AttachArgs, SessionArgs, StopArgs, TellArgs};
 
 use super::dispatch::detect_brief_source;
 use super::store::{
-    emit_decision_event, live_agent_keys, now_ns, now_secs, open_fleet_store, proc_pid_starttime,
-    verify_agent_pid, write_atomic,
+    emit_decision_event, live_agent_keys, now_ns, now_secs, open_fleet_store, proc_pid_cgroup,
+    proc_pid_starttime, verify_agent_pid, write_atomic,
 };
 
 /// Infer the agent provider from a model name or shorthand:
@@ -162,11 +163,20 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
         }
         c
     };
+    let fleet_tmp = home.join("tmp").join(&item.key);
+    fs::create_dir_all(&fleet_tmp)?;
+    let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
+    let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
     command
         .current_dir(&wt_path)
         .env("TACHO_AGENT", &item.key)
         .env("TACHO_TASK", &item.key)
         .env("TACHO_MANAGED_WORKER", "1")
+        .env("TMPDIR", &fleet_tmp_str)
+        .env("TMP", &fleet_tmp_str)
+        .env("TEMP", &fleet_tmp_str)
+        .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err))
@@ -174,13 +184,14 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
 
     let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes());
-        let _ = stdin.write_all(b"\n");
+        stdin.write_all(prompt.as_bytes())?;
+        stdin.write_all(b"\n")?;
     }
     let pid = child.id();
     let now = now_secs();
     let base_pr = item.base.as_deref().and_then(|s| s.parse::<u64>().ok());
     let starttime = proc_pid_starttime(pid);
+    let cgroup = proc_pid_cgroup(pid);
 
     let run = AgentRun {
         key: item.key.clone(),
@@ -204,7 +215,7 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
         session_id: None,
         compare: item.compare.clone(),
         starttime,
-        cgroup: None,
+        cgroup,
     };
 
     let because = format!(
@@ -215,13 +226,13 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
         st.agents.insert(item.key.clone(), run);
         st.todo.retain(|t| t.key != item.key);
     })?;
-    let _ = store.emit_state_band(
+    store.emit_state_band(
         &format!("task:{}/state", root_key),
         "InProgress",
         TaskStatus::InProgress,
         &because,
         now_ns(),
-    );
+    )?;
     emit_decision_event(&format!("agent:{}", item.key), "dispatch:start", &because);
     Ok(pid)
 }
@@ -426,13 +437,13 @@ pub fn execute_attach(args: AttachArgs) -> io::Result<()> {
     } else {
         ("Review", TaskStatus::Review)
     };
-    let _ = store.emit_state_band(
+    store.emit_state_band(
         &format!("task:{}/state", base_key(&args.key)),
         label,
         status,
         &because,
         now_ns(),
-    );
+    )?;
     emit_decision_event(&format!("agent:{}", args.key), "dispatch:attach", &because);
     println!("{because}");
     Ok(())
@@ -462,10 +473,15 @@ pub fn execute_stop(args: StopArgs) -> io::Result<()> {
         agent.pid,
     );
     if let Some((prog, stop_args)) = stop_plan.custom_cmd {
-        let _ = Command::new(prog).args(stop_args).status();
+        let status = Command::new(&prog).args(&stop_args).status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "stop command '{prog}' exited with {status}"
+            )));
+        }
     }
     if let Some(pid) = stop_plan.pid {
-        if verify_agent_pid(pid, &args.key, agent.session_id.as_deref(), agent.starttime) {
+        if verify_agent_pid(pid, &args.key, agent.cgroup.as_deref(), agent.starttime) {
             unsafe {
                 let _ = libc::kill(-(pid as i32), libc::SIGTERM);
                 let _ = libc::kill(pid as i32, libc::SIGTERM);
@@ -497,20 +513,23 @@ pub fn execute_stop(args: StopArgs) -> io::Result<()> {
     Ok(())
 }
 
-/// Executes `tacho tell <key> "<message>"`.
-pub fn execute_tell(args: TellArgs) -> io::Result<()> {
-    let mut store = open_fleet_store()?;
+/// Executes a single `tell` action decided by `tacho_core::decide::decide`.
+pub fn deliver_tell_action(
+    store: &mut FleetStore,
+    target_key: &str,
+    message: &str,
+) -> io::Result<()> {
     let state = store.load()?;
-    let root = base_key(&args.key);
+    let root = base_key(target_key);
     let Some(last) = state
         .agents
-        .get(&args.key)
+        .get(target_key)
         .or_else(|| tacho_core::decide::dispatch::latest(&state.agents, &state.retired, root))
         .cloned()
     else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("unknown agent '{}'", args.key),
+            format!("unknown agent '{target_key}'"),
         ));
     };
 
@@ -545,7 +564,7 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
         &last.key,
         &last.worktree,
         last.session_id.as_deref(),
-        &args.message,
+        message,
         is_live,
         is_idle,
         last.model.as_deref(),
@@ -563,17 +582,19 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
                     "live tell command '{program}' exited with {status}"
                 )));
             }
-            let because = format!("live-command tell {}: {}", last.key, args.message);
+            let because = format!("live-command tell {}: {}", last.key, message);
             store.mutate(Some(("watch", "tell", &last.key, &because)), |st| {
                 st.nudged.insert(last.key.clone());
                 if let Some(a) = st.agents.get_mut(&last.key) {
-                    a.status_note = format!("nudged (live): {}", args.message);
+                    a.status_note = format!("nudged (live): {message}");
                 }
             })?;
             emit_decision_event(&format!("agent:{}", last.key), "watch:tell", &because);
             println!("Delivered live message to running session {}", last.key);
         }
-        TellPlan::LiveInbox { key, message, .. } => {
+        TellPlan::LiveInbox {
+            key, message: msg, ..
+        } => {
             let home = crate::paths::resolve_home();
             let inbox_dir = home.join("inbox");
             fs::create_dir_all(&inbox_dir)?;
@@ -582,19 +603,16 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
             if !existing.is_empty() && !existing.ends_with('\n') {
                 existing.push('\n');
             }
-            existing.push_str(&message);
+            existing.push_str(&msg);
             existing.push('\n');
             write_atomic(&inbox_file, existing.as_bytes())?;
 
-            let because = format!("queued live inbox message for running session {key}: {message}");
+            let because = format!("queued live inbox message for running session {key}: {msg}");
             store.mutate(Some(("watch", "tell", &key, &because)), |st| {
                 st.nudged.insert(key.clone());
-                st.inbox
-                    .entry(key.clone())
-                    .or_default()
-                    .push(message.clone());
+                st.inbox.entry(key.clone()).or_default().push(msg.clone());
                 if let Some(a) = st.agents.get_mut(&key) {
-                    a.status_note = format!("nudged (live inbox): {}", args.message);
+                    a.status_note = format!("nudged (live inbox): {message}");
                 }
             })?;
             emit_decision_event(&format!("agent:{key}"), "watch:tell", &because);
@@ -606,7 +624,7 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
         TellPlan::ResumeWithMessage { key, command, .. } => {
             if is_live {
                 if let Some(pid) = last.pid {
-                    if verify_agent_pid(pid, &key, last.session_id.as_deref(), last.starttime) {
+                    if verify_agent_pid(pid, &key, last.cgroup.as_deref(), last.starttime) {
                         unsafe {
                             let _ = libc::kill(-(pid as i32), libc::SIGTERM);
                         }
@@ -637,9 +655,22 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
                     "Cannot resume worker {key}: failed to clone log fd: {e}"
                 ))
             })?;
+            let home = crate::paths::resolve_home();
+            let fleet_tmp = home.join("tmp").join(&key);
+            fs::create_dir_all(&fleet_tmp)?;
+            let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
+            let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
             let mut cmd = Command::new(&command.program);
             cmd.args(&command.args)
                 .current_dir(&last.worktree)
+                .env("TACHO_AGENT", &key)
+                .env("TACHO_TASK", &key)
+                .env("TACHO_MANAGED_WORKER", "1")
+                .env("TMPDIR", &fleet_tmp_str)
+                .env("TMP", &fleet_tmp_str)
+                .env("TEMP", &fleet_tmp_str)
+                .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
+                .env("PYTHONDONTWRITEBYTECODE", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file))
                 .stderr(Stdio::from(log_err))
@@ -655,16 +686,18 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
             })?;
             let resumed_pid = child.id();
             let resumed_starttime = proc_pid_starttime(resumed_pid);
-            let because = format!("resumed session {key} with message: {}", args.message);
+            let resumed_cgroup = proc_pid_cgroup(resumed_pid);
+            let because = format!("resumed session {key} with message: {message}");
             store.mutate(Some(("watch", "tell", &key, &because)), |st| {
                 st.nudged.insert(key.clone());
                 if let Some(a) = st.agents.get_mut(&key) {
                     a.pid = Some(resumed_pid);
                     a.starttime = resumed_starttime;
+                    a.cgroup = resumed_cgroup;
                     a.finished_at = None;
                     a.exit_code = None;
-                    a.status_note = format!("nudged: {}", args.message);
-                    a.brief = format!("{}\n\nGuidance from operator:\n{}", a.brief, args.message);
+                    a.status_note = format!("nudged: {message}");
+                    a.brief = format!("{}\n\nGuidance from operator:\n{message}", a.brief);
                 }
             })?;
             emit_decision_event(&format!("agent:{key}"), "watch:tell", &because);
@@ -675,4 +708,60 @@ pub fn execute_tell(args: TellArgs) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Runs `decide`, records the decision tick in `decision_ticks`, and executes `tell` actions from the resulting `DecisionPlan`.
+pub fn execute_tell_with(store: &mut FleetStore, args: TellArgs) -> io::Result<()> {
+    let state = store.load()?;
+    let root = base_key(&args.key);
+    let Some(last) = state
+        .agents
+        .get(&args.key)
+        .or_else(|| tacho_core::decide::dispatch::latest(&state.agents, &state.retired, root))
+        .cloned()
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("unknown agent '{}'", args.key),
+        ));
+    };
+
+    let now = now_secs();
+    let mut inbox = state.inbox.clone();
+    inbox.insert(last.key.clone(), vec![args.message.clone()]);
+    let mut live_keys = live_agent_keys(&state);
+    live_keys.insert(last.key.clone());
+
+    let decision_state = DecisionState {
+        max_parallel: state.max_workers,
+        todo: state.todo.clone(),
+        agents: state.agents.clone(),
+        retired: state.retired.clone(),
+        holds: state.holds.clone(),
+        samples: state.samples.clone(),
+        inbox,
+        ..Default::default()
+    };
+    let world_obs = WorldObservation {
+        now,
+        live_keys,
+        ..Default::default()
+    };
+    let plan = decide(&decision_state, &world_obs);
+    store
+        .record_decision_tick(now, &decision_state, &world_obs, &plan)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    for (agent_key, msg) in &plan.tell_actions {
+        if agent_key == &last.key {
+            deliver_tell_action(store, agent_key, msg)?;
+        }
+    }
+    Ok(())
+}
+
+/// Executes `tacho tell <key> "<message>"`.
+pub fn execute_tell(args: TellArgs) -> io::Result<()> {
+    let mut store = open_fleet_store()?;
+    execute_tell_with(&mut store, args)
 }

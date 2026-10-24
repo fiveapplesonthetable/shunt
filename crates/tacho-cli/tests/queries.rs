@@ -12,7 +12,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
 
 use tacho_core::{
     encode_snapshot_header, Encoder, FileEditKind, Input, Recorder, SessionKey, ToolInput, WaitOn,
@@ -1107,10 +1106,28 @@ fn test_system_during_builds_with_real_traced() {
         .stderr(Stdio::null());
     let traced_child = traced_cmd.spawn().expect("failed to start traced");
 
-    // Wait for sockets
-    let cap = Instant::now() + Duration::from_secs(5);
-    while (!consumer_sock.exists() || !producer_sock.exists()) && Instant::now() < cap {
-        std::thread::yield_now();
+    // Wait for sockets via inotify on temp_dir
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "inotify_init1 failed");
+        let c = std::ffi::CString::new(temp_dir.path().as_os_str().as_bytes()).unwrap();
+        let wd =
+            unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO) };
+        assert!(wd >= 0, "inotify_add_watch failed");
+        let mut buf = [0u8; 4096];
+        while !consumer_sock.exists() || !producer_sock.exists() {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+            assert!(rc > 0, "inotify poll failed");
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert!(n > 0, "inotify read failed");
+        }
+        unsafe { libc::close(fd) };
     }
 
     // 2. Start unprivileged traced_probes

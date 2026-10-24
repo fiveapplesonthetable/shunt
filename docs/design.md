@@ -547,8 +547,8 @@ BLAKE3 digest and byte size, or a count, or nothing. Paths are made relative to
 the run's cwd; absolute paths outside it keep their first two components and
 become `<outside>/...`.
 
-Opt-in secret scrubbing (`scrub = true` in `$TACHO_HOME/config.toml` or
-`TACHO_SCRUB=1`, default `false`): when enabled, command argv, review finding
+Default-on secret scrubbing (`scrub = true` by default in `$TACHO_HOME/config.toml` or
+`TACHO_SCRUB=1`; opt-out via `scrub = false` or `TACHO_SCRUB=0`): command argv, review finding
 titles, custom args, and custom names pass through regex and shape scrubbers
 before persistence. The scrubber replaces with `<redacted>`: `Authorization:`
 and `Bearer` values, `--token|--password|--secret|--api-key[= ]value`,
@@ -610,3 +610,45 @@ start to exit), ingest throughput, snapshot time and peak RSS at 100k, 1M and
   interprets it.
 - Hooks see what the agent reports. A command an agent runs outside its tool
   interface is invisible unless the run is wrapped and system tracing is on.
+
+## 14. Autonomous `decide` Engine and Pluggable Interfaces
+
+The orchestrator decision loop (`tacho_core::decide::decide`) is a pure,
+deterministic, replayable function `DecideInput -> DecisionPlan` split into five
+domain engines:
+
+- `decide::dispatch`: queue scheduling, hold evaluation, model/provider routing,
+  cooldowns, worktree start/resume planning, and multi-provider scorecards.
+- `decide::verify`: strict `.github/workflows/ci.yaml` parsing (refusing any
+  unknown `${{ }}` expression), area + affected-units check selection
+  (`Check { area, units }`), presubmit/postsubmit/release-gate batch execution,
+  flake ledger with counterexample exclusion, and failing-PR bisection.
+- `decide::land`: verified merge-train assembly, regenerable artifact vs. source
+  conflict classification, `drop_breakers`, post-merge tree verification, and
+  head-SHA-bound release notices (`Pending` / `Sending` / `Sent` / `Uncertain`).
+- `decide::watch`: child-process-tree CPU + commit + mtime progress verdicts,
+  `(pid, starttime)` and cgroup identity-verified rogue burner reaping, `starve`
+  CPU-share budgeting, and `PreToolUse` command guardrails.
+- `decide::ops`: tell-once operator notification ledger, versioned redacted
+  snapshots, self-update step machine, watchdog issue lifecycle, safe tidy
+  rescue (`refs/tacho/rescue/<key>-<ts>`, never `git stash`), and fleet-scoped
+  `TMPDIR`/`TMP`/`TEMP`/`JAVA_TOOL_OPTIONS` isolation so nothing writes to `/`.
+
+The daemon autonomously observes world events (agents, PRs, CI, `main`,
+worktrees, burners, and host resources) and invokes `decide` on events,
+recording every input and resulting `DecisionPlan` (including `tell_actions` and
+`WatchAction::RemoveWorktree`) to `decision_ticks` for deterministic replay via
+`tacho replay`.
+
+All external side effects and project-specific rules implement the six synchronous
+traits in `tacho_core::decide::plugin`:
+
+- `ProviderPlugin`: model/provider routing, auth/quota readiness, argv synthesis.
+- `ForgePlugin`: issues, PRs, labels, comments, merge execution, tree checks.
+- `NotifierPlugin`: operator alerts, daily digests, and release notices.
+- `ProvisionerPlugin`: worktree creation/removal, cgroup slices, and host probes.
+- `WatcherPlugin`: `/proc` process trees, `(pid, starttime)` / cgroup identity,
+  and burner reaping.
+- `ProjectPolicy`: area classification, proof plans, conflict rules, and
+  `PreToolUse` command guardrails.
+

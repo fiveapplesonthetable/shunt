@@ -38,7 +38,7 @@ fn parity_015_resume_with_kept_provider_still_follows_active_session_when_unpinn
     let session = Session {
         name: "codex-prof".to_string(),
         provider: "codex".to_string(),
-        model: "gpt-6-luna".to_string(),
+        model: "gpt-5.4".to_string(),
     };
     let mut stopped = BTreeMap::new();
     stopped.insert(
@@ -83,7 +83,7 @@ fn parity_016_active_session_cannot_be_overridden_by_caller_args() {
     let session = Session {
         name: "codex-prof".to_string(),
         provider: "codex".to_string(),
-        model: "gpt-6-luna".to_string(),
+        model: "gpt-5.4".to_string(),
     };
     let mut req = pr_start_req("task-x", "do x", 1094);
     req.pr = None;
@@ -370,9 +370,9 @@ fn parity_023_session_command_switches_provider_and_model() {
         panic!("expected Started");
     };
     assert_eq!(spec.argv[0], "codex");
-    assert_eq!(spec.model, "gpt-6-luna");
+    assert_eq!(spec.model, "gpt-5.4");
     assert_eq!(state.runs["hands-1094"].provider, "codex");
-    assert_eq!(state.runs["hands-1094"].model, "gpt-6-luna");
+    assert_eq!(state.runs["hands-1094"].model, "gpt-5.4");
 }
 
 #[test]

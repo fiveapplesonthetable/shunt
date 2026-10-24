@@ -194,7 +194,7 @@ fn parity_task_provider_and_compare_expansion() {
     assert_eq!(resolve(None, None, &cfg).unwrap(), None);
     assert_eq!(
         resolve(Some("codex"), None, &cfg).unwrap(),
-        Some(("codex".to_string(), "gpt-6-luna".to_string()))
+        Some(("codex".to_string(), "gpt-5.4".to_string()))
     );
     assert_eq!(
         resolve(Some("claude"), None, &cfg).unwrap(),

@@ -35,7 +35,7 @@ fn test_canary_secrets_zero_leak() {
 
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     // 1. Seed secrets via tacho hook claude (SessionStart + PreToolUse + PostToolUse)
     let send_hook = |payload: serde_json::Value| {

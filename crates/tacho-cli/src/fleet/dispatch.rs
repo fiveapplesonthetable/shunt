@@ -22,8 +22,9 @@ use tacho_daemon::FleetState;
 use crate::cli::{HoldArgs, NextArgs, ReleaseArgs, RetireArgs, TodoArgs};
 
 pub use super::session::{
-    build_session_argv, execute_attach, execute_session, execute_session_with, execute_stop,
-    execute_tell, infer_provider_from_model, spawn_worker_for_item, SessionOptions,
+    build_session_argv, deliver_tell_action, execute_attach, execute_session, execute_session_with,
+    execute_stop, execute_tell, execute_tell_with, infer_provider_from_model,
+    spawn_worker_for_item, SessionOptions,
 };
 use super::store::{
     emit_decision_event, live_agent_keys, load_fleet_meta, mutate_fleet_meta, now_ns, now_secs,
@@ -357,22 +358,22 @@ pub fn execute_todo_with(args: TodoOptions) -> io::Result<()> {
         }
     })?;
 
-    let _ = mutate_fleet_meta(|m| {
+    mutate_fleet_meta(|m| {
         for k in &added_keys {
             m.retired.remove(k);
             m.retired.remove(base_key(k));
         }
-    });
+    })?;
 
     let ts = now_ns();
     for k in &added_keys {
-        let _ = store.emit_state_band(
+        store.emit_state_band(
             &format!("task:{k}/state"),
             "Queued",
             TaskStatus::Queued,
             &because,
             ts,
-        );
+        )?;
     }
     emit_decision_event(&format!("task:{key}"), "dispatch:todo", &because);
     println!("Queued: {}", added_keys.join(", "));
@@ -510,7 +511,7 @@ pub fn execute_retire(args: RetireArgs) -> io::Result<()> {
         st.holds = new_holds;
     })?;
 
-    let _ = mutate_fleet_meta(|meta| {
+    mutate_fleet_meta(|meta| {
         meta.retired.insert(
             args.key.clone(),
             RetiredMeta {
@@ -521,15 +522,15 @@ pub fn execute_retire(args: RetireArgs) -> io::Result<()> {
                 held_for,
             },
         );
-    });
+    })?;
 
-    let _ = store.emit_state_band(
+    store.emit_state_band(
         &format!("task:{}/state", base_key(&args.key)),
         "Cancelled",
         TaskStatus::Cancelled,
         &why,
         now_ns(),
-    );
+    )?;
     emit_decision_event(&format!("task:{}", args.key), "dispatch:retire", &why);
     println!("Retired {}", args.key);
     Ok(())

@@ -8,19 +8,91 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tacho_ingest::streams::claude::StreamParser;
 
 use crate::cli::TailArgs;
 use crate::client::DaemonClient;
+
+/// Handle for stopping a live `tacho tail` follow loop immediately via an `AtomicBool`
+/// and a non-blocking wakeup self-pipe (`pipe2(O_CLOEXEC | O_NONBLOCK)`).
+#[derive(Clone)]
+pub struct FollowHandle {
+    stop: Arc<AtomicBool>,
+    wake_read: Arc<OwnedFd>,
+    wake_write: Arc<OwnedFd>,
+}
+
+impl FollowHandle {
+    /// Creates a new `FollowHandle` backed by a non-blocking wakeup self-pipe.
+    pub fn new() -> io::Result<Self> {
+        let mut fds = [-1i32; 2];
+        // SAFETY: `fds` is a valid 2-element `[c_int; 2]` buffer.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `pipe2` succeeded and returned two fresh owned file descriptors.
+        let (read_fd, write_fd) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        Ok(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            wake_read: Arc::new(read_fd),
+            wake_write: Arc::new(write_fd),
+        })
+    }
+
+    /// Signals the follow loop to stop and writes `1u8` to the wakeup pipe to unblock `poll(..., -1)`.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let byte: u8 = 1;
+        // SAFETY: `self.wake_write` is a valid open non-blocking pipe file descriptor.
+        let _ = unsafe {
+            libc::write(
+                self.wake_write.as_raw_fd(),
+                (&byte as *const u8).cast::<libc::c_void>(),
+                1,
+            )
+        };
+    }
+
+    /// Returns `true` if stop has been requested.
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Raw file descriptor for the read end of the wakeup self-pipe.
+    pub fn wake_read_fd(&self) -> RawFd {
+        self.wake_read.as_raw_fd()
+    }
+
+    /// Shared `AtomicBool` stop flag.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    /// Registers `SIGINT` and `SIGTERM` to set the stop flag and write to the wakeup pipe.
+    pub fn register_signals(&self) -> io::Result<()> {
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&self.stop))?;
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&self.stop))?;
+        signal_hook::low_level::pipe::register(
+            signal_hook::consts::SIGINT,
+            self.wake_write.try_clone()?,
+        )?;
+        signal_hook::low_level::pipe::register(
+            signal_hook::consts::SIGTERM,
+            self.wake_write.try_clone()?,
+        )?;
+        Ok(())
+    }
+}
 
 /// Persisted offset entry for a tracked transcript file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,9 +142,20 @@ struct FileTailState {
 
 /// Executes `tacho tail`.
 pub fn execute_tail(args: TailArgs) -> Result<(), String> {
+    let handle = FollowHandle::new().map_err(|e| format!("failed to create wakeup pipe: {e}"))?;
+    if !args.once {
+        handle
+            .register_signals()
+            .map_err(|e| format!("failed to register signal handlers: {e}"))?;
+    }
+    execute_tail_with_handle(args, handle)
+}
+
+/// Executes `tacho tail` using an explicit [`FollowHandle`] for event-driven stop control.
+pub fn execute_tail_with_handle(args: TailArgs, handle: FollowHandle) -> Result<(), String> {
     let client = DaemonClient::new();
     let home = crate::paths::resolve_home();
-    let _ = crate::paths::ensure_dir_0700(&home);
+    crate::paths::ensure_dir_0700(&home).map_err(|e| e.to_string())?;
     let offsets_path = home.join("tail-offsets.json");
 
     let target_path = match args.path {
@@ -102,7 +185,7 @@ pub fn execute_tail(args: TailArgs) -> Result<(), String> {
             &mut saved_offsets,
             &mut states,
         )?;
-        let _ = save_offsets(&offsets_path, &saved_offsets);
+        save_offsets(&offsets_path, &saved_offsets)?;
         println!(
             "Tailed {total_initial} events from {}.",
             target_path.display()
@@ -111,11 +194,10 @@ pub fn execute_tail(args: TailArgs) -> Result<(), String> {
     }
 
     let mut watcher = InotifyWatcher::new()?;
-    register_target_watches(&mut watcher, &target_path);
+    register_target_watches(&mut watcher, &target_path)?;
 
     let initial_files = collect_jsonl_files(&target_path);
     let mut pending_retry_files = BTreeSet::new();
-    let mut backoff = Duration::from_millis(250);
 
     match tail_files(
         &initial_files,
@@ -126,38 +208,46 @@ pub fn execute_tail(args: TailArgs) -> Result<(), String> {
     ) {
         Ok(n) => {
             if n > 0 {
-                let _ = save_offsets(&offsets_path, &saved_offsets);
+                save_offsets(&offsets_path, &saved_offsets)?;
             }
         }
         Err(e) => {
             eprintln!("Warning: failed to send tailed inputs to daemon: {e}; retrying...");
             pending_retry_files.extend(initial_files);
-            backoff = (backoff * 2).min(Duration::from_secs(5));
         }
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop));
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop));
+    let runtime_dir = client
+        .api_sock()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::paths::resolve_runtime);
 
-    while !stop.load(Ordering::Relaxed) {
-        let timeout_ms = backoff.as_millis().min(5000) as i32;
-        let events = match watcher.read_events(timeout_ms) {
-            Ok(evs) => evs,
-            Err(e) => {
-                eprintln!("inotify error: {e}");
-                Vec::new()
-            }
+    if !pending_retry_files.is_empty() && !handle.is_stopped() {
+        wait_for_retry_or_stop(
+            &runtime_dir,
+            watcher.raw_fd(),
+            handle.wake_read_fd(),
+            &handle.stop,
+        )?;
+    }
+
+    while !handle.is_stopped() {
+        let events = if pending_retry_files.is_empty() {
+            watcher.read_events(handle.wake_read_fd())?
+        } else {
+            watcher.drain_events()?
         };
 
-        let mut files_to_process = std::mem::take(&mut pending_retry_files);
-        if watcher.is_polling_fallback() {
-            files_to_process.extend(collect_jsonl_files(&target_path));
+        if handle.is_stopped() {
+            break;
         }
+
+        let mut files_to_process = std::mem::take(&mut pending_retry_files);
 
         for (mask, path) in events {
             if (mask & libc::IN_CREATE) != 0 && path.is_dir() {
-                watcher.add_dir(&path);
+                watcher.add_dir(&path)?;
                 if let Ok(entries) = fs::read_dir(&path) {
                     for entry in entries.flatten() {
                         let ep = entry.path();
@@ -189,28 +279,18 @@ pub fn execute_tail(args: TailArgs) -> Result<(), String> {
         ) {
             Ok(emitted) => {
                 if emitted > 0 {
-                    if let Err(e) = save_offsets(&offsets_path, &saved_offsets) {
-                        eprintln!("Warning: failed to save tail offsets: {e}");
-                    }
+                    save_offsets(&offsets_path, &saved_offsets)?;
                 }
-                backoff = Duration::from_millis(250);
             }
             Err(e) => {
                 eprintln!("Warning: failed to send tailed inputs to daemon: {e}; retrying...");
                 pending_retry_files.extend(file_list);
-                // Wait for the daemon's socket dir to change (daemon restart) instead of
-                // spinning; the timeout is only a backstop re-try, never a correctness signal.
-                let watch = client
-                    .api_sock()
-                    .parent()
-                    .and_then(crate::client::watch_dir);
-                let mut pfd = libc::pollfd {
-                    fd: watch.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: one valid pollfd; a negative fd is ignored and poll just waits.
-                unsafe { libc::poll(&mut pfd, 1, 500) };
+                wait_for_retry_or_stop(
+                    &runtime_dir,
+                    watcher.raw_fd(),
+                    handle.wake_read_fd(),
+                    &handle.stop,
+                )?;
             }
         }
     }
@@ -501,22 +581,83 @@ fn save_offsets(path: &Path, offsets: &BTreeMap<String, StoredOffset>) -> Result
     Ok(())
 }
 
-fn register_target_watches(watcher: &mut InotifyWatcher, target: &Path) {
+fn register_target_watches(watcher: &mut InotifyWatcher, target: &Path) -> Result<(), String> {
     if target.is_file() {
-        if let Some(parent) = target.parent() {
-            watcher.add_dir(parent);
-        }
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        watcher.add_dir(parent)?;
     } else if target.is_dir() {
-        watcher.add_dir(target);
-        if let Ok(entries) = fs::read_dir(target) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    watcher.add_dir(&p);
-                }
+        watcher.add_dir(target)?;
+        let entries = fs::read_dir(target)
+            .map_err(|e| format!("failed to read directory '{}': {e}", target.display()))?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                watcher.add_dir(&p)?;
             }
         }
+    } else if let Some(parent) = target.parent().filter(|p| p.is_dir()) {
+        watcher.add_dir(parent)?;
+    } else {
+        return Err(format!("target path '{}' does not exist", target.display()));
     }
+    Ok(())
+}
+
+/// Blocks on `poll(..., -1)` until the daemon runtime directory changes (`api.sock` restart),
+/// a transcript file changes, or the stop wakeup pipe fires.
+fn wait_for_retry_or_stop(
+    runtime_dir: &Path,
+    transcript_inotify_fd: RawFd,
+    wake_fd: RawFd,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    if stop.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let watch = crate::client::watch_dir(runtime_dir).ok_or_else(|| {
+        format!(
+            "inotify failed to watch daemon runtime directory '{}'",
+            runtime_dir.display()
+        )
+    })?;
+    let mut pfds = [
+        libc::pollfd {
+            fd: watch.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: transcript_inotify_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: `pfds` contains 3 valid file descriptors; blocks indefinitely until a kernel
+    // inotify event or wakeup pipe write without any timed poll sleep.
+    let res = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+    if res < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(format!("poll failed while waiting for daemon retry: {err}"));
+        }
+    } else if (pfds[2].revents & libc::POLLIN) != 0 {
+        drain_pipe_fd(wake_fd);
+    }
+    Ok(())
+}
+
+fn drain_pipe_fd(fd: RawFd) {
+    let mut buf = [0u8; 64];
+    // SAFETY: `fd` is a valid non-blocking pipe file descriptor and `buf` is a local array.
+    while unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) } > 0 {}
 }
 
 /// Thin wrapper managing Linux inotify file descriptor and watches.
@@ -527,12 +668,16 @@ struct InotifyWatcher {
 }
 
 impl InotifyWatcher {
-    /// Initializes non-blocking inotify instance with `FD_CLOEXEC`, falling back to
-    /// poll-driven directory scans if the user or system inotify limit is exhausted.
+    /// Initializes a non-blocking inotify instance with `FD_CLOEXEC`, failing loudly if
+    /// `inotify_init1` fails.
     fn new() -> Result<Self, String> {
-        // SAFETY: libc::inotify_init1 takes valid flags. IN_NONBLOCK ensures poll-driven non-blocking I/O,
+        // SAFETY: libc::inotify_init1 takes valid flags. IN_NONBLOCK ensures non-blocking reads,
         // and IN_CLOEXEC prevents file descriptor leaks across process execution.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(format!("inotify_init1 failed: {err}"));
+        }
         Ok(Self {
             fd,
             wd_to_dir: HashMap::new(),
@@ -540,22 +685,18 @@ impl InotifyWatcher {
         })
     }
 
-    fn is_polling_fallback(&self) -> bool {
-        self.fd < 0
+    fn raw_fd(&self) -> RawFd {
+        self.fd
     }
 
-    /// Adds a directory watch descriptor for transcript modifications and directory creation.
-    fn add_dir(&mut self, dir: &Path) -> bool {
-        if self.fd < 0 {
-            return false;
-        }
+    /// Adds a directory watch descriptor for transcript modifications and directory creation,
+    /// failing loudly if `inotify_add_watch` fails.
+    fn add_dir(&mut self, dir: &Path) -> Result<(), String> {
         if self.dir_to_wd.contains_key(dir) {
-            return true;
+            return Ok(());
         }
-        let c_path = match CString::new(dir.as_os_str().as_bytes()) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
+        let c_path = CString::new(dir.as_os_str().as_bytes())
+            .map_err(|e| format!("invalid directory path '{}': {e}", dir.display()))?;
         const WATCH_MASK: u32 = libc::IN_MODIFY
             | libc::IN_CLOSE_WRITE
             | libc::IN_CREATE
@@ -564,29 +705,34 @@ impl InotifyWatcher {
         // SAFETY: self.fd is a valid inotify file descriptor, and c_path is a null-terminated C string.
         let wd = unsafe { libc::inotify_add_watch(self.fd, c_path.as_ptr(), WATCH_MASK) };
         if wd < 0 {
-            return false;
+            let err = io::Error::last_os_error();
+            return Err(format!(
+                "inotify_add_watch failed for '{}': {err}",
+                dir.display()
+            ));
         }
         self.wd_to_dir.insert(wd, dir.to_path_buf());
         self.dir_to_wd.insert(dir.to_path_buf(), wd);
-        true
+        Ok(())
     }
 
-    /// Polls for inotify events with `timeout_ms` and returns parsed events.
-    fn read_events(&mut self, timeout_ms: i32) -> Result<Vec<(u32, PathBuf)>, String> {
-        if self.fd < 0 {
-            // Poll-based fallback when inotify instances are exhausted
-            unsafe {
-                let _ = libc::poll(std::ptr::null_mut(), 0, timeout_ms.min(100));
-            }
-            return Ok(Vec::new());
-        }
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: &mut pfd points to a valid pollfd struct for exactly 1 descriptor.
-        let res = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    /// Blocks in `poll(..., -1)` on the inotify descriptor and `wake_fd`, then drains and
+    /// returns parsed inotify events.
+    fn read_events(&mut self, wake_fd: RawFd) -> Result<Vec<(u32, PathBuf)>, String> {
+        let mut pfds = [
+            libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `pfds` points to 2 valid descriptors (`self.fd` and `wake_fd`).
+        let res = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
         if res < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -594,10 +740,19 @@ impl InotifyWatcher {
             }
             return Err(format!("inotify poll failed: {err}"));
         }
-        if res == 0 || (pfd.revents & libc::POLLIN) == 0 {
+        if (pfds[1].revents & libc::POLLIN) != 0 {
+            drain_pipe_fd(wake_fd);
+            return Ok(Vec::new());
+        }
+        if res == 0 || (pfds[0].revents & libc::POLLIN) == 0 {
             return Ok(Vec::new());
         }
 
+        self.drain_events()
+    }
+
+    /// Reads all currently queued events from the non-blocking inotify descriptor.
+    fn drain_events(&mut self) -> Result<Vec<(u32, PathBuf)>, String> {
         let mut events = Vec::new();
         let mut buf = [0u8; 8192];
         loop {

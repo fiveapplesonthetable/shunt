@@ -1406,8 +1406,8 @@ fn test_pluggable_traits_and_project_policy_unification() {
         .render_tachoenv("wt-alpha", 0, "/cache", &BTreeMap::new())
         .unwrap();
     assert!(env_text.contains("TACHO_PORT_BASE="));
-    assert!(env_text.contains("CARGO_TARGET_DIR=/cache/warm/slot-0/target"));
-    assert!(env_text.contains("DATABASE_URL=postgres://"));
+    assert!(env_text.contains("CARGO_TARGET_DIR='/cache/warm/slot-0/target'"));
+    assert!(env_text.contains("DATABASE_URL='postgres://"));
 
     // 5. WatcherPlugin: custom workflow and deploy gates
     let watcher = DefaultWatcherPlugin::default();
@@ -1684,7 +1684,7 @@ fn test_multi_tick_adversarial_simulation_across_all_concerns() {
     state5.batches.push(b3);
 
     let obs5 = WorldObservation {
-        now: 2_500,
+        now: 5_500,
         main_sha: "main-001".to_string(),
         open_prs: vec![pr101],
         live_keys: BTreeSet::from(["live-worker".to_string()]),
@@ -1998,4 +1998,111 @@ mod torture_proptests {
             prop_assert!(!rendered_issue.contains(&sk_token));
         }
     }
+}
+
+#[test]
+fn test_decide_populates_tell_actions_and_worktree_removal() {
+    use crate::decide::{decide, DecisionState, WorldObservation};
+
+    let mut state = DecisionState::default();
+    state.agents.insert(
+        "live-stalled".to_string(),
+        AgentRun {
+            key: "live-stalled".to_string(),
+            worktree: "/tmp/wt/live-stalled".to_string(),
+            started_at: 100,
+            ..Default::default()
+        },
+    );
+    state.samples.insert(
+        "live-stalled".to_string(),
+        vec![
+            ProgressSample {
+                ts: 100,
+                log_bytes: 0,
+                head_sha: String::new(),
+                dirty_files: 0,
+                cpu_ticks: 0,
+            },
+            ProgressSample {
+                ts: 2_000,
+                log_bytes: 0,
+                head_sha: String::new(),
+                dirty_files: 0,
+                cpu_ticks: 1,
+            },
+        ],
+    );
+    state.agents.insert(
+        "retired-agent".to_string(),
+        AgentRun {
+            key: "retired-agent".to_string(),
+            worktree: "/tmp/wt/retired-agent".to_string(),
+            started_at: 100,
+            finished_at: Some(200),
+            exit_code: Some(0),
+            ..Default::default()
+        },
+    );
+    state.agents.insert(
+        "merged-agent".to_string(),
+        AgentRun {
+            key: "merged-agent".to_string(),
+            worktree: "/tmp/wt/merged-agent".to_string(),
+            started_at: 100,
+            finished_at: Some(200),
+            exit_code: Some(0),
+            pr: Some(77),
+            pr_source: Some("stated".to_string()),
+            ..Default::default()
+        },
+    );
+    state.retired.insert("retired-agent".to_string());
+    state.merged_prs.insert(77);
+    state.inbox.insert(
+        "live-stalled".to_string(),
+        vec!["please focus on auth".to_string()],
+    );
+
+    let mut obs = WorldObservation {
+        now: 3_000,
+        main_sha: "1111111111111111111111111111111111111111".to_string(),
+        ..Default::default()
+    };
+    obs.live_keys.insert("live-stalled".to_string());
+    obs.agent_samples.insert(
+        "live-stalled".to_string(),
+        ProgressSample {
+            ts: 3_000,
+            log_bytes: 0,
+            head_sha: String::new(),
+            dirty_files: 0,
+            cpu_ticks: 2,
+        },
+    );
+
+    let plan = decide(&state, &obs);
+
+    assert!(plan
+        .tell_actions
+        .iter()
+        .any(|(k, m)| k == "live-stalled" && m == "please focus on auth"));
+    assert!(plan
+        .tell_actions
+        .iter()
+        .any(|(k, m)| k == "live-stalled" && m.contains("Stall nudge")));
+    assert!(!plan.next_state.inbox.contains_key("live-stalled"));
+
+    assert!(plan.tidy_decisions.iter().any(|d| matches!(
+        d,
+        TidyDecision::RemoveTree { path, rescue: false, .. } if path == "/tmp/wt/retired-agent"
+    )));
+    assert!(plan.tidy_decisions.iter().any(|d| matches!(
+        d,
+        TidyDecision::RemoveTree { path, rescue: false, .. } if path == "/tmp/wt/merged-agent"
+    )));
+    assert!(!plan.tidy_decisions.iter().any(|d| matches!(
+        d,
+        TidyDecision::RemoveTree { path, .. } if path == "/tmp/wt/live-stalled"
+    )));
 }

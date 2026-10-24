@@ -23,8 +23,8 @@ use tacho_core::{Scrubber, TaskStatus};
 use crate::cli::{BatchArgs, FlakesArgs};
 
 use super::store::{
-    emit_decision_event, load_fleet_env, now_ns, now_secs, open_fleet_store, resolve_live_main_sha,
-    resolve_live_pr_heads,
+    emit_decision_event, load_fleet_env, now_ns, now_secs, open_fleet_store,
+    record_batch_pid_identity, resolve_live_main_sha, resolve_live_pr_heads,
 };
 
 /// Origin of a batch verification run:
@@ -216,16 +216,27 @@ pub fn launch_detached_batch(opts: &BatchOptions) -> io::Result<PathBuf> {
     for (k, v) in &merged_env {
         cmd.env(k, v);
     }
+    let fleet_tmp = home.join("tmp").join(format!("batch-{batch_id}"));
+    fs::create_dir_all(&fleet_tmp)?;
+    let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
+    let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
     cmd.env("TACHO_HOME", &home)
         .env("TACHO_BATCH_FOREGROUND", "1")
         .env("TACHO_BATCH_DETACHED", "0")
         .env("TACHO_BATCH_ORIGIN", opts.origin.as_str())
+        .env("TMPDIR", &fleet_tmp_str)
+        .env("TMP", &fleet_tmp_str)
+        .env("TEMP", &fleet_tmp_str)
+        .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file))
         .process_group(0);
 
-    let _child = cmd.spawn()?;
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    record_batch_pid_identity(&batch_id, pid)?;
     let because = format!(
         "spawned detached {} batch logging to {}",
         opts.origin.as_str(),
@@ -488,6 +499,12 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
     );
 
     let merged_env = load_fleet_env(opts.env_file.as_deref());
+    record_batch_pid_identity(&batch_id, std::process::id())?;
+    let home = crate::paths::resolve_home();
+    let fleet_tmp = home.join("tmp").join(format!("batch-{batch_id}"));
+    fs::create_dir_all(&fleet_tmp)?;
+    let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
+    let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
     let run_probe = |k: usize, label: &str| -> io::Result<(bool, bool, String, u64, u64)> {
         let p_start = now_ns();
         let prefix_prs: Vec<String> = pr_nums.iter().take(k).map(|n| n.to_string()).collect();
@@ -518,6 +535,11 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             .env("TACHO_BATCH_PROBE_K", k.to_string())
             .env("TACHO_BATCH_PROBE_PRS", prefix_prs.join(","))
             .env("TACHO_BATCH_LABEL", label)
+            .env("TMPDIR", &fleet_tmp_str)
+            .env("TMP", &fleet_tmp_str)
+            .env("TEMP", &fleet_tmp_str)
+            .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()?;
         let p_end = now_ns();
         let raw_txt = format!(
@@ -531,13 +553,13 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
     };
 
     let (ok, timed_out, mut log_text, p0_start, p0_end) = run_probe(pr_nums.len(), "r0")?;
-    let _ = store.emit_duration_slice(
+    store.emit_duration_slice(
         &format!("batch:{batch_id}"),
         &format!("check PRs {:?}", pr_nums),
         p0_start,
         p0_end,
         &check_cmd,
-    );
+    )?;
 
     if timed_out {
         let area_name = area_list.first().map(String::as_str).unwrap_or("workspace");
@@ -626,13 +648,13 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         let f_tests_initial = failed_tests(&log_text);
         let (retry_ok, _retry_to, retry_log, r_start, r_end) =
             run_probe(pr_nums.len(), "r0-again")?;
-        let _ = store.emit_duration_slice(
+        store.emit_duration_slice(
             &format!("batch:{batch_id}"),
             "retry r0-again",
             r_start,
             r_end,
             "flake retry on failure without counterexample",
-        );
+        )?;
         if retry_ok {
             flaked_on_retry = true;
             recorded_flake_names = if f_tests_initial.is_empty() {
@@ -780,13 +802,13 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         })?;
         for &pr in &pr_nums {
             if let Some(a) = state.agents.values().find(|a| a.pr == Some(pr)) {
-                let _ = store.emit_state_band(
+                store.emit_state_band(
                     &format!("task:{}/state", base_key(&a.key)),
                     "Done",
                     TaskStatus::Done,
                     &because,
                     now_ns(),
-                );
+                )?;
             }
         }
         emit_decision_event(&format!("batch:{batch_id}"), "verify:pass", &because);
@@ -812,13 +834,13 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         };
         while let ProbeStep::Probe(k) = next_probe(&bisect) {
             let (probe_ok, _probe_to, probe_log, ps, pe) = run_probe(k, &format!("bisect-k{k}"))?;
-            let _ = store.emit_duration_slice(
+            store.emit_duration_slice(
                 &format!("batch:{batch_id}"),
                 &format!("bisect k={k}"),
                 ps,
                 pe,
                 &format!("probe k={k} ok={probe_ok}"),
-            );
+            )?;
             if !probe_ok && k > 0 {
                 log_text = probe_log;
                 kind = classify(&log_text).to_string();
@@ -857,13 +879,13 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             store.mutate(Some(("verify", "main_broken", &batch_id, &because)), |st| {
                 st.batches.push(b_run);
             })?;
-            let _ = store.emit_duration_slice(
+            store.emit_duration_slice(
                 &format!("batch:{batch_id}"),
                 "main-broken",
                 batch_start_ns,
                 now_ns(),
                 &because,
-            );
+            )?;
             eprintln!("Batch {batch_id} MAIN BROKEN: {sum}");
             return Err(io::Error::other(because));
         }
@@ -922,13 +944,13 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         let parent_map = parents(&state.open_prs_cache);
         if let Some(c_pr) = culprit {
             if let Some(a) = state.agents.values().find(|a| a.pr == Some(c_pr)) {
-                let _ = store.emit_state_band(
+                store.emit_state_band(
                     &format!("task:{}/state", base_key(&a.key)),
                     "Failed",
                     TaskStatus::Failed,
                     &because,
                     now_ns(),
-                );
+                )?;
             }
             let reruns = reruns_on_red(&pr_nums, c_pr, &parent_map);
             eprintln!("Batch {batch_id} FAILED: {sum} (culprit PR #{c_pr}, reruns={reruns:?})");
@@ -936,7 +958,9 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 let mut rerun_opts = opts.clone();
                 rerun_opts.prs = reruns;
                 rerun_opts.dry_run = false;
-                let _ = execute_batch_with(rerun_opts);
+                if let Err(rerun_err) = execute_batch_with(rerun_opts) {
+                    eprintln!("Rerun batch failed: {rerun_err}");
+                }
             }
         } else {
             eprintln!("Batch {batch_id} FAILED: {sum}");

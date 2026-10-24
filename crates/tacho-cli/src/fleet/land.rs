@@ -114,13 +114,13 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
                     }
                 }
             })?;
-            let _ = store.emit_state_band(
+            store.emit_state_band(
                 &format!("train:{}", open.id),
                 "mismatch",
                 TaskStatus::Failed,
                 &err,
                 now_ns(),
-            );
+            )?;
             emit_decision_event(&format!("train:{}", open.id), "land:mismatch", &err);
             return Err(io::Error::other(err));
         }
@@ -135,13 +135,13 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
                 }
             }
         })?;
-        let _ = store.emit_state_band(
+        store.emit_state_band(
             &format!("train:{}", open.id),
             "landed",
             TaskStatus::Done,
             &because,
             now_ns(),
-        );
+        )?;
         emit_decision_event(&format!("train:{}", open.id), "land:done", &because);
         println!("{because}");
         return Ok(());

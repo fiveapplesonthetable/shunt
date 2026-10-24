@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::paths::{ensure_dir_0700, resolve_home, resolve_runtime};
 
@@ -64,7 +64,7 @@ impl DaemonClient {
     }
 
     /// Connects to `api.sock`. If the daemon is not running, launches it detached
-    /// and waits for kernel inotify event or process exit.
+    /// and blocks on kernel inotify events or process exit (`pidfd`).
     pub fn connect_api(&self) -> io::Result<UnixStream> {
         let sock = self.api_sock();
 
@@ -73,47 +73,92 @@ impl DaemonClient {
             return Ok(stream);
         }
 
+        ensure_dir_0700(&self.home_dir)?;
+        ensure_dir_0700(&self.runtime_dir)?;
+        let inotify = watch_dir(&self.runtime_dir).ok_or_else(|| {
+            io::Error::other(format!(
+                "inotify unavailable for watching runtime directory {:?}",
+                self.runtime_dir
+            ))
+        })?;
+
         // 2. Daemon not responding; spawn it detached
         let mut spawned_child = self.spawn_daemon_detached()?;
+        let child_pidfd = spawned_child.as_ref().and_then(|child| {
+            use std::os::fd::FromRawFd;
+            let raw =
+                unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as i32 };
+            (raw >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+        });
 
-        // 3. Wait on a kernel inotify event for api.sock to appear and accept connections.
-        // The fd is owned so every return path closes it. The poll timeout is only a backstop
-        // re-check (e.g. if inotify is unavailable); correctness comes from the events.
-        let inotify = watch_dir(&self.runtime_dir);
-        let cap = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < cap {
+        // 3. Block on kernel inotify events for api.sock or child pidfd exit (no timed poll).
+        loop {
             if let Ok(stream) = UnixStream::connect(&sock) {
                 return Ok(stream);
             }
             if let Some(ref mut child) = spawned_child {
                 if let Ok(Some(status)) = child.try_wait() {
+                    if let Ok(stream) = UnixStream::connect(&sock) {
+                        return Ok(stream);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         format!("tachograph daemon process exited prematurely with {status}"),
                     ));
                 }
+            } else if !self.is_daemon_or_spawn_locked() {
+                if let Ok(stream) = UnixStream::connect(&sock) {
+                    return Ok(stream);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!(
+                        "tachograph daemon failed to start and respond at {:?}",
+                        sock
+                    ),
+                ));
             }
-            let mut pfd = libc::pollfd {
-                fd: inotify.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one valid pollfd (a negative fd is ignored by poll).
-            unsafe { libc::poll(&mut pfd, 1, 250) };
-            if let Some(ref fd) = inotify {
-                let mut buf = [0u8; 4096];
-                // SAFETY: reading into a local buffer from a non-blocking fd we own.
-                unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            let mut pfds = [
+                libc::pollfd {
+                    fd: inotify.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: child_pidfd.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: valid pollfd array; negative fd in pfds[1] is ignored by poll.
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            let mut buf = [0u8; 4096];
+            // SAFETY: reading into a local buffer from a non-blocking fd we own.
+            while unsafe { libc::read(inotify.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0
+            {
             }
         }
+    }
 
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "tachograph daemon failed to start and respond at {:?}",
-                sock
-            ),
-        ))
+    fn is_daemon_or_spawn_locked(&self) -> bool {
+        for name in ["spawn.lock", "daemon.lock"] {
+            let p = self.runtime_dir.join(name);
+            if let Ok(f) = OpenOptions::new().read(true).write(true).open(&p) {
+                let res = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if res != 0 {
+                    return true;
+                }
+                let _ = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+            }
+        }
+        false
     }
 
     /// Tries connecting to `api.sock` immediately without spawning a daemon.
@@ -309,7 +354,12 @@ pub(crate) fn watch_dir(dir: &std::path::Path) -> Option<std::os::fd::OwnedFd> {
     }
     // SAFETY: `raw` is a fresh fd we exclusively own.
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    let mask = libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB;
+    let mask = libc::IN_CREATE
+        | libc::IN_MOVED_TO
+        | libc::IN_ATTRIB
+        | libc::IN_CLOSE_WRITE
+        | libc::IN_CLOSE_NOWRITE
+        | libc::IN_DELETE;
     // SAFETY: valid fd and NUL-terminated path.
     let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path_c.as_ptr(), mask) };
     (wd >= 0).then_some(fd)

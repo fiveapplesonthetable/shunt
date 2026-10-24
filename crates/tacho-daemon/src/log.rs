@@ -39,23 +39,33 @@ impl EventLog {
                 track_key TEXT NOT NULL,
                 cause_seq INTEGER,
                 agent TEXT,
-                body BLOB NOT NULL
+                body BLOB NOT NULL,
+                counter_value INTEGER,
+                custom_name TEXT
             );",
             [],
         )?;
 
-        let _ = conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts_ns);",
             [],
-        );
+        )?;
 
-        let _ = conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_kind_seq ON events(kind, seq);",
             [],
-        );
+        )?;
 
-        let _ = conn.execute("ALTER TABLE events ADD COLUMN counter_value INTEGER;", []);
-        let _ = conn.execute("ALTER TABLE events ADD COLUMN custom_name TEXT;", []);
+        for col_sql in [
+            "ALTER TABLE events ADD COLUMN counter_value INTEGER;",
+            "ALTER TABLE events ADD COLUMN custom_name TEXT;",
+        ] {
+            if let Err(e) = conn.execute(col_sql, []) {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+            }
+        }
 
         Ok(Self { conn })
     }
@@ -81,15 +91,15 @@ impl EventLog {
             [],
         )?;
 
-        let _ = conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts_ns);",
             [],
-        );
+        )?;
 
-        let _ = conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_kind_seq ON events(kind, seq);",
             [],
-        );
+        )?;
 
         Ok(Self { conn })
     }
@@ -124,7 +134,9 @@ impl EventLog {
 
             for ev in iter {
                 body_buf.clear();
-                let _ = ev.body.encode(&mut body_buf);
+                ev.body
+                    .encode(&mut body_buf)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
                 stmt.execute(params![
                     ev.seq,

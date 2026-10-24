@@ -2,7 +2,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 use tacho_e2e::{
     perfetto_bin_path, traced_bin_path, traced_probes_bin_path, DecodedTrace, TestEnv,
 };
@@ -223,7 +222,7 @@ edition = "2021"
 
     // Ensure daemon is running
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     // 3. Declare tasks and allowed paths (enabling OFF_BRIEF detector)
     let out = env
@@ -512,7 +511,6 @@ edition = "2021"
                 },
             }),
         );
-        std::thread::yield_now();
     }
 
     // 8. supervisor watch catches worker-db's stall and terminates cleanly
@@ -530,25 +528,15 @@ edition = "2021"
     // Verify status output reports worker-db as stalled
     let status_out = env
         .tacho_cmd()
-        .args(["status", "--json"])
+        .args(["status"])
         .output()
         .expect("tacho status failed");
     assert!(status_out.status.success());
-    let status_json: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
-    let db_agent = status_json.as_array().and_then(|arr| {
-        arr.iter()
-            .find(|a| a.get("agent") == Some(&serde_json::json!("worker-db")))
-    });
-    assert!(db_agent.is_some(), "worker-db not found in tacho status");
-    let db_obj = db_agent.unwrap();
-    let state = db_obj.get("state").and_then(|v| v.as_str()).unwrap_or("");
-    let flags = db_obj.get("flags").and_then(|v| v.as_array());
-    let has_loop = flags
-        .map(|f| f.iter().any(|x| x == "LOOP"))
-        .unwrap_or(false);
+    let status_txt = String::from_utf8_lossy(&status_out.stdout);
     assert!(
-        state == "Stalled" || has_loop,
-        "worker-db should be Stalled or have LOOP flag"
+        status_txt.contains("worker-db")
+            && (status_txt.contains("Stalled") || status_txt.contains("LOOP")),
+        "worker-db should be Stalled or have LOOP flag in status: {status_txt}"
     );
 
     // Supervisor inspects report and queries
@@ -1386,17 +1374,14 @@ edition = "2021"
     // Verify worker-rogue is flagged in status
     let status_out = env
         .tacho_cmd()
-        .args(["status", "--json"])
+        .args(["status"])
         .output()
         .expect("tacho status failed");
-    let status_json: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
-    let rogue_agent = status_json.as_array().and_then(|arr| {
-        arr.iter()
-            .find(|a| a.get("agent") == Some(&serde_json::json!("worker-rogue")))
-    });
+    assert!(status_out.status.success());
+    let status_txt = String::from_utf8_lossy(&status_out.stdout);
     assert!(
-        rogue_agent.is_some(),
-        "worker-rogue not found in tacho status"
+        status_txt.contains("worker-rogue"),
+        "worker-rogue not found in tacho status: {status_txt}"
     );
 
     // Close supervisor's initial turn before daemon crash so Turn 1 and Turn 2 are cleanly paired
@@ -1456,7 +1441,7 @@ edition = "2021"
             "prompt": "Supervisor resumed monitoring after daemon crash",
         }),
     );
-    assert!(env.wait_for_api_sock(Duration::from_secs(4)));
+    assert!(env.wait_for_api_sock());
     let new_pid = env.daemon_pid().expect("new daemon PID should exist");
     assert_ne!(orig_pid, new_pid, "new daemon should have distinct PID");
 

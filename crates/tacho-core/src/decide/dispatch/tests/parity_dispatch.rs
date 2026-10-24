@@ -449,7 +449,7 @@ fn parity_014_resume_falls_back_to_task_when_switching_to_provider_without_sessi
     let session = Session {
         name: "codex-prof".to_string(),
         provider: "codex".to_string(),
-        model: "gpt-6-luna".to_string(),
+        model: "gpt-5.4".to_string(),
     };
     let mut stopped = BTreeMap::new();
     stopped.insert(
@@ -481,12 +481,12 @@ fn parity_014_resume_falls_back_to_task_when_switching_to_provider_without_sessi
     let ActionKind::Start(spec) = &actions[0].kind else {
         panic!("expected Start");
     };
-    assert_eq!(&spec.argv[..4], &["codex", "exec", "--model", "gpt-6-luna"]);
+    assert_eq!(&spec.argv[..4], &["codex", "exec", "--model", "gpt-5.4"]);
     assert!(!spec.argv.contains(&"--resume".to_string()));
     assert!(spec.brief.contains("original task body"));
     assert!(spec.brief.contains("/tmp/wt-legacy"));
     let r2 = &state.runs["legacy-task~2"];
     assert_eq!(r2.provider, "codex");
-    assert_eq!(r2.model, "gpt-6-luna");
+    assert_eq!(r2.model, "gpt-5.4");
     assert_eq!(r2.session.as_deref().unwrap_or(""), "");
 }

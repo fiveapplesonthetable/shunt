@@ -183,7 +183,14 @@ fn test_real_cli_binary_end_to_end() {
     let json_stdout = String::from_utf8_lossy(&out.stdout);
     let status_val: serde_json::Value =
         serde_json::from_str(&json_stdout).expect("valid JSON from tacho status --json");
-    assert!(status_val.is_array(), "Expected JSON array of agents");
+    assert!(
+        status_val.is_array()
+            || status_val
+                .get("agents")
+                .and_then(|v| v.as_array())
+                .is_some(),
+        "Expected JSON array of agents or StatusSnapshot object with agents array, got: {status_val}"
+    );
 
     // 6. `tacho trace -o <path>`
     let trace_path = temp.path().join("cli_test_trace.pftrace");

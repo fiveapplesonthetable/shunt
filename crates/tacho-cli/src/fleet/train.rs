@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use tacho_core::decide::dispatch::{PullFacts, TodoItem};
@@ -403,12 +403,12 @@ pub fn assemble_train(
     })?;
 
     if opts.run_batch {
-        let _ = execute_batch_with(BatchOptions {
+        execute_batch_with(BatchOptions {
             prs: train.prs.clone(),
             origin: BatchOrigin::Train,
             foreground: true,
             ..Default::default()
-        });
+        })?;
     }
 
     Ok(train)
@@ -490,13 +490,13 @@ pub fn execute_train_with(args: TrainOptions) -> io::Result<()> {
         store.mutate(Some(("land", "train_open", &tid, &because)), |st| {
             st.trains = with_train(&st.trains, train);
         })?;
-        let _ = store.emit_state_band(
+        store.emit_state_band(
             &format!("train:{tid}"),
             "open",
             TaskStatus::InProgress,
             &because,
             now_ns(),
-        );
+        )?;
         emit_decision_event(&format!("train:{tid}"), "land:train_open", &because);
         println!("{because}");
         return Ok(());
@@ -610,6 +610,128 @@ pub fn execute_release_train(args: ReleaseTrainArgs) -> io::Result<()> {
     execute_release_train_with(ReleaseTrainOptions::from(args))
 }
 
+/// Removes a scratch worktree created during release-train verification, returning an error if cleanup fails.
+pub fn cleanup_scratch_worktree(repo_root: &Path, scratch_wt: &Path) -> Result<(), String> {
+    let out = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(scratch_wt)
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| {
+            format!(
+                "git worktree remove failed for {}: {e}",
+                scratch_wt.display()
+            )
+        })?;
+    if !out.status.success() && scratch_wt.exists() {
+        std::fs::remove_dir_all(scratch_wt).map_err(|e| {
+            format!(
+                "git worktree remove failed ({}) and remove_dir_all failed for {}: {e}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                scratch_wt.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn verify_train_compilation_in_scratch(
+    cwd: &Path,
+    initial_main: &str,
+    slice: &[u64],
+    open_prs_cache: &[PullFacts],
+    compile_cmd: &str,
+    cleanup_err_slot: &mut Option<String>,
+) -> Result<(), String> {
+    let prs_str = slice
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let scratch_path = scratch.path().join("wt");
+    let add_out = Command::new("git")
+        .args(["worktree", "add", "--detach"])
+        .arg(&scratch_path)
+        .arg(initial_main)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("git worktree add failed: {e}"))?;
+    if !add_out.status.success() {
+        return Err(format!(
+            "Failed to create scratch worktree at {initial_main}: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        ));
+    }
+
+    for &pr_num in slice {
+        let Some(pr) = open_prs_cache.iter().find(|p| p.number == pr_num) else {
+            if let Err(ce) = cleanup_scratch_worktree(cwd, &scratch_path) {
+                *cleanup_err_slot = Some(ce.clone());
+                return Err(ce);
+            }
+            return Err(format!("PR #{pr_num} not found in open PR cache"));
+        };
+        let merge_out = match Command::new("git")
+            .args(["merge", "--no-ff", "--no-edit", &pr.head])
+            .current_dir(&scratch_path)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                if let Err(ce) = cleanup_scratch_worktree(cwd, &scratch_path) {
+                    *cleanup_err_slot = Some(ce.clone());
+                    return Err(ce);
+                }
+                return Err(e.to_string());
+            }
+        };
+        if !merge_out.status.success() {
+            if let Err(ce) = cleanup_scratch_worktree(cwd, &scratch_path) {
+                *cleanup_err_slot = Some(ce.clone());
+                return Err(ce);
+            }
+            return Err(format!(
+                "Merge conflict merging PR #{pr_num} ({}) onto train: {}",
+                pr.head,
+                String::from_utf8_lossy(&merge_out.stderr)
+            ));
+        }
+    }
+
+    let out = match Command::new("bash")
+        .args(["-c", compile_cmd])
+        .current_dir(&scratch_path)
+        .env("TACHO_TRAIN_SLICE_PRS", &prs_str)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            if let Err(ce) = cleanup_scratch_worktree(cwd, &scratch_path) {
+                *cleanup_err_slot = Some(ce.clone());
+                return Err(ce);
+            }
+            return Err(e.to_string());
+        }
+    };
+
+    if let Err(ce) = cleanup_scratch_worktree(cwd, &scratch_path) {
+        *cleanup_err_slot = Some(ce.clone());
+        return Err(ce);
+    }
+
+    if !out.status.success() {
+        let err_txt = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return Err(err_txt.trim().to_string());
+    }
+    Ok(())
+}
+
 /// Executes `tacho release-train` with [`ReleaseTrainOptions`].
 pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
     let mut store = open_fleet_store()?;
@@ -635,106 +757,20 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
             "merged-tree compile command cannot be empty before release-train",
         ));
     }
+    let mut cleanup_error: Option<String> = None;
     let (surviving, dropped) = drop_breakers(&ordered_nums, &parent_map, |slice| {
-        let prs_str = slice
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // Build the merged tree for the slice in a scratch worktree
-        let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let scratch_path = scratch.path();
-        let add_out = Command::new("git")
-            .args(["worktree", "add", "--detach"])
-            .arg(scratch_path)
-            .arg(&initial_main)
-            .current_dir(&cwd)
-            .output()
-            .map_err(|e| format!("git worktree add failed: {e}"))?;
-        if !add_out.status.success() {
-            return Err(format!(
-                "Failed to create scratch worktree at {initial_main}: {}",
-                String::from_utf8_lossy(&add_out.stderr)
-            ));
-        }
-
-        struct ScratchWorktreeGuard<'a> {
-            scratch_path: PathBuf,
-            cwd: &'a Path,
-            removed: bool,
-        }
-
-        impl<'a> ScratchWorktreeGuard<'a> {
-            fn new(scratch_path: PathBuf, cwd: &'a Path) -> Self {
-                Self {
-                    scratch_path,
-                    cwd,
-                    removed: false,
-                }
-            }
-
-            fn remove(&mut self) {
-                if !self.removed {
-                    self.removed = true;
-                    let _ = Command::new("git")
-                        .args(["worktree", "remove", "--force"])
-                        .arg(&self.scratch_path)
-                        .current_dir(self.cwd)
-                        .output();
-                }
-            }
-        }
-
-        impl<'a> Drop for ScratchWorktreeGuard<'a> {
-            fn drop(&mut self) {
-                self.remove();
-            }
-        }
-
-        let mut guard = ScratchWorktreeGuard::new(scratch_path.to_path_buf(), &cwd);
-
-        // Merge each PR head into scratch worktree
-        for &pr_num in slice {
-            let Some(pr) = state.open_prs_cache.iter().find(|p| p.number == pr_num) else {
-                guard.remove();
-                return Err(format!("PR #{pr_num} not found in open PR cache"));
-            };
-            let merge_out = Command::new("git")
-                .args(["merge", "--no-ff", "--no-edit", &pr.head])
-                .current_dir(scratch_path)
-                .output()
-                .map_err(|e| e.to_string())?;
-            if !merge_out.status.success() {
-                guard.remove();
-                return Err(format!(
-                    "Merge conflict merging PR #{pr_num} ({}) onto train: {}",
-                    pr.head,
-                    String::from_utf8_lossy(&merge_out.stderr)
-                ));
-            }
-        }
-
-        // Compile the merged slice inside the scratch worktree
-        let out = Command::new("bash")
-            .args(["-c", &compile_cmd])
-            .current_dir(scratch_path)
-            .env("TACHO_TRAIN_SLICE_PRS", &prs_str)
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        guard.remove();
-
-        if !out.status.success() {
-            let err_txt = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            return Err(err_txt.trim().to_string());
-        }
-        Ok(())
+        verify_train_compilation_in_scratch(
+            &cwd,
+            &initial_main,
+            slice,
+            &state.open_prs_cache,
+            &compile_cmd,
+            &mut cleanup_error,
+        )
     });
+    if let Some(ce) = cleanup_error {
+        return Err(io::Error::other(ce));
+    }
 
     let mut changed_union = BTreeSet::new();
     let mut member_shas = BTreeMap::new();
@@ -763,10 +799,15 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
     let changed_vec: Vec<String> = changed_union.into_iter().collect();
     let settled_cmds = settle(&changed_vec, &state.generators);
     for cmd in &settled_cmds {
-        let _ = Command::new("bash")
+        let status = Command::new("bash")
             .args(["-c", cmd])
             .current_dir(&cwd)
-            .status();
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "generator command '{cmd}' failed with {status}"
+            )));
+        }
     }
 
     let head = Command::new("git")
@@ -831,9 +872,9 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
         .cloned()
         .unwrap_or(NoticeState::Pending);
     let (next_notice, _) = transition_release_notice(&prev_notice, &head, now, |_| Ok(()));
-    let _ = mutate_fleet_meta(|m| {
+    mutate_fleet_meta(|m| {
         m.train_notices.insert(tpr.branch.clone(), next_notice);
-    });
+    })?;
 
     if !settled_cmds.is_empty() {
         println!("Settled generators: {:?}", settled_cmds);

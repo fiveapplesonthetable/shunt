@@ -16,7 +16,7 @@ fn test_status_vs_agents_now_sql() {
 
     // Ensure daemon is running
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

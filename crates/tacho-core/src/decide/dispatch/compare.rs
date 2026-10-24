@@ -59,7 +59,7 @@ pub fn resolve(
     Ok(Some((prov, m.to_string())))
 }
 
-/// Parse `codex:gpt-6-luna,claude:sonnet` into unique `(provider, model)` workers in order; a bare
+/// Parse `codex:gpt-5.4,claude:sonnet` into unique `(provider, model)` workers in order; a bare
 /// word is a model with an inferred provider (R61).
 pub fn parse_compare(spec: &str, cfg: &DispatchConfig) -> Result<Vec<(String, String)>, String> {
     let mut workers = Vec::new();

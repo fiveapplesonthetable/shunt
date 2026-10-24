@@ -22,7 +22,7 @@ done < "{}"
 
     // Ensure daemon is ready
     let _ = env.tacho_cmd().arg("status").output();
-    assert!(env.wait_for_api_sock(std::time::Duration::from_secs(3)));
+    assert!(env.wait_for_api_sock());
 
     // Execute tacho run -- bash <script>
     let output = env

@@ -561,16 +561,56 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .unwrap();
     assert!(tick1.status.success());
 
-    // Wait for the mock agent process to exit before running tick #2 to reap & attribute PR #42
+    // Wait for the mock agent process to write its PR line and exit using kernel inotify + pidfd
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let logs_dir = tacho_home.join("logs");
+        let _ = fs::create_dir_all(&logs_dir);
+        let log_file = logs_dir.join("auto-task.log");
+        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        assert!(inotify_fd >= 0, "inotify_init1 failed");
+        let c_logs = std::ffi::CString::new(logs_dir.as_os_str().as_bytes()).unwrap();
+        let wd = unsafe {
+            libc::inotify_add_watch(
+                inotify_fd,
+                c_logs.as_ptr(),
+                libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE,
+            )
+        };
+        assert!(wd >= 0, "inotify_add_watch failed");
+        while !fs::read_to_string(&log_file)
+            .map(|s| s.contains("PR: #42"))
+            .unwrap_or(false)
+        {
+            let mut pfd = libc::pollfd {
+                fd: inotify_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+            assert!(rc > 0, "inotify poll failed");
+            let mut buf = [0u8; 1024];
+            while unsafe { libc::read(inotify_fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        }
+        unsafe { libc::close(inotify_fd) };
+    }
     if let Ok(store) = FleetStore::open(&tacho_home.join("events.sqlite")) {
         if let Ok(st) = store.load() {
             if let Some(agent) = st.agents.get("auto-task") {
                 if let Some(pid) = agent.pid {
-                    let cap = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    while unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-                        && std::time::Instant::now() < cap
-                    {
-                        std::thread::yield_now();
+                    let pidfd = unsafe {
+                        libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) as libc::c_int
+                    };
+                    if pidfd >= 0 {
+                        let mut pfd = libc::pollfd {
+                            fd: pidfd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        unsafe {
+                            let _ = libc::poll(&mut pfd, 1, -1);
+                            libc::close(pidfd);
+                        }
                     }
                 }
             }
@@ -673,6 +713,15 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
     // and the next `tacho hook claude` drains and injects the message.
     let mut store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
     let my_pid = std::process::id(); // Guaranteed alive PID
+    let my_starttime = fs::read_to_string(format!("/proc/{my_pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            let rparen = s.rfind(')')?;
+            s[rparen + 2..]
+                .split_whitespace()
+                .nth(19)
+                .and_then(|v| v.parse::<u64>().ok())
+        });
     store
         .mutate(None, |st| {
             st.agents.insert(
@@ -680,6 +729,7 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
                 tacho_core::decide::dispatch::AgentRun {
                     key: "live-worker".to_string(),
                     pid: Some(my_pid),
+                    starttime: my_starttime,
                     provider: "claude".to_string(),
                     worktree: wt_root.join("db-wt").to_string_lossy().to_string(),
                     started_at: 1000,
@@ -797,13 +847,24 @@ fn test_status_sections_staleness_needs_and_scrubber() {
     // Seed FleetStore with rich fleet state, including a GitHub token secret in status_note to test Scrubber
     let secret_token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
+    let self_pid = std::process::id();
+    let self_starttime = fs::read_to_string(format!("/proc/{self_pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            let rparen = s.rfind(')')?;
+            s[rparen + 2..]
+                .split_whitespace()
+                .nth(19)
+                .and_then(|v| v.parse::<u64>().ok())
+        });
     store
         .mutate(None, |st| {
             st.agents.insert(
                 "worker-alpha".to_string(),
                 tacho_core::decide::dispatch::AgentRun {
                     key: "worker-alpha".to_string(),
-                    pid: Some(std::process::id()),
+                    pid: Some(self_pid),
+                    starttime: self_starttime,
                     area: "core".to_string(),
                     brief: format!("Investigate auth header {secret_token}"),
                     status_note: format!("read: checking token {secret_token}"),

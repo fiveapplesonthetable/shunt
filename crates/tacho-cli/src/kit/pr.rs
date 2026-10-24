@@ -429,7 +429,7 @@ pub fn execute_pr(args: PrArgs) -> io::Result<()> {
     if !errors.is_empty() {
         let joined = errors.join("\n  - ");
         let because = format!("pr preflight refused: {}", errors.join("; "));
-        let _ = store.record_decision("verify", "pr_refused", &head_sha, &because);
+        store.record_decision("verify", "pr_refused", &head_sha, &because)?;
         emit_decision_event("system", "verify:pr_refused", &because);
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -477,7 +477,7 @@ pub fn execute_pr(args: PrArgs) -> io::Result<()> {
         Ok(o) if o.status.success() => {
             let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
             let because = format!("opened PR {url} for branch {branch}");
-            let _ = store.record_decision("verify", "pr_opened", &branch, &because);
+            store.record_decision("verify", "pr_opened", &branch, &because)?;
             emit_decision_event(&format!("agent:{branch}"), "verify:pr_opened", &because);
             println!("{url}");
             Ok(())
