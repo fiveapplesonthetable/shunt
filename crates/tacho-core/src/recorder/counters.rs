@@ -337,32 +337,6 @@ impl Recorder {
             return;
         }
 
-        if op == CustomOp::Instant && track == "milestones" {
-            let ms_name = name
-                .as_deref()
-                .map(|n| truncate_utf8(&self.scrubber.scrub(n), 128));
-            let desc = args
-                .get("description")
-                .or_else(|| args.get("detail"))
-                .map(|d| truncate_utf8(&self.scrubber.scrub(d), 256));
-            let body = tacho::event::Body::Milestone(tacho::Milestone {
-                name: ms_name.clone(),
-                description: desc,
-            });
-            self.emit(
-                "milestones",
-                Kind::Milestone,
-                ts,
-                None,
-                None,
-                None,
-                ms_name,
-                Some(body),
-                out,
-            );
-            return;
-        }
-
         let custom_kind = match op {
             CustomOp::Counter => TrackKind::Counter,
             CustomOp::State => TrackKind::State,

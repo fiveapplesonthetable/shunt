@@ -1059,57 +1059,6 @@ edition = "2021"
                 );
             }
         }
-
-        // Milestones
-        if pr_idx == 2 {
-            let m_out = env
-                .tacho_cmd()
-                .args([
-                    "emit",
-                    "instant",
-                    "milestones",
-                    "Milestone: Foundation Stack Merged",
-                ])
-                .output()
-                .unwrap();
-            assert!(
-                m_out.status.success(),
-                "emit instant milestone failed: {}",
-                String::from_utf8_lossy(&m_out.stderr)
-            );
-        } else if pr_idx == 4 {
-            let m_out = env
-                .tacho_cmd()
-                .args([
-                    "emit",
-                    "instant",
-                    "milestones",
-                    "Milestone: Core Services Ready",
-                ])
-                .output()
-                .unwrap();
-            assert!(
-                m_out.status.success(),
-                "emit instant milestone failed: {}",
-                String::from_utf8_lossy(&m_out.stderr)
-            );
-        } else if pr_idx == 6 {
-            let m_out = env
-                .tacho_cmd()
-                .args([
-                    "emit",
-                    "instant",
-                    "milestones",
-                    "Milestone: Release v1.0.0-rc1 Stack Ready",
-                ])
-                .output()
-                .unwrap();
-            assert!(
-                m_out.status.success(),
-                "emit instant milestone failed: {}",
-                String::from_utf8_lossy(&m_out.stderr)
-            );
-        }
     }
 
     // Complete core feature tasks
@@ -1589,28 +1538,7 @@ edition = "2021"
     // Deep structural assertions on decoded Perfetto protobuf trace
     let decoded = DecodedTrace::from_file(&fleet_trace_path).unwrap();
 
-    // (a) Top-level `tacho/milestones` state track progression (`TYPE_STATE`)
-    let milestone_states = decoded.state_events_on("tacho/milestones");
-    let milestone_names: Vec<&str> = milestone_states.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(
-        milestone_names,
-        vec![
-            "Milestone: Foundation Stack Merged",
-            "Milestone: Core Services Ready",
-            "Milestone: Release v1.0.0-rc1 Stack Ready",
-        ],
-        "tacho/milestones state track must record all 3 milestones in order"
-    );
-    for pair in milestone_states.windows(2) {
-        assert!(
-            pair[1].ts >= pair[0].ts,
-            "tacho/milestones timestamps must be monotonic: {:?} vs {:?}",
-            pair[0],
-            pair[1]
-        );
-    }
-
-    // (b) Agent `turns`, `lane:N` (`lane 1`), `stalls`, `worktree` commits/head moves,
+    // (a) Agent `turns`, `lane:N` (`lane 1`), `stalls`, `worktree` commits/head moves,
     //     `procs/slot N`, and step-function counters (`cpu`, `rss`, `commits`, `files_edited`)
     assert!(
         !decoded

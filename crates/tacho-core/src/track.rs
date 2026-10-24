@@ -84,7 +84,6 @@ pub fn compute_track_rank(key: &str, name: &str) -> i32 {
         "proc_count" => 112,
         "daemon" => 1,
         "agents" => 2,
-        "milestones" => 3,
         "tasks" => 4,
         "machine" => 5,
         "providers" => 6,

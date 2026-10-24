@@ -225,18 +225,6 @@ impl Recorder {
             return chain;
         }
 
-        if track_key == "milestones" {
-            add(
-                "milestones",
-                Some("tacho"),
-                "milestones",
-                Some("Fleet-wide milestone progression"),
-                TrackKind::State,
-                None,
-            );
-            return chain;
-        }
-
         if track_key == "daemon/counters" {
             add(
                 "daemon/counters",

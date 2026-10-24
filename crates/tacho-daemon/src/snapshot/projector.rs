@@ -239,11 +239,6 @@ impl SnapshotProjector {
             Kind::TrackCreated | Kind::Prompt => Ok(()),
             Kind::FileEdited => self.on_file_edited(ev, out),
             Kind::Milestone if ev.track_key.ends_with("/turns") => self.on_turn_milestone(ev, out),
-            Kind::Milestone if ev.track_key == "milestones" => {
-                let mut ev = ev;
-                ev.ts_ns = self.next_track_ts("milestones", ev.ts_ns);
-                out.emit(&ev, Some(TrackEventType::State))
-            }
             Kind::TaskQueued => self.on_task_queued(ev, out),
             Kind::TaskState => self.on_task_state(ev, out),
             Kind::Stall => self.on_stall(ev, out),

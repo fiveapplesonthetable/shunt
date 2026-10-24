@@ -16,7 +16,7 @@ One lightweight daemon records what every coding agent does into a single SQLite
 
 - **Single Source of Truth (`events.sqlite`):** Everything flows through `$TACHO_HOME/events.sqlite` in SQLite WAL mode. There are no separate in-memory event ring buffers: traces, PerfettoSQL queries, and supervisor status/reports are all backed by the same SQLite WAL log.
 - **Resilient Direct SQLite Fallback:** If the daemon process is unreachable or crashed, `tacho trace`, `tacho status`, and `tacho report` open `events.sqlite` directly in read-only mode. Dead/zombie worker processes (`ESRCH` / `'Z'`) are automatically reaped, closing open slices with `abandoned = true`.
-- **Duration, State & Counter-First Perfetto UX:** `SnapshotProjector` pairs every lifecycle interval into true duration slices (`turns`, `lane:1..k`, `stalls`, `worktree`, `procs/slot 0..k`, `messages`, `review`), `TYPE_STATE` bands (`agent:<id>/state`, `task:<slug>/state`, `milestones`), and step-function counters (`files_edited`, `commits`, `proc_count`, `cpu`, `rss`, `tokens_*`, `cost`) with **zero zero-duration instant clutter**.
+- **Duration, State & Counter-First Perfetto UX:** `SnapshotProjector` pairs every lifecycle interval into true duration slices (`turns`, `lane:1..k`, `stalls`, `worktree`, `procs/slot 0..k`, `messages`, `review`), `TYPE_STATE` bands (`agent:<id>/state`, `task:<slug>/state`), and step-function counters (`files_edited`, `commits`, `proc_count`, `cpu`, `rss`, `tokens_*`, `cost`) with **zero zero-duration instant clutter**.
 - **High-Throughput Ingestion & Fast Streaming Snapshots:** Sustains **&ge; 50,000 inputs/sec** on `api.sock` (up to **511,195 inputs/sec** peak) and streams 10,000,000 rows (641 MB) in **7.87 s** (1.27M rows/s) with only a **+4.0 MB RSS delta** from 1M to 10M rows.
 - **Supervisor Control Loop & 7 Detectors:** Turns 97 MB of messy worker transcripts into ~180 tokens. Detects `LOOP`, `SPIN`, `BURN`, `FAILING`, `OFF_BRIEF`, CPU-aware `SILENT` (checks `/proc` + cgroup CPU counters so long compiles never false-positive), and `CLAIM` (flags runs exiting 0 after edits without passing tests), with an optional `on_stall` shell hook.
 - **Claim Verification (`--diff-claims`):** `tacho report <agent> --diff-claims` cross-references recorded edits, passing tests after the final edit, commits, pushes, and git worktree status against agent claims.
@@ -130,7 +130,7 @@ Open any exported snapshot in [ui.perfetto.dev](https://ui.perfetto.dev) to insp
 </p>
 
 Features rendered in the trace:
-- **State Bands (`TYPE_STATE`):** `agent:<id>/state` (`Thinking`, `Tool`, `Waiting`, `Stalled`, `Idle`, `Exited`), `task:<slug>/state` (`Queued`, `InProgress`, `Review`, `Done`, `Failed`), and `tacho/milestones`.
+- **State Bands (`TYPE_STATE`):** `agent:<id>/state` (`Thinking`, `Tool`, `Waiting`, `Stalled`, `Idle`, `Exited`) and `task:<slug>/state` (`Queued`, `InProgress`, `Review`, `Done`, `Failed`).
 - **Duration Slices (0 Instant Clutter):** Nested `turns` and `lane:1..k` tool calls, `agent:<id>/stalls` stall windows, `run:<n>/worktree` dirty-to-commit intervals, `run:<n>/procs/slot 0..k` child process lifetimes, `task:<slug>/review` spans, and `tacho/messages` delivery flights.
 - **Step-Function Counters:** `files_edited`, `commits`, `proc_count`, `cpu`, `rss`, `tokens_in`, `tokens_out`, `tokens_cached`, `cost`, and `machine/*` metrics.
 - **Causal Flow Arrows:** Explicit flow arrows linking tool invocations to subagent runs, inter-agent messages, stall recoveries, and multi-run task retries.

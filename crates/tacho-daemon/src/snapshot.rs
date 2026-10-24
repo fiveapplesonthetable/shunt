@@ -181,10 +181,6 @@ fn finalize_snapshot_registry(reg: &mut TrackRegistry, summaries: &[EventTrackSu
                     }
                 }
             }
-            Kind::Milestone if track_key == "milestones" => {
-                register_hierarchy(reg, &rec_helper, "milestones", TrackKind::State, None);
-                active_keys.insert("milestones".to_string());
-            }
             Kind::TaskQueued => {
                 let st = task_state_track(track_key);
                 register_hierarchy(reg, &rec_helper, &st, TrackKind::State, None);

@@ -152,7 +152,6 @@ live state, rebuilt from the log on start.
 
 ```
 tacho                                   root; description: host, version
-├── milestones                          TYPE_STATE: project-wide milestone phases
 ├── messages                            duration slices: MessageSent -> MessageDelivered
 ├── machine                             counters: load1, cpu_busy, mem_used, active_builds, active_tests, disk:<mount>
 ├── daemon                              lifecycle duration slice (DaemonStarted -> Stop/Snapshot)
