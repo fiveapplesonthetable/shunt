@@ -770,7 +770,25 @@ edition = "2021"
     );
 
     // 11. Stacked PR Workflow: 6 stacked PRs (pr-01 .. pr-06)
-    // with TaskQueued, TaskState, Review findings, git -C rebases, and gh pr commands
+    // with TaskQueued, TaskState, Review findings, git -C rebases, gh pr commands,
+    // and fleet tick / batch / train spans
+    let _ = env
+        .tacho_cmd()
+        .args(["emit", "slice-begin", "fleet/ticks", "TickPass [4 workers]"])
+        .output();
+    let _ = env
+        .tacho_cmd()
+        .args([
+            "emit",
+            "slice-begin",
+            "batch:batch-1",
+            "BatchVerification [batch-1: 6 PRs]",
+        ])
+        .output();
+    let _ = env
+        .tacho_cmd()
+        .args(["emit", "state", "train:train-1", "open"])
+        .output();
     for pr_idx in 1..=6 {
         let pr_slug = format!("pr-{:02}", pr_idx);
         let feat_file = format!("src/feature_{:02}.rs", pr_idx);
@@ -851,6 +869,8 @@ edition = "2021"
                 "tool_name": "Edit",
                 "tool_input": {
                     "file_path": feat_file,
+                    "old_string": "",
+                    "new_string": format!("pub fn feature_{:02}() -> usize {{\n    {}\n}}\n", pr_idx, pr_idx),
                 },
             }),
         );
@@ -1061,7 +1081,19 @@ edition = "2021"
         }
     }
 
-    // Complete core feature tasks
+    // Complete core feature tasks and close fleet batch / train / tick spans
+    let _ = env
+        .tacho_cmd()
+        .args(["emit", "slice-end", "batch:batch-1"])
+        .output();
+    let _ = env
+        .tacho_cmd()
+        .args(["emit", "state", "train:train-1", "landed"])
+        .output();
+    let _ = env
+        .tacho_cmd()
+        .args(["emit", "slice-end", "fleet/ticks"])
+        .output();
     for t_slug in ["auth-task", "db-task", "api-task"] {
         let out = env
             .tacho_cmd()

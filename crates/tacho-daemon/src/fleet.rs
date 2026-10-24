@@ -1101,13 +1101,15 @@ pub fn execute_decide_tick(
         let mut stat_buf = [0u8; 1024];
         for burner in &plan.burner_kills {
             let still_matches = match burner.starttime {
-                Some(expected_st) => crate::sampler::read_process_stat_and_comm_slice(
-                    burner.pid,
-                    page_size,
-                    &mut stat_buf,
-                )
-                .is_some_and(|st| st.start_ticks == expected_st),
-                None => true,
+                Some(expected_st) if expected_st > 0 => {
+                    crate::sampler::read_process_stat_and_comm_slice(
+                        burner.pid,
+                        page_size,
+                        &mut stat_buf,
+                    )
+                    .is_some_and(|st| st.start_ticks == expected_st)
+                }
+                _ => false,
             };
             if still_matches && burner.pid > 1 {
                 unsafe {

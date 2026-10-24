@@ -316,11 +316,12 @@ impl Perfetto {
             Some(pid) => {
                 // Record the start time with the pid so `stop` can tell the
                 // session process from an unrelated process that reused the pid.
-                let record = match proc_start_time(pid) {
-                    Some(t) => format!("{pid} {t}\n"),
-                    None => format!("{pid}\n"),
-                };
-                write_atomic(&pid_file, record.as_bytes())?;
+                if let Some(t) = proc_start_time(pid) {
+                    let record = format!("{pid} {t}\n");
+                    write_atomic(&pid_file, record.as_bytes())?;
+                } else {
+                    let _ = fs::remove_file(&pid_file);
+                }
             }
             None => {
                 // A stale file from an earlier session would point `stop` at
@@ -636,7 +637,7 @@ struct SessionProcess {
 }
 
 impl SessionProcess {
-    fn open_verified(rec: &PidRecord, binary: &Path) -> Option<Self> {
+    fn open_verified(rec: &PidRecord, _binary: &Path) -> Option<Self> {
         use std::os::fd::FromRawFd;
         // SAFETY: plain syscall; a non-negative return is a new fd we own.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, rec.pid as libc::c_int, 0) };
@@ -651,8 +652,8 @@ impl SessionProcess {
             return None;
         }
         let identity_ok = match rec.start_time {
-            Some(t) => proc_start_time(rec.pid) == Some(t),
-            None => cmdline_looks_like(rec.pid, binary),
+            Some(t) if t > 0 => proc_start_time(rec.pid) == Some(t),
+            _ => false,
         };
         identity_ok.then_some(Self { pidfd })
     }
@@ -692,17 +693,6 @@ impl SessionProcess {
             }
         }
     }
-}
-
-/// Legacy pid files carry no start time; accept only a process whose argv[0]
-/// is the configured binary or is named `perfetto`.
-fn cmdline_looks_like(pid: u32, binary: &Path) -> bool {
-    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
-    let argv0 = Path::new(std::ffi::OsStr::from_bytes(argv0));
-    argv0 == binary || argv0.file_name().is_some_and(|n| n == "perfetto")
 }
 
 /// Checks if a given PID is currently running and owned by the current user's UID.

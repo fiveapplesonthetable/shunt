@@ -122,20 +122,18 @@ pub fn pid_alive(pid: u32) -> bool {
     !stat[rparen + 1..].trim_start().starts_with('Z')
 }
 
-/// Check whether `pid` is alive AND its `/proc/<pid>/stat` `starttime` is readable and matches `expected_starttime` (if recorded).
+/// Check whether `pid` is alive AND its `/proc/<pid>/stat` `starttime` is readable and matches `expected_starttime`.
 pub fn pid_alive_with_starttime(pid: u32, expected_starttime: Option<u64>) -> bool {
+    let Some(exp) = expected_starttime.filter(|&st| st > 0) else {
+        return false;
+    };
     if !pid_alive(pid) {
         return false;
     }
     let Some(actual_st) = proc_pid_starttime(pid) else {
         return false;
     };
-    if let Some(exp) = expected_starttime {
-        if actual_st != exp {
-            return false;
-        }
-    }
-    true
+    actual_st == exp
 }
 
 /// Normalize a path string by canonicalizing if it exists on disk, or stripping trailing slashes.
@@ -166,12 +164,15 @@ pub fn verify_kill_target(
             "refusing to signal pid {pid}: could not read /proc/{pid}/stat starttime"
         ));
     };
-    if let Some(rec_st) = recorded_starttime {
-        if act_st != rec_st {
-            return Err(format!(
-                "refusing to signal pid {pid}: starttime mismatch (recorded {rec_st}, actual {act_st}; PID was reused)"
-            ));
-        }
+    let Some(rec_st) = recorded_starttime.filter(|&st| st > 0) else {
+        return Err(format!(
+            "refusing to signal pid {pid}: no starttime recorded in pid file"
+        ));
+    };
+    if act_st != rec_st {
+        return Err(format!(
+            "refusing to signal pid {pid}: starttime mismatch (recorded {rec_st}, actual {act_st}; PID was reused)"
+        ));
     }
 
     let norm_root = normalize_path_str(worktree_root);
