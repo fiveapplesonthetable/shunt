@@ -46,8 +46,8 @@ pub use dispatch::{
     execute_attach, execute_hold, execute_next, execute_release, execute_retire,
     execute_retire_with, execute_session, execute_session_with, execute_stop, execute_tell,
     execute_tell_with, execute_todo, execute_todo_with, format_retired_lines,
-    infer_provider_from_model, spawn_worker_for_item, validate_retire_reason, ResolvedBrief,
-    RetireOptions, SessionOptions, TodoOptions,
+    infer_provider_from_model, spawn_worker_for_item, spawn_worker_in_dir, validate_retire_reason,
+    ResolvedBrief, RetireOptions, SessionOptions, TodoOptions,
 };
 pub use land::{execute_land, execute_land_with, verify_train_land_integrity, LandOptions};
 pub use ops::{

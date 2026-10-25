@@ -195,22 +195,31 @@ pub(crate) fn emit_decision_event(track: &str, name: &str, because: &str) {
     }
 }
 
-/// Creates (mode 0700) and returns the private temp dir `<fleet home>/tmp/<name>`.
+/// Creates (mode 0700) and returns the private temp dir `<fleet home>/tmp/<sanitized_name>`.
 pub(crate) fn private_tmp_dir(name: &str) -> io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let dir = crate::paths::resolve_home().join("tmp").join(name);
+    let safe_name = tacho_core::decide::ops::config::sanitize_tmp_name(name);
+    let tmp_root = crate::paths::resolve_home().join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    fs::set_permissions(&tmp_root, fs::Permissions::from_mode(0o700))?;
+    let dir = tmp_root.join(safe_name);
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     Ok(dir)
 }
 
 /// Points every temp-dir convention of a spawned agent or runner at `dir`: `TMPDIR`, `TMP`,
-/// `TEMP`, and the JVM's `java.io.tmpdir` (through `JAVA_TOOL_OPTIONS`).
+/// `TEMP`, and the JVM's `java.io.tmpdir` (through `JAVA_TOOL_OPTIONS`, preserving any existing
+/// flags).
 pub(crate) fn apply_private_tmp_env(cmd: &mut Command, dir: &Path) {
-    cmd.env("TMPDIR", dir).env("TMP", dir).env("TEMP", dir).env(
-        "JAVA_TOOL_OPTIONS",
-        format!("-Djava.io.tmpdir={}", dir.display()),
-    );
+    let existing_java = std::env::var("JAVA_TOOL_OPTIONS").ok();
+    let dir_str = dir.to_string_lossy();
+    let merged_java =
+        tacho_core::decide::ops::config::merge_java_tmp_options(existing_java.as_deref(), &dir_str);
+    cmd.env("TMPDIR", dir)
+        .env("TMP", dir)
+        .env("TEMP", dir)
+        .env("JAVA_TOOL_OPTIONS", merged_java);
 }
 
 /// [`private_tmp_dir`] followed by [`apply_private_tmp_env`].

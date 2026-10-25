@@ -91,6 +91,19 @@ pub fn build_session_argv(
 
 /// Spawns a provider agent process for a `TodoItem` in its worktree.
 pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Result<u32> {
+    spawn_worker_in_dir(store, item, None)
+}
+
+/// Spawns a provider agent process for a `TodoItem`, using `wt_override` if supplied or
+/// resolving/provisioning an isolated linked worktree on a named branch off `main`.
+///
+/// Refuses to start (and places a hold + pages the owner) if the resolved directory is the
+/// repository's main checkout or is not an isolated linked git worktree on a named branch.
+pub fn spawn_worker_in_dir(
+    store: &mut FleetStore,
+    item: &TodoItem,
+    wt_override: Option<&Path>,
+) -> io::Result<u32> {
     let state = store.load()?;
     let inferred_prov = item.provider.clone().or_else(|| {
         item.model
@@ -115,13 +128,68 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
     let log_path = logs_dir.join(format!("{}.log", item.key));
 
     let cwd = std::env::current_dir()?;
-    let root_key = base_key(&item.key);
-    let wt_path = state
+    let root_key = base_key(&item.key).to_string();
+    let wt_path = if let Some(explicit_dir) = wt_override {
+        explicit_dir.to_path_buf()
+    } else if let Some(w) = state
         .worktrees
         .get(&item.key)
-        .or_else(|| state.worktrees.get(root_key))
-        .map(|w| PathBuf::from(&w.path))
-        .unwrap_or_else(|| cwd.clone());
+        .or_else(|| state.worktrees.get(&root_key))
+    {
+        PathBuf::from(&w.path)
+    } else if let Some(prior) = state
+        .agents
+        .get(&item.key)
+        .or_else(|| tacho_core::decide::dispatch::latest(&state.agents, &state.retired, &root_key))
+        .filter(|a| !a.worktree.is_empty())
+    {
+        PathBuf::from(&prior.worktree)
+    } else if tacho_daemon::exec::observe::verify_worker_worktree(&cwd).is_ok() {
+        cwd.clone()
+    } else if tacho_daemon::exec::observe::inside_git_checkout(&cwd) {
+        let wt_slug = if tacho_core::decide::verify::slug_problem(&item.key).is_none() {
+            item.key.clone()
+        } else {
+            root_key.clone()
+        };
+        let (path, code) = crate::kit::start::provision_worktree_in_store(
+            store,
+            crate::cli::StartArgs {
+                slug: wt_slug,
+                base: item.base.clone(),
+                dir: None,
+            },
+        )?;
+        if code != 0 {
+            return Err(io::Error::other(format!(
+                "refusing to start worker {}: worktree provisioning exited with code {code}",
+                item.key
+            )));
+        }
+        path
+    } else {
+        cwd.clone()
+    };
+
+    if let Err(reason) = tacho_daemon::exec::observe::verify_worker_worktree(&wt_path) {
+        let now = now_secs();
+        let root_for_hold = root_key.clone();
+        let reason_for_store = reason.clone();
+        store.mutate(
+            Some(("dispatch", "start_refused", &item.key, &reason)),
+            move |st| {
+                st.holds = with_hold(&st.holds, &root_for_hold, &reason_for_store, now);
+            },
+        )?;
+        let _ = tacho_core::decide::plugin::notify_owner_command(
+            &format!(
+                "[tacho] worker {} refused: no worktree of its own",
+                item.key
+            ),
+            &reason,
+        );
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+    }
 
     let log_file = File::create(&log_path)?;
     let log_err = log_file.try_clone()?;
@@ -139,7 +207,7 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
     );
 
     let prior_session =
-        tacho_core::decide::dispatch::latest(&state.agents, &state.retired, root_key)
+        tacho_core::decide::dispatch::latest(&state.agents, &state.retired, &root_key)
             .and_then(|a| a.session_id.as_deref());
     let wt_str = wt_path.to_string_lossy();
     let (prog, prog_args, prog_env) = build_session_argv(
@@ -656,6 +724,21 @@ pub fn deliver_tell_action(
                         last.worktree
                     ),
                 ));
+            }
+            if let Err(reason) =
+                tacho_daemon::exec::observe::verify_worker_worktree(Path::new(&last.worktree))
+            {
+                let now = now_secs();
+                let root_for_hold = base_key(&key).to_string();
+                let reason_for_store = reason.clone();
+                store.mutate(Some(("watch", "tell_refused", &key, &reason)), move |st| {
+                    st.holds = with_hold(&st.holds, &root_for_hold, &reason_for_store, now);
+                })?;
+                let _ = tacho_core::decide::plugin::notify_owner_command(
+                    &format!("[tacho] worker {key} refused: no worktree of its own"),
+                    &reason,
+                );
+                return Err(io::Error::new(RESUME_REFUSED, reason));
             }
             let log_file = fs::OpenOptions::new()
                 .create(true)

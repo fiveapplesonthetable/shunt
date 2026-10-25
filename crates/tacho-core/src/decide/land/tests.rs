@@ -491,3 +491,121 @@ fn run_records_and_words_a_compiled_member_the_final_merge_omitted() {
     let task = dec.next.todo.iter().find(|t| t.key == "rebase-2").unwrap();
     assert!(task.brief.contains("missing from the final merge"));
 }
+
+// =============================================================================
+// Golden Screenshot Fix Classification Tests (`test_shots_fix.py`)
+// =============================================================================
+
+const ANDROID_SHOTS_DIR: &str = "frontend/android/docs/screenshots/";
+const HOME_SHOT: &str = "frontend/android/docs/screenshots/03-home.png";
+const SIGNIN_SHOT: &str = "frontend/android/docs/screenshots/01-signin.png";
+const HOME_SCREEN_KT: &str = "frontend/android/app/src/main/java/app/mobile/ui/home/HomeScreen.kt";
+const THEME_KT: &str = "frontend/android/app/src/main/java/app/mobile/ui/theme/Theme.kt";
+
+fn draw_shot_report(dir: &std::path::Path, path: &str, before: &[u8], after: &[u8]) {
+    for (side, data) in [("before", before), ("after", after)] {
+        let full = dir.join("android").join(side).join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, data).unwrap();
+    }
+    let changed_path = dir.join("android").join("changed.txt");
+    let mut existing = std::fs::read_to_string(&changed_path).unwrap_or_default();
+    existing.push_str(&format!("changed\t{path}\tgolden\n"));
+    std::fs::write(&changed_path, existing).unwrap();
+}
+
+fn eval_shot_verdicts(
+    dir: &std::path::Path,
+    touched: &[&str],
+    catalogue: usize,
+) -> Vec<super::shots::ShotFixVerdict> {
+    let rules = super::shots::ShotRules::default();
+    let golden = BTreeSet::from([HOME_SHOT.to_string(), SIGNIN_SHOT.to_string()]);
+    let report = super::shots::read_report_goldens(dir, &golden, &rules);
+    let (goldens, total) = report.get("android").cloned().unwrap_or_default();
+    super::shots::classify_moved_goldens(&goldens, total, catalogue, touched, &rules)
+}
+
+#[test]
+fn test_a_shot_that_changed_size_is_a_rendering_break_naming_both_sizes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = super::shots::encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let tall = super::shots::encode_rgba_png(40, 70, |_, _| [10, 10, 200, 255]);
+    draw_shot_report(tmp.path(), HOME_SHOT, &old, &tall);
+    let verdicts = eval_shot_verdicts(tmp.path(), &[THEME_KT], 10);
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].kind, super::shots::ShotFixKind::Canvas);
+    assert!(verdicts[0]
+        .line
+        .contains("every shot is 40x70, expected 40x80"));
+    assert!(verdicts[0].line.contains("Theme.kt"));
+}
+
+#[test]
+fn test_most_of_the_catalogue_moving_at_once_is_a_canvas_even_at_the_same_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = super::shots::encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let red = super::shots::encode_rgba_png(40, 80, |_, _| [200, 10, 10, 255]);
+    draw_shot_report(tmp.path(), HOME_SHOT, &old, &red);
+    draw_shot_report(tmp.path(), SIGNIN_SHOT, &old, &red);
+    let verdicts = eval_shot_verdicts(tmp.path(), &[HOME_SCREEN_KT], 3);
+    let kinds: BTreeSet<_> = verdicts.iter().map(|v| v.kind).collect();
+    assert_eq!(kinds, BTreeSet::from([super::shots::ShotFixKind::Canvas]));
+}
+
+#[test]
+fn test_a_canvas_break_exits_non_zero_and_commits_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = super::shots::encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let tall = super::shots::encode_rgba_png(40, 70, |_, _| [10, 10, 200, 255]);
+    draw_shot_report(tmp.path(), HOME_SHOT, &old, &tall);
+    let results = eval_shot_verdicts(tmp.path(), &[HOME_SCREEN_KT], 10);
+    assert_eq!(super::shots::shots_fix_verdict(&results).1, 1);
+    assert!(!results
+        .iter()
+        .any(|r| r.kind == super::shots::ShotFixKind::Intended));
+}
+
+#[test]
+fn test_a_golden_whose_screen_the_diff_touches_is_intended() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = super::shots::encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let red = super::shots::encode_rgba_png(40, 80, |_, _| [200, 10, 10, 255]);
+    draw_shot_report(tmp.path(), HOME_SHOT, &old, &red);
+    let verdicts = eval_shot_verdicts(tmp.path(), &[HOME_SCREEN_KT], 10);
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].kind, super::shots::ShotFixKind::Intended);
+    assert_eq!(super::shots::shots_fix_verdict(&verdicts).1, 0);
+}
+
+#[test]
+fn test_a_golden_nothing_in_the_diff_reaches_is_drift_with_its_pixel_delta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = super::shots::encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let red = super::shots::encode_rgba_png(40, 80, |_, _| [200, 10, 10, 255]);
+    draw_shot_report(tmp.path(), SIGNIN_SHOT, &old, &red);
+    let verdicts = eval_shot_verdicts(tmp.path(), &[HOME_SCREEN_KT], 10);
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].kind, super::shots::ShotFixKind::Drift);
+    assert!(verdicts[0].line.contains("50.000% of its channels differ"));
+    assert_eq!(super::shots::shots_fix_verdict(&verdicts).1, 1);
+}
+
+#[test]
+fn test_a_noise_move_of_a_non_golden_shot_is_not_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = super::shots::encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let red = super::shots::encode_rgba_png(40, 80, |_, _| [200, 10, 10, 255]);
+    draw_shot_report(
+        tmp.path(),
+        &format!("{ANDROID_SHOTS_DIR}09-other.png"),
+        &old,
+        &red,
+    );
+    let verdicts = eval_shot_verdicts(tmp.path(), &[HOME_SCREEN_KT], 10);
+    assert!(verdicts.is_empty());
+    assert_eq!(
+        super::shots::shots_fix_verdict(&[]),
+        ("no golden screenshot moved".to_string(), 0)
+    );
+}

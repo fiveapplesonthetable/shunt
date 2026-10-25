@@ -462,12 +462,7 @@ fn test_pr_push_args_and_body_formatting_with_proof_commands_and_outputs() {
     let first_push = push_args_for_branch("feat-alpha", false);
     assert_eq!(
         first_push,
-        vec![
-            "push",
-            "-u",
-            "origin",
-            "HEAD:refs/heads/feat-alpha"
-        ]
+        vec!["push", "-u", "origin", "HEAD:refs/heads/feat-alpha"]
     );
 
     let update_push = push_args_for_branch("feat-alpha", true);

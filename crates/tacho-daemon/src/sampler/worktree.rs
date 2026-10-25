@@ -230,12 +230,20 @@ pub fn run_git_in_worktree(cwd: &Path, args: &[&str], timeout: Duration) -> io::
     if cwd.as_os_str().is_empty() || !cwd.join(".git").exists() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} is not a git worktree toplevel (missing .git)", cwd.display()),
+            format!(
+                "{} is not a git worktree toplevel (missing .git)",
+                cwd.display()
+            ),
         ));
     }
     let canon = cwd.canonicalize()?;
     let ceiling = canon.parent().unwrap_or(&canon);
-    let toplevel = run_git_with_ceiling(&canon, &["rev-parse", "--show-toplevel"], timeout, Some(ceiling))?;
+    let toplevel = run_git_with_ceiling(
+        &canon,
+        &["rev-parse", "--show-toplevel"],
+        timeout,
+        Some(ceiling),
+    )?;
     let top_canon = Path::new(toplevel.trim()).canonicalize()?;
     if top_canon != canon {
         return Err(io::Error::new(

@@ -273,6 +273,11 @@ pub fn build_tidy_snapshot(
             held_paths.insert(wt.path.clone());
         }
     }
+    for a in state.agents.values() {
+        if !a.worktree.is_empty() && !is_linked_worktree(Path::new(&a.worktree)) {
+            held_paths.insert(a.worktree.clone());
+        }
+    }
 
     let mut worktrees = Vec::new();
     let mut recorded_paths = BTreeSet::new();
@@ -425,12 +430,15 @@ pub fn is_git_checkout(dir: &Path) -> bool {
 }
 
 /// Whether `dir` is a linked git worktree (`git worktree add`), not a main repository checkout
-/// (`dir/.git` must be a gitfile rather than a `.git/` directory, and `--git-dir` must differ
-/// from `--git-common-dir`).
+/// or a directory holding one (`dir/.git` must be a gitfile rather than a `.git/` directory,
+/// `--git-dir` must differ from `--git-common-dir`, and `--git-common-dir` must not reside inside `dir`).
 pub fn is_linked_worktree(dir: &Path) -> bool {
     if dir.as_os_str().is_empty() || !dir.join(".git").is_file() || !is_git_checkout(dir) {
         return false;
     }
+    let Ok(canon) = dir.canonicalize() else {
+        return false;
+    };
     let Ok(out) = crate::sampler::run_git_in_worktree(
         dir,
         &["rev-parse", "--git-dir", "--git-common-dir"],
@@ -445,9 +453,81 @@ pub fn is_linked_worktree(dir: &Path) -> bool {
     let gd = dir.join(git_dir).canonicalize().ok();
     let cd = dir.join(common_dir).canonicalize().ok();
     match (gd, cd) {
-        (Some(g), Some(c)) => g != c,
+        (Some(g), Some(c)) => g != c && !c.starts_with(&canon),
         _ => false,
     }
+}
+
+/// Whether `dir` resolves to a repository's main checkout (or a subdirectory inside the main checkout,
+/// or a parent directory holding a main checkout).
+pub fn resolves_to_main_checkout(dir: &Path) -> bool {
+    if dir.as_os_str().is_empty() || !dir.exists() {
+        return false;
+    }
+    if is_linked_worktree(dir) {
+        return false;
+    }
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    for anc in canon.ancestors() {
+        let dot_git = anc.join(".git");
+        if dot_git.exists() {
+            return dot_git.is_dir() || !is_linked_worktree(anc);
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&canon) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.join(".git").is_dir() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Validates that `dir` is an isolated linked git worktree on a named branch other than `main`/`master`.
+///
+/// Returns the checked-out branch name on success, or a refusal reason when `dir` resolves to the
+/// main checkout, is not a linked git worktree, has a detached `HEAD`, or is on `main`/`master`.
+pub fn verify_worker_worktree(dir: &Path) -> Result<String, String> {
+    if dir.as_os_str().is_empty() || !dir.exists() {
+        return Err(format!(
+            "refusing to start worker in '{}': directory does not exist",
+            dir.display()
+        ));
+    }
+    if resolves_to_main_checkout(dir) {
+        return Err(format!(
+            "refusing to start worker in {}: directory resolves to the main checkout",
+            dir.display()
+        ));
+    }
+    if !is_linked_worktree(dir) {
+        return Err(format!(
+            "refusing to start worker in {}: directory is not an isolated linked git worktree",
+            dir.display()
+        ));
+    }
+    let branch = crate::sampler::run_git_in_worktree(
+        dir,
+        &["symbolic-ref", "--short", "-q", "HEAD"],
+        GIT_CAP,
+    )
+    .map_err(|_| {
+        format!(
+            "refusing to start worker in {}: HEAD is detached (worker must run on a named branch)",
+            dir.display()
+        )
+    })?;
+    let branch = branch.trim().to_string();
+    if branch.is_empty() || branch == "main" || branch == "master" {
+        return Err(format!(
+            "refusing to start worker in {}: branch '{}' is not an isolated worker branch",
+            dir.display(),
+            branch
+        ));
+    }
+    Ok(branch)
 }
 
 /// Whether `start` or an ancestor has a `.git` entry.
@@ -673,6 +753,27 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
     tidy_snapshot.held_paths.extend(live_holds.paths);
     tidy_snapshot.held_ports.extend(live_holds.ports);
 
+    let mut main_checkout_workers = BTreeMap::new();
+    for key in &live_keys {
+        let dir = state
+            .agents
+            .get(key)
+            .map(|a| a.worktree.as_str())
+            .filter(|w| !w.is_empty())
+            .or_else(|| {
+                host.live_state
+                    .agents
+                    .get(key)
+                    .and_then(|a| a.cwd.as_deref())
+                    .filter(|w| !w.is_empty())
+            });
+        if let Some(d) = dir {
+            if resolves_to_main_checkout(Path::new(d)) {
+                main_checkout_workers.insert(key.clone(), d.to_string());
+            }
+        }
+    }
+
     let world = WorldObservation {
         now,
         main_sha: host.main_sha.clone(),
@@ -691,6 +792,7 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
         ready_trains,
         burners,
         main_ci: observe_main_ci(state, host.repo),
+        main_checkout_workers,
     };
     (decision_state_of(state, now), world)
 }

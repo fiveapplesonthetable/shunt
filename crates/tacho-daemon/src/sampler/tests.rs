@@ -999,3 +999,132 @@ fn test_failed_decide_tick_records_time_and_backs_off() {
     assert_eq!(s.decide_backoff_until_ns, 0);
     assert!(s.decide_due(13, 282 * sec), "normal event wake restored");
 }
+
+#[test]
+fn test_failing_forge_makes_sampler_run_decide_once_per_backoff_step_not_every_2s() {
+    use crate::appender::spawn_appender;
+    use crate::log::EventLog;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use tacho_core::decide::dispatch::PullFacts;
+    use tacho_core::decide::ops::snapshot::MainCiRun;
+    use tacho_core::decide::plugin::ForgePlugin;
+    use tacho_core::Recorder;
+
+    struct ToggleFailingForge {
+        calls: AtomicUsize,
+        should_fail: AtomicBool,
+    }
+
+    impl ForgePlugin for ToggleFailingForge {
+        fn forge_name(&self) -> &str {
+            "mock"
+        }
+        fn plan_pr_facts_cmd(&self, _pr_number: u64) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_mergeable_cmd(&self, _pr_number: u64) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_checks_cmd(&self, _pr_or_ref: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_update_issue_body_cmd(&self, _issue_number: u64, _body: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_issue_comment_cmd(&self, _issue_number: u64, _body: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_main_ci_cmd(&self, _branch: &str, _workflow: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn plan_open_prs_cmd(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn open_prs(
+            &self,
+            _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+        ) -> Result<Vec<PullFacts>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.should_fail.load(Ordering::SeqCst) {
+                Err("simulated forge outage".to_string())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        fn main_ci_run(
+            &self,
+            _branch: &str,
+            _workflow: &str,
+            _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+        ) -> Result<Option<MainCiRun>, String> {
+            if self.should_fail.load(Ordering::SeqCst) {
+                Err("simulated forge outage".to_string())
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("events.sqlite");
+    let log = EventLog::open(&db_path).unwrap();
+    let recorder = Recorder::new();
+    let (appender, _thread) = spawn_appender(recorder, log, 128);
+
+    let forge = Arc::new(ToggleFailingForge {
+        calls: AtomicUsize::new(0),
+        should_fail: AtomicBool::new(true),
+    });
+
+    let mut sampler = ProcSampler::new(&[]);
+    sampler.set_home_dir(temp.path().to_path_buf());
+    sampler.set_decide_refresh_secs(60);
+    sampler.set_decide_forge(Some(forge.clone()));
+
+    let sec = 1_000_000_000u64;
+    let mut buf = String::new();
+    let mut call_times_sec = Vec::new();
+    let mut prev_calls = 0usize;
+
+    // Step through 2-second sampler passes from t = 2s up to t = 2702s (1,351 passes).
+    // Expected decide attempts when failing every call:
+    // - Pass 1 at t = 2s     (fails -> backs off +60s until 62s)
+    // - Pass at t = 62s      (fails -> backs off +120s (2m) until 182s)
+    // - Pass at t = 182s     (fails -> backs off +240s (4m) until 422s)
+    // - Pass at t = 422s     (fails -> backs off +480s (8m) until 902s)
+    // - Pass at t = 902s     (fails -> backs off +900s (15m cap) until 1802s)
+    // - Pass at t = 1802s    (fails -> backs off +900s (15m cap) until 2702s)
+    // - Pass at t = 2702s
+    for step in 1..=1351u64 {
+        let t_sec = step * 2;
+        sampler.sample_tick(&appender, t_sec * sec, &mut buf);
+        let now_calls = forge.calls.load(Ordering::SeqCst);
+        if now_calls > prev_calls {
+            assert_eq!(now_calls, prev_calls + 1);
+            call_times_sec.push(t_sec);
+            prev_calls = now_calls;
+        }
+    }
+
+    assert_eq!(
+        call_times_sec,
+        vec![2, 62, 182, 422, 902, 1802, 2702],
+        "failing forge must run decide once per backoff step (60s, 2m, 4m, 8m, 15m), not once per 2s pass"
+    );
+
+    // Recover the forge: next due tick (t = 2702 + 900 = 3602s) succeeds and resets backoff to 60s.
+    forge.should_fail.store(false, Ordering::SeqCst);
+    sampler.sample_tick(&appender, 3602 * sec, &mut buf);
+    assert_eq!(forge.calls.load(Ordering::SeqCst), 8);
+    assert_eq!(sampler.decide_failures, 0);
+    assert_eq!(sampler.decide_backoff_until_ns, 0);
+
+    // Next normal coarse refresh is 60s later (t = 3662s), not 900s later.
+    sampler.sample_tick(&appender, 3660 * sec, &mut buf);
+    assert_eq!(forge.calls.load(Ordering::SeqCst), 8);
+    sampler.sample_tick(&appender, 3662 * sec, &mut buf);
+    assert_eq!(forge.calls.load(Ordering::SeqCst), 9);
+}

@@ -912,3 +912,101 @@ fn concurrent_fleet_store_mutations_preserve_integrity() {
     let final_state = store.load().unwrap();
     assert_eq!(final_state.todo.len(), 48);
 }
+
+#[test]
+fn start_worker_whose_directory_is_main_checkout_never_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let main_checkout = tmp.path().join("repo");
+    std::fs::create_dir_all(&main_checkout).unwrap();
+
+    git(&main_checkout, &["init", "-q", "-b", "main"]);
+    git(&main_checkout, &["config", "user.email", "t@example.com"]);
+    git(&main_checkout, &["config", "user.name", "Tester"]);
+    std::fs::write(main_checkout.join("README.md"), "main checkout\n").unwrap();
+    git(&main_checkout, &["add", "README.md"]);
+    git(&main_checkout, &["commit", "-q", "-m", "initial"]);
+
+    let marker = tmp.path().join("worker-ran.marker");
+    let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+    let main_str = main_checkout.to_string_lossy().to_string();
+    let mut touch_provider = tacho_core::decide::dispatch::ProviderSpec::claude();
+    touch_provider.name = "touch-marker".to_string();
+    touch_provider.binary = "touch".to_string();
+    touch_provider.start_args = vec![marker.display().to_string()];
+    store
+        .mutate(None, |st| {
+            st.default_provider = "touch-marker".to_string();
+            st.providers
+                .insert("touch-marker".to_string(), touch_provider);
+            st.worktrees.insert(
+                "bad-worker".to_string(),
+                tacho_daemon::WorktreeEntry {
+                    slug: "bad-worker".to_string(),
+                    path: main_str.clone(),
+                    branch: "main".to_string(),
+                    base_sha: String::new(),
+                    base_pr: None,
+                    port: 3300,
+                    port_last: 3319,
+                    created_at: 100,
+                },
+            );
+        })
+        .unwrap();
+
+    let item = tacho_core::decide::dispatch::TodoItem {
+        key: "bad-worker".to_string(),
+        brief: "Attempt to run in main checkout".to_string(),
+        provider: Some("touch-marker".to_string()),
+        ..Default::default()
+    };
+
+    // 1. Attempt to start via recorded worktree pointing at main checkout: must be refused before spawn.
+    let res1 = super::spawn_worker_for_item(&mut store, &item);
+    assert!(
+        res1.is_err(),
+        "worker whose directory is the main checkout must be refused"
+    );
+    assert!(
+        !marker.exists(),
+        "worker whose directory is the main checkout must never run"
+    );
+
+    // 2. Attempt to start via explicit directory override pointing at main checkout: must also be refused.
+    let item2 = tacho_core::decide::dispatch::TodoItem {
+        key: "bad-worker-2".to_string(),
+        brief: "Attempt explicit main checkout dir".to_string(),
+        provider: Some("touch-marker".to_string()),
+        ..Default::default()
+    };
+    let res2 = super::spawn_worker_in_dir(&mut store, &item2, Some(&main_checkout));
+    assert!(res2.is_err());
+    assert!(
+        !marker.exists(),
+        "worker whose directory is the main checkout must never run"
+    );
+
+    let st = store.load().unwrap();
+    assert!(
+        st.holds.contains_key("bad-worker"),
+        "refused worker must be placed on hold"
+    );
+    assert!(
+        st.holds.contains_key("bad-worker-2"),
+        "refused worker must be placed on hold"
+    );
+    assert!(
+        !st.agents.contains_key("bad-worker") && !st.agents.contains_key("bad-worker-2"),
+        "refused worker must not be recorded as a running agent"
+    );
+    let decisions = store.recent_decisions(20, None, None).unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.action == "start_refused" && d.target == "bad-worker"),
+        "expected start_refused decision for bad-worker, got: {:?}",
+        decisions
+    );
+}

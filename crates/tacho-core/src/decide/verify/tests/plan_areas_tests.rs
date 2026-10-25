@@ -563,3 +563,246 @@ fn test_prune_stale_records_drops_closed_or_moved_heads() {
     assert_eq!(next_failed.keys().copied().collect::<Vec<_>>(), vec![10]);
     assert!(next_untied.is_empty());
 }
+
+// =============================================================================
+// Costly Area Selection & Related Unit Tests (`test_selection.py`, `test_related.py`)
+// =============================================================================
+
+fn eval_costly(paths: &[&str], pull_request: bool, train: bool) -> BTreeSet<String> {
+    let mut found = vec!["secrets"];
+    for &p in paths {
+        if p.starts_with("frontend/admin/") {
+            found.push("console");
+        }
+        if p.starts_with("frontend/android/") {
+            found.push("android");
+        }
+        if p.starts_with("crates/") {
+            found.push("rust");
+        }
+        if p == "deploy/Dockerfile" || p == ".dockerignore" {
+            found.push("image");
+        }
+    }
+    select_costly_areas(&found, paths, pull_request, train)
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn test_a_console_change_builds_no_image_and_no_release() {
+    let got = eval_costly(&["frontend/admin/src/a.ts"], true, false);
+    assert!(!got.contains("image"));
+    assert!(!got.contains("android-release"));
+    assert!(got.contains("console-browser"));
+}
+
+#[test]
+fn test_a_service_change_builds_no_image() {
+    let got = eval_costly(&["crates/api-service/src/a.rs"], true, false);
+    assert!(!got.contains("image"));
+}
+
+#[test]
+fn test_a_dockerfile_change_builds_the_image() {
+    let got = eval_costly(&["deploy/Dockerfile"], true, false);
+    assert!(got.contains("image"));
+}
+
+#[test]
+fn test_a_crate_manifest_change_builds_the_image() {
+    let got = eval_costly(&["crates/core-lib/Cargo.toml"], true, false);
+    assert!(got.contains("image"));
+}
+
+#[test]
+fn test_an_android_source_change_assembles_no_release() {
+    let got = eval_costly(
+        &["frontend/android/app/src/main/java/app/mobile/Home.kt"],
+        true,
+        false,
+    );
+    assert!(got.contains("android"));
+    assert!(!got.contains("android-release"));
+}
+
+#[test]
+fn test_an_android_build_script_change_assembles_the_release() {
+    let got = eval_costly(&["frontend/android/app/build.gradle.kts"], true, false);
+    assert!(got.contains("android-release"));
+}
+
+#[test]
+fn test_console_screenshots_alone_run_no_browser_suite() {
+    let got = eval_costly(&["frontend/admin/screenshots/home.png"], true, false);
+    assert!(got.contains("console"));
+    assert!(!got.contains("console-browser"));
+}
+
+#[test]
+fn test_a_console_source_beside_screenshots_runs_the_browser_suite() {
+    let got = eval_costly(
+        &[
+            "frontend/admin/screenshots/home.png",
+            "frontend/admin/src/a.ts",
+        ],
+        true,
+        false,
+    );
+    assert!(got.contains("console-browser"));
+}
+
+#[test]
+fn test_a_train_builds_all_three() {
+    let got = eval_costly(
+        &[
+            "frontend/admin/src/a.ts",
+            "frontend/android/app/src/main/java/a.kt",
+        ],
+        true,
+        true,
+    );
+    assert!(got.contains("image"));
+    assert!(got.contains("android-release"));
+    assert!(got.contains("console-browser"));
+}
+
+#[test]
+fn test_main_builds_every_part_of_the_areas_it_runs() {
+    let got = eval_costly(
+        &[
+            "frontend/admin/src/a.ts",
+            "frontend/android/app/src/main/java/a.kt",
+            "deploy/Dockerfile",
+        ],
+        false,
+        false,
+    );
+    assert!(got.contains("image"));
+    assert!(got.contains("android-release"));
+    assert!(got.contains("console-browser"));
+}
+
+#[test]
+fn test_a_change_with_no_android_has_no_release_to_assemble() {
+    let got = eval_costly(&["frontend/admin/src/a.ts"], false, false);
+    assert!(!got.contains("android-release"));
+}
+
+fn fixture_fleet_tests() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "tools/tacho/tests/test_plan.py".to_string(),
+            "from tacho import plan\n".to_string(),
+        ),
+        (
+            "tools/tacho/tests/test_runs.py".to_string(),
+            "from tacho import runs, plan\n".to_string(),
+        ),
+        (
+            "tools/tacho/tests/test_mail.py".to_string(),
+            "import unittest\nfrom tacho import mail\n# the plan is not imported here\n"
+                .to_string(),
+        ),
+    ])
+}
+
+#[test]
+fn test_a_module_selects_the_tests_that_import_it_and_no_other() {
+    let tests = fixture_fleet_tests();
+    assert_eq!(
+        related_package_tests(
+            &["tools/tacho/tacho/plan.py"],
+            &tests,
+            "tools/tacho",
+            "tacho"
+        ),
+        vec!["tests.test_plan", "tests.test_runs"]
+    );
+}
+
+#[test]
+fn test_a_changed_test_selects_itself() {
+    let tests = fixture_fleet_tests();
+    assert_eq!(
+        related_package_tests(
+            &["tools/tacho/tests/test_mail.py"],
+            &tests,
+            "tools/tacho",
+            "tacho"
+        ),
+        vec!["tests.test_mail"]
+    );
+}
+
+#[test]
+fn test_a_script_outside_the_package_selects_everything() {
+    let tests = fixture_fleet_tests();
+    assert_eq!(
+        related_package_tests(&["tools/tacho/bin/tacho"], &tests, "tools/tacho", "tacho"),
+        vec!["*"]
+    );
+}
+
+#[test]
+fn test_a_path_outside_the_fleet_selects_nothing() {
+    let tests = fixture_fleet_tests();
+    assert!(
+        related_package_tests(&["crates/app/src/lib.rs"], &tests, "tools/tacho", "tacho")
+            .is_empty()
+    );
+}
+
+fn fixture_console_modules() -> (BTreeMap<String, String>, BTreeSet<String>) {
+    let modules = BTreeMap::from([
+        (
+            "frontend/admin/src/lib/money.ts".to_string(),
+            "export const x = 1\n".to_string(),
+        ),
+        (
+            "frontend/admin/tests/money.test.mjs".to_string(),
+            "import { x } from '../src/lib/money.ts'\n".to_string(),
+        ),
+        (
+            "frontend/admin/tests/names.test.mjs".to_string(),
+            "import { y } from '../src/lib/names.ts'\n".to_string(),
+        ),
+        (
+            "frontend/admin/src/lib/names.ts".to_string(),
+            "export const y = 1\n".to_string(),
+        ),
+    ]);
+    let tests = BTreeSet::from([
+        "frontend/admin/tests/money.test.mjs".to_string(),
+        "frontend/admin/tests/names.test.mjs".to_string(),
+    ]);
+    (modules, tests)
+}
+
+#[test]
+fn test_a_library_module_selects_the_test_that_imports_it() {
+    let (modules, tests) = fixture_console_modules();
+    assert_eq!(
+        related_console_tests(
+            &["frontend/admin/src/lib/money.ts"],
+            &modules,
+            &tests,
+            "frontend/admin/"
+        ),
+        vec!["tests/money.test.mjs"]
+    );
+}
+
+#[test]
+fn test_a_changed_config_selects_everything() {
+    let (modules, tests) = fixture_console_modules();
+    assert_eq!(
+        related_console_tests(
+            &["frontend/admin/package.json"],
+            &modules,
+            &tests,
+            "frontend/admin/"
+        ),
+        vec!["*"]
+    );
+}

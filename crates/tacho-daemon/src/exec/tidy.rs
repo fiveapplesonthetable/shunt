@@ -107,9 +107,8 @@ pub fn apply_tidy_decisions(
                 }
                 let p = Path::new(path);
                 if p.exists() && !super::observe::is_linked_worktree(p) {
-                    let msg = format!(
-                        "keeping {path}: refusing to remove non-worktree or main checkout"
-                    );
+                    let msg =
+                        format!("keeping {path}: refusing to remove non-worktree or main checkout");
                     eprintln!("[tacho-fleet] {msg}");
                     store.record_decision("watch", "remove_worktree_failed", path, &msg)?;
                     continue;
@@ -145,9 +144,8 @@ pub fn apply_tidy_decisions(
                 }
                 let p = Path::new(path);
                 if p.exists() && !super::observe::is_linked_worktree(p) {
-                    let msg = format!(
-                        "keeping {path}: refusing to remove non-worktree or main checkout"
-                    );
+                    let msg =
+                        format!("keeping {path}: refusing to remove non-worktree or main checkout");
                     eprintln!("[tacho-fleet] {msg}");
                     store.record_decision("watch", "remove_worktree_failed", path, &msg)?;
                     continue;
@@ -191,8 +189,11 @@ fn remove_worktree(store: &mut FleetStore, path: &str, because: &str) -> io::Res
                 ),
             ));
         }
-        let common_git_dir =
-            crate::sampler::run_git_in_worktree(p, &["rev-parse", "--git-common-dir"], GIT_TIMEOUT)?;
+        let common_git_dir = crate::sampler::run_git_in_worktree(
+            p,
+            &["rev-parse", "--git-common-dir"],
+            GIT_TIMEOUT,
+        )?;
         let common_path = p.join(common_git_dir.trim()).canonicalize()?;
         let main_repo = common_path.parent().unwrap_or(&common_path);
         crate::sampler::run_git(
@@ -294,8 +295,7 @@ pub fn tree_of_worktree(root: &Path) -> io::Result<String> {
             .stderr(std::process::Stdio::piped())
             .process_group(0)
             .spawn()?;
-        let exited =
-            crate::sampler::wait_child_exit(&child, std::time::Duration::from_secs(30))?;
+        let exited = crate::sampler::wait_child_exit(&child, std::time::Duration::from_secs(30))?;
         if !exited {
             unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
         }

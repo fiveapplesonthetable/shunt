@@ -53,10 +53,12 @@ pub use release::{
     ProvedBatch, StatusRow, TrainBatchSummary, Waiting,
 };
 pub use shots::{
-    android_redraw_command, decode_png, encode_rgba_png, format_redraw_failure, golden_names,
-    moved, moved_summary, pixel_moved, refresh_commit_subject, shot_stem, stale_shots_step,
-    stray_refusal, stray_shots, DecodedPng, ShotRules, StaleShotsStep, DEFAULT_PIXEL_EDGE,
-    DEFAULT_PIXEL_SHARE_PPM, PNG_SIGNATURE,
+    android_redraw_command, canvas_line, classify_moved_goldens, decode_png, encode_rgba_png,
+    format_redraw_failure, golden_names, moved, moved_summary, pixel_moved, read_report_goldens,
+    refresh_commit_subject, share_changed, shot_stem, shots_fix_lines, shots_fix_verdict, size_of,
+    stale_shots_step, stray_refusal, stray_shots, DecodedPng, MovedGolden, ShotFixKind,
+    ShotFixVerdict, ShotRules, StaleShotsStep, DEFAULT_PIXEL_EDGE, DEFAULT_PIXEL_SHARE_PPM,
+    GOLDEN_MOVED_MARKER, MOST_CATALOGUE_SHARE, PNG_SIGNATURE,
 };
 pub use train::{
     did_not_land_subject, landed_line, open_for_id, refusal, reuse_or_make, stopped_loud_line,

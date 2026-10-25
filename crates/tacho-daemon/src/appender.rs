@@ -251,8 +251,10 @@ impl AppenderHandle {
         } else {
             SEND_TIMEOUT
         };
-        self.sender
-            .send_timeout(AppenderCommand::Input(Box::new(input), received_at_ns), timeout)
+        self.sender.send_timeout(
+            AppenderCommand::Input(Box::new(input), received_at_ns),
+            timeout,
+        )
     }
 
     /// Sends a batch of input events into the flight recorder pipeline with a bounded timeout

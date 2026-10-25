@@ -688,7 +688,58 @@ fn execute_actions(
             }
             SuperviseAction::Escalate { key, because } => {
                 println!("Supervise: {because}");
-                store.record_decision("watch", "supervise", key, because)?;
+                if let Some(a) = state.agents.get(key) {
+                    if let Some(pid) = a.pid {
+                        let id = Identity {
+                            pid,
+                            starttime: a.starttime,
+                            cgroup: a.cgroup.as_deref(),
+                        };
+                        match identity::signal_verified(&id, key, libc::SIGTERM) {
+                            Ok(Signalled::Delivered | Signalled::Gone) => {
+                                store.mutate(Some(("watch", "supervise", key, because)), |st| {
+                                    if let Some(ag) = st.agents.get_mut(key) {
+                                        ag.finished_at.get_or_insert(now);
+                                        ag.exit_code.get_or_insert(143);
+                                        ag.status_note = "stopped: escalated".to_string();
+                                    }
+                                    st.holds = tacho_core::decide::dispatch::with_hold(
+                                        &st.holds,
+                                        base_key(key),
+                                        because,
+                                        now,
+                                    );
+                                })?;
+                            }
+                            Ok(Signalled::Refused) => {
+                                f.record(
+                                    store,
+                                    "watch",
+                                    "supervise_stop_refused",
+                                    key,
+                                    &format!(
+                                        "refused to stop escalated worker {key}: identity not verified"
+                                    ),
+                                    false,
+                                )?;
+                            }
+                            Err(e) => {
+                                f.record(
+                                    store,
+                                    "watch",
+                                    "supervise_stop_failed",
+                                    key,
+                                    &format!("failed to stop escalated worker {key}: {e}"),
+                                    true,
+                                )?;
+                            }
+                        }
+                    } else {
+                        store.record_decision("watch", "supervise", key, because)?;
+                    }
+                } else {
+                    store.record_decision("watch", "supervise", key, because)?;
+                }
                 f.hands
                     .emit(&format!("agent:{key}"), "watch:supervise", because);
             }
@@ -1431,5 +1482,236 @@ mod tests {
             "",
             "enclosing parent repo must not have staged files"
         );
+    }
+
+    #[test]
+    fn test_retired_main_checkout_survives_tidy_with_index_and_untracked_files_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let holder = dir.path().join("holder");
+        let main_checkout = holder.join("repo");
+        std::fs::create_dir_all(&main_checkout).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main_checkout)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "Tester"]);
+        std::fs::write(main_checkout.join("README.md"), "hello\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+
+        // Stage a file in the main checkout's index and create an untracked file.
+        std::fs::write(main_checkout.join("staged.txt"), "staged work\n").unwrap();
+        run_git(&["add", "staged.txt"]);
+        std::fs::write(main_checkout.join("untracked.txt"), "untracked work\n").unwrap();
+
+        let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+        let main_path_str = main_checkout.to_string_lossy().to_string();
+        let holder_path_str = holder.to_string_lossy().to_string();
+        store
+            .mutate(None, |st| {
+                st.retired.insert("retired-main".to_string());
+                st.retired.insert("retired-holder".to_string());
+                st.worktrees.insert(
+                    "retired-main".to_string(),
+                    crate::fleet::WorktreeEntry {
+                        slug: "retired-main".to_string(),
+                        path: main_path_str.clone(),
+                        branch: "main".to_string(),
+                        base_sha: String::new(),
+                        base_pr: None,
+                        port: 3200,
+                        port_last: 3219,
+                        created_at: 100,
+                    },
+                );
+                st.worktrees.insert(
+                    "retired-holder".to_string(),
+                    crate::fleet::WorktreeEntry {
+                        slug: "retired-holder".to_string(),
+                        path: holder_path_str.clone(),
+                        branch: "main".to_string(),
+                        base_sha: String::new(),
+                        base_pr: None,
+                        port: 3220,
+                        port_last: 3239,
+                        created_at: 100,
+                    },
+                );
+                st.agents.insert(
+                    "retired-main".to_string(),
+                    AgentRun {
+                        key: "retired-main".to_string(),
+                        worktree: main_path_str.clone(),
+                        started_at: 100,
+                        finished_at: Some(200),
+                        exit_code: Some(0),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        // 1. Run a full autonomous tick: tidy must not plan or execute removal of the main checkout.
+        let live = tacho_core::LiveState::default();
+        let mut hands = DaemonHands {
+            home: home.clone(),
+            live_state: live.clone(),
+            appender: None,
+        };
+        let mut opts = TickOptions::new(&live);
+        opts.explicit_main_sha = Some("a".repeat(40));
+        opts.procs = Some(Vec::new());
+        opts.now_override = Some(100_000);
+        let out = run_tick(&home, &mut store, &mut hands, opts).unwrap();
+        assert!(
+            out.plan.tidy_decisions.is_empty(),
+            "decide must never plan tidy removal for the main checkout or its holder: {:?}",
+            out.plan.tidy_decisions
+        );
+
+        // 2. Also invoke apply_tidy_decisions directly with RemoveTree and RemoveCheckout (with and without rescue).
+        let explicit = vec![
+            tacho_core::decide::watch::TidyDecision::RemoveTree {
+                path: main_path_str.clone(),
+                rescue: true,
+                because: "retired worktree".to_string(),
+            },
+            tacho_core::decide::watch::TidyDecision::RemoveCheckout {
+                path: main_path_str.clone(),
+                rescue: false,
+                because: "stale checkout".to_string(),
+            },
+            tacho_core::decide::watch::TidyDecision::RemoveTree {
+                path: holder_path_str.clone(),
+                rescue: false,
+                because: "holder of main checkout".to_string(),
+            },
+            tacho_core::decide::watch::TidyDecision::RemoveCheckout {
+                path: holder_path_str.clone(),
+                rescue: true,
+                because: "holder checkout".to_string(),
+            },
+        ];
+        let removed = tidy::apply_tidy_decisions(&mut store, &explicit, 100_000, false).unwrap();
+        assert!(removed.is_empty());
+
+        // Main checkout, its staged index, and its untracked files are all intact.
+        assert!(main_checkout.join(".git").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(main_checkout.join("staged.txt")).unwrap(),
+            "staged work\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(main_checkout.join("untracked.txt")).unwrap(),
+            "untracked work\n"
+        );
+        let cached = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&main_checkout)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&cached.stdout).trim(),
+            "staged.txt",
+            "main checkout git index must remain intact"
+        );
+    }
+
+    #[test]
+    fn test_worker_running_in_main_checkout_is_stopped_with_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let main_checkout = dir.path().join("repo");
+        std::fs::create_dir_all(&main_checkout).unwrap();
+
+        let st = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&main_checkout)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        // Spawn a background worker process whose recorded worktree is the main checkout.
+        let mut child = unsafe {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("bash")
+                .args(["-c", "read -r _ || true"])
+                .current_dir(&main_checkout)
+                .stdin(std::process::Stdio::piped())
+                .pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        let _child_stdin = child.stdin.take();
+        let pid = child.id();
+        let starttime = identity::proc_pid_starttime(pid).expect("child starttime");
+
+        let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+        let main_str = main_checkout.to_string_lossy().to_string();
+        store
+            .mutate(None, |s| {
+                s.agents.insert(
+                    "rogue-worker".to_string(),
+                    AgentRun {
+                        key: "rogue-worker".to_string(),
+                        pid: Some(pid),
+                        starttime: Some(starttime),
+                        worktree: main_str.clone(),
+                        started_at: 1_000,
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        let forge = MockForge::default();
+        let live = tacho_core::LiveState::default();
+        let mut hands = DaemonHands {
+            home: home.clone(),
+            live_state: live.clone(),
+            appender: None,
+        };
+        let mut opts = TickOptions::new(&live);
+        opts.explicit_main_sha = Some("a".repeat(40));
+        opts.forge = Some(&forge);
+        opts.procs = Some(Vec::new());
+        opts.now_override = Some(1_010);
+
+        let out = run_tick(&home, &mut store, &mut hands, opts).unwrap();
+        let wait_status = child.wait().unwrap();
+        assert!(
+            !wait_status.success(),
+            "worker in main checkout must be terminated by supervision"
+        );
+        assert!(
+            out.plan.supervision_actions.iter().any(
+                |a| matches!(a, SuperviseAction::Escalate { key, .. } if key == "rogue-worker")
+            ),
+            "expected Escalate supervision action for rogue-worker, got: {:?}",
+            out.plan.supervision_actions
+        );
+        assert!(
+            !out.plan.owner_notifications.is_empty(),
+            "expected owner notification/page when stopping worker in main checkout"
+        );
+        let final_state = store.load().unwrap();
+        assert!(
+            final_state.holds.contains_key("rogue-worker"),
+            "rogue-worker must be placed on hold"
+        );
+        assert_eq!(final_state.agents["rogue-worker"].finished_at, Some(1_010));
     }
 }

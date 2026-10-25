@@ -159,6 +159,37 @@ pub fn moved(before: Option<&[u8]>, after: Option<&[u8]>, golden: bool) -> bool 
     )
 }
 
+/// Returns `(width, height)` of a PNG, or `None` when missing or unreadable (`pixels.py::size_of`).
+pub fn size_of(data: Option<&[u8]>) -> Option<(u32, u32)> {
+    let one = decode_png(data)?;
+    Some((one.width, one.height))
+}
+
+/// Share of channels (`0.0..=1.0`) that differ between two same-sized PNGs, or `None` when
+/// dimensions/channels differ or either image cannot be decoded (`pixels.py::share_changed`).
+pub fn share_changed(before: Option<&[u8]>, after: Option<&[u8]>) -> Option<f64> {
+    let (one, two) = (decode_png(before)?, decode_png(after)?);
+    if (one.width, one.height, one.channels) != (two.width, two.height, two.channels) {
+        return None;
+    }
+    let mut differing: u64 = 0;
+    for (ra, rb) in one.rows.iter().zip(two.rows.iter()) {
+        if ra == rb {
+            continue;
+        }
+        for (&x, &y) in ra.iter().zip(rb.iter()) {
+            if x != y {
+                differing += 1;
+            }
+        }
+    }
+    let total = u64::from(one.width) * u64::from(one.height) * (one.channels as u64);
+    if total == 0 {
+        return None;
+    }
+    Some((differing as f64) / (total as f64))
+}
+
 /// Encodes a valid 8-bit non-interlaced RGBA PNG using stored zlib blocks.
 pub fn encode_rgba_png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
     let mut raw = Vec::with_capacity((height as usize) * ((width as usize) * 4 + 1));
@@ -713,4 +744,278 @@ pub fn android_redraw_command(gradle_slot: &str) -> String {
 
 pub fn refresh_commit_subject(label: &str) -> String {
     format!("Screenshots for train {label}")
+}
+
+// =============================================================================
+// Golden Screenshot Fix Classification (`shotsfix.py`)
+// =============================================================================
+
+pub const GOLDEN_MOVED_MARKER: &str = "a golden screenshot moved";
+pub const MOST_CATALOGUE_SHARE: f64 = 0.5;
+
+fn shot_setup_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(^|/)(build\.gradle(\.kts)?|settings\.gradle(\.kts)?|libs\.versions\.toml|gradle\.properties|vite\.config\.\w+|playwright\.config\.\w+|screenshots\.mjs|shot-settle\.mjs|shot-report\.sh|Dockerfile)$|/screenshot/|/theme/|/design/|^\.github/workflows/",
+        )
+        .expect("static regex")
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShotFixKind {
+    Canvas,
+    Intended,
+    Drift,
+}
+
+impl ShotFixKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Canvas => "canvas",
+            Self::Intended => "intended",
+            Self::Drift => "drift",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MovedGolden {
+    pub path: String,
+    pub before: Option<(u32, u32)>,
+    pub after: Option<(u32, u32)>,
+    pub share: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShotFixVerdict {
+    pub path: String,
+    pub kind: ShotFixKind,
+    pub line: String,
+}
+
+fn format_opt_size(size: Option<(u32, u32)>) -> String {
+    match size {
+        None => "none".to_string(),
+        Some((w, h)) => format!("{w}x{h}"),
+    }
+}
+
+fn setup_note<S: AsRef<str>>(touched: &[S]) -> String {
+    let re = shot_setup_re();
+    let found: Vec<&str> = touched
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|f| re.is_match(f))
+        .take(5)
+        .collect();
+    if found.is_empty() {
+        "nothing in the diff touches build or test setup, so look at the runner image and the toolchain".to_string()
+    } else {
+        format!("the diff touches build or test setup: {}", found.join(", "))
+    }
+}
+
+/// Names the canvas break: what every shot is now, what it was, and what in the diff could have done it.
+pub fn canvas_line<S: AsRef<str>>(moved: &[MovedGolden], touched: &[S]) -> String {
+    let now: Vec<String> = moved
+        .iter()
+        .map(|g| format_opt_size(g.after))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let was: Vec<String> = moved
+        .iter()
+        .map(|g| format_opt_size(g.before))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let what = if now.len() == 1 && was.len() == 1 && now != was {
+        format!("every shot is {}, expected {}", now[0], was[0])
+    } else if now != was {
+        format!("shots are {}, expected {}", now.join(", "), was.join(", "))
+    } else {
+        let first = now.first().map(String::as_str).unwrap_or("none");
+        format!("{} golden shots moved at once at {first}", moved.len())
+    };
+    format!(
+        "rendering setup broke, not a screen: {what}; {}",
+        setup_note(touched)
+    )
+}
+
+fn canvas_changed(moved: &[MovedGolden], moved_total: usize, catalogue: usize) -> bool {
+    let resized = moved.iter().any(|g| g.before != g.after);
+    resized || (catalogue > 0 && (moved_total as f64) > MOST_CATALOGUE_SHARE * (catalogue as f64))
+}
+
+/// Classify each moved golden of one area (`Canvas`, `Intended`, or `Drift`).
+pub fn classify_moved_goldens<S: AsRef<str>>(
+    moved: &[MovedGolden],
+    moved_total: usize,
+    catalogue: usize,
+    touched: &[S],
+    rules: &ShotRules,
+) -> Vec<ShotFixVerdict> {
+    if moved.is_empty() {
+        return Vec::new();
+    }
+    if canvas_changed(moved, moved_total, catalogue) {
+        let line = canvas_line(moved, touched);
+        return moved
+            .iter()
+            .map(|g| ShotFixVerdict {
+                path: g.path.clone(),
+                kind: ShotFixKind::Canvas,
+                line: line.clone(),
+            })
+            .collect();
+    }
+    let empty_golden = BTreeSet::new();
+    let mut out = Vec::with_capacity(moved.len());
+    for g in moved {
+        let mut check_files: Vec<&str> = touched.iter().map(AsRef::as_ref).collect();
+        check_files.push(g.path.as_str());
+        if g.after.is_some() && stray_shots(&check_files, &empty_golden, rules).is_empty() {
+            out.push(ShotFixVerdict {
+                path: g.path.clone(),
+                kind: ShotFixKind::Intended,
+                line: "the diff reaches this screen; redrawn golden committed".to_string(),
+            });
+        } else if g.after.is_none() {
+            out.push(ShotFixVerdict {
+                path: g.path.clone(),
+                kind: ShotFixKind::Drift,
+                line: "the golden is no longer drawn and nothing in the diff removes it"
+                    .to_string(),
+            });
+        } else {
+            let delta = match g.share {
+                None => String::new(),
+                Some(s) => format!(", {:.3}% of its channels differ", s * 100.0),
+            };
+            out.push(ShotFixVerdict {
+                path: g.path.clone(),
+                kind: ShotFixKind::Drift,
+                line: format!("nothing in the diff reaches this screen{delta}; not committed"),
+            });
+        }
+    }
+    out
+}
+
+/// `(final_line, exit_status)` for a set of golden verdicts.
+pub fn shots_fix_verdict(results: &[ShotFixVerdict]) -> (String, i32) {
+    if results.is_empty() {
+        return ("no golden screenshot moved".to_string(), 0);
+    }
+    if results.iter().any(|r| r.kind == ShotFixKind::Canvas) {
+        return (
+            "the canvas changed: fix the rendering setup, commit no screenshots".to_string(),
+            1,
+        );
+    }
+    if results.iter().any(|r| r.kind == ShotFixKind::Drift) {
+        return (
+            "a golden moved without a change to its screen: find what else changed the render, commit no screenshots".to_string(),
+            1,
+        );
+    }
+    (
+        format!(
+            "{} golden screenshot(s) follow their screens' intended changes",
+            results.len()
+        ),
+        0,
+    )
+}
+
+/// Format one status line per classified golden verdict.
+pub fn shots_fix_lines(results: &[ShotFixVerdict]) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| format!("{:8} {}: {}", r.kind.as_str(), r.path, r.line))
+        .collect()
+}
+
+/// Per area, read the goldens a shot-report directory shows moved, and how many shots of that area moved in all.
+pub fn read_report_goldens(
+    shots_dir: &std::path::Path,
+    golden: &BTreeSet<String>,
+    rules: &ShotRules,
+) -> BTreeMap<String, (Vec<MovedGolden>, usize)> {
+    let area_of = |p: &str| -> Option<&str> {
+        rules
+            .area_roots
+            .iter()
+            .find(|(_, r)| p.starts_with(r.as_str()))
+            .map(|(a, _)| a.as_str())
+    };
+    let read_side = |area: &str, side: &str, path: &str| -> Option<Vec<u8>> {
+        std::fs::read(shots_dir.join(area).join(side).join(path)).ok()
+    };
+
+    let mut redrawn: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for (area, _) in &rules.area_roots {
+        let Ok(content) = std::fs::read_to_string(shots_dir.join(area).join("changed.txt")) else {
+            continue;
+        };
+        let mut entries = Vec::new();
+        for line in content.lines().filter(|l| !l.is_empty()) {
+            let mut parts = line.split('\t');
+            if let (Some(state), Some(path)) = (parts.next(), parts.next()) {
+                entries.push((state.to_string(), path.to_string()));
+            }
+        }
+        redrawn.insert(area.clone(), entries);
+    }
+
+    let mut moved_set: BTreeSet<(String, String)> = BTreeSet::new();
+    for (area, files) in &redrawn {
+        for (state, path) in files {
+            let did_move = if state != "changed" {
+                true
+            } else {
+                let before = read_side(area, "before", path);
+                let after = read_side(area, "after", path);
+                moved(before.as_deref(), after.as_deref(), golden.contains(path))
+            };
+            if did_move {
+                if let Some(owner_area) = area_of(path) {
+                    moved_set.insert((owner_area.to_string(), path.clone()));
+                }
+            }
+        }
+    }
+
+    let mut found = BTreeMap::new();
+    for (area, files) in redrawn {
+        let mut goldens = Vec::new();
+        for (state, path) in files {
+            if !golden.contains(&path) || !moved_set.contains(&(area.clone(), path.clone())) {
+                continue;
+            }
+            let before = if state == "new" {
+                None
+            } else {
+                read_side(&area, "before", &path)
+            };
+            let after = if state == "gone" {
+                None
+            } else {
+                read_side(&area, "after", &path)
+            };
+            goldens.push(MovedGolden {
+                path,
+                before: size_of(before.as_deref()),
+                after: size_of(after.as_deref()),
+                share: share_changed(before.as_deref(), after.as_deref()),
+            });
+        }
+        let total = moved_set.iter().filter(|(a, _)| a == &area).count();
+        found.insert(area, (goldens, total));
+    }
+    found
 }

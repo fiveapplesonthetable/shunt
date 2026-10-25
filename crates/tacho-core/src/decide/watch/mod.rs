@@ -59,7 +59,10 @@ pub use diag::{
     DAY_SECS, DEFAULT_LOCK_HOLDERS, HOUR_SECS, LINE_CHARS, LOCK_FILES, REDACT_MARK, TAIL_LINES,
     TRANSCRIPT_KEEP_SECS, WEEK_SECS,
 };
-pub use guard::{background_refusal, burner_refusal, shell_tokens, stage_burner_word};
+pub use guard::{
+    background_refusal, burner_refusal, loosened_limits_in_diff, shell_tokens, stage_burner_word,
+    time_based_tests_in_diff, vague_waits_in_diff,
+};
 pub use jobs::{
     job_kill, job_name_problem, job_start_check, job_wait, kill_group, last_log_line,
     tail_non_empty, valid_job_name, wait_for, MAX_JOB_NAME_LEN, WAIT_BEAT_SECS, WAIT_LIMIT_SECS,

@@ -116,6 +116,9 @@ pub struct WorldObservation {
     /// until all their members are merged or closed).
     #[serde(default)]
     pub main_ci: Option<crate::decide::verify::MainCiObs>,
+    /// Live workers whose directory resolves to the repository's main checkout (`key -> path`).
+    #[serde(default)]
+    pub main_checkout_workers: BTreeMap<String, String>,
 }
 
 /// An observed runaway burner process (e.g. stress, yes).
@@ -244,9 +247,29 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         }
     }
 
-    // 3. Sample progress and supervise live agents (`MOVING`, `STALLED`, `HUNG`).
+    // 3. Sample progress and supervise live agents (`MOVING`, `STALLED`, `HUNG`), and refuse any
+    // worker whose directory resolves to the main checkout.
     let mut supervision_actions = Vec::new();
+    for (key, wt_path) in &obs.main_checkout_workers {
+        let because = format!(
+            "worker {key} directory {wt_path} resolves to the main checkout; stopping with a page"
+        );
+        supervision_actions.push(SuperviseAction::Escalate {
+            key: key.clone(),
+            because: because.clone(),
+        });
+        next.holds =
+            crate::decide::dispatch::with_hold(&next.holds, base_key(key), &because, obs.now);
+        if let Some(a) = next.agents.get_mut(key) {
+            a.finished_at = Some(obs.now);
+            a.exit_code = Some(143);
+            a.status_note = "stopped: directory resolves to main checkout".to_string();
+        }
+    }
     for key in &obs.live_keys {
+        if obs.main_checkout_workers.contains_key(key) {
+            continue;
+        }
         if let Some(sample) = obs.agent_samples.get(key) {
             let existing = next.samples.get(key).map(Vec::as_slice).unwrap_or(&[]);
             let updated = take_sample(existing, sample.clone(), 60);
@@ -597,6 +620,16 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
             target: format!("pr:{pr_num}"),
             summary: reason.clone(),
             command_hint: format!("tacho hand {pr_num}"),
+        });
+    }
+    for (key, wt_path) in &obs.main_checkout_workers {
+        attention_items.push(AttentionItem {
+            kind: "main-checkout-worker".to_string(),
+            target: key.clone(),
+            summary: format!(
+                "worker {key} was started with the main checkout ({wt_path}) as its directory and was stopped"
+            ),
+            command_hint: format!("tacho start {}", base_key(key)),
         });
     }
     let self_update = decide_self_update(

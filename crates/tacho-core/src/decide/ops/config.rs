@@ -416,3 +416,124 @@ pub fn render_env_file(entries: &[(String, String)]) -> String {
     }
     out
 }
+
+/// Sanitizes a temporary-directory leaf name so path traversal (`..`, `/`) can never escape
+/// `<fleet_home>/tmp/<name>`.
+pub fn sanitize_tmp_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Preserves existing `JAVA_TOOL_OPTIONS` flags while replacing any prior `-Djava.io.tmpdir=...`
+/// flag and setting `-Djava.io.tmpdir=<tmp_dir>`.
+pub fn merge_java_tmp_options(existing: Option<&str>, tmp_dir: &str) -> String {
+    let mut tokens: Vec<String> = existing
+        .unwrap_or("")
+        .split_whitespace()
+        .filter(|tok| !tok.starts_with("-Djava.io.tmpdir="))
+        .map(str::to_string)
+        .collect();
+    tokens.push(format!("-Djava.io.tmpdir={tmp_dir}"));
+    tokens.join(" ")
+}
+
+/// Renders the systemd `50-tmp.conf` drop-in redirecting a runner service's `TMPDIR`, `TMP`,
+/// `TEMP`, and `JAVA_TOOL_OPTIONS` into `tmp_dir` off the root disk.
+pub fn runner_tmp_dropin(tmp_dir: &str) -> String {
+    format!(
+        "[Service]\nEnvironment=\"TMPDIR={tmp_dir}\" \"TMP={tmp_dir}\" \"TEMP={tmp_dir}\" \"JAVA_TOOL_OPTIONS=-Djava.io.tmpdir={tmp_dir}\"\n"
+    )
+}
+
+/// Action decided by [`check_root_disk`] when inspecting `/` filesystem capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootDiskAction {
+    /// True when `/` usage is `>= 80%` or free space is `< 20 GiB`.
+    pub warn: bool,
+    /// True when `/` free space is `< 40 GiB` (prune unused runner Docker volumes).
+    pub prune_docker_volumes: bool,
+    pub used_percent: u8,
+    pub avail_gib: u64,
+    pub summary: String,
+}
+
+/// Evaluates root disk (`/`) capacity: warns when `>= 80%` full or `< 20 GiB` free, and triggers
+/// runner Docker volume pruning when `< 40 GiB` free.
+pub fn check_root_disk(total_bytes: u64, avail_bytes: u64) -> RootDiskAction {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let used_bytes = total_bytes.saturating_sub(avail_bytes);
+    let used_percent = if total_bytes > 0 {
+        ((used_bytes as u128 * 100) / (total_bytes as u128)).min(100) as u8
+    } else {
+        0
+    };
+    let avail_gib = avail_bytes / GIB;
+    let warn = used_percent >= 80 || avail_bytes < 20 * GIB;
+    let prune_docker_volumes = avail_bytes < 40 * GIB;
+    let summary = format!(
+        "root disk / is {used_percent}% used ({avail_gib} GiB free); warn={warn}, prune_volumes={prune_docker_volumes}"
+    );
+    RootDiskAction {
+        warn,
+        prune_docker_volumes,
+        used_percent,
+        avail_gib,
+        summary,
+    }
+}
+
+#[cfg(test)]
+mod tmp_and_rootdisk_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_tmp_name_and_merge_java_tmp_options_prevent_traversal_and_preserve_flags() {
+        assert_eq!(sanitize_tmp_name("../../etc/passwd"), "etc_passwd");
+        assert_eq!(sanitize_tmp_name("worker-1"), "worker-1");
+        assert_eq!(sanitize_tmp_name("..."), "default");
+
+        assert_eq!(
+            merge_java_tmp_options(
+                Some("-Xmx4g -Djava.io.tmpdir=/old/tmp -XX:+UseG1GC"),
+                "/srv/fleet/tmp/w1"
+            ),
+            "-Xmx4g -XX:+UseG1GC -Djava.io.tmpdir=/srv/fleet/tmp/w1"
+        );
+        let dropin = runner_tmp_dropin("/srv/fleet/tmp/runner");
+        assert!(dropin.contains("TMPDIR=/srv/fleet/tmp/runner"));
+        assert!(dropin.contains("-Djava.io.tmpdir=/srv/fleet/tmp/runner"));
+    }
+
+    #[test]
+    fn check_root_disk_warns_and_prunes_volumes_at_thresholds() {
+        let gib = 1024 * 1024 * 1024u64;
+        // 100 GiB total, 50 GiB free -> ok
+        let healthy = check_root_disk(100 * gib, 50 * gib);
+        assert!(!healthy.warn);
+        assert!(!healthy.prune_docker_volumes);
+
+        // 100 GiB total, 35 GiB free (< 40 GiB) -> prune volumes, no warn yet (65% used)
+        let prune_only = check_root_disk(100 * gib, 35 * gib);
+        assert!(!prune_only.warn);
+        assert!(prune_only.prune_docker_volumes);
+
+        // 100 GiB total, 18 GiB free (82% used, < 20 GiB) -> both warn and prune
+        let critical = check_root_disk(100 * gib, 18 * gib);
+        assert!(critical.warn);
+        assert!(critical.prune_docker_volumes);
+    }
+}

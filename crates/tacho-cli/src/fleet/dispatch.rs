@@ -24,7 +24,7 @@ use crate::cli::{HoldArgs, NextArgs, ReleaseArgs, RetireArgs, TodoArgs};
 pub use super::session::{
     build_session_argv, deliver_tell_action, execute_attach, execute_session, execute_session_with,
     execute_stop, execute_tell, execute_tell_with, infer_provider_from_model,
-    spawn_worker_for_item, SessionOptions,
+    spawn_worker_for_item, spawn_worker_in_dir, SessionOptions,
 };
 use super::store::{
     emit_decision_event, live_agent_keys, load_fleet_meta, mutate_fleet_meta, now_ns, now_secs,

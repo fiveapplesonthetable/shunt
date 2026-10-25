@@ -468,14 +468,17 @@ pub fn run_provisioner_bounded(
     }
 }
 
-/// Core implementation of `tacho start`, returning an exit code (`0` on success, `3` when
-/// first install / provisioner exceeds its timeout cap).
-pub fn start_worktree_with_code(args: StartArgs) -> io::Result<i32> {
+/// Core implementation of `tacho start` against an already-opened [`tacho_daemon::FleetStore`],
+/// returning `(worktree_path, exit_code)` (`0` on success, `3` when first install / provisioner
+/// exceeds its timeout cap).
+pub fn provision_worktree_in_store(
+    store: &mut tacho_daemon::FleetStore,
+    args: StartArgs,
+) -> io::Result<(PathBuf, i32)> {
     if let Some(prob) = slug_problem(&args.slug) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, prob));
     }
 
-    let mut store = open_fleet_store()?;
     let state = store.load()?;
     let cwd = std::env::current_dir()?;
 
@@ -626,7 +629,7 @@ pub fn start_worktree_with_code(args: StartArgs) -> io::Result<i32> {
                     "First install / provisioner exceeded the {install_timeout}s timeout cap; re-run `tacho start {}` to finish.",
                     args.slug
                 );
-                return Ok(code);
+                return Ok((wt_path, code));
             }
         }
     }
@@ -654,7 +657,15 @@ pub fn start_worktree_with_code(args: StartArgs) -> io::Result<i32> {
     println!("Branch:   {}", args.slug);
     println!("Base SHA: {}", base_sha);
     println!("Ports:    {}..={}", base_port, port_last);
-    Ok(0)
+    Ok((wt_path, 0))
+}
+
+/// Core implementation of `tacho start`, returning an exit code (`0` on success, `3` when
+/// first install / provisioner exceeds its timeout cap).
+pub fn start_worktree_with_code(args: StartArgs) -> io::Result<i32> {
+    let mut store = open_fleet_store()?;
+    let (_wt_path, code) = provision_worktree_in_store(&mut store, args)?;
+    Ok(code)
 }
 
 /// Executes `tacho start <slug> [--base main|<pr>]`.

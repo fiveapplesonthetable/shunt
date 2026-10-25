@@ -117,6 +117,8 @@ pub struct ProcSampler {
     decide_failures: u32,
     /// Earliest timestamp (`now_ns`) at which an autonomous decide tick may retry after failure.
     decide_backoff_until_ns: u64,
+    /// Optional forge override for autonomous decide ticks (e.g. for deterministic testing).
+    decide_forge: Option<std::sync::Arc<dyn tacho_core::decide::plugin::ForgePlugin + Send + Sync>>,
     /// Set by [`SamplerWaker::request_decide`] to force a decide pass on the next tick.
     decide_requested: std::sync::Arc<AtomicBool>,
 }
@@ -157,6 +159,7 @@ impl ProcSampler {
             decide_refresh_ns: 60 * 1_000_000_000,
             decide_failures: 0,
             decide_backoff_until_ns: 0,
+            decide_forge: None,
             decide_requested: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
@@ -186,6 +189,14 @@ impl ProcSampler {
     /// Sets the coarse refresh interval for time-based decide rules.
     pub fn set_decide_refresh_secs(&mut self, secs: u64) {
         self.decide_refresh_ns = secs.max(1).saturating_mul(1_000_000_000);
+    }
+
+    /// Sets an explicit [`tacho_core::decide::plugin::ForgePlugin`] implementation for autonomous decide ticks.
+    pub fn set_decide_forge(
+        &mut self,
+        forge: Option<std::sync::Arc<dyn tacho_core::decide::plugin::ForgePlugin + Send + Sync>>,
+    ) {
+        self.decide_forge = forge;
     }
 
     /// Shares the flag that forces a decide pass on the next tick when set.
@@ -218,14 +229,16 @@ impl ProcSampler {
         self.decide_backoff_until_ns = 0;
     }
 
-    /// Records a failed decide pass and schedules exponential backoff (`1x, 2x, 4x, 8x, 16x`
-    /// of `decide_refresh_ns`) so subsequent 2s sampler ticks do not spin on a failing forge.
+    /// Records a failed decide pass and schedules exponential backoff (`1x, 2x, 4x, 8x, 15x`
+    /// of `decide_refresh_ns` — i.e. 60 s, 2 m, 4 m, 8 m, and up to 15 minutes when
+    /// `decide_refresh_ns` is 60 s) so subsequent 2s sampler ticks do not spin on a failing forge.
     pub(crate) fn record_decide_failure(&mut self, effective_seq: u64, now_ns: u64) {
         self.last_decide_seq = Some(effective_seq);
         self.last_decide_ns = now_ns;
         self.decide_failures = self.decide_failures.saturating_add(1);
         let shift = (self.decide_failures - 1).min(4);
-        let backoff = self.decide_refresh_ns.saturating_mul(1u64 << shift);
+        let mult = (1u64 << shift).min(15);
+        let backoff = self.decide_refresh_ns.saturating_mul(mult);
         self.decide_backoff_until_ns = now_ns.saturating_add(backoff);
     }
 
@@ -555,12 +568,18 @@ impl ProcSampler {
                         live_state: (*latest_live).clone(),
                         appender: Some(appender.clone()),
                     };
-                    let gh_forge = std::env::var("TACHO_GH_REPO")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                        .map(tacho_core::decide::plugin::GitHubForge::new);
+                    let gh_forge = if self.decide_forge.is_none() {
+                        std::env::var("TACHO_GH_REPO")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(tacho_core::decide::plugin::GitHubForge::new)
+                    } else {
+                        None
+                    };
                     let mut opts = crate::exec::TickOptions::new(&latest_live);
-                    if let Some(ref f) = gh_forge {
+                    if let Some(ref f) = self.decide_forge {
+                        opts.forge = Some(f.as_ref());
+                    } else if let Some(ref f) = gh_forge {
                         opts.forge = Some(f);
                     }
                     for run in latest_runs.iter() {
