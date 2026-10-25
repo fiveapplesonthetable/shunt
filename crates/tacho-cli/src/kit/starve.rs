@@ -16,8 +16,10 @@ use tacho_core::decide::watch::starve::{
     plan_starve as plan_starve_core, should_stop_burner, StarvePlan,
 };
 
-use super::procs::{pid_alive_with_starttime, proc_pid_pgid, proc_pid_starttime};
-use super::{emit_decision_event, open_fleet_store, write_atomic, FdEventWatcher};
+use super::procs::{
+    pid_alive_with_starttime, proc_pid_pgid, proc_pid_starttime, signal_group_and_leader,
+};
+use super::{emit_decision_event, open_fleet_store, use_private_tmp, write_atomic, FdEventWatcher};
 use crate::cli::StarveArgs;
 
 pub const STARVE_MAX_SECS: u64 = 300;
@@ -162,11 +164,13 @@ pub fn stop_registered_burner(burner: &RegisteredBurner) -> bool {
 
     let wc = WatchConfig::default();
     if should_stop_burner(pid, pgid, &environ, &cmdline, &wc) {
-        unsafe {
-            let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-            let _ = libc::kill(pid as i32, libc::SIGKILL);
+        match signal_group_and_leader(pid, libc::SIGKILL) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[tacho-starve] failed to stop burner pid {pid}: {e}");
+                false
+            }
         }
-        true
     } else {
         false
     }
@@ -221,12 +225,13 @@ impl BurnersGuard {
         for (mut child, reg) in self.children.drain(..) {
             let pid = child.id();
             if pid_alive_with_starttime(pid, reg.starttime) {
-                unsafe {
-                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-                    let _ = libc::kill(pid as i32, libc::SIGKILL);
+                if let Err(e) = signal_group_and_leader(pid, libc::SIGKILL) {
+                    eprintln!("[tacho-starve] failed to stop burner pid {pid}: {e}");
                 }
             }
-            let _ = child.wait();
+            if let Err(e) = child.wait() {
+                eprintln!("[tacho-starve] failed to reap burner pid {pid}: {e}");
+            }
         }
         clear_registered_burners(&self.home);
     }
@@ -291,6 +296,7 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
     // 2. Spawn `plan.burners` (4 per CPU) pinned to `plan.cpus` in isolated process groups
     for _ in 0..plan.burners {
         let mut b_cmd = Command::new(&wrap[0]);
+        use_private_tmp(&mut b_cmd, "starve")?;
         b_cmd
             .args(&wrap[1..])
             .args(["timeout", &timeout_secs.to_string(), "yes"])
@@ -315,6 +321,7 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
 
     // 3. Spawn the target command pinned to the same CPU slice in its own process group
     let mut target_cmd = Command::new(&wrap[0]);
+    use_private_tmp(&mut target_cmd, "starve")?;
     target_cmd
         .args(&wrap[1..])
         .args(&args.cmd)
@@ -355,24 +362,18 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
         if is_merge_batch_active() {
             preempted_by_batch = true;
             if pid_alive_with_starttime(target_pid, target_st) {
-                unsafe {
-                    let _ = libc::kill(-(target_pid as i32), libc::SIGKILL);
-                    let _ = libc::kill(target_pid as i32, libc::SIGKILL);
-                }
+                signal_group_and_leader(target_pid, libc::SIGKILL)?;
             }
-            let _ = child.wait();
+            child.wait()?;
             break 1;
         }
 
         let now = Instant::now();
         if now >= deadline {
             if pid_alive_with_starttime(target_pid, target_st) {
-                unsafe {
-                    let _ = libc::kill(-(target_pid as i32), libc::SIGKILL);
-                    let _ = libc::kill(target_pid as i32, libc::SIGKILL);
-                }
+                signal_group_and_leader(target_pid, libc::SIGKILL)?;
             }
-            let _ = child.wait();
+            child.wait()?;
             eprintln!("command exceeded the {timeout_secs}-second starve limit");
             break 124;
         }

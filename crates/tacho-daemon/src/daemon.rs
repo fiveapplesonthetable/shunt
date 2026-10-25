@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::appender::{spawn_appender_with_hook_timeout, AppenderHandle};
+use crate::appender::{spawn_appender_with_silence, AppenderHandle};
 use crate::config::Config;
 use crate::log::EventLog;
 use crate::paths::DaemonPaths;
@@ -84,8 +84,14 @@ impl Daemon {
         };
 
         // 3. Spawn appender thread (no in-memory rings; SQLite WAL is the sole source)
-        let (appender, appender_thread) =
-            spawn_appender_with_hook_timeout(recorder, log, 65_536, on_stall, on_stall_timeout);
+        let (appender, appender_thread) = spawn_appender_with_silence(
+            recorder,
+            log,
+            65_536,
+            on_stall,
+            on_stall_timeout,
+            Duration::from_secs(config.detectors.silent_s),
+        );
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
@@ -99,7 +105,7 @@ impl Daemon {
             Ok(pair) => pair,
             Err(e) => {
                 appender.shutdown();
-                let _ = appender_thread.join();
+                join_logged("appender", appender_thread);
                 return Err(e);
             }
         };
@@ -118,8 +124,8 @@ impl Daemon {
                 shutdown_flag.store(true, Ordering::Release);
                 appender.shutdown();
                 drop(sampler_waker);
-                let _ = sampler_thread.join();
-                let _ = appender_thread.join();
+                join_logged("sampler", sampler_thread);
+                join_logged("appender", appender_thread);
                 return Err(e);
             }
         };
@@ -246,20 +252,20 @@ impl Daemon {
             }
         }
         if let Some(t) = self.otlp_thread.take() {
-            let _ = t.join();
+            join_logged("otlp", t);
         }
         if let Some(t) = self.retention_thread.take() {
-            let _ = t.join();
+            join_logged("retention", t);
         }
         self.sampler_waker.wake();
         if let Some(t) = self.sampler_thread.take() {
-            let _ = t.join();
+            join_logged("sampler", t);
         }
         if let Some(t) = self.appender_thread.take() {
-            let _ = t.join();
+            join_logged("appender", t);
         }
         if let Some(t) = self.signal_thread.take() {
-            let _ = t.join();
+            join_logged("signal", t);
         }
     }
 }
@@ -267,6 +273,22 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Joins a daemon thread, reporting a panic instead of discarding it.
+fn join_logged(name: &str, handle: JoinHandle<()>) {
+    if handle.join().is_err() {
+        eprintln!("[tacho-daemon] {name} thread panicked");
+    }
+}
+
+/// Removes a socket file on shutdown; an already-missing file is fine.
+fn remove_socket_logged(path: &std::path::Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("[tacho-daemon] failed to remove {}: {e}", path.display()),
     }
 }
 
@@ -283,6 +305,10 @@ fn shutdown_pipe() -> io::Result<(std::os::unix::io::RawFd, std::os::unix::io::R
 ///
 /// Runs hourly, deleting rows older than `retention_days` in small batches of 1,000
 /// while listening on `wake_rx` for immediate shutdown notification.
+///
+/// The hourly wait is a maintenance schedule (retention is defined in days), not a poll for
+/// state. Between batches the thread only checks, without waiting, whether shutdown was
+/// requested: each batch is its own short transaction, so the appender interleaves freely.
 fn spawn_retention_thread(
     retention_days: u32,
     paths: DaemonPaths,
@@ -338,12 +364,11 @@ fn spawn_retention_thread(
                             }
                             match log.prune_older_than(cutoff_ns, BATCH_SIZE) {
                                 Ok(0) => break, // Done
-                                Ok(_) => match wake_rx.recv_timeout(Duration::from_millis(50)) {
-                                    Ok(())
-                                    | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                Ok(_) => match wake_rx.try_recv() {
+                                    Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
                                         return;
                                     }
-                                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                                    Err(crossbeam_channel::TryRecvError::Empty) => {}
                                 },
                                 Err(e) => {
                                     eprintln!("[tacho-daemon] retention prune error: {}", e);
@@ -394,8 +419,8 @@ fn spawn_signal_handler(
                     eprintln!("[tacho-daemon] failed to write final trace: {}", e);
                 }
 
-                let _ = fs::remove_file(paths.api_sock());
-                let _ = fs::remove_file(paths.trace_sock());
+                remove_socket_logged(&paths.api_sock());
+                remove_socket_logged(&paths.trace_sock());
             }
         })
         .expect("failed to spawn signal thread");

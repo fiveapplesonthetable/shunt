@@ -936,3 +936,23 @@ fn test_root_pid_recycled_reads_as_gone() {
     };
     assert!(sampler.run_process_gone(&dead));
 }
+
+#[test]
+fn test_decide_due_only_on_event_request_or_refresh() {
+    let mut s = ProcSampler::new(&[]);
+    s.set_decide_refresh_secs(60);
+    let sec = 1_000_000_000u64;
+    assert!(s.decide_due(0, 0), "first tick always decides");
+
+    s.last_decide_seq = Some(7);
+    s.last_decide_ns = 100 * sec;
+    assert!(
+        !s.decide_due(7, 101 * sec),
+        "no event, no request, refresh not due"
+    );
+    assert!(s.decide_due(8, 101 * sec), "a decide-relevant commit");
+    assert!(s.decide_due(7, 160 * sec), "coarse refresh elapsed");
+
+    s.decide_requested.store(true, Ordering::Release);
+    assert!(s.decide_due(7, 101 * sec), "explicit request");
+}

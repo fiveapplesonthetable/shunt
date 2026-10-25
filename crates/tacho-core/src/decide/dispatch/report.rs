@@ -121,7 +121,6 @@ pub fn record_pr(
     run: &Run,
     prs: &[ForgePr],
     branches_by_pr: &BTreeMap<u64, String>,
-    cfg: &DispatchConfig,
 ) -> Option<PrRecord> {
     match stated_pr(&run.summary) {
         Some(Some(n)) => {
@@ -142,7 +141,8 @@ pub fn record_pr(
                 &run.summary,
                 prs,
                 run.started,
-                &cfg.fork_owner,
+                // Any PR head owner: fleets push branches to the main repo, never a fork.
+                "",
             ) {
                 Some(p) => PrRecord::Found(FoundPr {
                     number: p.number,
@@ -160,14 +160,15 @@ pub fn record_prs(
     runs: &mut Runs,
     prs: &[ForgePr],
     branches_by_pr: &BTreeMap<u64, String>,
-    cfg: &DispatchConfig,
+    // Unused since PR attribution stopped filtering by a fork owner; kept so callers are stable.
+    _cfg: &DispatchConfig,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for (key, run) in runs.iter_mut() {
         if run.status != RunStatus::Done || run.pr != PrRecord::NotLooked {
             continue;
         }
-        let Some(rec) = record_pr(run, prs, branches_by_pr, cfg) else {
+        let Some(rec) = record_pr(run, prs, branches_by_pr) else {
             continue;
         };
         let line = match &rec {

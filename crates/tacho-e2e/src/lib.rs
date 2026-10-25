@@ -291,8 +291,9 @@ impl TestEnv {
             Err(_) => return false,
         };
         use std::io::{BufRead, BufReader, Write};
-        let _ = stream.write_all(b"{\"cmd\":\"flush\"}\n");
-        let _ = stream.flush();
+        if stream.write_all(b"{\"cmd\":\"flush\"}\n").is_err() || stream.flush().is_err() {
+            return false;
+        }
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         if reader.read_line(&mut line).is_ok() {
@@ -302,80 +303,89 @@ impl TestEnv {
         }
     }
 
-    /// Blocks until `f()` holds, woken by inotify events on the sandbox
-    /// directories (`home_dir` and `runtime_dir`), bounded only by
-    /// [`SUITE_SAFETY_CAP`].
-    pub fn wait_until<F>(&self, mut f: F) -> bool
+    /// Blocks until `f()` holds, re-checking whenever an entry changes in the
+    /// parent directory of any path in `awaited`.
+    ///
+    /// `what` names the condition for the hang report. Every path whose state
+    /// `f` reads must be listed in `awaited`; its exact parent directory is
+    /// watched (not just the sandbox roots), so writes in subdirectories and
+    /// SQLite `-wal` updates next to the database wake the wait.
+    ///
+    /// # Panics
+    ///
+    /// If no inotify instance is available (naming the awaited paths and
+    /// `fs.inotify.max_user_instances`), or if [`SUITE_SAFETY_CAP`] expires,
+    /// with a hang report naming `what` and the tail of `daemon.log`.
+    pub fn wait_until<F>(&self, what: &str, awaited: &[&Path], mut f: F)
     where
         F: FnMut() -> bool,
     {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        use std::os::unix::ffi::OsStrExt;
-        if f() {
-            return true;
-        }
+        let watch = DirWatch::new(awaited, what);
         let deadline = Instant::now() + SUITE_SAFETY_CAP;
-        // SAFETY: plain syscall.
-        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if raw < 0 {
-            return f();
-        }
-        // SAFETY: `raw` is a fresh fd we own.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mask = libc::IN_MODIFY
-            | libc::IN_CREATE
-            | libc::IN_MOVED_TO
-            | libc::IN_ATTRIB
-            | libc::IN_CLOSE_WRITE
-            | libc::IN_DELETE;
-        for dir in [&self.home_dir, &self.runtime_dir] {
-            if let Ok(c_dir) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
-                // SAFETY: valid fd and NUL-terminated path.
-                unsafe {
-                    libc::inotify_add_watch(fd.as_raw_fd(), c_dir.as_ptr(), mask);
-                }
+        // The watch is armed before the first check, so no change is missed.
+        while !f() {
+            if !watch.wait_event(deadline) && !f() {
+                self.hang_report(what);
             }
-        }
-        loop {
-            if f() {
-                return true;
-            }
-            if !poll_readable(fd.as_raw_fd(), Some(deadline)) {
-                return f();
-            }
-            let mut buf = [0u8; 4096];
-            // SAFETY: valid fd and buffer; drains pending events.
-            while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
         }
     }
 
-    /// Blocks until process `pid` exits, woken by its pidfd. Returns `true`
-    /// once it is gone (including if it was already gone), `false` only if
-    /// the safety cap [`SUITE_SAFETY_CAP`] expires first.
+    /// Panics with a hang report: the awaited condition plus the last
+    /// [`HANG_LOG_TAIL_LINES`] lines of `daemon.log`.
+    fn hang_report(&self, what: &str) -> ! {
+        panic!(
+            "hang: waited {SUITE_SAFETY_CAP:?} for {what}\n--- last {HANG_LOG_TAIL_LINES} lines of \
+             {} ---\n{}",
+            self.daemon_log().display(),
+            log_tail(&self.daemon_log(), HANG_LOG_TAIL_LINES)
+        )
+    }
+
+    /// Blocks until process `pid` exits, woken by its pidfd (no inotify).
+    /// Returns `true` once it is gone (including if it was already gone).
+    ///
+    /// # Panics
+    ///
+    /// With a hang report if [`SUITE_SAFETY_CAP`] expires first.
     pub fn wait_pid_exit(pid: u32) -> bool {
-        match PidFd::open(pid) {
-            Some(fd) => fd.wait_exit(Some(SUITE_SAFETY_CAP)),
-            None => true,
+        if let Some(fd) = PidFd::open(pid) {
+            assert!(
+                fd.wait_exit(Some(SUITE_SAFETY_CAP)),
+                "hang: waited {SUITE_SAFETY_CAP:?} for pid {pid} to exit"
+            );
         }
+        true
     }
 
     /// Blocks until `path` exists, woken by inotify on its parent directory.
-    /// Returns `false` only if the safety cap expires first.
+    /// Always returns `true`; it never returns on failure.
+    ///
+    /// # Panics
+    ///
+    /// If inotify is unavailable or [`SUITE_SAFETY_CAP`] expires (hang report).
     pub fn wait_for_path(path: &Path) -> bool {
-        wait_for_path_until(path, Instant::now() + SUITE_SAFETY_CAP, || true)
+        wait_for_path_until(path, || true);
+        true
     }
 
-    /// Waits for `api.sock` to appear (inotify) and accept a connection.
-    ///
-    /// The wait is event-driven and bounded only by [`SUITE_SAFETY_CAP`], so a
-    /// slow machine cannot turn it into a spurious failure.
+    /// Waits for `api.sock` to appear and accept a connection. Always returns
+    /// `true`; failures panic with a hang report including the daemon log tail.
     pub fn wait_for_api_sock(&self) -> bool {
         let sock = self.api_sock();
         if let Some(parent) = sock.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(e) = fs::create_dir_all(parent) {
+                panic!("cannot create {}: {e}", parent.display());
+            }
         }
+        let watch = DirWatch::new(&[&sock], "api.sock to accept connections");
+        let deadline = Instant::now() + SUITE_SAFETY_CAP;
         let connectable = || std::os::unix::net::UnixStream::connect(&sock).is_ok();
-        wait_for_path_until(&sock, Instant::now() + SUITE_SAFETY_CAP, connectable)
+        while !connectable() {
+            if !watch.wait_event(deadline) && !connectable() {
+                self.hang_report(&format!("{} to accept connections", sock.display()));
+            }
+        }
+        true
     }
 
     /// Queries the trace via `trace_processor_shell` using standard SQL through stdin.
@@ -547,47 +557,110 @@ fn poll_readable(fd: libc::c_int, deadline: Option<Instant>) -> bool {
     }
 }
 
+/// Number of `daemon.log` lines included in a hang report.
+pub const HANG_LOG_TAIL_LINES: usize = 40;
+
+/// Returns the last `n` lines of `path`, or a note saying why it is unreadable.
+fn log_tail(path: &Path, n: usize) -> String {
+    match fs::read_to_string(path) {
+        Ok(s) => {
+            let lines: Vec<&str> = s.lines().collect();
+            lines[lines.len().saturating_sub(n)..].join("\n")
+        }
+        Err(e) => format!("(unreadable: {e})"),
+    }
+}
+
+/// An inotify instance watching the parent directory of each awaited path.
+struct DirWatch {
+    fd: std::os::fd::OwnedFd,
+}
+
+impl DirWatch {
+    /// Watches the exact parent directory of every path in `awaited`.
+    ///
+    /// # Panics
+    ///
+    /// With an actionable message naming `what`, the awaited paths and
+    /// `fs.inotify.max_user_instances` if no inotify instance is available,
+    /// or if a parent directory cannot be watched.
+    fn new(awaited: &[&Path], what: &str) -> Self {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        let names = || {
+            awaited
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // SAFETY: plain syscall.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if raw < 0 {
+            panic!(
+                "cannot wait for {what} ({}): inotify_init1 failed ({}); the user is out of \
+                 inotify instances, raise fs.inotify.max_user_instances",
+                names(),
+                io::Error::last_os_error()
+            );
+        }
+        // SAFETY: `raw` is a fresh fd we own.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mask = libc::IN_MODIFY
+            | libc::IN_CREATE
+            | libc::IN_MOVED_TO
+            | libc::IN_ATTRIB
+            | libc::IN_CLOSE_WRITE
+            | libc::IN_DELETE;
+        for path in awaited {
+            let dir = path.parent().unwrap_or(Path::new("/"));
+            let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
+                .unwrap_or_else(|_| panic!("path {} contains NUL", dir.display()));
+            // SAFETY: valid fd and NUL-terminated path.
+            let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c_dir.as_ptr(), mask) };
+            if wd < 0 {
+                panic!(
+                    "cannot wait for {what}: inotify_add_watch({}) failed ({}); the directory \
+                     must exist (raise fs.inotify.max_user_watches if ENOSPC)",
+                    dir.display(),
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        Self { fd }
+    }
+
+    /// Blocks until an event arrives (then drains the queue) or `deadline`
+    /// passes. Returns `false` only on deadline expiry.
+    fn wait_event(&self, deadline: Instant) -> bool {
+        use std::os::fd::AsRawFd;
+        if !poll_readable(self.fd.as_raw_fd(), Some(deadline)) {
+            return false;
+        }
+        let mut buf = [0u8; 4096];
+        // SAFETY: valid fd and buffer; the fd is non-blocking, so this drains
+        // pending events and stops at EAGAIN.
+        while unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        true
+    }
+}
+
 /// Blocks until `path` exists and `ready()` holds, re-checking on every
 /// inotify event in the parent directory. The watch is installed before the
 /// first check, so a creation in between cannot be missed.
-fn wait_for_path_until(path: &Path, deadline: Instant, mut ready: impl FnMut() -> bool) -> bool {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    let check = |ready: &mut dyn FnMut() -> bool| path.exists() && ready();
-    let Some(parent) = path.parent() else {
-        return check(&mut ready);
-    };
-    // SAFETY: plain syscall.
-    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-    if raw < 0 {
-        return check(&mut ready);
-    }
-    // SAFETY: `raw` is a fresh fd we own.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let Ok(c_parent) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
-        return check(&mut ready);
-    };
-    // SAFETY: valid fd and NUL-terminated path.
-    let wd = unsafe {
-        libc::inotify_add_watch(
-            fd.as_raw_fd(),
-            c_parent.as_ptr(),
-            libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_ATTRIB | libc::IN_CLOSE_WRITE,
-        )
-    };
-    if wd < 0 {
-        return check(&mut ready);
-    }
-    loop {
-        if check(&mut ready) {
-            return true;
+///
+/// # Panics
+///
+/// If inotify is unavailable or [`SUITE_SAFETY_CAP`] expires.
+fn wait_for_path_until(path: &Path, mut ready: impl FnMut() -> bool) {
+    let what = format!("{} to exist", path.display());
+    let watch = DirWatch::new(&[path], &what);
+    let deadline = Instant::now() + SUITE_SAFETY_CAP;
+    let mut check = || path.exists() && ready();
+    while !check() {
+        if !watch.wait_event(deadline) && !check() {
+            panic!("hang: waited {SUITE_SAFETY_CAP:?} for {what}");
         }
-        if !poll_readable(fd.as_raw_fd(), Some(deadline)) {
-            return check(&mut ready);
-        }
-        let mut buf = [0u8; 4096];
-        // SAFETY: valid fd and buffer; drains pending events.
-        while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
     }
 }
 
@@ -913,6 +986,26 @@ mod tests {
         writer.join().unwrap();
         // Already-existing path returns immediately.
         assert!(TestEnv::wait_for_path(&target));
+    }
+
+    #[test]
+    fn wait_until_wakes_on_write_in_a_subdirectory() {
+        let env = TestEnv::new().unwrap();
+        let sub = env.home_dir.join("logs");
+        fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("a.log");
+        fs::write(&file, b"").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let f = file.clone();
+        let writer = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            fs::write(&f, b"done").unwrap();
+        });
+        tx.send(()).unwrap();
+        env.wait_until("a.log to say done", &[&file], || {
+            fs::read_to_string(&file).is_ok_and(|s| s == "done")
+        });
+        writer.join().unwrap();
     }
 
     #[test]

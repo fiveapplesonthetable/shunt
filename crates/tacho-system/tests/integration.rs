@@ -45,24 +45,68 @@ fn find_binary(env_var: &str, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Blocks until every path in `paths` (all directly inside `dir`) exists,
-/// woken by inotify rather than polling.
+/// Blocks until every path in `paths` (all directly inside `dir`) exists.
+///
+/// The awaited sockets are created by `traced`, which offers no readiness
+/// pipe, so this waits on inotify events in `dir`: the watch is armed before
+/// the first check, and each event triggers a re-check (no polling).
+///
+/// # Panics
+///
+/// With an actionable message naming the awaited paths and
+/// `fs.inotify.max_user_instances` if no inotify instance is available.
 fn wait_for_paths(dir: &std::path::Path, paths: &[&std::path::Path]) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
-    assert!(fd >= 0, "inotify_init1 failed");
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
-    // Watch first, then check, so a creation between the two is not missed.
-    let wd =
-        unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO) };
-    assert!(wd >= 0, "inotify_add_watch failed");
+    let awaited = || {
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // SAFETY: plain syscall.
+    let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if raw < 0 {
+        panic!(
+            "cannot wait for {}: inotify_init1 failed ({}); the user is out of inotify \
+             instances, raise fs.inotify.max_user_instances",
+            awaited(),
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: `raw` is a fresh fd we own; closed on drop.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("dir has no NUL");
+    // SAFETY: valid fd and NUL-terminated path.
+    let wd = unsafe {
+        libc::inotify_add_watch(
+            fd.as_raw_fd(),
+            c.as_ptr(),
+            libc::IN_CREATE | libc::IN_MOVED_TO,
+        )
+    };
+    assert!(
+        wd >= 0,
+        "cannot wait for {}: inotify_add_watch({}) failed ({})",
+        awaited(),
+        dir.display(),
+        std::io::Error::last_os_error()
+    );
     let mut buf = [0u8; 4096];
     while !paths.iter().all(|p| p.exists()) {
         // Blocking read: returns when something is created in `dir`.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        assert!(n > 0, "inotify read failed");
+        // SAFETY: valid fd and buffer.
+        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            assert!(
+                err.kind() == std::io::ErrorKind::Interrupted,
+                "inotify read failed while waiting for {}: {err}",
+                awaited()
+            );
+        }
     }
-    unsafe { libc::close(fd) };
 }
 
 /// Parses a single integer result from Trace Processor query output.

@@ -22,6 +22,7 @@ use super::store::{
     emit_decision_event, load_fleet_meta, mutate_fleet_meta, now_ns, now_secs, open_fleet_store,
     resolve_live_main_sha, resolve_live_pr_heads, NoticeState,
 };
+use crate::kit::use_private_tmp;
 
 /// Options for `tacho train`.
 #[derive(Debug, Clone, Default)]
@@ -303,12 +304,13 @@ pub fn assemble_train(
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            let out = Command::new("bash")
+            let mut compile = Command::new("bash");
+            compile
                 .args(["-c", compile_cmd])
                 .current_dir(cwd)
-                .env("TACHO_TRAIN_SLICE_PRS", &prs_csv)
-                .output()
-                .map_err(|e| e.to_string())?;
+                .env("TACHO_TRAIN_SLICE_PRS", &prs_csv);
+            use_private_tmp(&mut compile, "train").map_err(|e| e.to_string())?;
+            let out = compile.output().map_err(|e| e.to_string())?;
             if out.status.success() {
                 Ok(())
             } else {
@@ -700,12 +702,12 @@ fn verify_train_compilation_in_scratch(
         }
     }
 
-    let out = match Command::new("bash")
+    let mut compile = Command::new("bash");
+    compile
         .args(["-c", compile_cmd])
         .current_dir(&scratch_path)
-        .env("TACHO_TRAIN_SLICE_PRS", &prs_str)
-        .output()
-    {
+        .env("TACHO_TRAIN_SLICE_PRS", &prs_str);
+    let out = match use_private_tmp(&mut compile, "train").and_then(|()| compile.output()) {
         Ok(o) => o,
         Err(e) => {
             if let Err(ce) = cleanup_scratch_worktree(cwd, &scratch_path) {
@@ -799,10 +801,10 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
     let changed_vec: Vec<String> = changed_union.into_iter().collect();
     let settled_cmds = settle(&changed_vec, &state.generators);
     for cmd in &settled_cmds {
-        let status = Command::new("bash")
-            .args(["-c", cmd])
-            .current_dir(&cwd)
-            .status()?;
+        let mut generator = Command::new("bash");
+        generator.args(["-c", cmd]).current_dir(&cwd);
+        use_private_tmp(&mut generator, "generators")?;
+        let status = generator.status()?;
         if !status.success() {
             return Err(io::Error::other(format!(
                 "generator command '{cmd}' failed with {status}"

@@ -26,6 +26,7 @@ use super::store::{
     emit_decision_event, load_fleet_env, now_ns, now_secs, open_fleet_store,
     record_batch_pid_identity, resolve_live_main_sha, resolve_live_pr_heads,
 };
+use crate::kit::{apply_private_tmp_env, private_tmp_dir, use_private_tmp};
 
 /// Origin of a batch verification run:
 /// - `Daemon`: reruns the same tree once on red (recording flakes to the flake ledger,
@@ -216,18 +217,11 @@ pub fn launch_detached_batch(opts: &BatchOptions) -> io::Result<PathBuf> {
     for (k, v) in &merged_env {
         cmd.env(k, v);
     }
-    let fleet_tmp = home.join("tmp").join(format!("batch-{batch_id}"));
-    fs::create_dir_all(&fleet_tmp)?;
-    let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
-    let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
+    use_private_tmp(&mut cmd, &format!("batch-{batch_id}"))?;
     cmd.env("TACHO_HOME", &home)
         .env("TACHO_BATCH_FOREGROUND", "1")
         .env("TACHO_BATCH_DETACHED", "0")
         .env("TACHO_BATCH_ORIGIN", opts.origin.as_str())
-        .env("TMPDIR", &fleet_tmp_str)
-        .env("TMP", &fleet_tmp_str)
-        .env("TEMP", &fleet_tmp_str)
-        .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -500,11 +494,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
 
     let merged_env = load_fleet_env(opts.env_file.as_deref());
     record_batch_pid_identity(&batch_id, std::process::id())?;
-    let home = crate::paths::resolve_home();
-    let fleet_tmp = home.join("tmp").join(format!("batch-{batch_id}"));
-    fs::create_dir_all(&fleet_tmp)?;
-    let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
-    let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
+    let fleet_tmp = private_tmp_dir(&format!("batch-{batch_id}"))?;
     let run_probe = |k: usize, label: &str| -> io::Result<(bool, bool, String, u64, u64)> {
         let p_start = now_ns();
         let prefix_prs: Vec<String> = pr_nums.iter().take(k).map(|n| n.to_string()).collect();
@@ -521,6 +511,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             &check_cmd,
         ])
         .current_dir(&cwd);
+        apply_private_tmp_env(&mut cmd, &fleet_tmp);
         for (ek, ev) in &merged_env {
             cmd.env(ek, ev);
         }
@@ -535,10 +526,6 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             .env("TACHO_BATCH_PROBE_K", k.to_string())
             .env("TACHO_BATCH_PROBE_PRS", prefix_prs.join(","))
             .env("TACHO_BATCH_LABEL", label)
-            .env("TMPDIR", &fleet_tmp_str)
-            .env("TMP", &fleet_tmp_str)
-            .env("TEMP", &fleet_tmp_str)
-            .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()?;
         let p_end = now_ns();

@@ -1047,6 +1047,71 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Blocks until every path in `paths` (all directly inside `dir`) exists.
+///
+/// The awaited sockets are created by `traced`, which offers no readiness
+/// pipe, so this waits on inotify events in `dir`: the watch is armed before
+/// the first check, and each event triggers a re-check (no polling).
+///
+/// # Panics
+///
+/// With an actionable message naming the awaited paths and
+/// `fs.inotify.max_user_instances` if no inotify instance is available.
+fn wait_for_paths(dir: &std::path::Path, paths: &[&std::path::Path]) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let awaited = || {
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // SAFETY: plain syscall.
+    let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if raw < 0 {
+        panic!(
+            "cannot wait for {}: inotify_init1 failed ({}); the user is out of inotify \
+             instances, raise fs.inotify.max_user_instances",
+            awaited(),
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: `raw` is a fresh fd we own; closed on drop.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("dir has no NUL");
+    // SAFETY: valid fd and NUL-terminated path.
+    let wd = unsafe {
+        libc::inotify_add_watch(
+            fd.as_raw_fd(),
+            c.as_ptr(),
+            libc::IN_CREATE | libc::IN_MOVED_TO,
+        )
+    };
+    assert!(
+        wd >= 0,
+        "cannot wait for {}: inotify_add_watch({}) failed ({})",
+        awaited(),
+        dir.display(),
+        std::io::Error::last_os_error()
+    );
+    let mut buf = [0u8; 4096];
+    while !paths.iter().all(|p| p.exists()) {
+        // Blocking read: returns when something is created in `dir`.
+        // SAFETY: valid fd and buffer.
+        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            assert!(
+                err.kind() == std::io::ErrorKind::Interrupted,
+                "inotify read failed while waiting for {}: {err}",
+                awaited()
+            );
+        }
+    }
+}
+
+/// Resolves a binary from an environment variable or PATH.
 fn find_binary(env_var: &str, name: &str) -> Option<PathBuf> {
     if let Ok(val) = env::var(env_var) {
         let p = PathBuf::from(val.trim());
@@ -1106,29 +1171,7 @@ fn test_system_during_builds_with_real_traced() {
         .stderr(Stdio::null());
     let traced_child = traced_cmd.spawn().expect("failed to start traced");
 
-    // Wait for sockets via inotify on temp_dir
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
-        assert!(fd >= 0, "inotify_init1 failed");
-        let c = std::ffi::CString::new(temp_dir.path().as_os_str().as_bytes()).unwrap();
-        let wd =
-            unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO) };
-        assert!(wd >= 0, "inotify_add_watch failed");
-        let mut buf = [0u8; 4096];
-        while !consumer_sock.exists() || !producer_sock.exists() {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
-            assert!(rc > 0, "inotify poll failed");
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            assert!(n > 0, "inotify read failed");
-        }
-        unsafe { libc::close(fd) };
-    }
+    wait_for_paths(temp_dir.path(), &[&consumer_sock, &producer_sock]);
 
     // 2. Start unprivileged traced_probes
     let mut probes_cmd = Command::new(&probes_bin);

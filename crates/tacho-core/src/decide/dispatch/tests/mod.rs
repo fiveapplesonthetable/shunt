@@ -5,10 +5,12 @@ mod parity_dispatch;
 mod parity_dispatch_b;
 mod parity_extra;
 mod parity_hands;
+mod parity_holds;
 mod parity_plan;
 mod parity_plan_b;
 mod parity_resume;
 mod parity_runs;
+mod parity_stop;
 mod props;
 
 use super::config::DispatchConfig;
@@ -30,7 +32,6 @@ pub(super) fn test_cfg() -> DispatchConfig {
     cfg.providers.codex_default = "gpt-5.4".to_string();
     cfg.slots = 4;
     cfg.owner_issue = 42;
-    cfg.fork_owner = "fork".to_string();
     cfg
 }
 

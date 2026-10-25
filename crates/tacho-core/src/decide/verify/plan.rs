@@ -262,6 +262,28 @@ pub fn new_batch_id(existing: &[BatchRun]) -> String {
     format!("b{:03}", max_n + 1)
 }
 
+/// Open PRs held by a `main-broken` batch: members still at the head the batch recorded.
+///
+/// Main itself was red when the batch ran, so re-checking those heads proves nothing until
+/// the batch is cleared (see [`crate::decide::verify::unbreak`]); a member that has moved on is
+/// free to be checked again.
+fn main_broken_blocked<'a>(
+    open_prs: &'a [PullFacts],
+    existing_batches: &'a [BatchRun],
+) -> impl Iterator<Item = u64> + 'a {
+    existing_batches
+        .iter()
+        .filter(|b| b.status == "main-broken")
+        .flat_map(move |b| {
+            b.prs.iter().copied().filter(move |n| {
+                let recorded = b.shas.get(n);
+                open_prs
+                    .iter()
+                    .any(|p| p.number == *n && recorded.is_none_or(|sha| *sha == p.head))
+            })
+        })
+}
+
 /// Plan verification batches for open PRs that need checking.
 ///
 /// Rules:
@@ -282,6 +304,7 @@ pub fn batches(
         .iter()
         .filter(|b| b.status == "running" || b.status == "bisecting")
         .flat_map(|b| b.prs.iter().copied())
+        .chain(main_broken_blocked(open_prs, existing_batches))
         .collect();
     let running_groups: BTreeSet<&str> = existing_batches
         .iter()

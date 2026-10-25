@@ -15,6 +15,8 @@ use tacho_core::decide::verify::{parse_env, slug_problem};
 use tacho_core::TaskStatus;
 use tacho_daemon::{FleetState, WorktreeEntry};
 
+use super::procs::signal_group_and_leader;
+use super::use_private_tmp;
 use super::{
     emit_decision_event, now_ns, now_secs, open_fleet_store, write_atomic, FdEventWatcher,
 };
@@ -420,6 +422,7 @@ pub fn run_provisioner_bounded(
     let err_file = out_tmp.reopen()?;
 
     let mut cmd = Command::new("bash");
+    use_private_tmp(&mut cmd, "provision")?;
     cmd.args(["-c", cmd_str])
         .current_dir(wt_path)
         .stdin(Stdio::null())
@@ -455,11 +458,8 @@ pub fn run_provisioner_bounded(
 
         let now = Instant::now();
         if now >= deadline {
-            unsafe {
-                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-                let _ = libc::kill(pid as i32, libc::SIGKILL);
-            }
-            let _ = child.wait();
+            signal_group_and_leader(pid, libc::SIGKILL)?;
+            child.wait()?;
             return Ok(Err(3));
         }
 

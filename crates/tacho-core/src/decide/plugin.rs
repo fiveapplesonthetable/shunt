@@ -628,6 +628,8 @@ pub trait ProvisionerPlugin: Send + Sync {
     fn db_recipe(&self, worktree_name: &str, ports: &PortBlock) -> ProvisionDbRecipe;
 
     /// Compute dependency and compiler cache environment variables for `slot`.
+    ///
+    /// An empty `cache_root` means "use the provisioner's configured root".
     fn deps_cache_env(&self, slot: u32, cache_root: &str) -> BTreeMap<String, String>;
 
     /// Render the deterministic `.tachoenv` file contents for `worktree_name` and `slot`.
@@ -666,10 +668,75 @@ pub trait ProvisionerPlugin: Send + Sync {
     }
 }
 
+/// Layout of the warm dependency and compiler caches handed to worktrees.
+///
+/// Each entry maps an environment variable to a path relative to the cache root; `{slot}` in a
+/// path is replaced by the worktree slot so per-slot build dirs never collide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WarmCacheLayout {
+    /// Cache root. Empty means "not configured": use [`WarmCacheLayout::for_fleet_home`] to derive
+    /// `<fleet home>/cache`, or pass an explicit root to [`ProvisionerPlugin::deps_cache_env`].
+    pub root: String,
+    /// Environment variable -> path under the root (may contain `{slot}`).
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for WarmCacheLayout {
+    fn default() -> Self {
+        let env = [
+            ("CARGO_TARGET_DIR", "warm/slot-{slot}/target"),
+            ("CARGO_HOME", "cargo-home"),
+            ("SCCACHE_DIR", "sccache"),
+            ("NPM_CONFIG_CACHE", "npm"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        Self {
+            root: String::new(),
+            env,
+        }
+    }
+}
+
+impl WarmCacheLayout {
+    /// Default layout rooted at `<fleet_home>/cache`.
+    pub fn for_fleet_home(fleet_home: &str) -> Self {
+        Self {
+            root: format!("{}/cache", fleet_home.trim_end_matches('/')),
+            ..Self::default()
+        }
+    }
+
+    /// Resolves the layout for `slot` under `root` (or under [`Self::root`] when `root` is
+    /// empty). Returns no variables when neither root is configured.
+    pub fn env_for_slot(&self, slot: u32, root: &str) -> BTreeMap<String, String> {
+        let root = if root.is_empty() { &self.root } else { root };
+        let root = root.trim_end_matches('/');
+        if root.is_empty() {
+            return BTreeMap::new();
+        }
+        let slot = slot.to_string();
+        self.env
+            .iter()
+            .map(|(k, rel)| {
+                (
+                    k.clone(),
+                    format!("{root}/{}", rel.replace("{slot}", &slot)),
+                )
+            })
+            .collect()
+    }
+}
+
 /// Default configurable worktree provisioner backed by [`VerifyConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefaultProvisioner {
     pub verify: VerifyConfig,
+    /// Warm cache layout; project config may override paths and variables.
+    #[serde(default)]
+    pub warm_cache: WarmCacheLayout,
     pub db_image: String,
     pub db_user: String,
     pub db_password: String,
@@ -684,6 +751,17 @@ impl Default for DefaultProvisioner {
             db_user: "postgres".to_string(),
             db_password: "postgres".to_string(),
             db_name: "app_test".to_string(),
+            warm_cache: WarmCacheLayout::default(),
+        }
+    }
+}
+
+impl DefaultProvisioner {
+    /// Default provisioner whose warm caches live under `<fleet_home>/cache`.
+    pub fn for_fleet_home(fleet_home: &str) -> Self {
+        Self {
+            warm_cache: WarmCacheLayout::for_fleet_home(fleet_home),
+            ..Self::default()
         }
     }
 }
@@ -746,16 +824,7 @@ impl ProvisionerPlugin for DefaultProvisioner {
     }
 
     fn deps_cache_env(&self, slot: u32, cache_root: &str) -> BTreeMap<String, String> {
-        let root = cache_root.trim_end_matches('/');
-        let mut env = BTreeMap::new();
-        env.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            format!("{root}/warm/slot-{slot}/target"),
-        );
-        env.insert("CARGO_HOME".to_string(), format!("{root}/cargo-home"));
-        env.insert("SCCACHE_DIR".to_string(), format!("{root}/sccache"));
-        env.insert("NPM_CONFIG_CACHE".to_string(), format!("{root}/npm"));
-        env
+        self.warm_cache.env_for_slot(slot, cache_root)
     }
 }
 

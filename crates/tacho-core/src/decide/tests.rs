@@ -1396,17 +1396,17 @@ fn test_pluggable_traits_and_project_policy_unification() {
     assert!(payload_str.contains("<redacted>"));
 
     // 4. ProvisionerPlugin: port block, DB recipe, deps cache, .tachoenv
-    let provisioner = DefaultProvisioner::default();
+    let provisioner = DefaultProvisioner::for_fleet_home("fleet-home");
     let ports0 = provisioner.allocate_port_block(0).unwrap();
     let ports1 = provisioner.allocate_port_block(1).unwrap();
     assert_ne!(ports0.http_port, ports1.http_port);
     let db = provisioner.db_recipe("wt-alpha", &ports0);
     assert_eq!(db.host_port, ports0.db_port);
     let env_text = provisioner
-        .render_tachoenv("wt-alpha", 0, "/cache", &BTreeMap::new())
+        .render_tachoenv("wt-alpha", 0, "", &BTreeMap::new())
         .unwrap();
     assert!(env_text.contains("TACHO_PORT_BASE="));
-    assert!(env_text.contains("CARGO_TARGET_DIR='/cache/warm/slot-0/target'"));
+    assert!(env_text.contains("CARGO_TARGET_DIR='fleet-home/cache/warm/slot-0/target'"));
     assert!(env_text.contains("DATABASE_URL='postgres://"));
 
     // 5. WatcherPlugin: custom workflow and deploy gates

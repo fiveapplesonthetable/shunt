@@ -635,9 +635,55 @@ domain engines:
 
 The daemon autonomously observes world events (agents, PRs, CI, `main`,
 worktrees, burners, and host resources) and invokes `decide` on events,
-recording every input and resulting `DecisionPlan` (including `tell_actions` and
+recording each input and resulting `DecisionPlan` (including `tell_actions` and
 `WatchAction::RemoveWorktree`) to `decision_ticks` for deterministic replay via
 `tacho replay`.
+
+### 14.1 Daemon decide loop
+
+`decide` runs on the sampler thread, but not on every sampler tick. A tick runs
+it only when one of these holds:
+
+- **A decide-relevant event was committed.** After each commit the appender
+  bumps `AppenderHandle::decide_seq` and wakes the sampler if the batch held
+  agent lifecycle or state (`Run`, `RunEnded`, `AgentState`), a `Stall`, a task
+  change (`TaskQueued`, `TaskState`), a `Milestone` (commit/push), or progress
+  (`FileEdited`, `TurnEnded`). Tool calls, commands, reads, messages and counter
+  samples do not count, so the sampler's own samples never retrigger `decide`.
+- **A pass was requested explicitly**: `SamplerWaker::request_decide`, or the
+  `decide_tick` API command, which runs `execute_decide_tick` directly.
+- **The coarse refresh elapsed**: `[sampler] decide_refresh_secs` (default 60 s),
+  checked on the sampler's existing `timerfd` tick. It exists only for rules
+  that depend on elapsed time alone (stall age, tidy age).
+
+`execute_decide_tick` writes a `decision_ticks` row only when something
+changed. It fingerprints the inputs with wall-clock fields zeroed (`now`,
+sample timestamps, worktree ages, burner ages, `last_tick_ts`) and the plan
+without its `last_tick_ts`. If both match the latest row, it records nothing,
+executes nothing, and returns that row's id. A time-based rule that fires
+changes the plan, so its tick is still recorded.
+
+None of these loops runs on a fixed cadence:
+
+- The appender blocks on its channel. The only deadline it keeps is the
+  earliest moment an agent could turn SILENT: the latest event of each agent
+  plus `silent_s`, rescheduled one full timeout later after each detector
+  pass. With no such agent it blocks indefinitely.
+- Retention pruning checks for shutdown between batches without waiting.
+- CLI clients read until they get a reply or the daemon hangs up (EOF). Only
+  single-reply interactive requests carry one overall cap
+  (`INTERACTIVE_REPLY_CAP`, 30 s), because a human is waiting at the terminal.
+
+**Executors.** The daemon is the authoritative executor of autonomous plans:
+`execute_decide_tick` delivers `tell_actions`, removes tidied worktrees and
+kills burners. Burner kills follow the same identity rule as the CLI's
+`verify_agent_pid`: a recorded `starttime > 0` is required, or nothing is
+signalled. The process is pinned with a pidfd, its starttime is checked again,
+and `SIGKILL` goes through `pidfd_send_signal`. `ESRCH` means the process is
+already gone. Any other failure, such as `EPERM`, is recorded as
+`kill_burner_failed` and returned as an error once the tick's state is saved.
+CLI paths that still act on plans (`tacho fleet watch` and session commands)
+are legacy and must apply the same checks. New executors belong in the daemon.
 
 All external side effects and project-specific rules implement the six synchronous
 traits in `tacho_core::decide::plugin`:

@@ -214,7 +214,14 @@ pub fn rescue_worktree(store: &mut FleetStore, wt_p: &Path, now: i64) -> io::Res
         .and_then(|s| s.to_str())
         .unwrap_or("worktree");
     let tree_sha = crate::kit::tree_of_worktree(wt_p)?;
-    let parent_sha = git_stdout(wt_p, &["rev-parse", "HEAD"]).unwrap_or_default();
+    // An unborn branch has no HEAD, so the snapshot becomes a root commit; any other
+    // rev-parse failure would silently drop history from the rescue, so it is reported.
+    let has_head = git_stdout(wt_p, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_ok();
+    let parent_sha = if has_head {
+        git_stdout(wt_p, &["rev-parse", "HEAD"])?
+    } else {
+        String::new()
+    };
     let message = format!("tacho rescue snapshot for {slug}");
     let mut commit_args = vec!["commit-tree", tree_sha.as_str()];
     if !parent_sha.is_empty() {

@@ -15,7 +15,13 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
     ensure_dir_0700(&runtime).map_err(|e| e.to_string())?;
 
     let paths = DaemonPaths::custom(&home, &runtime).map_err(|e| e.to_string())?;
-    let mut config = Config::load_or_default(&paths.config_file()).unwrap_or_default();
+    let mut config = Config::load_or_default(&paths.config_file()).unwrap_or_else(|e| {
+        eprintln!(
+            "[tacho-daemon] ignoring invalid config {}: {e}; using defaults",
+            paths.config_file().display()
+        );
+        Config::default()
+    });
 
     if let Some(otlp) = args.otlp {
         config.otlp_addr = Some(otlp);
@@ -24,11 +30,9 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
         config.detectors.on_stall = Some(on_stall);
     }
 
+    // `Daemon::start` records `daemon.pid` atomically once its sockets are up.
     let mut daemon = Daemon::start(paths.clone(), config).map_err(|e| e.to_string())?;
-
-    // Record daemon.pid for reliable discovery
     let pid_file = runtime.join("daemon.pid");
-    let _ = std::fs::write(&pid_file, std::process::id().to_string());
 
     // Wait until daemon receives shutdown signal via kernel signal-hook self-pipe (no sleep loop)
     let mut signals = signal_hook::iterator::Signals::new([
@@ -48,7 +52,14 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
         }
     }
 
-    let _ = std::fs::remove_file(&pid_file);
+    match std::fs::remove_file(&pid_file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "[tacho-daemon] failed to remove {}: {e}",
+            pid_file.display()
+        ),
+    }
     daemon.stop();
     Ok(())
 }

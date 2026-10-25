@@ -123,8 +123,6 @@ pub struct DispatchConfig {
     pub escalation_lines: usize,
     /// Quiet minutes after which the watcher nudges (named in the nudge brief).
     pub nudge_quiet_minutes: u32,
-    /// PRs owned by this login are candidates for `find_pr` (empty = any owner).
-    pub fork_owner: String,
     pub brief: BriefConfig,
     pub providers: ProviderTables,
 }
@@ -161,7 +159,6 @@ impl Default for DispatchConfig {
             tail_lines: 8,
             escalation_lines: 20,
             nudge_quiet_minutes: 45,
-            fork_owner: String::new(),
             brief: BriefConfig::default(),
             providers: ProviderTables::default(),
         }

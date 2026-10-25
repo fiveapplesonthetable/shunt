@@ -71,6 +71,12 @@ pub struct SamplerConfig {
     pub cgroup: bool,
     /// Minimum interval between worktree file-change scans in seconds (default: 30 s).
     pub worktree_scan_secs: u64,
+    /// Coarse refresh for time-based `decide` rules, in seconds (default: 60 s).
+    ///
+    /// The daemon runs `decide` when a relevant event is committed or a tick is requested;
+    /// this refresh, checked on the sampler's timerfd tick, only exists so rules that depend
+    /// on elapsed time alone (stall age, tidy age) fire without a triggering event.
+    pub decide_refresh_secs: u64,
 }
 
 impl Default for SamplerConfig {
@@ -80,6 +86,7 @@ impl Default for SamplerConfig {
             mounts: vec!["/".to_string()],
             cgroup: true,
             worktree_scan_secs: 30,
+            decide_refresh_secs: 60,
         }
     }
 }
@@ -153,6 +160,7 @@ mod tests {
         assert_eq!(cfg.sampler.interval_ms, 2000);
         assert!(cfg.sampler.cgroup);
         assert_eq!(cfg.sampler.worktree_scan_secs, 30);
+        assert_eq!(cfg.sampler.decide_refresh_secs, 60);
         assert_eq!(cfg.detectors.silent_s, 300);
         assert_eq!(cfg.detectors.loop_count, 4);
         assert_eq!(cfg.detectors.on_stall_timeout_secs, 60);

@@ -3,6 +3,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
 mod budget_diag_props;
+mod parity_starve_progress;
+mod parity_supervise_chains;
 mod progress;
 mod starve_jobs;
 mod supervise_hourly;

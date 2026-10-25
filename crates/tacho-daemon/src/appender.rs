@@ -4,12 +4,12 @@
 //! and TrackRegistry for concurrent readers.
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tacho_core::{AgentRole, Event, Input, LiveState, Recorder, SessionKey, TrackRegistry};
+use tacho_core::{AgentRole, Event, Input, Kind, LiveState, Recorder, SessionKey, TrackRegistry};
 
 use crate::log::EventLog;
 
@@ -17,11 +17,10 @@ use crate::log::EventLog;
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long [`AppenderHandle::flush`] waits for the appender to confirm a commit.
 const FLUSH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
-/// Group commit window: inputs arriving within this window share one SQLite transaction.
-/// It also paces the idle detector tick (silence detection needs time to advance).
-const COMMIT_INTERVAL: Duration = Duration::from_millis(50);
-/// Detector tick cadence while the queue is continuously busy.
-const TICK_INTERVAL: Duration = Duration::from_millis(200);
+/// Upper bound on how long one burst of already-queued inputs is gathered into a single
+/// SQLite transaction. The appender never waits for more input to arrive: it drains what is
+/// queued and commits, so this only caps latency under a continuous flood.
+const MAX_COMMIT_WINDOW: Duration = Duration::from_millis(50);
 /// Events per SQLite transaction before committing early.
 const MAX_BATCH_SIZE: usize = 256;
 /// Bound on queued `on_stall` hook jobs; further stalls are dropped (and logged once).
@@ -84,7 +83,15 @@ impl AppenderHooks {
         use std::os::fd::AsRawFd;
         if let Some((_, ref write_fd)) = self.hook_expire_pipe {
             let byte = [1u8];
-            let _ = unsafe { libc::write(write_fd.as_raw_fd(), byte.as_ptr().cast(), 1) };
+            // SAFETY: writing one byte from a local buffer to a pipe fd we own.
+            let n = unsafe { libc::write(write_fd.as_raw_fd(), byte.as_ptr().cast(), 1) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                // A full pipe already holds a pending expiry.
+                if err.kind() != std::io::ErrorKind::WouldBlock {
+                    eprintln!("[tacho-daemon] failed to expire on_stall hook: {err}");
+                }
+            }
         }
     }
 
@@ -171,11 +178,20 @@ pub struct AppenderHandle {
     state_notify: Arc<StateNotify>,
     shutdown_requested: Arc<AtomicBool>,
     sampler_waker: Arc<Mutex<Option<crate::sampler::SamplerWaker>>>,
+    /// Bumped on every commit that contains an event `decide` reacts to.
+    decide_seq: Arc<AtomicU64>,
 }
 
 impl AppenderHandle {
-    /// Attaches the sampler waker so committed lifecycle/stall/task events immediately wake
-    /// the sampler/decide loop.
+    /// Returns a counter that advances whenever a committed batch contains an event that
+    /// can change a `decide` outcome (see [`is_decide_relevant`]). The sampler compares it
+    /// with the value seen at its last decide pass.
+    pub fn decide_seq(&self) -> u64 {
+        self.decide_seq.load(Ordering::Acquire)
+    }
+
+    /// Attaches the sampler waker so committed decide-relevant events (lifecycle, stall,
+    /// task, progress) immediately wake the sampler/decide loop.
     pub fn set_sampler_waker(&self, waker: crate::sampler::SamplerWaker) {
         *self.sampler_waker.lock().unwrap_or_else(|p| p.into_inner()) = Some(waker);
     }
@@ -262,7 +278,13 @@ impl AppenderHandle {
     /// and the command only exists to wake an idle loop promptly.
     pub fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
-        let _ = self.sender.try_send(AppenderCommand::Shutdown);
+        match self.sender.try_send(AppenderCommand::Shutdown) {
+            Ok(()) => {}
+            // A full queue keeps the loop busy, so it reaches the flag check without this
+            // wake; a disconnected queue means the loop has already exited.
+            Err(crossbeam_channel::TrySendError::Full(_))
+            | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+        }
     }
 
     /// Returns a shared, atomic reference to the latest published LiveState.
@@ -410,7 +432,9 @@ fn run_stall_hook(cmd_str: &str, job: &StallJob, timeout: Duration, hooks: &Appe
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
-    let _ = child.wait();
+    if let Err(e) = child.wait() {
+        eprintln!("[tacho-daemon] failed to reap on_stall hook: {}", e);
+    }
 }
 
 /// Waits up to `timeout` for `pid` (our unreaped child) to exit, leaving it unreaped.
@@ -444,7 +468,8 @@ fn wait_exit_without_reaping(
                         break;
                     }
                 }
-                let _ = tx.send(());
+                // Not actionable: a failed send only means the waiter already timed out.
+                tx.send(()).ok();
             })?;
         return Ok(rx.recv_timeout(timeout).is_ok());
     }
@@ -552,12 +577,36 @@ fn sorted_runs(map: &HashMap<SessionKey, ActiveRun>) -> Vec<ActiveRun> {
 }
 
 /// Spawns the dedicated appender thread with an optional `on_stall` shell hook and custom timeout.
+///
+/// The silence detector is scheduled with [`tacho_core::DetectorConfig`]'s default timeout;
+/// use [`spawn_appender_with_silence`] when the recorder was configured with another one.
 pub fn spawn_appender_with_hook_timeout(
     recorder: Recorder,
     log: EventLog,
     channel_capacity: usize,
     on_stall: Option<String>,
     on_stall_timeout: Duration,
+) -> (AppenderHandle, std::thread::JoinHandle<()>) {
+    spawn_appender_with_silence(
+        recorder,
+        log,
+        channel_capacity,
+        on_stall,
+        on_stall_timeout,
+        Duration::from_nanos(tacho_core::DetectorConfig::default().silent_timeout_ns),
+    )
+}
+
+/// Spawns the appender thread. `silent_timeout` must equal the recorder's configured
+/// `silent_timeout_ns`: the appender sleeps until the earliest moment an agent could turn
+/// SILENT and runs the detector then, instead of ticking on a fixed cadence.
+pub fn spawn_appender_with_silence(
+    recorder: Recorder,
+    log: EventLog,
+    channel_capacity: usize,
+    on_stall: Option<String>,
+    on_stall_timeout: Duration,
+    silent_timeout: Duration,
 ) -> (AppenderHandle, std::thread::JoinHandle<()>) {
     let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
 
@@ -572,6 +621,7 @@ pub fn spawn_appender_with_hook_timeout(
         state_notify: Arc::new(StateNotify::default()),
         shutdown_requested: Arc::new(AtomicBool::new(false)),
         sampler_waker: Arc::new(Mutex::new(None)),
+        decide_seq: Arc::new(AtomicU64::new(0)),
     };
 
     let (stall_hooks, stall_worker) = match on_stall {
@@ -592,6 +642,11 @@ pub fn spawn_appender_with_hook_timeout(
     };
 
     let last_published_reg_len = recorder.registry().len();
+    let silence = SilenceClock::seeded(
+        silent_timeout.as_nanos().min(u64::MAX as u128) as u64,
+        recorder.live_state(),
+        wall_clock_ns(),
+    );
     let appender = Appender {
         receiver,
         recorder,
@@ -602,7 +657,7 @@ pub fn spawn_appender_with_hook_timeout(
         batch: Vec::with_capacity(MAX_BATCH_SIZE),
         flush_notifiers: Vec::new(),
         last_published_reg_len,
-        last_tick: Instant::now(),
+        silence,
     };
     let join_handle = std::thread::Builder::new()
         .name("tacho-appender".to_string())
@@ -610,7 +665,9 @@ pub fn spawn_appender_with_hook_timeout(
             appender.run();
             // Dropping the hook sender (inside `run`) lets the worker finish queued hooks.
             if let Some(worker) = stall_worker {
-                let _ = worker.join();
+                if worker.join().is_err() {
+                    eprintln!("[tacho-daemon] on_stall worker thread panicked");
+                }
             }
         })
         .expect("failed to spawn appender thread");
@@ -630,7 +687,87 @@ struct Appender {
     batch: Vec<Event>,
     flush_notifiers: Vec<Sender<()>>,
     last_published_reg_len: usize,
-    last_tick: Instant,
+    silence: SilenceClock,
+}
+
+/// Whether a committed event can change a `decide` outcome: agent lifecycle and state,
+/// stalls, task queue changes, milestones (commits/pushes), and progress (edits, turns).
+/// Tool calls, commands, file reads, messages and counter samples are not, so the sampler's
+/// own counter samples never retrigger `decide`.
+pub(crate) fn is_decide_relevant(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Run
+            | Kind::RunEnded
+            | Kind::TurnEnded
+            | Kind::FileEdited
+            | Kind::Stall
+            | Kind::TaskQueued
+            | Kind::TaskState
+            | Kind::AgentState
+            | Kind::Milestone
+    )
+}
+
+/// Schedules the SILENT detector from committed events instead of a fixed tick.
+///
+/// An agent can only turn SILENT `timeout_ns` after its latest event, so the appender only
+/// needs to run the detector at the earliest such deadline. After a detector pass, agents
+/// whose deadline passed are rescheduled one full timeout later (their silence may be
+/// suppressed by CPU activity, which is not an event here) and exited agents are dropped;
+/// each agent is therefore checked at most once per timeout while it stays quiet.
+struct SilenceClock {
+    timeout_ns: u64,
+    /// Agent id to the wall-clock time from which its silence deadline is counted.
+    since_ns: HashMap<String, u64>,
+}
+
+impl SilenceClock {
+    /// Starts tracking every non-exited agent restored from the log as of `now_ns`, so a
+    /// restart delays silence detection by at most one timeout rather than losing it.
+    fn seeded(timeout_ns: u64, live: &LiveState, now_ns: u64) -> Self {
+        let since_ns = live
+            .agents
+            .iter()
+            .filter(|(_, a)| a.state != "Exited")
+            .map(|(id, _)| (id.clone(), now_ns))
+            .collect();
+        Self {
+            timeout_ns,
+            since_ns,
+        }
+    }
+
+    /// Records a committed event for `agent` at `ts_ns`.
+    fn note(&mut self, agent: &str, ts_ns: u64) {
+        match self.since_ns.get_mut(agent) {
+            Some(since) => *since = (*since).max(ts_ns),
+            None => {
+                self.since_ns.insert(agent.to_string(), ts_ns);
+            }
+        }
+    }
+
+    /// Wall-clock time of the next detector pass, or `None` when no agent can go silent.
+    fn next_deadline_ns(&self) -> Option<u64> {
+        self.since_ns
+            .values()
+            .min()
+            .map(|since| since.saturating_add(self.timeout_ns))
+    }
+
+    /// Updates the schedule after a detector pass at `now_ns`.
+    fn settle(&mut self, now_ns: u64, live: &LiveState) {
+        let timeout_ns = self.timeout_ns;
+        self.since_ns.retain(|agent, since| {
+            if since.saturating_add(timeout_ns) > now_ns {
+                return true;
+            }
+            let exited = live.agents.get(agent).is_none_or(|a| a.state == "Exited");
+            *since = now_ns;
+            !exited
+        });
+    }
 }
 
 /// Whether the loop should keep going after a command.
@@ -645,15 +782,27 @@ impl Appender {
         self.shared.shutdown_requested.load(Ordering::Acquire)
     }
 
-    /// Main loop: wait for the first command, gather more for up to one commit window,
-    /// then commit them in one transaction.
+    /// Main loop: block until a command arrives or the next silence deadline passes, drain
+    /// whatever else is already queued, and commit it in one transaction.
+    ///
+    /// There is no fixed tick: with no agent that could turn SILENT the loop blocks on the
+    /// channel indefinitely, and otherwise it sleeps exactly until the earliest deadline.
     fn run(mut self) {
         while !self.shutdown_requested() {
             // Chaos injection hook: intentionally wedges the appender thread to simulate SQLite
             // lock contention and verify the daemon degrades cleanly (test14_wedged_appender).
             self.shared.hooks.block_while_wedged();
 
-            let first = match self.receiver.recv_timeout(COMMIT_INTERVAL) {
+            let received = match self.silence.next_deadline_ns() {
+                None => self
+                    .receiver
+                    .recv()
+                    .map_err(|_| RecvTimeoutError::Disconnected),
+                Some(deadline_ns) => self.receiver.recv_timeout(Duration::from_nanos(
+                    deadline_ns.saturating_sub(wall_clock_ns()),
+                )),
+            };
+            let first = match received {
                 Ok(cmd) => cmd,
                 Err(RecvTimeoutError::Timeout) => {
                     self.tick();
@@ -669,18 +818,23 @@ impl Appender {
             let mut flow = self.handle(first);
             while flow == Flow::Continue
                 && self.batch.len() < MAX_BATCH_SIZE
-                && window_start.elapsed() < COMMIT_INTERVAL
+                && window_start.elapsed() < MAX_COMMIT_WINDOW
             {
                 match self.receiver.try_recv() {
                     Ok(cmd) => flow = self.handle(cmd),
-                    Err(_) => break,
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
             }
             if flow == Flow::Stop {
                 break;
             }
 
-            if self.last_tick.elapsed() >= TICK_INTERVAL {
+            // A busy queue must not starve the detector past its deadline.
+            if self
+                .silence
+                .next_deadline_ns()
+                .is_some_and(|deadline_ns| deadline_ns <= wall_clock_ns())
+            {
                 self.tick();
             }
             if !self.batch.is_empty() || !self.flush_notifiers.is_empty() {
@@ -711,10 +865,11 @@ impl Appender {
         Flow::Continue
     }
 
-    /// Runs time-based detectors (silence, etc.).
+    /// Runs time-based detectors (silence, etc.) and reschedules the next pass.
     fn tick(&mut self) {
-        self.recorder.tick(wall_clock_ns(), &mut self.batch);
-        self.last_tick = Instant::now();
+        let now_ns = wall_clock_ns();
+        self.recorder.tick(now_ns, &mut self.batch);
+        self.silence.settle(now_ns, self.recorder.live_state());
     }
 
     /// Applies one input, tracking run starts/ends for the sampler, and commits early
@@ -812,11 +967,34 @@ impl Appender {
                 .live_state
                 .store(Arc::new(self.recorder.live_state().clone()));
             self.shared.state_notify.bump();
+
+            let mut decide_relevant = false;
+            for ev in &self.batch {
+                if let Some(agent) = ev.agent.as_deref() {
+                    self.silence.note(agent, ev.ts_ns);
+                }
+                decide_relevant |= is_decide_relevant(ev.kind);
+            }
             self.batch.clear();
+            if decide_relevant {
+                self.shared.decide_seq.fetch_add(1, Ordering::AcqRel);
+                let waker = self
+                    .shared
+                    .sampler_waker
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(waker) = waker {
+                    waker.trigger_tick();
+                }
+            }
         }
 
         for notifier in self.flush_notifiers.drain(..) {
-            let _ = notifier.send(());
+            // A requester that gave up waiting has dropped its receiver; nothing to do.
+            if notifier.send(()).is_err() {
+                continue;
+            }
         }
     }
 

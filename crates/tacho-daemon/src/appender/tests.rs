@@ -130,9 +130,13 @@ fn test_on_stall_hook_ignores_historical_replay() {
     trigger_loop_stall(&appender, "sess-new", "new-worker", now_ns());
 
     wait_for_file(&temp.path().join("new-worker.done"));
+    // The old worker may legitimately go SILENT now (its last event is an hour old and the
+    // detector runs at its deadline); only the replayed LOOP stall must not fire.
+    let old_marker =
+        std::fs::read_to_string(temp.path().join("old-worker.done")).unwrap_or_default();
     assert!(
-        !temp.path().join("old-worker.done").exists(),
-        "historical replay stall must not fire on_stall hook"
+        !old_marker.contains("LOOP"),
+        "historical replay stall must not fire on_stall hook, got {old_marker:?}"
     );
     appender.shutdown();
     thread.join().unwrap();
@@ -306,6 +310,64 @@ fn test_active_runs_track_start_and_end() {
         .unwrap();
     assert!(appender.flush());
     assert!(appender.active_runs().is_empty());
+    appender.shutdown();
+    thread.join().unwrap();
+}
+
+#[test]
+fn test_silence_clock_schedules_earliest_deadline_and_reschedules_quiet_agents() {
+    let mut live = LiveState::default();
+    let mut clock = SilenceClock::seeded(100, &live, 0);
+    assert_eq!(clock.next_deadline_ns(), None, "no agents, no deadline");
+
+    clock.note("a", 1_000);
+    clock.note("b", 500);
+    assert_eq!(clock.next_deadline_ns(), Some(600));
+    clock.note("b", 400);
+    assert_eq!(
+        clock.next_deadline_ns(),
+        Some(600),
+        "older events never move a deadline back"
+    );
+
+    // "b" is live and quiet: rescheduled a full timeout later. "a" (unknown) is dropped once due.
+    let mut b = tacho_core::AgentLiveState::new("b", "claude", "s-b");
+    b.state = "Running".into();
+    live.agents.insert("b".into(), b);
+    clock.settle(650, &live);
+    assert_eq!(clock.next_deadline_ns(), Some(750));
+    clock.settle(1_200, &live);
+    assert_eq!(clock.next_deadline_ns(), Some(1_300), "only b remains");
+}
+
+#[test]
+fn test_silence_detector_runs_at_deadline_without_fixed_tick() {
+    let temp = tempfile::tempdir().unwrap();
+    let (appender, thread) = spawn_appender(Recorder::new(), open_log(temp.path()), 16);
+    // The run's only event is far older than the default silence timeout, so its deadline
+    // has already passed when it is committed and the detector runs on the next loop turn.
+    let old = now_ns() - 2 * tacho_core::DetectorConfig::default().silent_timeout_ns;
+    appender
+        .send_input(run_start("s-silent", "quiet", old), old)
+        .unwrap();
+    assert!(appender.flush());
+    assert!(appender.flush());
+
+    let live = appender.live_state();
+    let agent = live.agents.get("quiet").expect("agent recorded");
+    assert!(
+        agent
+            .flags
+            .iter()
+            .any(|f| f.to_ascii_uppercase().contains("SILENT")),
+        "expected a SILENT flag, got state={} flags={:?}",
+        agent.state,
+        agent.flags
+    );
+    assert!(
+        appender.decide_seq() > 0,
+        "run start and stall are decide-relevant"
+    );
     appender.shutdown();
     thread.join().unwrap();
 }

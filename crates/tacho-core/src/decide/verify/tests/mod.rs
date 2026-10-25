@@ -11,6 +11,10 @@ use std::collections::BTreeMap;
 
 mod batch_edge_tests;
 mod batch_tests;
+mod parity_gate;
+mod parity_holds_batching;
+mod parity_land_safety;
+mod parity_main_broken;
 mod plan_areas_tests;
 mod proptests;
 mod warm_ci_tests;

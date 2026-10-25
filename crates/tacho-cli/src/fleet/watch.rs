@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use tacho_core::decide::dispatch::{base_key, resume_task, TodoItem};
+use tacho_core::decide::dispatch::{base_key, resume_task, AgentRun, TodoItem};
 use tacho_core::decide::land::open_for;
 use tacho_core::decide::verify::flake_tasks;
 use tacho_core::decide::watch::{
@@ -22,10 +22,11 @@ use crate::cli::{ProgressArgs, TickArgs, WatchdogArgs};
 
 use super::dispatch::{deliver_tell_action, spawn_worker_for_item};
 use super::ops::write_scrubbed_snapshot;
+use super::session::RESUME_REFUSED;
 use super::store::{
-    emit_decision_event, live_agent_keys, load_fleet_meta, mutate_fleet_meta, now_ns, now_secs,
-    open_fleet_store, proc_pid_starttime, resolve_live_main_sha, verify_agent_pid,
-    WatchdogIssueState,
+    classify_agent_process, emit_decision_event, kill_stopped_and_wait, live_agent_keys,
+    load_fleet_meta, mutate_fleet_meta, now_ns, now_secs, open_fleet_store, proc_pid_starttime,
+    resolve_live_main_sha, send_signal, verify_agent_pid, AgentProcess, WatchdogIssueState,
 };
 use super::tidy::{apply_tidy_decisions, build_tidy_snapshot};
 use tacho_daemon::FleetStore;
@@ -236,24 +237,112 @@ fn observe_git_and_deploys(
     )
 }
 
+/// Main's last completed CI run from the forge (`TACHO_MAIN_CI_JSON`, a `MainCiRun`).
+/// `None` (unknown) when unset or invalid.
+fn read_main_ci_run() -> Option<tacho_core::decide::ops::snapshot::MainCiRun> {
+    let raw = std::env::var("TACHO_MAIN_CI_JSON").ok()?;
+    match serde_json::from_str(&raw) {
+        Ok(run) => Some(run),
+        Err(e) => {
+            eprintln!("tacho: ignoring invalid TACHO_MAIN_CI_JSON: {e}");
+            None
+        }
+    }
+}
+
+/// Main-CI observation, with ancestry of each `main-broken` batch's main answered by git.
+fn observe_main_ci_hand(
+    cwd: &Path,
+    run: Option<&tacho_core::decide::ops::snapshot::MainCiRun>,
+    batches: &[tacho_core::decide::verify::BatchRun],
+) -> Option<tacho_core::decide::verify::MainCiObs> {
+    tacho_core::decide::verify::unbreak::observe_main_ci(run, batches, |a, b| {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", a, b])
+            .current_dir(cwd)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
 /// Kills a duplicate batch PID only when its recorded `starttime` or `cgroup` identity is verified.
+///
+/// Returns `Ok(true)` when the batch process was signalled or is already gone, `Ok(false)` when
+/// the kill was refused for lack of verified identity, and an error when signalling failed.
 pub(crate) fn kill_duplicate_batch(
     pid: u32,
     dup_id: &str,
     starttime: Option<u64>,
     cgroup: Option<&str>,
-) -> bool {
+) -> io::Result<bool> {
     if starttime.filter(|&st| st > 0).is_none() && cgroup.filter(|s| !s.is_empty()).is_none() {
-        return false;
+        return Ok(false);
     }
-    if verify_agent_pid(pid, dup_id, cgroup, starttime) {
-        unsafe {
-            let _ = libc::kill(pid as i32, libc::SIGTERM);
+    if !verify_agent_pid(pid, dup_id, cgroup, starttime) {
+        return Ok(false);
+    }
+    // ESRCH (`Ok(false)` from `send_signal`) means it exited meanwhile, which is also a success.
+    send_signal(pid as i32, libc::SIGTERM)?;
+    Ok(true)
+}
+
+/// Delivers a decided tell; a refused resume (old process still owns the worktree) is recorded
+/// as a decision instead of failing the whole tick. Other errors propagate.
+fn deliver_tell_or_record_refusal(
+    store: &mut FleetStore,
+    agent_key: &str,
+    msg: &str,
+) -> io::Result<()> {
+    match deliver_tell_action(store, agent_key, msg) {
+        Err(e) if e.kind() == RESUME_REFUSED => {
+            let because = e.to_string();
+            store.record_decision("watch", "tell_refused", agent_key, &because)?;
+            emit_decision_event(&format!("agent:{agent_key}"), "watch:attention", &because);
+            eprintln!("{because}");
+            Ok(())
         }
-        true
-    } else {
-        false
+        other => other,
     }
+}
+
+/// Carries out a supervisor `Resume` without ever restarting a running agent.
+///
+/// - Old process verified gone: queue a resume of the session.
+/// - Verified and stopped: kill it, wait for its exit event, then queue the resume.
+/// - Verified and running: deliver the guidance through the provider's tell path.
+/// - Identity unverified: refuse and record why; state is left untouched.
+fn supervise_resume(
+    store: &mut FleetStore,
+    a: &AgentRun,
+    because: &str,
+    now: i64,
+) -> io::Result<()> {
+    let key = a.key.as_str();
+    let exit_code = match classify_agent_process(a.pid, key, a.cgroup.as_deref(), a.starttime) {
+        AgentProcess::Gone => a.exit_code,
+        AgentProcess::Stopped(pid) => {
+            kill_stopped_and_wait(pid)?;
+            Some(128 + libc::SIGKILL)
+        }
+        AgentProcess::Running => return deliver_tell_or_record_refusal(store, key, because),
+        AgentProcess::Unverified => {
+            let refused = format!("refused resume of {key}: no identity for pid {:?}", a.pid);
+            store.record_decision("watch", "supervise_resume_refused", key, &refused)?;
+            emit_decision_event(&format!("agent:{key}"), "watch:attention", &refused);
+            eprintln!("{refused}");
+            return Ok(());
+        }
+    };
+    let resumed = resume_task(a, because, "", now);
+    store.mutate(Some(("watch", "supervise_resume", key, because)), |st| {
+        if let Some(ag) = st.agents.get_mut(key) {
+            ag.finished_at.get_or_insert(now);
+            ag.exit_code = exit_code;
+        }
+        st.todo.push(resumed);
+    })?;
+    Ok(())
 }
 
 /// Executes a single orchestrator & supervisor pass (`tacho tick`) driven entirely by `tacho_core::decide::decide`.
@@ -410,6 +499,8 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
         });
     }
 
+    let main_ci_run = read_main_ci_run();
+    let main_ci_obs = observe_main_ci_hand(&cwd, main_ci_run.as_ref(), &state.batches);
     let world_obs = WorldObservation {
         now,
         main_sha,
@@ -427,6 +518,7 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
         ready_trains,
         tidy_snapshot,
         burners: burner_obs,
+        main_ci: main_ci_obs,
     };
 
     // 3. Call the pure decision engine (`decide`) — nothing else decides!
@@ -444,29 +536,45 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
     if !dup_batch_ids.is_empty() {
         let meta = load_fleet_meta().unwrap_or_default();
         for dup_id in &dup_batch_ids {
-            let because = format!("aborted duplicate batch {dup_id}");
-            if !args.dry_run {
-                let batch_id_rec = meta.batch_identities.get(dup_id).cloned();
-                store.mutate(
-                    Some(("watch", "kill_duplicate_batch", dup_id, &because)),
-                    |st| {
-                        for b in &mut st.batches {
-                            if &b.id == dup_id {
-                                if let Some(pid) = b.pid {
-                                    let (rec_st, rec_cg) = batch_id_rec
-                                        .as_ref()
-                                        .filter(|id| id.pid == pid)
-                                        .map(|id| (id.starttime, id.cgroup.as_deref()))
-                                        .unwrap_or((None, None));
-                                    let _ = kill_duplicate_batch(pid, dup_id, rec_st, rec_cg);
-                                }
-                                b.status = "aborted".to_string();
-                                b.finished_at = Some(now);
-                            }
-                        }
-                    },
-                )?;
+            if args.dry_run {
+                println!("would abort duplicate batch {dup_id}");
+                continue;
             }
+            let pid = state
+                .batches
+                .iter()
+                .find(|b| &b.id == dup_id)
+                .and_then(|b| b.pid);
+            let killed = match pid {
+                Some(pid) => {
+                    let (rec_st, rec_cg) = meta
+                        .batch_identities
+                        .get(dup_id)
+                        .filter(|id| id.pid == pid)
+                        .map(|id| (id.starttime, id.cgroup.as_deref()))
+                        .unwrap_or((None, None));
+                    kill_duplicate_batch(pid, dup_id, rec_st, rec_cg)?
+                }
+                // No process recorded: nothing is running, so the record alone is aborted.
+                None => true,
+            };
+            if !killed {
+                let because = format!("refused kill: no identity for duplicate batch {dup_id}");
+                store.record_decision("watch", "kill_duplicate_batch_refused", dup_id, &because)?;
+                emit_decision_event("system", "watch:attention", &because);
+                println!("{because}");
+                continue;
+            }
+            let because = format!("aborted duplicate batch {dup_id}");
+            store.mutate(
+                Some(("watch", "kill_duplicate_batch", dup_id, &because)),
+                |st| {
+                    for b in st.batches.iter_mut().filter(|b| &b.id == dup_id) {
+                        b.status = "aborted".to_string();
+                        b.finished_at = Some(now);
+                    }
+                },
+            )?;
             println!("{because}");
         }
     }
@@ -479,11 +587,37 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
         if !args.dry_run {
             let actual_st = proc_pid_starttime(b.pid);
             if b.starttime.filter(|&st| st > 0).is_some() && actual_st == b.starttime {
-                unsafe {
-                    let _ = libc::kill(b.pid as i32, libc::SIGKILL);
+                match send_signal(b.pid as i32, libc::SIGKILL) {
+                    Ok(true) => {
+                        store.record_decision(
+                            "watch",
+                            "kill_burner",
+                            &b.pid.to_string(),
+                            &because,
+                        )?;
+                        emit_decision_event("system", "watch:kill_burner", &because);
+                    }
+                    Ok(false) => {
+                        let gone = format!("burner pid={} exited before kill", b.pid);
+                        store.record_decision(
+                            "watch",
+                            "kill_burner_gone",
+                            &b.pid.to_string(),
+                            &gone,
+                        )?;
+                    }
+                    Err(e) => {
+                        let failed = format!("failed to kill burner pid={}: {e}", b.pid);
+                        store.record_decision(
+                            "watch",
+                            "kill_burner_failed",
+                            &b.pid.to_string(),
+                            &failed,
+                        )?;
+                        emit_decision_event("system", "watch:attention", &failed);
+                        eprintln!("{failed}");
+                    }
                 }
-                store.record_decision("watch", "kill_burner", &b.pid.to_string(), &because)?;
-                emit_decision_event("system", "watch:kill_burner", &because);
             } else {
                 eprintln!(
                     "[tacho-safety] burner PID {} starttime mismatch; refusing kill",
@@ -496,7 +630,7 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
 
     for (agent_key, msg) in &plan.tell_actions {
         if !args.dry_run {
-            deliver_tell_action(store, agent_key, msg)?;
+            deliver_tell_or_record_refusal(store, agent_key, msg)?;
         }
     }
 
@@ -552,21 +686,7 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
                 println!("Supervise: {because}");
                 if !args.dry_run {
                     if let Some(a) = state.agents.get(key) {
-                        if let Some(pid) = a.pid {
-                            if verify_agent_pid(pid, key, a.cgroup.as_deref(), a.starttime) {
-                                unsafe {
-                                    let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-                                }
-                            }
-                        }
-                        let resumed = resume_task(a, because, "", now);
-                        store.mutate(Some(("watch", "supervise_resume", key, because)), |st| {
-                            if let Some(ag) = st.agents.get_mut(key) {
-                                ag.finished_at = Some(now);
-                                ag.exit_code = Some(143);
-                            }
-                            st.todo.push(resumed);
-                        })?;
+                        supervise_resume(store, a, because, now)?;
                     }
                     emit_decision_event(&format!("agent:{key}"), "watch:supervise", because);
                 }
@@ -664,7 +784,19 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
             st.notified_failures = plan.next_state.notified_keys.clone();
             st.last_tick_ts = plan.next_state.last_tick_ts;
             st.last_watchdog_alert_ts = plan.next_state.last_watchdog_alert_ts;
+            if main_ci_run.is_some() {
+                st.main_ci = main_ci_run.clone();
+            }
+            st.batches.retain(|b| {
+                !plan
+                    .cleared_main_broken
+                    .iter()
+                    .any(|c| c.batch_id == b.id && b.status == "main-broken")
+            });
         })?;
+        for c in &plan.cleared_main_broken {
+            store.record_decision("verify", "clear_main_broken", &c.batch_id, &c.reason)?;
+        }
     }
 
     for item in &plan.dispatched_tasks {

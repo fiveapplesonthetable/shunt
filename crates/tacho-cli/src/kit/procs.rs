@@ -5,7 +5,6 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -15,8 +14,8 @@ use tacho_core::decide::watch::procs::owns;
 use tacho_core::decide::watch::{parse_note, with_note};
 
 use super::{
-    emit_decision_event, find_worktree_root, load_worktree_env, now_secs, open_fleet_store,
-    write_atomic, FdEventWatcher,
+    apply_private_tmp_env, emit_decision_event, find_worktree_root, load_worktree_env, now_secs,
+    open_fleet_store, private_tmp_dir, write_atomic, FdEventWatcher,
 };
 use crate::cli::{JobArgs, KillArgs, NoteArgs, WaitArgs};
 
@@ -101,6 +100,35 @@ pub fn proc_pid_cwd(pid: u32) -> Option<String> {
     fs::read_link(format!("/proc/{pid}/cwd"))
         .ok()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Sends `sig` to `pid` (a negative value addresses a process group).
+///
+/// Returns `Ok(true)` when delivered, `Ok(false)` when the target no longer exists (`ESRCH`),
+/// and an error for any other failure (for example `EPERM`).
+pub fn send_signal(pid: i32, sig: libc::c_int) -> io::Result<bool> {
+    // SAFETY: kill(2) has no memory-safety preconditions.
+    if unsafe { libc::kill(pid, sig) } == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(io::Error::new(
+            err.kind(),
+            format!("kill({pid}, {sig}) failed: {err}"),
+        ))
+    }
+}
+
+/// Sends `sig` to the process group led by `pid` and then to `pid` itself.
+///
+/// A target that no longer exists (`ESRCH`) is not an error; any other failure is returned.
+pub fn signal_group_and_leader(pid: u32, sig: libc::c_int) -> io::Result<()> {
+    send_signal(-(pid as i32), sig)?;
+    send_signal(pid as i32, sig)?;
+    Ok(())
 }
 
 /// Check whether `pid` is alive, `/proc/<pid>/stat` is readable, and not a zombie (`state != 'Z'`).
@@ -250,9 +278,11 @@ pub fn execute_job(args: JobArgs) -> io::Result<()> {
     let log_file = File::create(&log_file_path)?;
     let log_err = log_file.try_clone()?;
 
-    let job_tmp_dir = run_dir.join(format!("tmp-{}", args.name));
-    fs::create_dir_all(&job_tmp_dir)?;
-    fs::set_permissions(&job_tmp_dir, fs::Permissions::from_mode(0o700))?;
+    let worktree_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let job_tmp_dir = private_tmp_dir(&format!("job-{worktree_name}-{}", args.name))?;
 
     let env_vars = load_worktree_env(&root);
 
@@ -277,11 +307,11 @@ pub fn execute_job(args: JobArgs) -> io::Result<()> {
         .args(["-c", &wrapper_script])
         .current_dir(&root)
         .env("TACHO_JOB_NAME", &args.name)
-        .env("TMPDIR", &job_tmp_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err))
         .process_group(0);
+    apply_private_tmp_env(&mut command, &job_tmp_dir);
     for (k, v) in &env_vars {
         command.env(k, v);
     }
@@ -523,10 +553,7 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
     } else {
         libc::SIGTERM
     };
-    unsafe {
-        let _ = libc::kill(-(pid as i32), sig);
-        let _ = libc::kill(pid as i32, sig);
-    }
+    signal_group_and_leader(pid, sig)?;
 
     let mut escalated = args.now;
     if !args.now {
@@ -542,10 +569,7 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
         }
         if pid_alive_with_starttime(pid, actual_st) {
             escalated = true;
-            unsafe {
-                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-                let _ = libc::kill(pid as i32, libc::SIGKILL);
-            }
+            signal_group_and_leader(pid, libc::SIGKILL)?;
         }
     }
 

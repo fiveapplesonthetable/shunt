@@ -15,6 +15,43 @@ fn tacho_bin() -> String {
     env!("CARGO_BIN_EXE_tacho").to_string()
 }
 
+/// Blocks until process `pid` exits, woken by its pidfd. Returns at once if
+/// the process is already gone.
+fn wait_pid_exit(pid: u32) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    // SAFETY: plain syscall; a non-negative result is a fresh fd we own.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ESRCH),
+            "pidfd_open({pid}) failed: {err}"
+        );
+        return;
+    }
+    // SAFETY: `raw` was just returned by pidfd_open; closed on drop.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) };
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd; no timeout, the pidfd turns readable on exit.
+        if unsafe { libc::poll(&mut pfd, 1, -1) } > 0 {
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "poll(pidfd {pid}) failed: {err}"
+        );
+    }
+}
+
 fn init_git_repo(dir: &Path) -> String {
     let run = |args: &[&str]| {
         let st = Command::new("git")
@@ -561,61 +598,20 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .unwrap();
     assert!(tick1.status.success());
 
-    // Wait for the mock agent process to write its PR line and exit using kernel inotify + pidfd
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let logs_dir = tacho_home.join("logs");
-        let _ = fs::create_dir_all(&logs_dir);
-        let log_file = logs_dir.join("auto-task.log");
-        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        assert!(inotify_fd >= 0, "inotify_init1 failed");
-        let c_logs = std::ffi::CString::new(logs_dir.as_os_str().as_bytes()).unwrap();
-        let wd = unsafe {
-            libc::inotify_add_watch(
-                inotify_fd,
-                c_logs.as_ptr(),
-                libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE,
-            )
-        };
-        assert!(wd >= 0, "inotify_add_watch failed");
-        while !fs::read_to_string(&log_file)
-            .map(|s| s.contains("PR: #42"))
-            .unwrap_or(false)
-        {
-            let mut pfd = libc::pollfd {
-                fd: inotify_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
-            assert!(rc > 0, "inotify poll failed");
-            let mut buf = [0u8; 1024];
-            while unsafe { libc::read(inotify_fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-        }
-        unsafe { libc::close(inotify_fd) };
-    }
-    if let Ok(store) = FleetStore::open(&tacho_home.join("events.sqlite")) {
-        if let Ok(st) = store.load() {
-            if let Some(agent) = st.agents.get("auto-task") {
-                if let Some(pid) = agent.pid {
-                    let pidfd = unsafe {
-                        libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) as libc::c_int
-                    };
-                    if pidfd >= 0 {
-                        let mut pfd = libc::pollfd {
-                            fd: pidfd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        unsafe {
-                            let _ = libc::poll(&mut pfd, 1, -1);
-                            libc::close(pidfd);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Wait for the mock agent to exit via its pidfd (no inotify needed): once
+    // the process is gone its log is complete.
+    let agent_pid = FleetStore::open(&tacho_home.join("events.sqlite"))
+        .and_then(|store| store.load())
+        .expect("load fleet state after first tick")
+        .agents
+        .get("auto-task")
+        .and_then(|agent| agent.pid)
+        .expect("first tick must record the auto-task agent pid");
+    wait_pid_exit(agent_pid);
+    let log_file = tacho_home.join("logs").join("auto-task.log");
+    let log = fs::read_to_string(&log_file)
+        .unwrap_or_else(|e| panic!("read {}: {e}", log_file.display()));
+    assert!(log.contains("PR: #42"), "agent log lacks PR line:\n{log}");
     let tick2 = Command::new(tacho_bin())
         .args(["tick"])
         .current_dir(&repo_dir)

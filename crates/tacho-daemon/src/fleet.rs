@@ -90,6 +90,8 @@ pub struct FleetState {
     pub self_update_paths: Vec<String>,
     pub refused_self_update_sha: Option<String>,
     pub batch_timeout_secs: Option<u64>,
+    /// Main's last completed CI run as last observed by the hands; `None` when unknown.
+    pub main_ci: Option<tacho_core::decide::ops::snapshot::MainCiRun>,
 }
 
 impl Default for FleetState {
@@ -135,6 +137,7 @@ impl Default for FleetState {
             self_update_paths: vec!["crates/".to_string(), "scripts/".to_string()],
             refused_self_update_sha: None,
             batch_timeout_secs: None,
+            main_ci: None,
         }
     }
 }
@@ -646,6 +649,88 @@ impl FleetStore {
             .map_err(sql_err)?;
         Ok(deleted)
     }
+
+    /// Returns the id of the latest recorded tick when this tick would duplicate it: the
+    /// same decide inputs (ignoring the wall clock) and the same plan (ignoring the tick
+    /// timestamp it stamps into `next_state`).
+    ///
+    /// The wall clock is excluded from the input fingerprint because a periodic refresh
+    /// always advances it. It still counts whenever it changes the outcome: a time-based
+    /// rule that fires produces a different plan, and that tick is recorded.
+    pub fn unchanged_since_latest_tick(
+        &self,
+        state: &DecisionState,
+        obs: &WorldObservation,
+        plan: &DecisionPlan,
+    ) -> io::Result<Option<i64>> {
+        let Some((id, prev_state, prev_obs, prev_plan)) = self.load_latest_decision_tick()? else {
+            return Ok(None);
+        };
+        let same = input_fingerprint(state, obs)? == input_fingerprint(&prev_state, &prev_obs)?
+            && plan_fingerprint(plan)? == plan_fingerprint(&prev_plan)?;
+        Ok(same.then_some(id))
+    }
+}
+
+/// Stable hash of decide inputs with every wall-clock-derived field zeroed.
+fn input_fingerprint(state: &DecisionState, obs: &WorldObservation) -> io::Result<u64> {
+    let mut state = state.clone();
+    state.last_tick_ts = None;
+    let mut obs = obs.clone();
+    obs.now = 0;
+    obs.tidy_snapshot.now = 0;
+    for sample in obs.agent_samples.values_mut() {
+        sample.ts = 0;
+    }
+    for wt in &mut obs.tidy_snapshot.worktrees {
+        wt.age_secs = 0;
+    }
+    for burner in &mut obs.burners {
+        burner.elapsed_secs = 0;
+    }
+    canonical_hash(&(state, obs))
+}
+
+/// Stable hash of a plan, ignoring the tick timestamp `decide` stamps into `next_state`.
+fn plan_fingerprint(plan: &DecisionPlan) -> io::Result<u64> {
+    let mut plan = plan.clone();
+    plan.next_state.last_tick_ts = None;
+    canonical_hash(&plan)
+}
+
+/// Hashes `value`'s JSON form with object keys sorted, so `HashMap` iteration order (and
+/// serde_json's optional `preserve_order`) cannot make equal values hash differently.
+fn canonical_hash<T: Serialize>(value: &T) -> io::Result<u64> {
+    use std::hash::{Hash, Hasher};
+
+    fn feed(v: &serde_json::Value, h: &mut std::collections::hash_map::DefaultHasher) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                h.write_u8(b'{');
+                for k in keys {
+                    k.hash(h);
+                    feed(&map[k], h);
+                }
+                h.write_u8(b'}');
+            }
+            serde_json::Value::Array(items) => {
+                h.write_u8(b'[');
+                h.write_usize(items.len());
+                for item in items {
+                    feed(item, h);
+                }
+            }
+            other => other.to_string().hash(h),
+        }
+    }
+
+    let v =
+        serde_json::to_value(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    feed(&v, &mut h);
+    Ok(h.finish())
 }
 
 /// Converts persistent [`FleetState`] into the pure [`DecisionState`] input to [`tacho_core::decide::decide`].
@@ -729,6 +814,32 @@ pub fn git_head_sha(repo: &Path) -> Option<String> {
 
 /// Resolves a non-empty `main_sha` from fleet state, active worktrees/cwds, or git,
 /// defaulting to 40 zeros when running outside any git repository so `main_sha` is never empty.
+/// Main-CI observation for `decide`: the persisted last completed run, with each
+/// `main-broken` batch's main checked for ancestry in the first known git checkout.
+fn observe_main_ci(state: &FleetState) -> Option<tacho_core::decide::verify::MainCiObs> {
+    let repo = state
+        .worktrees
+        .values()
+        .map(|w| Path::new(&w.path))
+        .chain(state.agents.values().map(|a| Path::new(&a.worktree)))
+        .find(|p| !p.as_os_str().is_empty() && has_git_dir(p));
+    tacho_core::decide::verify::unbreak::observe_main_ci(
+        state.main_ci.as_ref(),
+        &state.batches,
+        |a, b| {
+            repo.is_some_and(|repo| {
+                std::process::Command::new("git")
+                    .args(["merge-base", "--is-ancestor", a, b])
+                    .current_dir(repo)
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            })
+        },
+    )
+}
+
 pub fn resolve_autonomous_main_sha(
     home_dir: &Path,
     state: &FleetState,
@@ -899,13 +1010,19 @@ pub fn deliver_tell_message(
     if let Some(wt) = worktree_dir {
         let wt_path = Path::new(wt);
         if wt_path.is_dir() {
+            // The inbox `.jsonl` written above is the delivery of record; the worktree copy is
+            // a convenience for agents that read their checkout, so its failure is only logged.
             let md_path = wt_path.join(".tacho-inbox.md");
-            if let Ok(mut mf) = std::fs::OpenOptions::new()
+            let appended = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(md_path)
-            {
-                let _ = writeln!(mf, "\n## Message ({now})\n{msg}");
+                .open(&md_path)
+                .and_then(|mut mf| writeln!(mf, "\n## Message ({now})\n{msg}"));
+            if let Err(e) = appended {
+                eprintln!(
+                    "[tacho-daemon] failed to append message to {}: {e}",
+                    md_path.display()
+                );
             }
         }
     }
@@ -919,7 +1036,9 @@ fn remove_worktree_dir(path: &Path) -> io::Result<()> {
     }
     if let Some(parent) = path.parent() {
         if has_git_dir(parent) {
-            let _ = std::process::Command::new("git")
+            // Prefer `git worktree remove` so git's worktree list stays consistent; if it
+            // fails, the directory is still removed below and git prunes the stale entry.
+            let status = std::process::Command::new("git")
                 .args(["worktree", "remove", "--force"])
                 .arg(path)
                 .current_dir(parent)
@@ -927,6 +1046,17 @@ fn remove_worktree_dir(path: &Path) -> io::Result<()> {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => eprintln!(
+                    "[tacho-daemon] git worktree remove {} exited with {s}; removing directory",
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "[tacho-daemon] failed to run git worktree remove {}: {e}; removing directory",
+                    path.display()
+                ),
+            }
         }
     }
     if path.exists() {
@@ -937,7 +1067,51 @@ fn remove_worktree_dir(path: &Path) -> io::Result<()> {
 
 /// Observes the world, runs [`tacho_core::decide::decide`], and (unless `dry_run`) records the tick
 /// to `decision_ticks` and executes every resulting `tell_actions`, `tidy_decisions`, and `burner_kills`.
+///
+/// Ticks are serialized process-wide through [`DECIDE_TICK_LOCK`]: the sampler's autonomous
+/// tick and the server's `decide_tick` request both come through here, and two overlapping
+/// ticks would read the same state and execute (and persist) conflicting plans.
 pub fn execute_decide_tick(
+    home_dir: &Path,
+    live_state: &tacho_core::LiveState,
+    explicit_main_sha: Option<String>,
+    dry_run: bool,
+) -> io::Result<(Option<i64>, DecisionState, WorldObservation, DecisionPlan)> {
+    // A tick that panicked left no lock-protected data behind (the guard protects `()`), so
+    // a poisoned lock is safe to take over.
+    let _serialized = DECIDE_TICK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    #[cfg(test)]
+    let _in_flight = tick_probe::enter();
+    execute_decide_tick_serialized(home_dir, live_state, explicit_main_sha, dry_run)
+}
+
+/// The single owner of decide-tick execution; see [`execute_decide_tick`].
+static DECIDE_TICK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only overlap detector: counts ticks in flight and records the most ever seen at once.
+#[cfg(test)]
+pub(crate) mod tick_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct InFlight;
+
+    pub(crate) fn enter() -> InFlight {
+        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+        InFlight
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn execute_decide_tick_serialized(
     home_dir: &Path,
     live_state: &tacho_core::LiveState,
     explicit_main_sha: Option<String>,
@@ -1067,12 +1241,20 @@ pub fn execute_decide_tick(
         batch_outcomes: new_batch_outcomes(&state),
         tidy_snapshot,
         burners: observe_proc_burners(),
+        main_ci: observe_main_ci(&state),
         ..Default::default()
     };
 
     let plan = tacho_core::decide::decide(&decision_state, &world_obs);
     let mut tick_id = None;
     if !dry_run {
+        // Same inputs and same decision as the last recorded tick: nothing new to record
+        // or execute. Return the id of that tick, which this one would duplicate.
+        if let Some(prev_id) =
+            store.unchanged_since_latest_tick(&decision_state, &world_obs, &plan)?
+        {
+            return Ok((Some(prev_id), decision_state, world_obs, plan));
+        }
         let id = store.record_decision_tick(now, &decision_state, &world_obs, &plan)?;
         tick_id = Some(id);
 
@@ -1097,33 +1279,30 @@ pub fn execute_decide_tick(
             }
         }
 
-        let page_size = crate::sampler::get_page_size();
-        let mut stat_buf = [0u8; 1024];
+        let mut kill_errors = Vec::new();
         for burner in &plan.burner_kills {
-            let still_matches = match burner.starttime {
-                Some(expected_st) if expected_st > 0 => {
-                    crate::sampler::read_process_stat_and_comm_slice(
-                        burner.pid,
-                        page_size,
-                        &mut stat_buf,
-                    )
-                    .is_some_and(|st| st.start_ticks == expected_st)
-                }
-                _ => false,
-            };
-            if still_matches && burner.pid > 1 {
-                unsafe {
-                    libc::kill(burner.pid as i32, libc::SIGKILL);
-                }
-                store.record_decision(
+            let target = format!("pid:{}", burner.pid);
+            match kill_verified_burner(burner) {
+                Ok(true) => store.record_decision(
                     "watch",
                     "kill_burner",
-                    &format!("pid:{}", burner.pid),
+                    &target,
                     &format!(
                         "killed runaway burner {} ({}s)",
                         burner.comm, burner.elapsed_secs
                     ),
-                )?;
+                )?,
+                // Already gone, or the pid now names a different process: nothing to do.
+                Ok(false) => {}
+                Err(e) => {
+                    store.record_decision(
+                        "watch",
+                        "kill_burner_failed",
+                        &target,
+                        &format!("failed to kill burner {}: {e}", burner.comm),
+                    )?;
+                    kill_errors.push(format!("{target}: {e}"));
+                }
             }
         }
 
@@ -1165,9 +1344,85 @@ pub fn execute_decide_tick(
                 }
             }
         })?;
+
+        // Kill failures are surfaced after the plan's state is persisted, so the rest of the
+        // tick is not lost while the caller still learns that a burner survived.
+        if !kill_errors.is_empty() {
+            return Err(io::Error::other(format!(
+                "burner kill failed: {}",
+                kill_errors.join("; ")
+            )));
+        }
     }
 
     Ok((tick_id, decision_state, world_obs, plan))
+}
+
+/// Sends `SIGKILL` to a burner chosen by `decide`, under the same identity rule as the CLI's
+/// `verify_agent_pid`: a recorded `starttime > 0` is required, and the live process must
+/// still have it.
+///
+/// The process is pinned with a pidfd before its starttime is checked and the signal is sent
+/// through that pidfd, so a pid recycled between the check and the kill cannot be hit.
+/// Returns `Ok(true)` when the signal was delivered, `Ok(false)` when there is nothing to
+/// kill (no recorded identity, the process is gone, or the pid now names another process),
+/// and `Err` for any other failure (e.g. `EPERM`).
+fn kill_verified_burner(burner: &tacho_core::decide::BurnerProcess) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let Some(expected_st) = burner.starttime.filter(|&st| st > 0) else {
+        eprintln!(
+            "[tacho-safety] burner pid {} has no recorded starttime; refusing signal without identity",
+            burner.pid
+        );
+        return Ok(false);
+    };
+    if burner.pid <= 1 {
+        return Ok(false);
+    }
+    // SAFETY: plain syscall; the result is checked before being wrapped.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, burner.pid as libc::pid_t, 0) };
+    if raw < 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            _ => Err(err),
+        };
+    }
+    // SAFETY: pidfd_open returned a fresh fd that we exclusively own.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+
+    let mut stat_buf = [0u8; 1024];
+    let page_size = crate::sampler::get_page_size();
+    let same_process =
+        crate::sampler::read_process_stat_and_comm_slice(burner.pid, page_size, &mut stat_buf)
+            .is_some_and(|st| st.start_ticks == expected_st);
+    if !same_process {
+        eprintln!(
+            "[tacho-safety] burner pid {} starttime no longer matches recorded {expected_st}; refusing signal to reused pid",
+            burner.pid
+        );
+        return Ok(false);
+    }
+
+    // SAFETY: valid pidfd; a null siginfo means "as if sent by kill(2)".
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(err),
+    }
 }
 
 /// Runs an autonomous world-observation and `decide` pass using the current [`tacho_core::LiveState`].
@@ -1232,6 +1487,38 @@ mod tests {
         assert_eq!(decisions[0].action, "queue");
         assert_eq!(decisions[0].target, "feat-1");
         assert_eq!(decisions[0].because, "queued by user");
+    }
+
+    #[test]
+    fn concurrent_decide_ticks_never_overlap() {
+        let dirs: Vec<_> = (0..8).map(|_| tempfile::tempdir().unwrap()).collect();
+        let start = std::sync::Barrier::new(dirs.len());
+        std::thread::scope(|s| {
+            let handles: Vec<_> = dirs
+                .iter()
+                .map(|d| {
+                    let start = &start;
+                    s.spawn(move || {
+                        start.wait();
+                        execute_decide_tick(
+                            d.path(),
+                            &tacho_core::LiveState::default(),
+                            Some("a".repeat(40)),
+                            true,
+                        )
+                        .map(|_| ())
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            tick_probe::MAX_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two decide ticks ran at the same time"
+        );
     }
 
     #[test]
@@ -1313,5 +1600,99 @@ mod tests {
         assert_eq!(recorded_obs.main_sha, "a".repeat(40));
         assert!(!recorded_obs.main_sha.is_empty());
         assert_eq!(recorded_plan.tell_actions, plan.tell_actions);
+    }
+
+    fn count_decision_ticks(store: &FleetStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM decision_ticks", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_decide_tick_with_unchanged_inputs_records_no_new_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let live = tacho_core::LiveState::default();
+        let sha = Some("b".repeat(40));
+
+        let (first, ..) = execute_decide_tick(home, &live, sha.clone(), false).unwrap();
+        let (second, ..) = execute_decide_tick(home, &live, sha.clone(), false).unwrap();
+        let store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+        assert_eq!(
+            first, second,
+            "an unchanged tick must point at the previous row"
+        );
+        assert_eq!(count_decision_ticks(&store), 1);
+
+        // A changed input (a different main) is a new tick.
+        let (third, ..) = execute_decide_tick(home, &live, Some("c".repeat(40)), false).unwrap();
+        assert_ne!(third, second);
+        assert_eq!(count_decision_ticks(&store), 2);
+    }
+
+    #[test]
+    fn test_input_fingerprint_ignores_wall_clock() {
+        let state = DecisionState::default();
+        let mut a = WorldObservation {
+            now: 100,
+            ..Default::default()
+        };
+        a.tidy_snapshot.now = 100;
+        let mut b = a.clone();
+        b.now = 999;
+        b.tidy_snapshot.now = 999;
+        assert_eq!(
+            input_fingerprint(&state, &a).unwrap(),
+            input_fingerprint(&state, &b).unwrap()
+        );
+        b.main_sha = "d".repeat(40);
+        assert_ne!(
+            input_fingerprint(&state, &a).unwrap(),
+            input_fingerprint(&state, &b).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_burner_kill_requires_matching_starttime() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut buf = [0u8; 1024];
+        let start = crate::sampler::read_process_stat_and_comm_slice(
+            pid,
+            crate::sampler::get_page_size(),
+            &mut buf,
+        )
+        .unwrap()
+        .start_ticks;
+        let burner = |starttime| tacho_core::decide::BurnerProcess {
+            pid,
+            comm: "cat".to_string(),
+            elapsed_secs: 0,
+            starttime,
+        };
+
+        assert!(!kill_verified_burner(&burner(None)).unwrap(), "no identity");
+        assert!(
+            !kill_verified_burner(&burner(Some(0))).unwrap(),
+            "zero starttime"
+        );
+        assert!(
+            !kill_verified_burner(&burner(Some(start + 1))).unwrap(),
+            "reused pid"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "refused kills must not signal"
+        );
+
+        assert!(kill_verified_burner(&burner(Some(start))).unwrap());
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }

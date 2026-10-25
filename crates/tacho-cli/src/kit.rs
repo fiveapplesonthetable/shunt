@@ -155,9 +155,13 @@ pub(crate) fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// Records a decision event on the daemon timeline.
+///
+/// The event is best effort (the decision itself is already persisted by the caller), but a
+/// delivery failure is reported on stderr rather than silently dropped.
 pub(crate) fn emit_decision_event(track: &str, name: &str, because: &str) {
     let client = DaemonClient::new();
-    let _ = client.send_request(&serde_json::json!({
+    let sent = client.send_request(&serde_json::json!({
         "input": {
             "type": "custom",
             "source_ts_ns": now_ns(),
@@ -169,6 +173,34 @@ pub(crate) fn emit_decision_event(track: &str, name: &str, because: &str) {
             }
         }
     }));
+    if let Err(e) = sent {
+        eprintln!("[tacho] could not record decision event {track}/{name}: {e}");
+    }
+}
+
+/// Creates (mode 0700) and returns the private temp dir `<fleet home>/tmp/<name>`.
+pub(crate) fn private_tmp_dir(name: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::paths::resolve_home().join("tmp").join(name);
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+/// Points every temp-dir convention of a spawned agent or runner at `dir`: `TMPDIR`, `TMP`,
+/// `TEMP`, and the JVM's `java.io.tmpdir` (through `JAVA_TOOL_OPTIONS`).
+pub(crate) fn apply_private_tmp_env(cmd: &mut Command, dir: &Path) {
+    cmd.env("TMPDIR", dir).env("TMP", dir).env("TEMP", dir).env(
+        "JAVA_TOOL_OPTIONS",
+        format!("-Djava.io.tmpdir={}", dir.display()),
+    );
+}
+
+/// [`private_tmp_dir`] followed by [`apply_private_tmp_env`].
+pub(crate) fn use_private_tmp(cmd: &mut Command, name: &str) -> io::Result<()> {
+    let dir = private_tmp_dir(name)?;
+    apply_private_tmp_env(cmd, &dir);
+    Ok(())
 }
 
 pub(crate) fn is_internal_tacho_path(path: &str) -> bool {

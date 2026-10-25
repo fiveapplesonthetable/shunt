@@ -39,57 +39,64 @@ impl TestSandbox {
 
 impl Drop for TestSandbox {
     fn drop(&mut self) {
-        use std::os::unix::ffi::OsStrExt;
         let pid_file = self.runtime.join("daemon.pid");
-        if let Ok(s) = fs::read_to_string(&pid_file) {
-            if let Ok(pid) = s.trim().parse::<i32>() {
-                if pid > 0 {
-                    unsafe {
-                        let inotify_fd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
-                        if inotify_fd >= 0 {
-                            if let Ok(c_dir) =
-                                std::ffi::CString::new(self.runtime.as_os_str().as_bytes())
-                            {
-                                libc::inotify_add_watch(
-                                    inotify_fd,
-                                    c_dir.as_ptr(),
-                                    libc::IN_DELETE | libc::IN_MODIFY | libc::IN_CLOSE_WRITE,
-                                );
-                            }
-                        }
-                        let pidfd = libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int;
-                        let _ = libc::kill(pid, libc::SIGTERM);
-                        if pidfd >= 0 {
-                            let mut pfd = libc::pollfd {
-                                fd: pidfd,
-                                events: libc::POLLIN,
-                                revents: 0,
-                            };
-                            let _ = libc::poll(&mut pfd, 1, -1);
-                            libc::close(pidfd);
-                        } else if inotify_fd >= 0 {
-                            while libc::kill(pid, 0) == 0 && pid_file.exists() {
-                                let mut pfd = libc::pollfd {
-                                    fd: inotify_fd,
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                };
-                                if libc::poll(&mut pfd, 1, -1) <= 0 {
-                                    break;
-                                }
-                                let mut buf = [0u8; 512];
-                                while libc::read(inotify_fd, buf.as_mut_ptr().cast(), buf.len()) > 0
-                                {
-                                }
-                            }
-                        }
-                        if inotify_fd >= 0 {
-                            libc::close(inotify_fd);
-                        }
-                    }
-                }
+        let Ok(s) = fs::read_to_string(&pid_file) else {
+            return;
+        };
+        let pid = match s.trim().parse::<i32>() {
+            Ok(pid) if pid > 0 => pid,
+            _ => return,
+        };
+        if let Err(e) = stop_and_wait(pid) {
+            let msg = format!("failed to stop test daemon pid {pid}: {e}");
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
             }
         }
+    }
+}
+
+/// SIGTERM `pid` and block until it has exited, via a pidfd (no polling, no inotify).
+///
+/// Fails loudly rather than skipping the wait: a daemon left running leaks into later tests.
+fn stop_and_wait(pid: i32) -> std::io::Result<()> {
+    // SAFETY: plain syscalls on an fd this function owns and closes.
+    unsafe {
+        let pidfd = libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int;
+        if pidfd < 0 {
+            let err = std::io::Error::last_os_error();
+            // Already gone: nothing to wait for.
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(std::io::Error::other(format!("pidfd_open: {err}")));
+        }
+        let result = (|| {
+            if libc::kill(pid, libc::SIGTERM) != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(std::io::Error::other(format!("kill: {err}")));
+                }
+            }
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd: pidfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut pfd, 1, -1) >= 0 {
+                    return Ok(());
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(std::io::Error::other(format!("poll(pidfd): {err}")));
+                }
+            }
+        })();
+        libc::close(pidfd);
+        result
     }
 }
 

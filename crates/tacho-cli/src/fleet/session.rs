@@ -21,9 +21,11 @@ use crate::cli::{AttachArgs, SessionArgs, StopArgs, TellArgs};
 
 use super::dispatch::detect_brief_source;
 use super::store::{
-    emit_decision_event, live_agent_keys, now_ns, now_secs, open_fleet_store, proc_pid_cgroup,
-    proc_pid_starttime, verify_agent_pid, write_atomic,
+    classify_agent_process, emit_decision_event, kill_stopped_and_wait, live_agent_keys, now_ns,
+    now_secs, open_fleet_store, proc_pid_cgroup, proc_pid_starttime, send_signal, verify_agent_pid,
+    write_atomic, AgentProcess,
 };
+use crate::kit::use_private_tmp;
 
 /// Infer the agent provider from a model name or shorthand:
 /// - `gpt-*`, `o1*`, `o3*`, `o4*`, `codex*` -> `"codex"`
@@ -163,19 +165,12 @@ pub fn spawn_worker_for_item(store: &mut FleetStore, item: &TodoItem) -> io::Res
         }
         c
     };
-    let fleet_tmp = home.join("tmp").join(&item.key);
-    fs::create_dir_all(&fleet_tmp)?;
-    let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
-    let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
+    use_private_tmp(&mut command, &item.key)?;
     command
         .current_dir(&wt_path)
         .env("TACHO_AGENT", &item.key)
         .env("TACHO_TASK", &item.key)
         .env("TACHO_MANAGED_WORKER", "1")
-        .env("TMPDIR", &fleet_tmp_str)
-        .env("TMP", &fleet_tmp_str)
-        .env("TEMP", &fleet_tmp_str)
-        .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log_file))
@@ -482,10 +477,8 @@ pub fn execute_stop(args: StopArgs) -> io::Result<()> {
     }
     if let Some(pid) = stop_plan.pid {
         if verify_agent_pid(pid, &args.key, agent.cgroup.as_deref(), agent.starttime) {
-            unsafe {
-                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-                let _ = libc::kill(pid as i32, libc::SIGTERM);
-            }
+            send_signal(-(pid as i32), libc::SIGTERM)?;
+            send_signal(pid as i32, libc::SIGTERM)?;
         }
     }
     let now = now_secs();
@@ -511,6 +504,36 @@ pub fn execute_stop(args: StopArgs) -> io::Result<()> {
         base_key(&args.key)
     );
     Ok(())
+}
+
+/// Error kind used when a resume is refused because the old process may still own the worktree.
+pub(crate) const RESUME_REFUSED: io::ErrorKind = io::ErrorKind::ResourceBusy;
+
+/// Makes sure no process still owns the worktree before a session for `key` is resumed.
+///
+/// Succeeds when the recorded process is verified gone, or verified and stopped (it is then
+/// killed and reaped). Refuses with [`RESUME_REFUSED`] when it is running or its identity
+/// cannot be verified, because resuming would put two agents on one worktree.
+pub(crate) fn ensure_resumable(
+    key: &str,
+    pid: Option<u32>,
+    cgroup: Option<&str>,
+    starttime: Option<u64>,
+) -> io::Result<()> {
+    match classify_agent_process(pid, key, cgroup, starttime) {
+        AgentProcess::Gone => Ok(()),
+        AgentProcess::Stopped(stopped_pid) => kill_stopped_and_wait(stopped_pid),
+        AgentProcess::Running => Err(io::Error::new(
+            RESUME_REFUSED,
+            format!("refusing to resume {key}: its process is still running"),
+        )),
+        AgentProcess::Unverified => Err(io::Error::new(
+            RESUME_REFUSED,
+            format!(
+                "refusing to resume {key}: a process holds its pid but has no recorded identity"
+            ),
+        )),
+    }
 }
 
 /// Executes a single `tell` action decided by `tacho_core::decide::decide`.
@@ -622,15 +645,9 @@ pub fn deliver_tell_action(
             );
         }
         TellPlan::ResumeWithMessage { key, command, .. } => {
-            if is_live {
-                if let Some(pid) = last.pid {
-                    if verify_agent_pid(pid, &key, last.cgroup.as_deref(), last.starttime) {
-                        unsafe {
-                            let _ = libc::kill(-(pid as i32), libc::SIGTERM);
-                        }
-                    }
-                }
-            }
+            // Never restart a running session and never put two agents on one worktree: the old
+            // process must be verified gone, or verified and stopped (then killed and reaped).
+            ensure_resumable(&key, last.pid, last.cgroup.as_deref(), last.starttime)?;
             if last.worktree.is_empty() || !Path::new(&last.worktree).is_dir() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -655,21 +672,13 @@ pub fn deliver_tell_action(
                     "Cannot resume worker {key}: failed to clone log fd: {e}"
                 ))
             })?;
-            let home = crate::paths::resolve_home();
-            let fleet_tmp = home.join("tmp").join(&key);
-            fs::create_dir_all(&fleet_tmp)?;
-            let fleet_tmp_str = fleet_tmp.to_string_lossy().to_string();
-            let java_tmp_opt = format!("-Djava.io.tmpdir={fleet_tmp_str}");
             let mut cmd = Command::new(&command.program);
+            use_private_tmp(&mut cmd, &key)?;
             cmd.args(&command.args)
                 .current_dir(&last.worktree)
                 .env("TACHO_AGENT", &key)
                 .env("TACHO_TASK", &key)
                 .env("TACHO_MANAGED_WORKER", "1")
-                .env("TMPDIR", &fleet_tmp_str)
-                .env("TMP", &fleet_tmp_str)
-                .env("TEMP", &fleet_tmp_str)
-                .env("JAVA_TOOL_OPTIONS", &java_tmp_opt)
                 .env("PYTHONDONTWRITEBYTECODE", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log_file))

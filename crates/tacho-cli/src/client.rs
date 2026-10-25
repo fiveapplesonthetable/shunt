@@ -4,6 +4,11 @@
 //! `tacho daemon` detached (`setsid`, stdio to `$TACHO_HOME/daemon.log`)
 //! and retries with exponential backoff up to a deadline.
 //! Trace snapshotting connects to `trace.sock` with fallback to `api.sock`.
+//!
+//! Reads from the daemon block until the reply arrives or the daemon hangs up: when the
+//! daemon process exits the kernel closes its end of the socket and the read returns EOF,
+//! which is reported as an error. The only time cap is [`INTERACTIVE_REPLY_CAP`] on
+//! single-reply requests, where a human is waiting at the terminal.
 
 use std::env;
 use std::fs::OpenOptions;
@@ -15,6 +20,24 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+/// Overall cap on waiting for a single-reply request (`send_request`). These back
+/// interactive commands, so a wedged-but-alive daemon must not hang the user's terminal
+/// forever; a dead daemon is detected immediately by EOF, not by this cap. Streaming and
+/// batch transfers have no cap and end on reply or hangup.
+const INTERACTIVE_REPLY_CAP: Duration = Duration::from_secs(30);
+
+/// Reads one NDJSON reply line, treating EOF (daemon hung up) as an error.
+fn read_reply_line(reader: &mut impl BufRead, line: &mut String) -> io::Result<()> {
+    line.clear();
+    if reader.read_line(line)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "tachograph daemon closed the connection before replying",
+        ));
+    }
+    Ok(())
+}
 
 use crate::paths::{ensure_dir_0700, resolve_home, resolve_runtime};
 
@@ -258,10 +281,13 @@ impl DaemonClient {
     }
 
     /// Sends a single NDJSON request to `api.sock` and reads a single JSON response.
+    ///
+    /// Fails at once if the daemon hangs up, and after [`INTERACTIVE_REPLY_CAP`] if it stays
+    /// connected without replying.
     pub fn send_request(&self, req: &serde_json::Value) -> io::Result<serde_json::Value> {
         let mut stream = self.connect_api()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(INTERACTIVE_REPLY_CAP))?;
+        stream.set_write_timeout(Some(INTERACTIVE_REPLY_CAP))?;
 
         let line = serde_json::to_string(req)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -271,19 +297,20 @@ impl DaemonClient {
 
         let mut reader = BufReader::new(stream);
         let mut resp_line = String::new();
-        reader.read_line(&mut resp_line)?;
+        read_reply_line(&mut reader, &mut resp_line)?;
 
         serde_json::from_str(&resp_line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Sends a batch of `Input` events over a persistent `api.sock` connection.
+    ///
+    /// Each chunk's acknowledgement is awaited with a blocking read that ends on the reply
+    /// or on daemon hangup; an error reply from the daemon is returned as an error.
     pub fn send_inputs_batch(&self, inputs: &[tacho_core::Input]) -> io::Result<()> {
         if inputs.is_empty() {
             return Ok(());
         }
         let mut stream = self.connect_api()?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut resp_line = String::new();
 
@@ -295,8 +322,14 @@ impl DaemonClient {
             stream.write_all(b"\n")?;
             stream.flush()?;
 
-            resp_line.clear();
-            reader.read_line(&mut resp_line)?;
+            read_reply_line(&mut reader, &mut resp_line)?;
+            let reply: serde_json::Value = serde_json::from_str(&resp_line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if let Some(err) = reply.get("error") {
+                return Err(io::Error::other(format!(
+                    "tachograph daemon rejected input batch: {err}"
+                )));
+            }
         }
         Ok(())
     }
@@ -322,9 +355,9 @@ impl DaemonClient {
         }
 
         // 2. Fall back to api.sock if daemon is running (do not spawn daemon for read-only trace)
+        // Streams until the daemon closes the connection (EOF), with no time cap: a large
+        // trace legitimately takes a while, and a daemon exit ends the stream.
         let mut stream = self.try_connect_api_fast()?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let req = serde_json::json!({
             "cmd": "trace",
             "since": since,

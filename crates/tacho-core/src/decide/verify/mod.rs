@@ -47,6 +47,8 @@ pub mod types;
 pub use types::*;
 mod verdict;
 pub use verdict::*;
+pub mod unbreak;
+pub use unbreak::{ClearedBatch, MainCiObs};
 pub mod worktree;
 pub use worktree::*;
 mod yaml;

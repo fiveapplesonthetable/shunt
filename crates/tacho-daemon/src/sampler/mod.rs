@@ -105,8 +105,13 @@ pub struct ProcSampler {
     cgroup_enabled: bool,
     worktree_scan_secs: u64,
     home_dir: Option<std::path::PathBuf>,
-    last_decide_state_seq: u64,
+    /// `AppenderHandle::decide_seq` at the last decide pass (`None` before the first).
+    last_decide_seq: Option<u64>,
     last_decide_ns: u64,
+    /// Coarse refresh for time-based decide rules; see `SamplerConfig::decide_refresh_secs`.
+    decide_refresh_ns: u64,
+    /// Set by [`SamplerWaker::request_decide`] to force a decide pass on the next tick.
+    decide_requested: std::sync::Arc<AtomicBool>,
 }
 
 impl ProcSampler {
@@ -139,8 +144,10 @@ impl ProcSampler {
             cgroup_enabled: true,
             worktree_scan_secs: 30,
             home_dir: None,
-            last_decide_state_seq: 0,
+            last_decide_seq: None,
             last_decide_ns: 0,
+            decide_refresh_ns: 60 * 1_000_000_000,
+            decide_requested: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -154,9 +161,29 @@ impl ProcSampler {
         self.worktree_scan_secs = secs;
     }
 
-    /// Sets `$TACHO_HOME` so each sampling tick also runs an autonomous `decide` pass.
+    /// Sets `$TACHO_HOME` so sampling ticks also run autonomous `decide` passes when one is
+    /// due (see [`ProcSampler::decide_due`]).
     pub fn set_home_dir(&mut self, home_dir: std::path::PathBuf) {
         self.home_dir = Some(home_dir);
+    }
+
+    /// Sets the coarse refresh interval for time-based decide rules.
+    pub fn set_decide_refresh_secs(&mut self, secs: u64) {
+        self.decide_refresh_ns = secs.max(1).saturating_mul(1_000_000_000);
+    }
+
+    /// Shares the flag that forces a decide pass on the next tick when set.
+    pub(crate) fn set_decide_request_flag(&mut self, flag: std::sync::Arc<AtomicBool>) {
+        self.decide_requested = flag;
+    }
+
+    /// Whether a decide pass is due at `now_ns`: on the first tick, after a decide-relevant
+    /// event was committed (`decide_seq` moved), on explicit request, or once the coarse
+    /// refresh interval has elapsed for rules that depend on time alone.
+    fn decide_due(&self, decide_seq: u64, now_ns: u64) -> bool {
+        self.last_decide_seq != Some(decide_seq)
+            || self.decide_requested.load(Ordering::Acquire)
+            || now_ns.saturating_sub(self.last_decide_ns) >= self.decide_refresh_ns
     }
 
     /// Reads `/proc/loadavg` using `pread` at offset 0 into a stack buffer.
@@ -464,11 +491,10 @@ impl ProcSampler {
         }
 
         if let Some(ref home_dir) = self.home_dir {
-            let cur_seq = appender.state_seq();
-            if cur_seq != self.last_decide_state_seq
-                || now_ns.saturating_sub(self.last_decide_ns) >= 1_000_000_000
-            {
-                self.last_decide_state_seq = cur_seq;
+            let decide_seq = appender.decide_seq();
+            if self.decide_due(decide_seq, now_ns) {
+                self.decide_requested.store(false, Ordering::Release);
+                self.last_decide_seq = Some(decide_seq);
                 self.last_decide_ns = now_ns;
                 let latest_live = appender.live_state();
                 if let Err(e) =
@@ -499,7 +525,7 @@ pub fn send_sample_if_changed(
         }
     }
     last_samples.insert(track_key.to_string(), value);
-    let _ = appender.send_input(
+    if let Err(e) = appender.send_input(
         Input::CounterSample {
             source_ts_ns: Some(now_ns),
             track_key: track_key.to_string(),
@@ -507,7 +533,11 @@ pub fn send_sample_if_changed(
             unit: unit.map(|s| s.to_string()),
         },
         now_ns,
-    );
+    ) {
+        // Forget the value so the next tick resends it instead of deduplicating it away.
+        last_samples.remove(track_key);
+        eprintln!("[tacho-daemon] dropped counter sample for {track_key}: {e}");
+    }
 }
 
 /// Parses unsigned 64-bit integer from ASCII byte slice without allocation.

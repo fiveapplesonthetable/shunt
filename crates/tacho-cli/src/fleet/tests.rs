@@ -13,8 +13,57 @@ use tacho_daemon::{DecisionRecord, FleetState, FleetStore};
 
 use super::*;
 
+/// Runs `git args` in `dir` hermetically and returns trimmed stdout.
+///
+/// `GIT_CEILING_DIRECTORIES` is set to the parent of `dir`'s tempdir so git
+/// never walks up into an enclosing repository (e.g. when `TMPDIR` lives in
+/// a checkout), and stdin is null with prompts disabled so git cannot block.
 fn git(dir: &Path, args: &[&str]) -> String {
-    git_stdout(dir, args).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+    let ceiling = std::env::temp_dir();
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CEILING_DIRECTORIES", &ceiling)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A fresh tempdir from which git cannot discover any repository.
+///
+/// The product's `git_stdout` deliberately lets git walk up (fleets run in nested repos), so a
+/// "not a repo" test must sit somewhere no enclosing checkout exists. Tries `TMPDIR`, then
+/// `/tmp` and `/dev/shm`, verifying each with an unbounded `git rev-parse`; panics with a clear
+/// message instead of silently testing the wrong thing.
+fn non_repo_tempdir() -> tempfile::TempDir {
+    let roots = [std::env::temp_dir(), "/tmp".into(), "/dev/shm".into()];
+    for root in &roots {
+        let Ok(dir) = tempfile::tempdir_in(root) else {
+            continue;
+        };
+        let discovered = std::process::Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_CEILING_DIRECTORIES")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap_or_else(|e| panic!("spawn git: {e}"));
+        if !discovered.success() {
+            return dir;
+        }
+    }
+    panic!("every temp root {roots:?} is inside a git repository; set TMPDIR outside any repo");
 }
 
 fn init_repo(dir: &Path) {
@@ -64,7 +113,7 @@ fn rescue_archives_dirty_and_untracked_work_without_stash() {
 
 #[test]
 fn rescue_fails_loudly_outside_a_repo_so_tidy_keeps_the_tree() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = non_repo_tempdir();
     let plain = tmp.path().join("not-a-repo");
     fs::create_dir(&plain).unwrap();
     fs::write(plain.join("precious.txt"), "keep me").unwrap();
@@ -85,7 +134,7 @@ fn rescue_fails_loudly_outside_a_repo_so_tidy_keeps_the_tree() {
 
 #[test]
 fn git_stdout_reports_failure_instead_of_empty_output() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = non_repo_tempdir();
     let err = git_stdout(tmp.path(), &["rev-parse", "HEAD"]).unwrap_err();
     assert!(err.to_string().contains("git rev-parse failed"), "{err}");
 }

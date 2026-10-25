@@ -304,6 +304,20 @@ crates/
 └── tacho-e2e/       # End-to-end integration, chaos torture, and black-box verification test suite
 ```
 
+## Testing
+
+Run the whole workspace suite under one overall cap with:
+
+```bash
+scripts/test-suite.sh            # cargo test --workspace --no-fail-fast
+TACHO_SUITE_CAP_SECS=1200 scripts/test-suite.sh   # override the 50 min default
+```
+
+Output is copied to `target/test-suite.log` (override with `TACHO_SUITE_LOG`).
+If the cap expires, the script prints a hang report naming the running test
+binary and its live test processes plus the last 40 lines of output, then
+exits 124.
+
 ## Documentation
 
 For the comprehensive system architecture guide, design specifications, and query guides, open [docs/index.html](docs/index.html).

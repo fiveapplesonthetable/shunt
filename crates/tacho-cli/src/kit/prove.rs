@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use tacho_core::decide::verify::{checks_for_files, AreaRule, ProofCheck, ProofSummary};
 use tacho_core::Scrubber;
 
+use super::procs::signal_group_and_leader;
+use super::use_private_tmp;
 use super::{
     emit_decision_event, find_worktree_root, is_internal_tacho_path, load_worktree_env, now_ns,
     now_secs, open_fleet_store, resolve_base_sha_for_worktree, tree_of_worktree, write_atomic,
@@ -387,6 +389,7 @@ pub fn run_prove_step(
     let err_file = out_tmp.reopen()?;
 
     let mut cmd = Command::new("bash");
+    use_private_tmp(&mut cmd, "prove")?;
     cmd.args(["-c", cmd_str])
         .current_dir(root)
         .env("TACHO_AREA", area)
@@ -418,11 +421,8 @@ pub fn run_prove_step(
         }
         let now = Instant::now();
         if now >= deadline {
-            unsafe {
-                let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-                let _ = libc::kill(pid as i32, libc::SIGKILL);
-            }
-            let _ = child.wait();
+            signal_group_and_leader(pid, libc::SIGKILL)?;
+            child.wait()?;
             break 124;
         }
         let rem_ms = deadline.saturating_duration_since(now).as_millis().min(500) as i32;

@@ -21,6 +21,7 @@ use super::store::{
     git_stdout, live_agent_keys, load_fleet_meta, mutate_fleet_meta, now_secs, open_fleet_store,
     write_atomic, CodeMoveRecord,
 };
+use crate::kit::use_private_tmp;
 
 // =============================================================================
 // Owner Notifier & Outgoing Payload Scrubber
@@ -404,10 +405,10 @@ pub fn run_self_update(
     }
 
     git_stdout(repo_dir, &["checkout", "--detach", target_sha])?;
-    let test_out = Command::new("bash")
-        .args(["-c", test_cmd])
-        .current_dir(repo_dir)
-        .output()?;
+    let mut test = Command::new("bash");
+    test.args(["-c", test_cmd]).current_dir(repo_dir);
+    use_private_tmp(&mut test, "self-update")?;
+    let test_out = test.output()?;
 
     let now = now_secs();
     if test_out.status.success() {

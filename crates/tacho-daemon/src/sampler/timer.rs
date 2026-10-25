@@ -4,6 +4,10 @@
 //! obtained by sampling on a clock. One periodic `timerfd` keeps a steady cadence (a slow
 //! tick does not shift later ones) without creating an fd per tick, while a pipe waker
 //! allows prompt, sleep-free shutdown and on-demand synchronous sampling ticks.
+//!
+//! `decide` does not run on every tick: a tick runs it only when the appender committed a
+//! decide-relevant event, when [`SamplerWaker::request_decide`] asked for it, or when the
+//! coarse `decide_refresh_secs` interval has elapsed (see `ProcSampler::decide_due`).
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +38,8 @@ struct SamplerControl {
     tick_seq: Mutex<u64>,
     tick_cvar: Condvar,
     running: AtomicBool,
+    /// Shared with the loop's `ProcSampler`; forces a decide pass on the next tick.
+    decide_requested: Arc<AtomicBool>,
 }
 
 impl SamplerControl {
@@ -43,6 +49,7 @@ impl SamplerControl {
             tick_seq: Mutex::new(0),
             tick_cvar: Condvar::new(),
             running: AtomicBool::new(true),
+            decide_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -55,8 +62,14 @@ impl SamplerControl {
             .as_ref()
         {
             let byte = [b't'];
-            unsafe {
-                let _ = libc::write(fd.as_raw_fd(), byte.as_ptr().cast(), 1);
+            // SAFETY: writing one byte from a local buffer to a pipe fd we own.
+            let n = unsafe { libc::write(fd.as_raw_fd(), byte.as_ptr().cast(), 1) };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                // A full pipe already holds a pending wake, which is all a wake needs.
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    eprintln!("[tacho-daemon] failed to wake sampler: {err}");
+                }
             }
         }
     }
@@ -84,6 +97,13 @@ impl SamplerWaker {
         }
     }
 
+    /// Asks for a `decide` pass on an immediate tick, even if no decide-relevant event was
+    /// committed since the last one. Does not block.
+    pub fn request_decide(&self) {
+        self.control.decide_requested.store(true, Ordering::Release);
+        self.trigger_tick();
+    }
+
     /// Triggers an immediate sampling tick and blocks until a full tick that started after
     /// this call has completed (or the sampler stops).
     pub fn sample_now(&self) {
@@ -98,17 +118,15 @@ impl SamplerWaker {
         // Require 2 completions so that even if a tick was already mid-flight when
         // `sample_now` was called, one full tick starts and finishes after this point.
         let target = seq.saturating_add(2);
+        // Every completed tick and the loop's exit notify `tick_cvar`, so this wait ends on
+        // the sampler's own progress; without a wake pipe the next timerfd tick serves.
         while *seq < target && self.control.running.load(Ordering::Acquire) {
             self.control.wake_pipe();
-            let (next_seq, timeout) = self
+            seq = self
                 .control
                 .tick_cvar
-                .wait_timeout(seq, Duration::from_secs(2))
+                .wait(seq)
                 .unwrap_or_else(|p| p.into_inner());
-            seq = next_seq;
-            if timeout.timed_out() {
-                break;
-            }
         }
     }
 }
@@ -165,6 +183,8 @@ fn run_sampler_loop(
     let mut proc_sampler = ProcSampler::new(&config.mounts);
     proc_sampler.set_cgroup_enabled(config.cgroup);
     proc_sampler.set_worktree_scan_secs(config.worktree_scan_secs);
+    proc_sampler.set_decide_refresh_secs(config.decide_refresh_secs);
+    proc_sampler.set_decide_request_flag(control.decide_requested.clone());
     if let Some(home) = home_dir {
         proc_sampler.set_home_dir(home);
     }
@@ -266,14 +286,22 @@ impl IntervalTimer {
             }
             if pfds[0].revents != 0 {
                 if let Some(fd) = &self.fd {
+                    // Reading resets the expiration count, coalescing missed ticks.
                     let mut expirations = 0u64;
-                    let _ = unsafe {
+                    // SAFETY: reading 8 bytes into a local u64 from a timerfd we own.
+                    let n = unsafe {
                         libc::read(
                             fd.as_raw_fd(),
                             &mut expirations as *mut u64 as *mut libc::c_void,
                             std::mem::size_of::<u64>(),
                         )
                     };
+                    if n < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() != io::ErrorKind::WouldBlock {
+                            eprintln!("[tacho-daemon] sampler timerfd read failed: {err}");
+                        }
+                    }
                 }
             }
             return true;

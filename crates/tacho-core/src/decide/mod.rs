@@ -112,6 +112,10 @@ pub struct WorldObservation {
     pub tidy_snapshot: TidySnapshot,
     #[serde(default)]
     pub burners: Vec<BurnerProcess>,
+    /// Main's last completed CI run; `None` when unknown (main-broken batches are then kept
+    /// until all their members are merged or closed).
+    #[serde(default)]
+    pub main_ci: Option<crate::decide::verify::MainCiObs>,
 }
 
 /// An observed runaway burner process (e.g. stress, yes).
@@ -170,6 +174,9 @@ pub struct DecisionPlan {
     pub burner_kills: Vec<BurnerProcess>,
     #[serde(default)]
     pub tell_actions: Vec<(String, String)>,
+    /// `main-broken` batches forgotten this tick, each with its reason.
+    #[serde(default)]
+    pub cleared_main_broken: Vec<crate::decide::verify::ClearedBatch>,
 }
 
 /// Replayable pure decision function `(DecisionState, WorldObservation) -> DecisionPlan`.
@@ -404,6 +411,22 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
             }
         }
     }
+
+    // 4b. Forget finished `main-broken` batches (`unbreak`): members all gone, or main green
+    // again on a newer descendant; still-open members are re-batched below on the new main.
+    let open_numbers: BTreeSet<u64> = obs
+        .open_prs
+        .iter()
+        .map(|p| p.number)
+        .filter(|n| !next.merged_prs.contains(n) && !next.closed_prs.contains(n))
+        .collect();
+    let cleared_main_broken =
+        crate::decide::verify::unbreak::clear(&next.batches, &open_numbers, obs.main_ci.as_ref());
+    next.batches.retain(|b| {
+        !cleared_main_broken
+            .iter()
+            .any(|c| c.batch_id == b.id && b.status == "main-broken")
+    });
 
     // 5. Queue automatic resume candidates (after backoff) and select next work up to free slots.
     let mut resumed_tasks = Vec::new();
@@ -653,6 +676,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         self_update,
         watchdog_alert,
         next_state: next,
+        cleared_main_broken,
         burner_kills,
         tell_actions,
     }

@@ -178,6 +178,106 @@ pub(crate) fn verify_agent_pid(
     true
 }
 
+/// What is known about the process recorded for an agent, for deciding whether a resume is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentProcess {
+    /// No process exists for the recorded identity: no pid, the pid is gone or a zombie,
+    /// or the pid was reused (recorded starttime differs from the live one).
+    Gone,
+    /// The recorded process is alive, its identity is verified, and it is job-control stopped.
+    Stopped(u32),
+    /// The recorded process is alive, its identity is verified, and it is running.
+    Running,
+    /// A process is alive at the recorded pid but no identity was recorded to prove it is ours.
+    Unverified,
+}
+
+/// Classifies the process recorded for `agent_key` without signalling it.
+pub(crate) fn classify_agent_process(
+    pid: Option<u32>,
+    agent_key: &str,
+    expected_cgroup: Option<&str>,
+    expected_starttime: Option<u64>,
+) -> AgentProcess {
+    let Some(pid) = pid else {
+        return AgentProcess::Gone;
+    };
+    if !pid_alive(pid) {
+        return AgentProcess::Gone;
+    }
+    if let Some(expected) = expected_starttime.filter(|&st| st > 0) {
+        if proc_pid_starttime(pid).is_some_and(|actual| actual != expected) {
+            // The pid now names a different process, so the recorded one has exited.
+            return AgentProcess::Gone;
+        }
+    }
+    if !verify_agent_pid(pid, agent_key, expected_cgroup, expected_starttime) {
+        return AgentProcess::Unverified;
+    }
+    if proc_pid_state(pid).is_some_and(|s| s == 'T' || s == 't') {
+        AgentProcess::Stopped(pid)
+    } else {
+        AgentProcess::Running
+    }
+}
+
+/// Reads field 3 (process state letter) of `/proc/<pid>/stat`.
+pub fn proc_pid_state(pid: u32) -> Option<char> {
+    let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rparen = content.rfind(')')?;
+    content[rparen + 1..].trim_start().chars().next()
+}
+
+pub use crate::kit::procs::send_signal;
+
+/// SIGKILLs the process group of a verified, stopped agent and blocks until its leader exits.
+///
+/// A stopped process cannot run, so SIGKILL is delivered immediately; the wait is on the
+/// pidfd exit event, not a timer.
+pub(crate) fn kill_stopped_and_wait(pid: u32) -> io::Result<()> {
+    send_signal(-(pid as i32), libc::SIGKILL)?;
+    wait_for_pid_exit_event(pid)
+}
+
+/// Blocks until `pid` exits, waiting on its pidfd. Returns immediately if it is already gone.
+pub(crate) fn wait_for_pid_exit_event(pid: u32) -> io::Result<()> {
+    // SAFETY: pidfd_open takes plain integers and returns a new fd or -1.
+    let pidfd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as libc::c_int;
+    if pidfd < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            err.kind(),
+            format!("pidfd_open({pid}) failed: {err}"),
+        ));
+    }
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = loop {
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call.
+        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if rc >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break rc;
+        }
+    };
+    let poll_err = io::Error::last_os_error();
+    // SAFETY: `pidfd` is an fd we own and close exactly once.
+    unsafe { libc::close(pidfd) };
+    if rc < 0 {
+        return Err(io::Error::new(
+            poll_err.kind(),
+            format!("poll on pidfd for {pid} failed: {poll_err}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Wait up to `timeout` for `pid` to exit using Linux `pidfd_open` + `libc::poll`
 /// (with `yield_now` fallback).
 pub fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
@@ -417,7 +517,17 @@ pub fn load_fleet_env(env_file_override: Option<&Path>) -> BTreeMap<String, Stri
 /// Runs `git -C <dir> <args>` and returns trimmed stdout, failing on a non-zero exit so callers
 /// never act on a half-done git step.
 pub fn git_stdout(dir: &Path, args: &[&str]) -> io::Result<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+    // Never let git block on a prompt, an editor, or a pager: stdin is closed and every
+    // interactive hook is disabled, so a git call either completes or fails.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_PAGER", "cat")
+        .output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "git {} failed: {}",
