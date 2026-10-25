@@ -27,6 +27,28 @@ use std::time::Duration;
 /// batch transfers have no cap and end on reply or hangup.
 const INTERACTIVE_REPLY_CAP: Duration = Duration::from_secs(30);
 
+/// Resolves the `tacho` CLI binary path, never returning a `deps/*` test harness executable.
+pub(crate) fn resolve_tacho_bin() -> PathBuf {
+    env::var_os("TACHO_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if let Ok(cur) = env::current_exe() {
+                if cur.file_name().and_then(|n| n.to_str()) == Some("tacho") {
+                    return cur;
+                }
+                let mut dir = cur.parent();
+                while let Some(d) = dir {
+                    let candidate = d.join("tacho");
+                    if candidate.is_file() {
+                        return candidate;
+                    }
+                    dir = d.parent();
+                }
+            }
+            PathBuf::from("tacho")
+        })
+}
+
 /// Reads one NDJSON reply line, treating EOF (daemon hung up) as an error.
 fn read_reply_line(reader: &mut impl BufRead, line: &mut String) -> io::Result<()> {
     line.clear();
@@ -241,23 +263,7 @@ impl DaemonClient {
             .mode(0o600)
             .open(self.daemon_log())?;
 
-        let exe = env::var_os("TACHO_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                // If running within cargo test / cargo run, find `tacho` in target dir or PATH.
-                // Never execute the test harness binary itself!
-                if let Ok(cur) = env::current_exe() {
-                    let mut dir = cur.parent();
-                    while let Some(d) = dir {
-                        let candidate = d.join("tacho");
-                        if candidate.is_file() {
-                            return candidate;
-                        }
-                        dir = d.parent();
-                    }
-                }
-                PathBuf::from("tacho")
-            });
+        let exe = resolve_tacho_bin();
         let mut cmd = Command::new(exe);
         cmd.arg("daemon")
             .env("TACHO_HOME", &self.home_dir)

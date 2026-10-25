@@ -27,10 +27,12 @@ const GIT_CAP: Duration = Duration::from_secs(5);
 
 /// Collects host `/proc` entries (ppid, cpu ticks, real age from starttime, cwd, argv).
 pub fn scan_procs() -> Vec<ProcEntry> {
+    use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir("/proc") else {
         return out;
     };
+    let my_uid = unsafe { libc::geteuid() };
     let uptime_secs = fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
@@ -42,6 +44,9 @@ pub fn scan_procs() -> Vec<ProcEntry> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
+        if entry.metadata().is_ok_and(|m| m.uid() != my_uid) {
+            continue;
+        }
         let p_dir = entry.path();
         let Ok(stat) = fs::read_to_string(p_dir.join("stat")) else {
             continue;
@@ -60,6 +65,9 @@ pub fn scan_procs() -> Vec<ProcEntry> {
         else {
             continue;
         };
+        if pid == 2 || ppid == 2 {
+            continue;
+        }
         // Age from the kernel's start time; unknown uptime means unknown age (0 = never
         // old enough for an age-based rule to fire).
         let elapsed_secs = uptime_secs
@@ -149,16 +157,17 @@ fn is_internal_kit_porcelain_line(line: &str) -> bool {
         || rel.starts_with(".tacho-run/")
 }
 
-/// Observes `dir` with bounded git calls; any part that cannot be read stays `None`.
+/// Observes `dir` with bounded git calls confined strictly to `dir` as its own worktree
+/// toplevel; any part that cannot be read (or if `dir` is not its own toplevel) stays `None`.
 pub fn observe_worktree(dir: &Path) -> WorktreeObs {
-    if dir.as_os_str().is_empty() || !dir.is_dir() {
+    if !is_git_checkout(dir) {
         return WorktreeObs::default();
     }
-    let head_sha = crate::sampler::run_git(dir, &["rev-parse", "HEAD"], GIT_CAP)
+    let head_sha = crate::sampler::run_git_in_worktree(dir, &["rev-parse", "HEAD"], GIT_CAP)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let dirty_files = crate::sampler::run_git(
+    let dirty_files = crate::sampler::run_git_in_worktree(
         dir,
         &["status", "--porcelain", "--untracked-files=all"],
         GIT_CAP,
@@ -289,14 +298,11 @@ pub fn build_tidy_snapshot(
         };
         let age_secs = (now - last_mod).max(0);
         // Unknown dirtiness is treated as dirty, so the janitor rescues before removing.
-        let dirty = wt_obs
-            .dirty_files
-            .map(|n| n > 0)
-            .unwrap_or_else(|| is_git_checkout(p));
+        let dirty = wt_obs.dirty_files.map(|n| n > 0).unwrap_or(true);
         let mut unpushed_commits = if wt.base_sha.is_empty() {
             0
         } else {
-            crate::sampler::run_git(
+            crate::sampler::run_git_in_worktree(
                 p,
                 &["rev-list", "--count", &format!("{}..HEAD", wt.base_sha)],
                 GIT_CAP,
@@ -306,9 +312,11 @@ pub fn build_tidy_snapshot(
             .unwrap_or(0)
         };
         if wt.base_sha.is_empty() || wt_obs.head_sha.as_deref() != Some(wt.base_sha.as_str()) {
-            if let Ok(remote_branches) =
-                crate::sampler::run_git(p, &["branch", "-r", "--contains", "HEAD"], GIT_CAP)
-            {
+            if let Ok(remote_branches) = crate::sampler::run_git_in_worktree(
+                p,
+                &["branch", "-r", "--contains", "HEAD"],
+                GIT_CAP,
+            ) {
                 if remote_branches.trim().is_empty()
                     && wt_obs
                         .head_sha
@@ -320,8 +328,13 @@ pub fn build_tidy_snapshot(
             }
         }
         let pr = state.agents.get(&wt.slug).and_then(|a| a.pr).or(wt.base_pr);
-        let pr_merged_or_closed =
-            pr.is_some_and(|pr| state.merged_prs.contains(&pr) || state.closed_prs.contains(&pr));
+        let is_retired = state.retired.contains(&wt.slug)
+            || state
+                .retired
+                .contains(tacho_core::decide::dispatch::base_key(&wt.slug));
+        let pr_merged_or_closed = is_retired
+            || pr
+                .is_some_and(|pr| state.merged_prs.contains(&pr) || state.closed_prs.contains(&pr));
         worktrees.push(WorktreeCandidate {
             path: wt.path.clone(),
             branch: wt.branch.clone(),
@@ -360,21 +373,21 @@ pub fn build_tidy_snapshot(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(now);
             let last_mod = wt_obs.newest_mtime.filter(|&m| m > 0).unwrap_or(dir_mtime);
-            let dirty = wt_obs
-                .dirty_files
-                .map(|n| n > 0)
-                .unwrap_or_else(|| is_git_checkout(&p));
-            let unpushed_commits =
-                crate::sampler::run_git(&p, &["branch", "-r", "--contains", "HEAD"], GIT_CAP)
-                    .ok()
-                    .map(|out| {
-                        if out.trim().is_empty() && wt_obs.head_sha.is_some() {
-                            1
-                        } else {
-                            0
-                        }
-                    })
-                    .unwrap_or(0);
+            let dirty = wt_obs.dirty_files.map(|n| n > 0).unwrap_or(true);
+            let unpushed_commits = crate::sampler::run_git_in_worktree(
+                &p,
+                &["branch", "-r", "--contains", "HEAD"],
+                GIT_CAP,
+            )
+            .ok()
+            .map(|out| {
+                if out.trim().is_empty() && wt_obs.head_sha.is_some() {
+                    1
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
             checkouts.push(CheckoutCandidate {
                 path: path_str,
                 age_secs: (now - last_mod).max(0),
@@ -397,14 +410,17 @@ pub fn build_tidy_snapshot(
     }
 }
 
-/// Whether `dir` is itself a git checkout (has a `.git` file or directory).
+/// Whether `dir` is itself a git checkout whose `--show-toplevel` is `dir`.
 pub fn is_git_checkout(dir: &Path) -> bool {
-    dir.join(".git").exists()
+    if dir.as_os_str().is_empty() || !dir.join(".git").exists() {
+        return false;
+    }
+    crate::sampler::run_git_in_worktree(dir, &["rev-parse", "--show-toplevel"], GIT_CAP).is_ok()
 }
 
-/// Whether `start` or an ancestor is a git checkout.
+/// Whether `start` or an ancestor has a `.git` entry.
 pub fn inside_git_checkout(start: &Path) -> bool {
-    start.ancestors().any(is_git_checkout)
+    start.ancestors().any(|d| d.join(".git").exists())
 }
 
 /// Git facts about the checkout the tick runs against.
@@ -1154,5 +1170,45 @@ mod tests {
         assert_eq!(snap_dirty.worktrees.len(), 1);
         assert!(snap_dirty.worktrees[0].dirty);
         assert!(snap_dirty.worktrees[0].age_secs < 60);
+    }
+
+    #[test]
+    fn test_git_commands_refuse_plain_subdir_inside_enclosing_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_repo = dir.path().join("srv-fleet");
+        std::fs::create_dir_all(&parent_repo).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&parent_repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "Tester"]);
+        std::fs::write(parent_repo.join("root.txt"), "root\n").unwrap();
+        run_git(&["add", "root.txt"]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+
+        // Create an untracked file in the enclosing parent repo and a plain subdirectory
+        // pretending to be a worktree (`--show-toplevel` would walk up to `parent_repo` if unconfined).
+        std::fs::write(parent_repo.join("untracked_parent.txt"), "do not stage\n").unwrap();
+        let plain_subdir = parent_repo.join("trees").join("not-a-worktree");
+        std::fs::create_dir_all(&plain_subdir).unwrap();
+        std::fs::write(plain_subdir.join("file.txt"), "hello\n").unwrap();
+
+        assert!(
+            !is_git_checkout(&plain_subdir),
+            "plain subdir inside a parent git repo must not be treated as its own worktree"
+        );
+        let obs = observe_worktree(&plain_subdir);
+        assert_eq!(obs, WorktreeObs::default());
+        assert!(
+            !parent_repo.join(".git").join("index.lock").exists(),
+            "observe_worktree must never leave .git/index.lock in parent repo"
+        );
     }
 }

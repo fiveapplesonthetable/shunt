@@ -1340,7 +1340,12 @@ fn test_pluggable_traits_and_project_policy_unification() {
         name: "github".to_string(),
         cli_bin: "gh".to_string(),
         repo: Some("org/repo".to_string()),
+        ..Default::default()
     };
+    assert!(
+        forge.merge_pr(1).is_err(),
+        "PR merging must be off by default on CliForgePlugin"
+    );
     let host: &dyn CodeHostPlugin = &forge;
     assert_eq!(host.forge_name(), "github");
     assert_eq!(
@@ -2107,11 +2112,11 @@ fn test_decide_populates_tell_actions_and_worktree_removal() {
 
     assert!(plan.tidy_decisions.iter().any(|d| matches!(
         d,
-        TidyDecision::RemoveTree { path, rescue: false, .. } if path == "/tmp/wt/retired-agent"
+        TidyDecision::RemoveTree { path, rescue: true, .. } if path == "/tmp/wt/retired-agent"
     )));
     assert!(plan.tidy_decisions.iter().any(|d| matches!(
         d,
-        TidyDecision::RemoveTree { path, rescue: false, .. } if path == "/tmp/wt/merged-agent"
+        TidyDecision::RemoveTree { path, rescue: true, .. } if path == "/tmp/wt/merged-agent"
     )));
     assert!(!plan.tidy_decisions.iter().any(|d| matches!(
         d,

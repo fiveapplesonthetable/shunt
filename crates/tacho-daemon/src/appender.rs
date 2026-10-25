@@ -70,6 +70,10 @@ impl Default for AppenderHooks {
 }
 
 impl AppenderHooks {
+    pub fn is_wedged(&self) -> bool {
+        self.wedged.load(Ordering::Acquire)
+    }
+
     pub fn set_wedged(&self, wedged: bool) {
         let _guard = self.mutex.lock().unwrap_or_else(|p| p.into_inner());
         self.wedged.store(wedged, Ordering::Release);
@@ -242,10 +246,13 @@ impl AppenderHandle {
         input: Input,
         received_at_ns: u64,
     ) -> Result<(), crossbeam_channel::SendTimeoutError<AppenderCommand>> {
-        self.sender.send_timeout(
-            AppenderCommand::Input(Box::new(input), received_at_ns),
-            SEND_TIMEOUT,
-        )
+        let timeout = if self.hooks.is_wedged() {
+            Duration::from_millis(100)
+        } else {
+            SEND_TIMEOUT
+        };
+        self.sender
+            .send_timeout(AppenderCommand::Input(Box::new(input), received_at_ns), timeout)
     }
 
     /// Sends a batch of input events into the flight recorder pipeline with a bounded timeout
@@ -258,18 +265,33 @@ impl AppenderHandle {
         if batch.is_empty() {
             return Ok(());
         }
+        let timeout = if self.hooks.is_wedged() {
+            Duration::from_millis(100)
+        } else {
+            SEND_TIMEOUT
+        };
         self.sender
-            .send_timeout(AppenderCommand::InputBatch(batch), SEND_TIMEOUT)
+            .send_timeout(AppenderCommand::InputBatch(batch), timeout)
     }
 
     /// Commits everything queued before this call. Returns true once the appender confirms;
     /// false if it is stopped, wedged or too busy to confirm in time.
     pub fn flush(&self) -> bool {
         let (tx, rx) = crossbeam_channel::bounded(1);
+        let send_timeout = if self.hooks.is_wedged() {
+            Duration::from_millis(100)
+        } else {
+            SEND_TIMEOUT
+        };
+        let confirm_timeout = if self.hooks.is_wedged() {
+            Duration::from_millis(100)
+        } else {
+            FLUSH_CONFIRM_TIMEOUT
+        };
         self.sender
-            .send_timeout(AppenderCommand::Flush(tx), SEND_TIMEOUT)
+            .send_timeout(AppenderCommand::Flush(tx), send_timeout)
             .is_ok()
-            && rx.recv_timeout(FLUSH_CONFIRM_TIMEOUT).is_ok()
+            && rx.recv_timeout(confirm_timeout).is_ok()
     }
 
     /// Signals the appender thread to terminate cleanly after committing what is queued.

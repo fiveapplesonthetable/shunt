@@ -104,11 +104,17 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
             println!("Would land train {}: PRs {:?}", open.id, open.prs);
             return Ok(());
         }
+        let merge_enabled = match std::env::var("TACHO_LAND_MERGE") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => state.merge_prs,
+        };
         let gh_forge = std::env::var("TACHO_GH_REPO")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .map(tacho_core::decide::plugin::GitHubForge::new);
-        let post_merge_tree = if let Some(ref forge) = gh_forge {
+            .map(|r| {
+                tacho_core::decide::plugin::GitHubForge::new(r).with_allow_merge(merge_enabled)
+            });
+        let post_merge_tree = if let (Some(ref forge), true) = (&gh_forge, merge_enabled) {
             use tacho_core::decide::plugin::ForgePlugin;
             for &pr in &open.prs {
                 let _ = forge.mark_pr_ready(pr);

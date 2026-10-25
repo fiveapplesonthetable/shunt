@@ -449,11 +449,15 @@ mod tests {
             .unwrap();
 
         let mut daemon = Daemon::start(paths.clone(), Config::default()).unwrap();
+        let ts_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         daemon
             .appender
             .send_input(
                 tacho_core::Input::RunStart {
-                    source_ts_ns: Some(1_000_000_000),
+                    source_ts_ns: Some(ts_ns),
                     provider: "claude".to_string(),
                     session_id: "sess-auto".to_string(),
                     agent: Some("worker-1".to_string()),
@@ -465,7 +469,7 @@ mod tests {
                     parent_session: None,
                     git_tree: None,
                 },
-                1_000_000_000,
+                ts_ns,
             )
             .unwrap();
         assert!(daemon.appender.flush());

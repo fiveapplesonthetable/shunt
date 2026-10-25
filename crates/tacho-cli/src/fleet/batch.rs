@@ -190,7 +190,7 @@ pub fn launch_detached_batch(opts: &BatchOptions) -> io::Result<PathBuf> {
         .open(&log_path)?;
     let err_file = log_file.try_clone()?;
 
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tacho"));
+    let exe = crate::client::resolve_tacho_bin();
     let mut cmd = Command::new(exe);
     cmd.arg("batch").arg("--foreground");
     for pr in &opts.prs {

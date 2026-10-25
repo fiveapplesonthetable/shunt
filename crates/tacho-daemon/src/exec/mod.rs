@@ -709,6 +709,32 @@ fn execute_actions(
     for c in &plan.cleared_main_broken {
         store.record_decision("verify", "clear_main_broken", &c.batch_id, &c.reason)?;
     }
+    if !plan.cleared_main_broken.is_empty()
+        && !plan
+            .next_state
+            .batches
+            .iter()
+            .any(|b| b.status == "main-broken")
+    {
+        if let Some(forge) = forge {
+            let reason = plan
+                .cleared_main_broken
+                .iter()
+                .map(|c| c.reason.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Err(e) = forge.close_issue("main is red", &reason) {
+                f.record(
+                    store,
+                    "watch",
+                    "close_issue_failed",
+                    "main is red",
+                    &format!("failed to close 'main is red' issue: {e}"),
+                    true,
+                )?;
+            }
+        }
+    }
 
     // Dispatch.
     for item in &plan.dispatched_tasks {
@@ -741,21 +767,77 @@ fn execute_actions(
         store.record_decision("watch", "self_update", target, &plan.self_update.because)?;
     }
     for n in &plan.owner_notifications {
-        store.record_decision("watch", "notify_owner", &n.key, &n.because)?;
-        let _ = tacho_core::decide::plugin::notify_owner_command(&n.subject, &n.body);
+        let mut notify_failed = false;
+        if let Err(e) = tacho_core::decide::plugin::notify_owner_command(&n.subject, &n.body) {
+            notify_failed = true;
+            f.record(
+                store,
+                "watch",
+                "notify_owner_failed",
+                &n.key,
+                &format!("failed to notify owner for {}: {e}", n.key),
+                true,
+            )?;
+        }
         if let Some(forge) = forge {
-            if n.kind == "main_red" || n.kind == "main-red" {
-                let _ = forge.set_issue("main is red", &n.body);
+            let issue_title = if n.kind == "main_red" || n.kind == "main-red" {
+                "main is red".to_string()
             } else {
-                let _ = forge.set_issue(&format!("tacho alert: {}", n.key), &n.body);
+                format!("tacho alert: {}", n.key)
+            };
+            if let Err(e) = forge.set_issue(&issue_title, &n.body) {
+                notify_failed = true;
+                f.record(
+                    store,
+                    "watch",
+                    "set_issue_failed",
+                    &n.key,
+                    &format!("failed to set issue '{issue_title}' for {}: {e}", n.key),
+                    true,
+                )?;
             }
+        }
+        if notify_failed {
+            store.mutate(None, |st| {
+                st.notified_failures.remove(&n.key);
+            })?;
+        } else {
+            store.record_decision("watch", "notify_owner", &n.key, &n.because)?;
         }
     }
     if let Some(alert) = &plan.watchdog_alert {
-        store.record_decision("watch", "watchdog_alert", "tick", alert)?;
-        let _ = tacho_core::decide::plugin::notify_owner_command("tacho is down", alert);
+        let mut alert_failed = false;
+        if let Err(e) = tacho_core::decide::plugin::notify_owner_command("tacho is down", alert) {
+            alert_failed = true;
+            f.record(
+                store,
+                "watch",
+                "watchdog_alert_failed",
+                "tick",
+                &format!("failed to notify owner of watchdog alert: {e}"),
+                true,
+            )?;
+        }
         if let Some(forge) = forge {
-            let _ = forge.set_issue("tacho is down", alert);
+            if let Err(e) = forge.set_issue("tacho is down", alert) {
+                alert_failed = true;
+                f.record(
+                    store,
+                    "watch",
+                    "watchdog_alert_failed",
+                    "tick",
+                    &format!("failed to set 'tacho is down' issue: {e}"),
+                    true,
+                )?;
+            }
+        }
+        if alert_failed {
+            let prev_ts = state.last_watchdog_alert_ts;
+            store.mutate(None, |st| {
+                st.last_watchdog_alert_ts = prev_ts;
+            })?;
+        } else {
+            store.record_decision("watch", "watchdog_alert", "tick", alert)?;
         }
     }
     Ok(())
@@ -1124,6 +1206,202 @@ mod tests {
                 .any(|(title, _)| title == "tacho alert: batch-red:b-red"),
             "expected batch-red alert issue on MockForge, got: {:?}",
             *issues
+        );
+    }
+
+    #[test]
+    fn test_run_tick_retries_failed_owner_notifications_and_watchdog_alerts_on_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+        store
+            .mutate(None, |st| {
+                st.batches.push(BatchRun {
+                    id: "b-red".to_string(),
+                    group: "core".to_string(),
+                    prs: vec![7],
+                    shas: BTreeMap::from([(7, "a".repeat(40))]),
+                    main_sha: "b".repeat(40),
+                    areas: vec!["core".to_string()],
+                    checks: Vec::new(),
+                    mode: BatchMode::Presubmit,
+                    status: "failed".to_string(),
+                    started_at: 100,
+                    finished_at: Some(120),
+                    tree: None,
+                    pid: None,
+                    log: "test failure".to_string(),
+                    culprit: Some(7),
+                    skipped: Vec::new(),
+                    flakes: Vec::new(),
+                });
+                st.max_workers = 1;
+                let my_pid = std::process::id();
+                let my_st = identity::proc_pid_starttime(my_pid).expect("own starttime");
+                st.agents.insert(
+                    "busy-worker".to_string(),
+                    AgentRun {
+                        key: "busy-worker".to_string(),
+                        pid: Some(my_pid),
+                        starttime: Some(my_st),
+                        started_at: 1_000,
+                        ..Default::default()
+                    },
+                );
+                st.todo.push(TodoItem {
+                    key: "pending-work-1".to_string(),
+                    brief: "Work item 1".to_string(),
+                    area: "core".to_string(),
+                    ..Default::default()
+                });
+                st.last_tick_ts = Some(1_000);
+            })
+            .unwrap();
+
+        let broken_forge = tacho_core::decide::plugin::CliForgePlugin {
+            name: "broken-gh".to_string(),
+            cli_bin: "/nonexistent/gh-binary".to_string(),
+            repo: Some("owner/repo".to_string()),
+            allow_merge: false,
+        };
+        let live = tacho_core::LiveState::default();
+        let mut hands = DaemonHands {
+            home: home.to_path_buf(),
+            live_state: live.clone(),
+            appender: None,
+        };
+        let mut opts1 = TickOptions::new(&live);
+        opts1.explicit_main_sha = Some("b".repeat(40));
+        opts1.forge = Some(&broken_forge);
+        opts1.procs = Some(Vec::new());
+        opts1.now_override = Some(2_000);
+
+        let err1 = run_tick(home, &mut store, &mut hands, opts1).unwrap_err();
+        assert!(
+            err1.to_string().contains("set_issue_failed")
+                && err1.to_string().contains("watchdog_alert_failed"),
+            "expected set_issue_failed and watchdog_alert_failed in tick error, got: {err1}"
+        );
+        let decisions1 = store.recent_decisions(50, None, None).unwrap();
+        assert!(
+            decisions1.iter().any(|d| d.action == "set_issue_failed"),
+            "expected set_issue_failed on broken forge, got: {:?}",
+            decisions1
+        );
+        assert!(
+            decisions1
+                .iter()
+                .any(|d| d.action == "watchdog_alert_failed"),
+            "expected watchdog_alert_failed on broken forge, got: {:?}",
+            decisions1
+        );
+
+        let st_after_fail = store.load().unwrap();
+        assert!(
+            !st_after_fail.notified_failures.contains("batch-red:b-red"),
+            "failed owner notification must be reverted from notified_failures so next tick retries"
+        );
+        assert_eq!(
+            st_after_fail.last_watchdog_alert_ts, None,
+            "failed watchdog alert must revert last_watchdog_alert_ts so next tick retries"
+        );
+
+        // Next tick with a working forge retries and succeeds.
+        store
+            .mutate(None, |st| {
+                st.last_tick_ts = Some(1_000);
+            })
+            .unwrap();
+        let working_forge = MockForge::default();
+        let mut opts2 = TickOptions::new(&live);
+        opts2.explicit_main_sha = Some("b".repeat(40));
+        opts2.forge = Some(&working_forge);
+        opts2.procs = Some(Vec::new());
+        opts2.now_override = Some(2_005);
+
+        let _out2 = run_tick(home, &mut store, &mut hands, opts2).unwrap();
+        let st_after_ok = store.load().unwrap();
+        assert!(st_after_ok.notified_failures.contains("batch-red:b-red"));
+        assert_eq!(st_after_ok.last_watchdog_alert_ts, Some(2_005));
+    }
+
+    #[test]
+    fn test_tidy_refuses_plain_subdir_inside_enclosing_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_repo = dir.path().join("srv-fleet");
+        std::fs::create_dir_all(&parent_repo).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&parent_repo)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "Tester"]);
+        std::fs::write(parent_repo.join("root.txt"), "root\n").unwrap();
+        run_git(&["add", "root.txt"]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(parent_repo.join("untracked_parent.txt"), "do not stage\n").unwrap();
+        let plain_subdir = parent_repo.join("trees").join("plain-dir");
+        std::fs::create_dir_all(&plain_subdir).unwrap();
+        std::fs::write(plain_subdir.join("work.txt"), "precious\n").unwrap();
+
+        let mut store = FleetStore::open(&parent_repo.join("events.sqlite")).unwrap();
+        store
+            .mutate(None, |st| {
+                st.worktrees.insert(
+                    "plain-dir".to_string(),
+                    crate::fleet::WorktreeEntry {
+                        slug: "plain-dir".to_string(),
+                        path: plain_subdir.to_string_lossy().to_string(),
+                        branch: "feat/plain".to_string(),
+                        base_sha: String::new(),
+                        base_pr: None,
+                        port: 3100,
+                        port_last: 3119,
+                        created_at: 100,
+                    },
+                );
+            })
+            .unwrap();
+
+        let decisions = vec![
+            tacho_core::decide::watch::TidyDecision::RemoveCheckout {
+                path: plain_subdir.to_string_lossy().to_string(),
+                rescue: true,
+                because: "test remove checkout on plain subdir".to_string(),
+            },
+            tacho_core::decide::watch::TidyDecision::RemoveTree {
+                path: plain_subdir.to_string_lossy().to_string(),
+                rescue: false,
+                because: "test remove tree on plain subdir".to_string(),
+            },
+        ];
+        let removed = tidy::apply_tidy_decisions(&mut store, &decisions, 1_000, false).unwrap();
+        assert!(
+            removed.is_empty(),
+            "plain subdir must not be removed when rescue fails or when non-git dir is passed"
+        );
+        assert!(
+            plain_subdir.join("work.txt").exists(),
+            "plain subdir contents must remain intact"
+        );
+
+        // Verify the enclosing parent git repo has zero staged changes (git add -A did NOT run in parent_repo).
+        let cached = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&parent_repo)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&cached.stdout).trim(),
+            "",
+            "enclosing parent repo must not have staged files"
         );
     }
 }

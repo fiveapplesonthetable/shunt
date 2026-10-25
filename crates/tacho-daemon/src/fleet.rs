@@ -96,6 +96,9 @@ pub struct FleetState {
     pub main_sha: Option<String>,
     /// Epoch seconds of the last successful forge refresh, per source (`prs`, `main`, `ci`).
     pub world_refreshed_at: BTreeMap<String, i64>,
+    /// Whether `tacho land` is permitted to run `gh pr merge`. Defaults to `false` (owner merges by hand).
+    #[serde(default)]
+    pub merge_prs: bool,
 }
 
 impl Default for FleetState {
@@ -144,6 +147,7 @@ impl Default for FleetState {
             main_ci: None,
             main_sha: None,
             world_refreshed_at: BTreeMap::new(),
+            merge_prs: false,
         }
     }
 }
@@ -987,9 +991,16 @@ pub fn execute_decide_tick(
         live_state: live_state.clone(),
         appender: None,
     };
+    let gh_forge = std::env::var("TACHO_GH_REPO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(tacho_core::decide::plugin::GitHubForge::new);
     let mut opts = crate::exec::TickOptions::new(live_state);
     opts.dry_run = dry_run;
     opts.explicit_main_sha = explicit_main_sha;
+    if let Some(ref f) = gh_forge {
+        opts.forge = Some(f);
+    }
     let out = crate::exec::run_tick(home_dir, &mut store, &mut hands, opts)?;
     Ok((out.tick_id, out.state, out.obs, out.plan))
 }
@@ -1106,6 +1117,28 @@ mod tests {
 
         let stale_wt_dir = home.join("wt-stale");
         std::fs::create_dir_all(&stale_wt_dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&stale_wt_dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "Tester"]);
+        std::fs::write(stale_wt_dir.join("README.md"), "init\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+        let base_sha = crate::sampler::run_git(
+            &stale_wt_dir,
+            &["rev-parse", "HEAD"],
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         let live_wt_dir = home.join("wt-live");
         std::fs::create_dir_all(&live_wt_dir).unwrap();
 
@@ -1115,13 +1148,14 @@ mod tests {
                     .entry("agent-alpha".to_string())
                     .or_default()
                     .push("Focus on fixing the parser edge case".to_string());
+                st.retired.insert("wt-stale".to_string());
                 st.worktrees.insert(
                     "wt-stale".to_string(),
                     WorktreeEntry {
                         slug: "wt-stale".to_string(),
                         path: stale_wt_dir.to_string_lossy().to_string(),
                         branch: "feat/stale".to_string(),
-                        base_sha: "a".repeat(40),
+                        base_sha: base_sha.clone(),
                         base_pr: None,
                         port: 0,
                         port_last: 0,
@@ -1173,7 +1207,7 @@ mod tests {
 
         let (_, _, recorded_obs, recorded_plan) =
             store.load_latest_decision_tick().unwrap().unwrap();
-        assert_eq!(recorded_obs.main_sha, "a".repeat(40));
+        assert_eq!(recorded_obs.main_sha, base_sha);
         assert!(!recorded_obs.main_sha.is_empty());
         assert_eq!(recorded_plan.tell_actions, plan.tell_actions);
     }

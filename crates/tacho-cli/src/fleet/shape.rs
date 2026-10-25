@@ -222,6 +222,41 @@ pub fn replay_pr_branch(
     }
 
     if !dry_run && !pr.branch.is_empty() {
+        let has_origin = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(repo_dir)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if has_origin {
+            let expected_head = pr.head.trim();
+            if expected_head.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing force-with-lease push for PR #{} ({}): expected remote head SHA is empty",
+                        pr.number, pr.branch
+                    ),
+                ));
+            }
+            let lease = format!("--force-with-lease={}:{expected_head}", pr.branch);
+            let push_out = Command::new("git")
+                .args([
+                    "push",
+                    "-q",
+                    &lease,
+                    "origin",
+                    &format!("{new_head}:refs/heads/{}", pr.branch),
+                ])
+                .current_dir(repo_dir)
+                .output()?;
+            if !push_out.status.success() {
+                return Err(io::Error::other(format!(
+                    "git push {lease} origin {new_head}:refs/heads/{} failed: {}",
+                    pr.branch,
+                    String::from_utf8_lossy(&push_out.stderr).trim()
+                )));
+            }
+        }
         let br_out = Command::new("git")
             .args(["branch", "-f", &pr.branch, &new_head])
             .current_dir(repo_dir)
@@ -233,36 +268,6 @@ pub fn replay_pr_branch(
                 new_head,
                 String::from_utf8_lossy(&br_out.stderr).trim()
             )));
-        }
-        let has_origin = Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .current_dir(repo_dir)
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if has_origin {
-            let lease = if pr.head.is_empty() {
-                "--force-with-lease".to_string()
-            } else {
-                format!("--force-with-lease={}:{}", pr.branch, pr.head)
-            };
-            let push_out = Command::new("git")
-                .args([
-                    "push",
-                    "-q",
-                    "--no-verify",
-                    &lease,
-                    "origin",
-                    &format!("{new_head}:refs/heads/{}", pr.branch),
-                ])
-                .current_dir(repo_dir)
-                .output()?;
-            if !push_out.status.success() {
-                return Err(io::Error::other(format!(
-                    "git push --no-verify {lease} origin {new_head}:refs/heads/{} failed: {}",
-                    pr.branch,
-                    String::from_utf8_lossy(&push_out.stderr).trim()
-                )));
-            }
         }
         let because = format!(
             "replayed PR #{} ({}) onto {} -> {}",
@@ -389,11 +394,30 @@ pub fn execute_replay(args: ReplayArgs) -> io::Result<()> {
         });
     if let Some(pr_num) = pr_num_opt {
         let cwd = std::env::current_dir()?;
-        let pr = state
-            .open_prs_cache
-            .iter()
-            .find(|p| p.number == pr_num)
-            .cloned()
+        let live_pr = std::env::var("TACHO_GH_REPO")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(tacho_core::decide::plugin::GitHubForge::new)
+            .and_then(|forge| {
+                use tacho_core::decide::plugin::ForgePlugin;
+                let mut runner = |argv: &[String]| {
+                    tacho_daemon::exec::observe::run_argv(
+                        Some(&cwd),
+                        argv,
+                        std::time::Duration::from_secs(15),
+                    )
+                };
+                forge.open_prs(&mut runner).ok()
+            })
+            .and_then(|prs| prs.into_iter().find(|p| p.number == pr_num));
+        let mut pr = live_pr
+            .or_else(|| {
+                state
+                    .open_prs_cache
+                    .iter()
+                    .find(|p| p.number == pr_num)
+                    .cloned()
+            })
             .unwrap_or_else(|| PullFacts {
                 number: pr_num,
                 branch: format!("pr-{pr_num}"),
@@ -402,6 +426,37 @@ pub fn execute_replay(args: ReplayArgs) -> io::Result<()> {
                 mergeable: "MERGEABLE".to_string(),
                 ..Default::default()
             });
+        // Observe the remote branch head at replay time when origin is configured so
+        // `--force-with-lease=<branch>:<observed_head>` uses a live observation rather than
+        // an empty or stale cached SHA.
+        if !pr.branch.is_empty() {
+            let refspec = format!("refs/heads/{}", pr.branch);
+            if let Ok(ls_out) = Command::new("git")
+                .args(["ls-remote", "origin", &refspec])
+                .current_dir(&cwd)
+                .output()
+            {
+                if ls_out.status.success() {
+                    if let Some(observed_sha) = String::from_utf8_lossy(&ls_out.stdout)
+                        .split_whitespace()
+                        .next()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        pr.head = observed_sha.to_string();
+                        let _ = Command::new("git")
+                            .args(["fetch", "-q", "origin", &refspec])
+                            .current_dir(&cwd)
+                            .status();
+                    }
+                }
+            }
+            if pr.head.is_empty() {
+                if let Ok(local_sha) = git_stdout(&cwd, &["rev-parse", &pr.branch]) {
+                    pr.head = local_sha;
+                }
+            }
+        }
         let _ = replay_pr_branch(&mut store, &cwd, &pr, args.dry_run)?;
         return Ok(());
     }

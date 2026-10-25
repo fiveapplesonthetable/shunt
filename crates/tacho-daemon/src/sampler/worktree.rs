@@ -213,22 +213,69 @@ fn resolve_git_dir(cwd: &Path) -> Option<PathBuf> {
 
 /// Executes a git command in `cwd` with a strict timeout, killing it on expiration.
 ///
+/// Runs a read-only `git` command in `cwd` with `--no-optional-locks` (so a timeout `SIGKILL`
+/// never leaves `.git/index.lock` behind) and a bounded timeout.
+///
 /// Stdout is drained on a helper thread while we wait, so output larger than the pipe
 /// buffer (a big `ls-files`) cannot deadlock git against us. Git runs in its own process
 /// group so a timeout kills any helpers it spawned too.
 pub fn run_git(cwd: &Path, args: &[&str], timeout: Duration) -> io::Result<String> {
+    run_git_with_ceiling(cwd, args, timeout, None)
+}
+
+/// Runs `git` confined strictly to `cwd` as its own worktree toplevel (`cwd/.git` must exist,
+/// `GIT_CEILING_DIRECTORIES` prevents walking up into any parent repository, and
+/// `rev-parse --show-toplevel` must equal `cwd`).
+pub fn run_git_in_worktree(cwd: &Path, args: &[&str], timeout: Duration) -> io::Result<String> {
+    if cwd.as_os_str().is_empty() || !cwd.join(".git").exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a git worktree toplevel (missing .git)", cwd.display()),
+        ));
+    }
+    let canon = cwd.canonicalize()?;
+    let ceiling = canon.parent().unwrap_or(&canon);
+    let toplevel = run_git_with_ceiling(&canon, &["rev-parse", "--show-toplevel"], timeout, Some(ceiling))?;
+    let top_canon = Path::new(toplevel.trim()).canonicalize()?;
+    if top_canon != canon {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing git in {}: toplevel is {}",
+                canon.display(),
+                top_canon.display()
+            ),
+        ));
+    }
+    run_git_with_ceiling(&canon, args, timeout, Some(ceiling))
+}
+
+fn run_git_with_ceiling(
+    cwd: &Path,
+    args: &[&str],
+    timeout: Duration,
+    ceiling: Option<&Path>,
+) -> io::Result<String> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
 
-    let mut child = Command::new("git")
+    let mut cmd = Command::new("git");
+    cmd.arg("--no-optional-locks")
         .arg("-C")
         .arg(cwd)
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_PAGER", "cat")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if let Some(c) = ceiling {
+        cmd.env("GIT_CEILING_DIRECTORIES", c);
+    }
+    let mut child = cmd.spawn()?;
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let reader = std::thread::Builder::new()
         .name("tacho-git-stdout".to_string())
@@ -396,7 +443,7 @@ pub fn scan_worktree_files(
     cwd: &Path,
     timeout: Duration,
 ) -> io::Result<(u64, Option<String>, u64)> {
-    let out = run_git(
+    let out = run_git_in_worktree(
         cwd,
         &["ls-files", "-m", "-o", "--exclude-standard", "-z"],
         timeout,

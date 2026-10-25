@@ -25,7 +25,9 @@ pub use proc_tree::{
 };
 pub use timer::{spawn_sampler, spawn_sampler_with_home, spawn_sampler_with_waker, SamplerWaker};
 pub(crate) use worktree::wait_child_exit;
-pub use worktree::{run_git, scan_worktree_files, scan_worktree_latest_mtime_ns};
+pub use worktree::{
+    run_git, run_git_in_worktree, scan_worktree_files, scan_worktree_latest_mtime_ns,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -502,9 +504,9 @@ impl ProcSampler {
             let decide_seq = appender.decide_seq();
             if self.decide_due(decide_seq, now_ns) {
                 self.decide_requested.store(false, Ordering::Release);
-                self.last_decide_seq = Some(decide_seq);
-                self.last_decide_ns = now_ns;
                 let latest_live = appender.live_state();
+                let latest_runs = appender.active_runs();
+                let effective_seq = appender.decide_seq();
                 if self.fleet_store.is_none() {
                     match crate::fleet::FleetStore::open(&home_dir.join("events.sqlite")) {
                         Ok(s) => self.fleet_store = Some(s),
@@ -520,14 +522,27 @@ impl ProcSampler {
                         live_state: (*latest_live).clone(),
                         appender: Some(appender.clone()),
                     };
+                    let gh_forge = std::env::var("TACHO_GH_REPO")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(tacho_core::decide::plugin::GitHubForge::new);
                     let mut opts = crate::exec::TickOptions::new(&latest_live);
-                    for run in active_runs.iter() {
+                    if let Some(ref f) = gh_forge {
+                        opts.forge = Some(f);
+                    }
+                    for run in latest_runs.iter() {
                         if run.pid > 0 {
                             opts.run_pids.insert(run.agent_id.clone(), run.pid);
                         }
                     }
-                    if let Err(e) = crate::exec::run_tick(home_dir, store, &mut hands, opts) {
-                        eprintln!("[tacho-daemon] autonomous decide tick failed: {e}");
+                    match crate::exec::run_tick(home_dir, store, &mut hands, opts) {
+                        Ok(_) => {
+                            self.last_decide_seq = Some(effective_seq);
+                            self.last_decide_ns = now_ns;
+                        }
+                        Err(e) => {
+                            eprintln!("[tacho-daemon] autonomous decide tick failed: {e}");
+                        }
                     }
                 }
             }

@@ -623,6 +623,10 @@ pub struct CliForgePlugin {
     pub name: String,
     pub cli_bin: String,
     pub repo: Option<String>,
+    /// Whether `merge_pr` is permitted to run `gh pr merge`. Defaults to `false` so PR merging
+    /// is off by config unless explicitly enabled.
+    #[serde(default)]
+    pub allow_merge: bool,
 }
 
 /// Alias for [`CliForgePlugin`] configured for GitHub (`gh`).
@@ -634,19 +638,27 @@ impl Default for CliForgePlugin {
             name: "github".to_string(),
             cli_bin: "gh".to_string(),
             repo: None,
+            allow_merge: false,
         }
     }
 }
 
 impl CliForgePlugin {
-    /// Creates a GitHub CLI forge plugin bound to `repo` (`owner/name`).
+    /// Creates a GitHub CLI forge plugin bound to `repo` (`owner/name`) with PR merging off by default.
     pub fn new(repo: impl Into<String>) -> Self {
         let r = repo.into();
         Self {
             name: "github".to_string(),
             cli_bin: "gh".to_string(),
             repo: (!r.trim().is_empty()).then_some(r),
+            allow_merge: false,
         }
+    }
+
+    /// Sets whether `merge_pr` is allowed to execute `gh pr merge`.
+    pub fn with_allow_merge(mut self, allow_merge: bool) -> Self {
+        self.allow_merge = allow_merge;
+        self
     }
 
     fn repo_args(&self) -> Vec<String> {
@@ -874,6 +886,11 @@ impl ForgePlugin for CliForgePlugin {
     }
 
     fn merge_pr(&self, pr: u64) -> Result<(), String> {
+        if !self.allow_merge {
+            return Err(format!(
+                "refusing to merge PR #{pr}: merging is off by config (merge_prs=false)"
+            ));
+        }
         let mut args = vec!["pr".to_string(), "merge".to_string(), pr.to_string()];
         args.extend(self.repo_args());
         args.push("--merge".to_string());

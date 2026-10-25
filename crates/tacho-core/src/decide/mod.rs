@@ -563,9 +563,16 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
                 .iter()
                 .any(|d| matches!(d, TidyDecision::RemoveTree { path, .. } if path == &a.worktree));
             if !already_queued {
+                let rescue = obs
+                    .tidy_snapshot
+                    .worktrees
+                    .iter()
+                    .find(|w| w.path == a.worktree)
+                    .map(|w| w.dirty || w.unpushed_commits > 0)
+                    .unwrap_or(true);
                 tidy_decisions.push(TidyDecision::RemoveTree {
                     path: a.worktree.clone(),
-                    rescue: false,
+                    rescue,
                     because,
                 });
             }
