@@ -278,9 +278,10 @@ pub fn format_pr_body_with_outputs(
 }
 
 /// Build the `git push` argument list for `branch`:
-/// always passes `--no-verify`, and includes `--force-with-lease` when `branch` already exists on `origin`.
+/// includes `--force-with-lease` when `branch` already exists on `origin`, without `--no-verify`
+/// so repository hooks run.
 pub fn push_args_for_branch(branch: &str, remote_branch_exists: bool) -> Vec<String> {
-    let mut args = vec!["push".to_string(), "--no-verify".to_string()];
+    let mut args = vec!["push".to_string()];
     if remote_branch_exists {
         args.push("--force-with-lease".to_string());
     }

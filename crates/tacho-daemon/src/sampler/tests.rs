@@ -956,3 +956,46 @@ fn test_decide_due_only_on_event_request_or_refresh() {
     s.decide_requested.store(true, Ordering::Release);
     assert!(s.decide_due(7, 101 * sec), "explicit request");
 }
+
+#[test]
+fn test_failed_decide_tick_records_time_and_backs_off() {
+    let mut s = ProcSampler::new(&[]);
+    s.set_decide_refresh_secs(60);
+    let sec = 1_000_000_000u64;
+
+    // First failure at t = 100s backs off for 60s (until t = 160s).
+    s.record_decide_failure(10, 100 * sec);
+    assert!(
+        !s.decide_due(10, 102 * sec),
+        "failed tick must not re-fire on the next 2s sampler pass"
+    );
+    assert!(
+        !s.decide_due(11, 130 * sec),
+        "failed tick must hold off even if decide_seq advances during backoff"
+    );
+    assert!(
+        !s.decide_due(10, 159 * sec),
+        "still within 60s backoff window"
+    );
+    assert!(
+        s.decide_due(10, 160 * sec),
+        "due again once 60s backoff elapses"
+    );
+
+    // Second consecutive failure at t = 160s doubles backoff to 120s (until t = 280s).
+    s.record_decide_failure(11, 160 * sec);
+    assert!(!s.decide_due(11, 220 * sec));
+    assert!(!s.decide_due(12, 279 * sec));
+    assert!(s.decide_due(11, 280 * sec));
+
+    // Explicit request still overrides backoff immediately.
+    s.decide_requested.store(true, Ordering::Release);
+    assert!(s.decide_due(11, 200 * sec));
+    s.decide_requested.store(false, Ordering::Release);
+
+    // Success clears backoff and resets failure counter.
+    s.record_decide_success(12, 280 * sec);
+    assert_eq!(s.decide_failures, 0);
+    assert_eq!(s.decide_backoff_until_ns, 0);
+    assert!(s.decide_due(13, 282 * sec), "normal event wake restored");
+}

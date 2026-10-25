@@ -113,6 +113,10 @@ pub struct ProcSampler {
     last_decide_ns: u64,
     /// Coarse refresh for time-based decide rules; see `SamplerConfig::decide_refresh_secs`.
     decide_refresh_ns: u64,
+    /// Number of consecutive failed autonomous decide ticks (reset to `0` on success).
+    decide_failures: u32,
+    /// Earliest timestamp (`now_ns`) at which an autonomous decide tick may retry after failure.
+    decide_backoff_until_ns: u64,
     /// Set by [`SamplerWaker::request_decide`] to force a decide pass on the next tick.
     decide_requested: std::sync::Arc<AtomicBool>,
 }
@@ -151,6 +155,8 @@ impl ProcSampler {
             last_decide_seq: None,
             last_decide_ns: 0,
             decide_refresh_ns: 60 * 1_000_000_000,
+            decide_failures: 0,
+            decide_backoff_until_ns: 0,
             decide_requested: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
@@ -190,10 +196,37 @@ impl ProcSampler {
     /// Whether a decide pass is due at `now_ns`: on the first tick, after a decide-relevant
     /// event was committed (`decide_seq` moved), on explicit request, or once the coarse
     /// refresh interval has elapsed for rules that depend on time alone.
+    ///
+    /// When a previous tick failed, autonomous ticks are held off until `decide_backoff_until_ns`
+    /// elapses so a forge outage never hot-loops `gh` on every 2s sampler pass.
     fn decide_due(&self, decide_seq: u64, now_ns: u64) -> bool {
+        if self.decide_requested.load(Ordering::Acquire) {
+            return true;
+        }
+        if now_ns < self.decide_backoff_until_ns {
+            return false;
+        }
         self.last_decide_seq != Some(decide_seq)
-            || self.decide_requested.load(Ordering::Acquire)
             || now_ns.saturating_sub(self.last_decide_ns) >= self.decide_refresh_ns
+    }
+
+    /// Records a successful decide pass and clears any failure backoff.
+    pub(crate) fn record_decide_success(&mut self, effective_seq: u64, now_ns: u64) {
+        self.last_decide_seq = Some(effective_seq);
+        self.last_decide_ns = now_ns;
+        self.decide_failures = 0;
+        self.decide_backoff_until_ns = 0;
+    }
+
+    /// Records a failed decide pass and schedules exponential backoff (`1x, 2x, 4x, 8x, 16x`
+    /// of `decide_refresh_ns`) so subsequent 2s sampler ticks do not spin on a failing forge.
+    pub(crate) fn record_decide_failure(&mut self, effective_seq: u64, now_ns: u64) {
+        self.last_decide_seq = Some(effective_seq);
+        self.last_decide_ns = now_ns;
+        self.decide_failures = self.decide_failures.saturating_add(1);
+        let shift = (self.decide_failures - 1).min(4);
+        let backoff = self.decide_refresh_ns.saturating_mul(1u64 << shift);
+        self.decide_backoff_until_ns = now_ns.saturating_add(backoff);
     }
 
     /// Reads `/proc/loadavg` using `pread` at offset 0 into a stack buffer.
@@ -537,10 +570,10 @@ impl ProcSampler {
                     }
                     match crate::exec::run_tick(home_dir, store, &mut hands, opts) {
                         Ok(_) => {
-                            self.last_decide_seq = Some(effective_seq);
-                            self.last_decide_ns = now_ns;
+                            self.record_decide_success(effective_seq, now_ns);
                         }
                         Err(e) => {
+                            self.record_decide_failure(effective_seq, now_ns);
                             eprintln!("[tacho-daemon] autonomous decide tick failed: {e}");
                         }
                     }

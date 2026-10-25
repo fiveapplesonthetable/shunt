@@ -139,7 +139,7 @@ fn classify_head_move(
     new_sha: &str,
 ) -> (&'static str, BTreeMap<String, String>) {
     let count = |range: &str| -> Option<u64> {
-        run_git(cwd, &["rev-list", "--count", range], Duration::from_secs(2))
+        run_git_in_worktree(cwd, &["rev-list", "--count", range], Duration::from_secs(2))
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
     };
@@ -420,7 +420,9 @@ fn read_git_head_sha(
                 if prev_reftable == Some(marker.as_str()) && prev_sha.is_some() {
                     return (prev_sha.map(|s| s.to_string()), Some(marker));
                 }
-                if let Ok(out) = run_git(cwd, &["rev-parse", "HEAD"], Duration::from_secs(2)) {
+                if let Ok(out) =
+                    run_git_in_worktree(cwd, &["rev-parse", "HEAD"], Duration::from_secs(2))
+                {
                     let sha = out.trim().to_string();
                     if !sha.is_empty() {
                         return (Some(sha), Some(marker));

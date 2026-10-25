@@ -269,15 +269,17 @@ pub fn run_tick(
     let _in_flight = tick_probe::enter();
 
     let tick_start_ns = now_ns();
+    let mut refresh_errors = Vec::new();
     if !opts.dry_run {
         if let Some(forge) = opts.forge {
-            let _ = observe::refresh_world(
+            let outcome = observe::refresh_world(
                 store,
                 forge,
                 opts.repo.as_deref(),
                 hands,
                 opts.refresh_timeout,
             )?;
+            refresh_errors = outcome.errors;
         }
     }
     let state = store.load()?;
@@ -310,8 +312,16 @@ pub fn run_tick(
     }
 
     // Same inputs and same decision as the last recorded tick: nothing new to record or
-    // execute. Point at the tick this one would duplicate.
+    // execute. Point at the tick this one would duplicate (unless forge refresh failed, which
+    // must surface as an error so the sampler backs off).
     if let Some(prev) = store.unchanged_since_latest_tick(&decision_state, &world_obs, &plan)? {
+        if !refresh_errors.is_empty() {
+            return Err(io::Error::other(format!(
+                "tick {prev}: {} forge refresh error(s): {}",
+                refresh_errors.len(),
+                refresh_errors.join("; ")
+            )));
+        }
         return Ok(TickOutcome {
             tick_id: Some(prev),
             deduped: true,
@@ -326,7 +336,7 @@ pub fn run_tick(
 
     let mut f = Failures {
         hands,
-        errors: Vec::new(),
+        errors: refresh_errors,
     };
     execute_actions(home, store, &mut f, &state, &plan, opts.forge, now)?;
 
@@ -1381,15 +1391,33 @@ mod tests {
                 rescue: false,
                 because: "test remove tree on plain subdir".to_string(),
             },
+            tacho_core::decide::watch::TidyDecision::RemoveTree {
+                path: parent_repo.to_string_lossy().to_string(),
+                rescue: true,
+                because: "test remove tree on main checkout".to_string(),
+            },
+            tacho_core::decide::watch::TidyDecision::RemoveCheckout {
+                path: parent_repo.to_string_lossy().to_string(),
+                rescue: false,
+                because: "test remove checkout on main checkout".to_string(),
+            },
         ];
+        assert!(
+            tidy::rescue_worktree(&mut store, &plain_subdir, 1_000).is_err(),
+            "rescue_worktree must refuse a plain subdir inside an enclosing repo"
+        );
         let removed = tidy::apply_tidy_decisions(&mut store, &decisions, 1_000, false).unwrap();
         assert!(
             removed.is_empty(),
-            "plain subdir must not be removed when rescue fails or when non-git dir is passed"
+            "neither plain subdir nor main checkout may ever be removed"
         );
         assert!(
             plain_subdir.join("work.txt").exists(),
             "plain subdir contents must remain intact"
+        );
+        assert!(
+            parent_repo.join("root.txt").exists(),
+            "main checkout must remain intact"
         );
 
         // Verify the enclosing parent git repo has zero staged changes (git add -A did NOT run in parent_repo).

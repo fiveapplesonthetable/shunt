@@ -1115,12 +1115,12 @@ mod tests {
         let db = home.join("events.sqlite");
         let mut store = FleetStore::open(&db).unwrap();
 
-        let stale_wt_dir = home.join("wt-stale");
-        std::fs::create_dir_all(&stale_wt_dir).unwrap();
+        let main_repo_dir = home.join("main-repo");
+        std::fs::create_dir_all(&main_repo_dir).unwrap();
         let run_git = |args: &[&str]| {
             let st = std::process::Command::new("git")
                 .args(args)
-                .current_dir(&stale_wt_dir)
+                .current_dir(&main_repo_dir)
                 .status()
                 .unwrap();
             assert!(st.success(), "git {args:?} failed");
@@ -1128,17 +1128,27 @@ mod tests {
         run_git(&["init", "-q", "-b", "main"]);
         run_git(&["config", "user.email", "t@example.com"]);
         run_git(&["config", "user.name", "Tester"]);
-        std::fs::write(stale_wt_dir.join("README.md"), "init\n").unwrap();
+        std::fs::write(main_repo_dir.join("README.md"), "init\n").unwrap();
         run_git(&["add", "README.md"]);
         run_git(&["commit", "-q", "-m", "initial"]);
         let base_sha = crate::sampler::run_git(
-            &stale_wt_dir,
+            &main_repo_dir,
             &["rev-parse", "HEAD"],
             std::time::Duration::from_secs(5),
         )
         .unwrap()
         .trim()
         .to_string();
+        let stale_wt_dir = home.join("wt-stale");
+        run_git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/stale",
+            stale_wt_dir.to_str().unwrap(),
+            "HEAD",
+        ]);
         let live_wt_dir = home.join("wt-live");
         std::fs::create_dir_all(&live_wt_dir).unwrap();
 
@@ -1149,6 +1159,20 @@ mod tests {
                     .or_default()
                     .push("Focus on fixing the parser edge case".to_string());
                 st.retired.insert("wt-stale".to_string());
+                st.retired.insert("main-checkout".to_string());
+                st.worktrees.insert(
+                    "main-checkout".to_string(),
+                    WorktreeEntry {
+                        slug: "main-checkout".to_string(),
+                        path: main_repo_dir.to_string_lossy().to_string(),
+                        branch: "main".to_string(),
+                        base_sha: base_sha.clone(),
+                        base_pr: None,
+                        port: 0,
+                        port_last: 0,
+                        created_at: 100,
+                    },
+                );
                 st.worktrees.insert(
                     "wt-stale".to_string(),
                     WorktreeEntry {
@@ -1197,7 +1221,11 @@ mod tests {
         );
         assert!(
             !stale_wt_dir.exists(),
-            "stale worktree should have been removed by decide tidy action"
+            "stale linked worktree should have been removed by decide tidy action"
+        );
+        assert!(
+            main_repo_dir.exists() && main_repo_dir.join("README.md").exists(),
+            "main checkout must NEVER be removed even if recorded in worktrees and retired"
         );
 
         let inbox_file = home.join("inbox/agent-alpha.jsonl");

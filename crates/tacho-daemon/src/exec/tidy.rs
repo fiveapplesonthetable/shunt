@@ -60,9 +60,12 @@ pub fn scan_live_process_holds(
     holds
 }
 
-/// Runs `git -C <dir> <args>` confined strictly to `dir` as its own worktree toplevel and
-/// returns trimmed stdout, failing on a non-zero exit so callers never act on a half-done git
-/// step. Never prompts, opens an editor, pages, or walks up into an enclosing repository.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Runs `git -C <dir> <args>` confined strictly to `dir` as its own worktree toplevel with a
+/// bounded timeout (`GIT_TIMEOUT`) and returns trimmed stdout, failing on a non-zero exit so
+/// callers never act on a half-done git step. Never prompts, opens an editor, pages, or walks up
+/// into an enclosing repository.
 pub fn git_stdout(dir: &Path, args: &[&str]) -> io::Result<String> {
     let sub = args.first().copied().unwrap_or("");
     if !super::observe::is_git_checkout(dir) {
@@ -71,27 +74,9 @@ pub fn git_stdout(dir: &Path, args: &[&str]) -> io::Result<String> {
             dir.display()
         )));
     }
-    let canon = dir.canonicalize()?;
-    let ceiling = canon.parent().unwrap_or(&canon);
-    let out = Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(&canon)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .env("GIT_CEILING_DIRECTORIES", ceiling)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_EDITOR", "true")
-        .env("GIT_PAGER", "cat")
-        .output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "git {sub} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let out = crate::sampler::run_git_in_worktree(dir, args, GIT_TIMEOUT)
+        .map_err(|e| io::Error::other(format!("git {sub} failed: {e}")))?;
+    Ok(out.trim().to_string())
 }
 
 /// Executes [`TidyDecision`]s. Returns the paths that were removed.
@@ -120,8 +105,17 @@ pub fn apply_tidy_decisions(
                 if dry_run {
                     continue;
                 }
+                let p = Path::new(path);
+                if p.exists() && !super::observe::is_linked_worktree(p) {
+                    let msg = format!(
+                        "keeping {path}: refusing to remove non-worktree or main checkout"
+                    );
+                    eprintln!("[tacho-fleet] {msg}");
+                    store.record_decision("watch", "remove_worktree_failed", path, &msg)?;
+                    continue;
+                }
                 if *rescue {
-                    if let Err(e) = rescue_worktree(store, Path::new(path), now) {
+                    if let Err(e) = rescue_worktree(store, p, now) {
                         let msg = format!("keeping worktree {path}: rescue failed: {e}");
                         eprintln!("[tacho-fleet] {msg}");
                         store.record_decision("watch", "rescue_failed", path, &msg)?;
@@ -149,8 +143,17 @@ pub fn apply_tidy_decisions(
                 if dry_run {
                     continue;
                 }
+                let p = Path::new(path);
+                if p.exists() && !super::observe::is_linked_worktree(p) {
+                    let msg = format!(
+                        "keeping {path}: refusing to remove non-worktree or main checkout"
+                    );
+                    eprintln!("[tacho-fleet] {msg}");
+                    store.record_decision("watch", "remove_worktree_failed", path, &msg)?;
+                    continue;
+                }
                 if *rescue {
-                    if let Err(e) = rescue_worktree(store, Path::new(path), now) {
+                    if let Err(e) = rescue_worktree(store, p, now) {
                         let msg = format!("keeping checkout {path}: rescue failed: {e}");
                         eprintln!("[tacho-fleet] {msg}");
                         store.record_decision("watch", "rescue_failed", path, &msg)?;
@@ -173,41 +176,34 @@ pub fn apply_tidy_decisions(
     Ok(removed)
 }
 
-/// Removes a verified git worktree/checkout and forgets it.
+/// Removes a verified linked git worktree (`git worktree add`) and forgets it.
 ///
-/// Refuses any directory that is not its own git worktree toplevel (`--show-toplevel == dir`),
-/// so non-git directories are never deleted. Linked git worktrees (`.git` file) are removed via
-/// `git worktree remove --force` from the parent repository; standalone git checkouts (`.git`
-/// directory) whose toplevel is `dir` are removed after `is_git_checkout` verification.
+/// Refuses any directory that is not a linked git worktree (`is_linked_worktree`), so neither
+/// the main checkout (`dir/.git` directory) nor a plain directory can ever be deleted.
 fn remove_worktree(store: &mut FleetStore, path: &str, because: &str) -> io::Result<()> {
     let p = Path::new(path);
     if p.exists() {
-        if !super::observe::is_git_checkout(p) {
+        if !super::observe::is_linked_worktree(p) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("refusing to remove {path}: directory is not a git worktree toplevel"),
+                format!(
+                    "refusing to remove {path}: directory is not a linked git worktree (main checkout is never removed)"
+                ),
             ));
         }
-        if p.join(".git").is_file() {
-            let parent = p
-                .parent()
-                .filter(|d| super::observe::inside_git_checkout(d));
-            let mut cmd = Command::new("git");
-            if let Some(parent) = parent {
-                cmd.arg("-C").arg(parent);
-            }
-            let out = cmd
-                .args(["worktree", "remove", "--force", path])
-                .stdin(std::process::Stdio::null())
-                .output()?;
-            if !out.status.success() && p.exists() {
-                return Err(io::Error::other(format!(
-                    "git worktree remove {path} failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-        } else {
-            std::fs::remove_dir_all(p)?;
+        let common_git_dir =
+            crate::sampler::run_git_in_worktree(p, &["rev-parse", "--git-common-dir"], GIT_TIMEOUT)?;
+        let common_path = p.join(common_git_dir.trim()).canonicalize()?;
+        let main_repo = common_path.parent().unwrap_or(&common_path);
+        crate::sampler::run_git(
+            main_repo,
+            &["worktree", "remove", "--force", path],
+            GIT_TIMEOUT,
+        )?;
+        if p.exists() {
+            return Err(io::Error::other(format!(
+                "git worktree remove {path} left directory in place"
+            )));
         }
     }
     store.mutate(Some(("watch", "remove_worktree", path, because)), |st| {

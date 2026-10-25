@@ -464,7 +464,6 @@ fn test_pr_push_args_and_body_formatting_with_proof_commands_and_outputs() {
         first_push,
         vec![
             "push",
-            "--no-verify",
             "-u",
             "origin",
             "HEAD:refs/heads/feat-alpha"
@@ -476,7 +475,6 @@ fn test_pr_push_args_and_body_formatting_with_proof_commands_and_outputs() {
         update_push,
         vec![
             "push",
-            "--no-verify",
             "--force-with-lease",
             "-u",
             "origin",

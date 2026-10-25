@@ -283,6 +283,12 @@ pub fn build_tidy_snapshot(
             continue;
         }
         recorded_paths.insert(wt.path.clone());
+        // The main checkout (or any non-linked directory) can never be a removal target;
+        // mark it held so `decide` never plans `RemoveTree` for it even if an agent retired.
+        if !is_linked_worktree(p) {
+            held_paths.insert(wt.path.clone());
+            continue;
+        }
         if let Some(parent) = p.parent() {
             if parent
                 .file_name()
@@ -362,7 +368,7 @@ pub fn build_tidy_snapshot(
                 continue;
             }
             let path_str = p.to_string_lossy().to_string();
-            if recorded_paths.contains(&path_str) {
+            if recorded_paths.contains(&path_str) || !is_linked_worktree(&p) {
                 continue;
             }
             let wt_obs = observe_worktree(&p);
@@ -416,6 +422,32 @@ pub fn is_git_checkout(dir: &Path) -> bool {
         return false;
     }
     crate::sampler::run_git_in_worktree(dir, &["rev-parse", "--show-toplevel"], GIT_CAP).is_ok()
+}
+
+/// Whether `dir` is a linked git worktree (`git worktree add`), not a main repository checkout
+/// (`dir/.git` must be a gitfile rather than a `.git/` directory, and `--git-dir` must differ
+/// from `--git-common-dir`).
+pub fn is_linked_worktree(dir: &Path) -> bool {
+    if dir.as_os_str().is_empty() || !dir.join(".git").is_file() || !is_git_checkout(dir) {
+        return false;
+    }
+    let Ok(out) = crate::sampler::run_git_in_worktree(
+        dir,
+        &["rev-parse", "--git-dir", "--git-common-dir"],
+        GIT_CAP,
+    ) else {
+        return false;
+    };
+    let mut lines = out.lines().map(str::trim).filter(|s| !s.is_empty());
+    let (Some(git_dir), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    let gd = dir.join(git_dir).canonicalize().ok();
+    let cd = dir.join(common_dir).canonicalize().ok();
+    match (gd, cd) {
+        (Some(g), Some(c)) => g != c,
+        _ => false,
+    }
 }
 
 /// Whether `start` or an ancestor has a `.git` entry.
@@ -1094,13 +1126,13 @@ mod tests {
     #[test]
     fn test_build_tidy_snapshot_uses_actual_idle_mtime_and_detects_untracked_dirty_files() {
         let dir = tempfile::tempdir().unwrap();
-        let wt_dir = dir.path().join("wt-active");
-        std::fs::create_dir_all(&wt_dir).unwrap();
+        let main_repo = dir.path().join("main-repo");
+        std::fs::create_dir_all(&main_repo).unwrap();
 
         let run_git = |args: &[&str]| {
             let st = std::process::Command::new("git")
                 .args(args)
-                .current_dir(&wt_dir)
+                .current_dir(&main_repo)
                 .status()
                 .unwrap();
             assert!(st.success(), "git {args:?} failed");
@@ -1108,13 +1140,26 @@ mod tests {
         run_git(&["init", "-q", "-b", "main"]);
         run_git(&["config", "user.email", "t@example.com"]);
         run_git(&["config", "user.name", "Tester"]);
-        std::fs::write(wt_dir.join("README.md"), "hello\n").unwrap();
+        std::fs::write(main_repo.join("README.md"), "hello\n").unwrap();
         run_git(&["add", "README.md"]);
         run_git(&["commit", "-q", "-m", "initial"]);
-        let base_sha = crate::sampler::run_git(&wt_dir, &["rev-parse", "HEAD"], GIT_CAP)
+        let base_sha = crate::sampler::run_git(&main_repo, &["rev-parse", "HEAD"], GIT_CAP)
             .unwrap()
             .trim()
             .to_string();
+
+        let wt_dir = dir.path().join("wt-active");
+        run_git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/active",
+            wt_dir.to_str().unwrap(),
+            "HEAD",
+        ]);
+        assert!(is_linked_worktree(&wt_dir));
+        assert!(!is_linked_worktree(&main_repo));
 
         // Provisioned `.tachoenv` alone must NOT mark the worktree dirty.
         std::fs::write(
@@ -1128,6 +1173,21 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         let mut state = FleetState::default();
+        // Even if the main checkout is recorded in `state.worktrees`, it must NEVER be a removal
+        // candidate in `snap.worktrees` and must be protected in `snap.held_paths`.
+        state.worktrees.insert(
+            "main-checkout".to_string(),
+            crate::fleet::WorktreeEntry {
+                slug: "main-checkout".to_string(),
+                path: main_repo.to_string_lossy().to_string(),
+                branch: "main".to_string(),
+                base_sha: base_sha.clone(),
+                base_pr: None,
+                port: 3000,
+                port_last: 3019,
+                created_at: now - 86_400,
+            },
+        );
         state.worktrees.insert(
             "wt-active".to_string(),
             crate::fleet::WorktreeEntry {
@@ -1149,6 +1209,13 @@ mod tests {
             now,
         );
         assert_eq!(snap_clean.worktrees.len(), 1);
+        assert_eq!(snap_clean.worktrees[0].path, wt_dir.to_string_lossy());
+        assert!(
+            snap_clean
+                .held_paths
+                .contains(&main_repo.to_string_lossy().to_string()),
+            "main checkout must be protected in held_paths"
+        );
         assert!(
             snap_clean.worktrees[0].age_secs < 60,
             "expected idle age_secs < 60 for recently modified worktree, got {}",
