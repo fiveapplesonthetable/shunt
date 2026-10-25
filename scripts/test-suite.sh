@@ -86,3 +86,21 @@ if ((timed_out)); then
 fi
 
 wait "$cargo_pid"
+
+# Ensure no `yes` burner process with `TACHO_STARVE=1` in its environment was left behind.
+leaked_burners=()
+while IFS= read -r pid; do
+  [[ -n $pid ]] || continue
+  if [[ -r /proc/$pid/environ ]] && tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx 'TACHO_STARVE=1'; then
+    leaked_burners+=("$pid")
+  fi
+done < <(pgrep -x yes 2>/dev/null || true)
+
+if ((${#leaked_burners[@]})); then
+  echo "error: test suite left behind yes burner(s) with TACHO_STARVE=1: ${leaked_burners[*]}" >&2
+  for pid in "${leaked_burners[@]}"; do
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  done
+  exit 1
+fi
+

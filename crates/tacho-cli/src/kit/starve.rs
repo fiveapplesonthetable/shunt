@@ -224,11 +224,16 @@ impl BurnersGuard {
     fn stop_all(&mut self) {
         for (mut child, reg) in self.children.drain(..) {
             let pid = child.id();
-            if pid_alive_with_starttime(pid, reg.starttime) {
+            let should_signal = match reg.starttime {
+                Some(_) => pid_alive_with_starttime(pid, reg.starttime),
+                None => super::procs::pid_alive(pid),
+            };
+            if should_signal {
                 if let Err(e) = signal_group_and_leader(pid, libc::SIGKILL) {
                     eprintln!("[tacho-starve] failed to stop burner pid {pid}: {e}");
                 }
             }
+            let _ = child.kill();
             if let Err(e) = child.wait() {
                 eprintln!("[tacho-starve] failed to reap burner pid {pid}: {e}");
             }

@@ -665,10 +665,21 @@ fn test_starve_plan_4_burners_per_cpu_one_eighth_fleet_cap_and_highest_4_default
 
 #[test]
 fn test_starve_registered_burner_verification_and_preemption() {
+    struct BurnerReapGuard(std::process::Child);
+    impl Drop for BurnerReapGuard {
+        fn drop(&mut self) {
+            let pid = self.0.id();
+            let _ = super::procs::signal_group_and_leader(pid, libc::SIGKILL);
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     // Spawn a real `yes` process in its own process group with TACHO_STARVE=1.
     // Pipe stdout and read 1 byte so the kernel guarantees `execve("yes")` has completed
     // (and `/proc/<pid>/cmdline` is `"yes"`, not the forked test runner) even under load 100.
-    let mut burner = Command::new("yes")
+    // BurnersGuard / BurnerReapGuard reaps the process group in every exit path (including panic).
+    let burner = Command::new("yes")
         .env("TACHO_STARVE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -676,14 +687,16 @@ fn test_starve_registered_burner_verification_and_preemption() {
         .process_group(0)
         .spawn()
         .unwrap();
+    let mut guard = BurnerReapGuard(burner);
     let mut one_byte = [0u8; 1];
-    burner
+    guard
+        .0
         .stdout
         .as_mut()
         .expect("piped stdout")
         .read_exact(&mut one_byte)
         .expect("yes must write to stdout after execve");
-    let pid = burner.id();
+    let pid = guard.0.id();
     let st = proc_pid_starttime(pid);
 
     // Mismatched starttime refuses to stop the process
@@ -696,7 +709,7 @@ fn test_starve_registered_burner_verification_and_preemption() {
     // Matching `(pid, starttime)` + `TACHO_STARVE=1` + `yes` + `pgid == pid` stops the burner
     let right_reg = RegisteredBurner { pid, starttime: st };
     assert!(stop_registered_burner(&right_reg));
-    let _ = burner.wait();
+    let _ = guard.0.wait();
 }
 
 #[test]
