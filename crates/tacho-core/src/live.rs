@@ -39,6 +39,8 @@ pub struct AgentLiveState {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub task: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
     pub state: String,
     pub state_since_ns: u64,
     #[serde(default)]
@@ -77,6 +79,7 @@ impl AgentLiveState {
             model: None,
             cwd: None,
             task: None,
+            pid: None,
             state: String::new(),
             state_since_ns: 0,
             run_start_ts_ns: 0,

@@ -22,11 +22,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::decide::dispatch::model::Mergeable as DispatchMergeable;
+use crate::decide::dispatch::PullFacts;
 use crate::decide::dispatch::{
     builtin_providers, DispatchConfig, Provider, ProviderCommand, ProviderSpec, StopPlan, TellPlan,
 };
 use crate::decide::land::LandConfig;
 use crate::decide::ops::snapshot::redact_json;
+use crate::decide::ops::snapshot::MainCiRun;
 use crate::decide::ops::OpsConfig;
 use crate::decide::verify::{
     allocate_ports, env_file, AreaRule, PathAreaRule, VerifyConfig, PORT_BLOCK_SIZE,
@@ -272,6 +274,77 @@ pub trait ForgePlugin: Send + Sync {
     /// Build the direct `argv` command to post an issue or PR comment (scrubbed by default).
     fn plan_issue_comment_cmd(&self, issue_number: u64, body: &str) -> Vec<String>;
 
+    /// Build the direct `argv` command listing the last completed CI run of `workflow` on
+    /// `branch` (JSON array with `headSha`, `conclusion`, `updatedAt`, ...).
+    fn plan_main_ci_cmd(&self, branch: &str, workflow: &str) -> Vec<String>;
+
+    /// Build the direct `argv` command listing open PRs (number, head, mergeability, labels).
+    fn plan_open_prs_cmd(&self) -> Vec<String>;
+
+    /// Parse the output of [`ForgePlugin::plan_main_ci_cmd`]. `Ok(None)` means the forge has no
+    /// completed run yet; `Err` means the output is not what the forge should return.
+    fn parse_main_ci(&self, stdout: &str) -> Result<Option<MainCiRun>, String> {
+        parse_gh_run_list(stdout)
+    }
+
+    /// Parse the output of [`ForgePlugin::plan_open_prs_cmd`].
+    fn parse_open_prs(&self, stdout: &str) -> Result<Vec<PullFacts>, String> {
+        parse_gh_pr_list(stdout)
+    }
+
+    /// Last completed CI run on `branch` for `workflow`.
+    ///
+    /// `run` executes one planned argv and returns its stdout; the caller owns the IO and must
+    /// bound it (the daemon caps each call). Core stays free of process spawning.
+    fn main_ci_run(
+        &self,
+        branch: &str,
+        workflow: &str,
+        run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Option<MainCiRun>, String> {
+        let out = run(&self.plan_main_ci_cmd(branch, workflow))?;
+        self.parse_main_ci(&out)
+    }
+
+    /// Open PRs with heads, mergeability, and labels. See [`ForgePlugin::main_ci_run`] for `run`.
+    fn open_prs(
+        &self,
+        run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Vec<PullFacts>, String> {
+        let out = run(&self.plan_open_prs_cmd())?;
+        self.parse_open_prs(&out)
+    }
+
+    /// Creates or updates an open issue with `title` and `body` (scrubbed via [`Scrubber`]).
+    fn set_issue(&self, title: &str, body: &str) -> Result<Option<u64>, String> {
+        let _ = (title, body);
+        Ok(None)
+    }
+
+    /// Closes an open issue matching `title` after posting `comment` (scrubbed via [`Scrubber`]).
+    fn close_issue(&self, title: &str, comment: &str) -> Result<bool, String> {
+        let _ = (title, comment);
+        Ok(false)
+    }
+
+    /// Posts a comment on issue `number` (scrubbed via [`Scrubber`]).
+    fn comment_issue(&self, number: u64, body: &str) -> Result<(), String> {
+        let _ = (number, body);
+        Ok(())
+    }
+
+    /// Marks draft PR `pr` ready for review.
+    fn mark_pr_ready(&self, pr: u64) -> Result<(), String> {
+        let _ = pr;
+        Ok(())
+    }
+
+    /// Merges PR `pr` on the forge.
+    fn merge_pr(&self, pr: u64) -> Result<(), String> {
+        let _ = pr;
+        Ok(())
+    }
+
     /// Resolve a raw mergeable string from the forge API, preserving `was_conflicting` when
     /// the forge transiently reports `"UNKNOWN"` right after a push.
     fn resolve_mergeable(&self, raw: &str, was_conflicting: bool) -> ForgeMergeableState {
@@ -338,6 +411,212 @@ pub trait ForgePlugin: Send + Sync {
 /// Alias for [`ForgePlugin`] so callers can refer to either `ForgePlugin` or `CodeHostPlugin`.
 pub use ForgePlugin as CodeHostPlugin;
 
+/// Parses `gh run list --json headSha,conclusion,updatedAt,status,databaseId,displayTitle`
+/// output (a JSON array, newest first) into the newest completed run.
+pub fn parse_gh_run_list(stdout: &str) -> Result<Option<MainCiRun>, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Run {
+        #[serde(default)]
+        database_id: u64,
+        #[serde(default)]
+        head_sha: String,
+        #[serde(default)]
+        conclusion: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        updated_at: String,
+        #[serde(default)]
+        display_title: String,
+    }
+    let runs: Vec<Run> = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("unexpected run list output: {e}"))?;
+    Ok(runs
+        .into_iter()
+        .find(|r| !r.head_sha.is_empty() && !r.conclusion.is_empty())
+        .map(|r| MainCiRun {
+            id: r.database_id,
+            status: if r.status.is_empty() {
+                "completed".to_string()
+            } else {
+                r.status
+            },
+            conclusion: r.conclusion.to_ascii_lowercase(),
+            sha: r.head_sha,
+            title: r.display_title,
+            age_seconds: None,
+            completed_at: r.updated_at,
+        }))
+}
+
+/// Parses `gh pr list --json number,title,headRefName,baseRefName,headRefOid,mergeable,isDraft,labels`.
+pub fn parse_gh_pr_list(stdout: &str) -> Result<Vec<PullFacts>, String> {
+    #[derive(Deserialize)]
+    struct Label {
+        #[serde(default)]
+        name: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Pr {
+        number: u64,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        head_ref_name: String,
+        #[serde(default)]
+        base_ref_name: String,
+        #[serde(default)]
+        head_ref_oid: String,
+        #[serde(default)]
+        mergeable: String,
+        #[serde(default)]
+        is_draft: bool,
+        #[serde(default)]
+        labels: Vec<Label>,
+    }
+    let prs: Vec<Pr> = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("unexpected PR list output: {e}"))?;
+    let mut out: Vec<PullFacts> = prs
+        .into_iter()
+        .map(|p| {
+            let mut labels: Vec<String> = p.labels.into_iter().map(|l| l.name).collect();
+            labels.sort();
+            PullFacts {
+                number: p.number,
+                title: p.title,
+                branch: p.head_ref_name,
+                base: p.base_ref_name,
+                head: p.head_ref_oid,
+                state: "OPEN".to_string(),
+                mergeable: p.mergeable,
+                draft: p.is_draft,
+                labels,
+                ..Default::default()
+            }
+        })
+        .collect();
+    out.sort_by_key(|p| p.number);
+    Ok(out)
+}
+
+/// Offline / test forge: returns configured values and never runs a command.
+#[derive(Debug, Clone)]
+pub struct MockForge {
+    /// Value returned by [`ForgePlugin::main_ci_run`]; `Err` simulates a forge failure.
+    pub main_ci: Result<Option<MainCiRun>, String>,
+    /// Value returned by [`ForgePlugin::open_prs`]; `Err` simulates a forge failure.
+    pub open_prs: Result<Vec<PullFacts>, String>,
+    /// Recorded `set_issue(title, body)` calls.
+    pub issues: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Recorded `close_issue(title, comment)` calls.
+    pub closed_issues: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Recorded `comment_issue(number, body)` calls.
+    pub issue_comments: std::sync::Arc<std::sync::Mutex<Vec<(u64, String)>>>,
+    /// Recorded `mark_pr_ready(pr)` calls.
+    pub ready_prs: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Recorded `merge_pr(pr)` calls.
+    pub merged_prs: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl Default for MockForge {
+    fn default() -> Self {
+        Self {
+            main_ci: Ok(None),
+            open_prs: Ok(Vec::new()),
+            issues: std::sync::Arc::default(),
+            closed_issues: std::sync::Arc::default(),
+            issue_comments: std::sync::Arc::default(),
+            ready_prs: std::sync::Arc::default(),
+            merged_prs: std::sync::Arc::default(),
+        }
+    }
+}
+
+impl ForgePlugin for MockForge {
+    fn forge_name(&self) -> &str {
+        "mock"
+    }
+    fn plan_pr_facts_cmd(&self, _pr_number: u64) -> Vec<String> {
+        Vec::new()
+    }
+    fn plan_mergeable_cmd(&self, _pr_number: u64) -> Vec<String> {
+        Vec::new()
+    }
+    fn plan_checks_cmd(&self, _pr_or_ref: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn plan_update_issue_body_cmd(&self, _issue_number: u64, _body: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn plan_issue_comment_cmd(&self, _issue_number: u64, _body: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn plan_main_ci_cmd(&self, _branch: &str, _workflow: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn plan_open_prs_cmd(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn main_ci_run(
+        &self,
+        _branch: &str,
+        _workflow: &str,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Option<MainCiRun>, String> {
+        self.main_ci.clone()
+    }
+    fn open_prs(
+        &self,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Vec<PullFacts>, String> {
+        self.open_prs.clone()
+    }
+    fn set_issue(&self, title: &str, body: &str) -> Result<Option<u64>, String> {
+        let scrubber = Scrubber::enabled();
+        let clean_title = scrubber.scrub(title);
+        let clean_body = scrubber.scrub(body);
+        let mut guard = self.issues.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((idx, existing)) = guard
+            .iter_mut()
+            .enumerate()
+            .find(|(_, (t, _))| t == &clean_title)
+        {
+            existing.1 = clean_body;
+            Ok(Some((idx + 1) as u64))
+        } else {
+            guard.push((clean_title, clean_body));
+            Ok(Some(guard.len() as u64))
+        }
+    }
+    fn close_issue(&self, title: &str, comment: &str) -> Result<bool, String> {
+        let scrubber = Scrubber::enabled();
+        let mut guard = self.closed_issues.lock().unwrap_or_else(|p| p.into_inner());
+        guard.push((scrubber.scrub(title), scrubber.scrub(comment)));
+        Ok(true)
+    }
+    fn comment_issue(&self, number: u64, body: &str) -> Result<(), String> {
+        let scrubber = Scrubber::enabled();
+        let mut guard = self
+            .issue_comments
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.push((number, scrubber.scrub(body)));
+        Ok(())
+    }
+    fn mark_pr_ready(&self, pr: u64) -> Result<(), String> {
+        let mut guard = self.ready_prs.lock().unwrap_or_else(|p| p.into_inner());
+        guard.push(pr);
+        Ok(())
+    }
+    fn merge_pr(&self, pr: u64) -> Result<(), String> {
+        let mut guard = self.merged_prs.lock().unwrap_or_else(|p| p.into_inner());
+        guard.push(pr);
+        Ok(())
+    }
+}
+
 /// Configurable CLI-backed forge plugin (defaults to GitHub CLI `gh` with explicit argv, no shell).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliForgePlugin {
@@ -345,6 +624,9 @@ pub struct CliForgePlugin {
     pub cli_bin: String,
     pub repo: Option<String>,
 }
+
+/// Alias for [`CliForgePlugin`] configured for GitHub (`gh`).
+pub type GitHubForge = CliForgePlugin;
 
 impl Default for CliForgePlugin {
     fn default() -> Self {
@@ -357,11 +639,66 @@ impl Default for CliForgePlugin {
 }
 
 impl CliForgePlugin {
+    /// Creates a GitHub CLI forge plugin bound to `repo` (`owner/name`).
+    pub fn new(repo: impl Into<String>) -> Self {
+        let r = repo.into();
+        Self {
+            name: "github".to_string(),
+            cli_bin: "gh".to_string(),
+            repo: (!r.trim().is_empty()).then_some(r),
+        }
+    }
+
     fn repo_args(&self) -> Vec<String> {
         match &self.repo {
             Some(r) if !r.is_empty() => vec!["--repo".to_string(), r.clone()],
             _ => Vec::new(),
         }
+    }
+
+    fn run_cli(&self, args: &[String]) -> Result<String, String> {
+        let out = std::process::Command::new(&self.cli_bin)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("failed to spawn {}: {e}", self.cli_bin))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{} {:?} failed: {}",
+                self.cli_bin,
+                args,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn find_open_issue_by_title(&self, title: &str) -> Result<Option<u64>, String> {
+        #[derive(Deserialize)]
+        struct IssueItem {
+            number: u64,
+            title: String,
+        }
+        let mut args = vec!["issue".to_string(), "list".to_string()];
+        args.extend(self.repo_args());
+        args.extend(
+            [
+                "--state",
+                "open",
+                "--limit",
+                "100",
+                "--json",
+                "number,title",
+            ]
+            .map(String::from),
+        );
+        let raw = self.run_cli(&args)?;
+        let items: Vec<IssueItem> =
+            serde_json::from_str(&raw).map_err(|e| format!("invalid gh issue list JSON: {e}"))?;
+        Ok(items
+            .into_iter()
+            .find(|i| i.title == title)
+            .map(|i| i.number))
     }
 }
 
@@ -400,6 +737,44 @@ impl ForgePlugin for CliForgePlugin {
         argv
     }
 
+    fn plan_main_ci_cmd(&self, branch: &str, workflow: &str) -> Vec<String> {
+        let mut argv = vec![self.cli_bin.clone(), "run".to_string(), "list".to_string()];
+        argv.extend(self.repo_args());
+        argv.extend(
+            [
+                "--branch",
+                branch,
+                "--workflow",
+                workflow,
+                "--status",
+                "completed",
+                "--limit",
+                "1",
+                "--json",
+                "databaseId,headSha,conclusion,status,updatedAt,displayTitle",
+            ]
+            .map(String::from),
+        );
+        argv
+    }
+
+    fn plan_open_prs_cmd(&self) -> Vec<String> {
+        let mut argv = vec![self.cli_bin.clone(), "pr".to_string(), "list".to_string()];
+        argv.extend(self.repo_args());
+        argv.extend(
+            [
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,title,headRefName,baseRefName,headRefOid,mergeable,isDraft,labels",
+            ]
+            .map(String::from),
+        );
+        argv
+    }
+
     fn plan_update_issue_body_cmd(&self, issue_number: u64, body: &str) -> Vec<String> {
         let scrubbed = Scrubber::enabled().scrub(body);
         let mut argv = vec![
@@ -427,6 +802,126 @@ impl ForgePlugin for CliForgePlugin {
         argv.push(scrubbed);
         argv
     }
+
+    fn set_issue(&self, title: &str, body: &str) -> Result<Option<u64>, String> {
+        if self.repo.as_deref().is_none_or(|r| r.is_empty()) {
+            return Ok(None);
+        }
+        let scrubber = Scrubber::enabled();
+        let clean_title = scrubber.scrub(title);
+        let clean_body = scrubber.scrub(body);
+        if let Some(num) = self.find_open_issue_by_title(&clean_title)? {
+            let mut args = vec!["issue".to_string(), "edit".to_string(), num.to_string()];
+            args.extend(self.repo_args());
+            args.push("--body".to_string());
+            args.push(clean_body);
+            self.run_cli(&args)?;
+            return Ok(Some(num));
+        }
+        let mut args = vec!["issue".to_string(), "create".to_string()];
+        args.extend(self.repo_args());
+        args.extend([
+            "--title".to_string(),
+            clean_title,
+            "--body".to_string(),
+            clean_body,
+        ]);
+        let out = self.run_cli(&args)?;
+        let parsed = out
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .or_else(|| out.trim().parse::<u64>().ok());
+        Ok(parsed)
+    }
+
+    fn close_issue(&self, title: &str, comment: &str) -> Result<bool, String> {
+        if self.repo.as_deref().is_none_or(|r| r.is_empty()) {
+            return Ok(false);
+        }
+        let scrubber = Scrubber::enabled();
+        let clean_title = scrubber.scrub(title);
+        let clean_comment = scrubber.scrub(comment);
+        let Some(num) = self.find_open_issue_by_title(&clean_title)? else {
+            return Ok(false);
+        };
+        let mut args = vec!["issue".to_string(), "close".to_string(), num.to_string()];
+        args.extend(self.repo_args());
+        args.extend(["--comment".to_string(), clean_comment]);
+        self.run_cli(&args)?;
+        Ok(true)
+    }
+
+    fn comment_issue(&self, number: u64, body: &str) -> Result<(), String> {
+        if self.repo.as_deref().is_none_or(|r| r.is_empty()) {
+            return Ok(());
+        }
+        let clean_body = Scrubber::enabled().scrub(body);
+        let mut args = vec![
+            "issue".to_string(),
+            "comment".to_string(),
+            number.to_string(),
+        ];
+        args.extend(self.repo_args());
+        args.extend(["--body".to_string(), clean_body]);
+        self.run_cli(&args).map(|_| ())
+    }
+
+    fn mark_pr_ready(&self, pr: u64) -> Result<(), String> {
+        let mut args = vec!["pr".to_string(), "ready".to_string(), pr.to_string()];
+        args.extend(self.repo_args());
+        self.run_cli(&args).map(|_| ())
+    }
+
+    fn merge_pr(&self, pr: u64) -> Result<(), String> {
+        let mut args = vec!["pr".to_string(), "merge".to_string(), pr.to_string()];
+        args.extend(self.repo_args());
+        args.push("--merge".to_string());
+        self.run_cli(&args).map(|_| ())
+    }
+}
+
+/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and, when `$TACHO_NOTIFY` is set to a
+/// non-empty command, runs `sh -c "$TACHO_NOTIFY"` with `TACHO_NOTIFY_SUBJECT` and
+/// `TACHO_NOTIFY_BODY` environment variables and stdin populated with the scrubbed body.
+pub fn notify_owner_command(subject: &str, body: &str) -> Result<bool, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let scrubber = Scrubber::enabled();
+    let clean_subject = scrubber.scrub(subject);
+    let clean_body = scrubber.scrub(body);
+    let Some(cmd_str) = std::env::var("TACHO_NOTIFY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let mut child = Command::new("sh")
+        .args(["-c", &cmd_str])
+        .env("TACHO_NOTIFY_SUBJECT", &clean_subject)
+        .env("TACHO_NOTIFY_BODY", &clean_body)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn TACHO_NOTIFY: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(clean_body.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to wait on TACHO_NOTIFY: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "TACHO_NOTIFY exited with {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(true)
 }
 
 // ============================================================================

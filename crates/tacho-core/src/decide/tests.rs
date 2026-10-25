@@ -463,6 +463,7 @@ fn test_watch_verdicts_supervision_starve_and_tidy() {
         head_sha: "a".to_string(),
         dirty_files: 0,
         cpu_ticks: 500,
+        ..Default::default()
     };
     let s1 = ProgressSample {
         ts: 2000,
@@ -470,6 +471,7 @@ fn test_watch_verdicts_supervision_starve_and_tidy() {
         head_sha: "a".to_string(),
         dirty_files: 0,
         cpu_ticks: 500,
+        ..Default::default()
     };
     // 2000s (>= 1800s) with 0 log growth and 0 CPU delta -> HUNG -> Resume
     let (v_hung, idle) = verdict(&[s0.clone(), s1], 2000);
@@ -486,6 +488,7 @@ fn test_watch_verdicts_supervision_starve_and_tidy() {
         head_sha: "a".to_string(),
         dirty_files: 0,
         cpu_ticks: 900,
+        ..Default::default()
     };
     let (v_stalled, idle2) = verdict(&[s0, s2], 3000);
     assert_eq!(v_stalled, Verdict::Stalled);
@@ -694,6 +697,7 @@ fn test_child_cpu_counts_toward_stalled_verdict() {
             head_sha: "abc".to_string(),
             dirty_files: 1,
             cpu_ticks: 100,
+            ..Default::default()
         },
         ProgressSample {
             ts: 1000 + 2800,
@@ -702,6 +706,7 @@ fn test_child_cpu_counts_toward_stalled_verdict() {
             dirty_files: 1,
             // 2800s * 10 ticks/s = 28_000 ticks (>= 5 ticks/s)
             cpu_ticks: 100 + 28_000,
+            ..Default::default()
         },
     ];
     let (v, _idle) = verdict(&samples_busy_child, 1000 + 2900);
@@ -716,6 +721,7 @@ fn test_child_cpu_counts_toward_stalled_verdict() {
             head_sha: "abc".to_string(),
             dirty_files: 1,
             cpu_ticks: 100,
+            ..Default::default()
         },
         ProgressSample {
             ts: 1000 + 2800,
@@ -723,6 +729,7 @@ fn test_child_cpu_counts_toward_stalled_verdict() {
             head_sha: "abc".to_string(),
             dirty_files: 1,
             cpu_ticks: 101,
+            ..Default::default()
         },
     ];
     let (v_idle, _) = verdict(&samples_idle_child, 1000 + 2900);
@@ -1491,6 +1498,7 @@ fn test_multi_tick_adversarial_simulation_across_all_concerns() {
                 log_bytes: 1024,
                 head_sha: "c1".to_string(),
                 dirty_files: 1,
+                ..Default::default()
             },
         )]),
         burners: vec![
@@ -1747,6 +1755,7 @@ mod torture_proptests {
                 tree: format!("tree-{num}"),
                 additions: 10,
                 deletions: 2,
+                labels: Vec::new(),
             })
     }
 
@@ -2023,6 +2032,7 @@ fn test_decide_populates_tell_actions_and_worktree_removal() {
                 head_sha: String::new(),
                 dirty_files: 0,
                 cpu_ticks: 0,
+                ..Default::default()
             },
             ProgressSample {
                 ts: 2_000,
@@ -2030,6 +2040,7 @@ fn test_decide_populates_tell_actions_and_worktree_removal() {
                 head_sha: String::new(),
                 dirty_files: 0,
                 cpu_ticks: 1,
+                ..Default::default()
             },
         ],
     );
@@ -2078,6 +2089,7 @@ fn test_decide_populates_tell_actions_and_worktree_removal() {
             head_sha: String::new(),
             dirty_files: 0,
             cpu_ticks: 2,
+            ..Default::default()
         },
     );
 

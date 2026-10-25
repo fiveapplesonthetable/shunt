@@ -166,6 +166,7 @@ impl Recorder {
         live_agent.model = scrubbed_model;
         live_agent.cwd = scrubbed_cwd;
         live_agent.task = scrubbed_task;
+        live_agent.pid = pid;
 
         self.runs.insert(key, run_state);
         {

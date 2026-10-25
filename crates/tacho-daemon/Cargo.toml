@@ -19,6 +19,7 @@ toml = "0.8"
 signal-hook = "0.3"
 libc = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"

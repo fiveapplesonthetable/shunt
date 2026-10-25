@@ -177,6 +177,9 @@ pub struct DecisionPlan {
     /// `main-broken` batches forgotten this tick, each with its reason.
     #[serde(default)]
     pub cleared_main_broken: Vec<crate::decide::verify::ClearedBatch>,
+    /// Running batches that duplicate an older one (same group / PR set) and must be aborted.
+    #[serde(default)]
+    pub duplicate_batch_aborts: Vec<String>,
 }
 
 /// Replayable pure decision function `(DecisionState, WorldObservation) -> DecisionPlan`.
@@ -679,6 +682,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         cleared_main_broken,
         burner_kills,
         tell_actions,
+        duplicate_batch_aborts: crate::decide::watch::duplicate_batches(&state.batches),
     }
 }
 

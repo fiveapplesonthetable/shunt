@@ -123,10 +123,8 @@ fn parse_tp_csv(output: &str) -> (Vec<String>, Vec<Vec<String>>) {
 
 #[test]
 fn test_scripted_fleet_queries() {
-    let Some(tp) = tacho_core::find_trace_processor() else {
-        eprintln!("Skipping test_scripted_fleet_queries: trace_processor_shell binary not found (set $TACHO_TP or add to PATH)");
-        return;
-    };
+    let tp = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell binary not found; run scripts/oracle.sh or set TACHO_TP");
     let temp_dir = tempfile::tempdir().unwrap();
     let trace_path = temp_dir.path().join("fleet.pftrace");
 
@@ -1070,12 +1068,10 @@ fn wait_for_paths(dir: &std::path::Path, paths: &[&std::path::Path]) {
     // SAFETY: plain syscall.
     let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
     if raw < 0 {
-        panic!(
-            "cannot wait for {}: inotify_init1 failed ({}); the user is out of inotify \
-             instances, raise fs.inotify.max_user_instances",
-            awaited(),
-            std::io::Error::last_os_error()
-        );
+        while !paths.iter().all(|p| p.exists()) {
+            unsafe { libc::poll(std::ptr::null_mut(), 0, 5) };
+        }
+        return;
     }
     // SAFETY: `raw` is a fresh fd we own; closed on drop.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };

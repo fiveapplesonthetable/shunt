@@ -149,6 +149,7 @@ impl Recorder {
                     live_agent.model = r.model.clone();
                     live_agent.cwd = r.cwd.clone();
                     live_agent.task = r.task.clone();
+                    live_agent.pid = r.pid;
 
                     self.runs.insert((agent_id.to_string(), run_n), run_state);
                     let det = self.detectors.entry(agent_id.to_string()).or_default();

@@ -131,7 +131,12 @@ fn test_kit_start_prove_and_pr_preflight() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(out2.status.success());
+    assert!(
+        out2.status.success(),
+        "idempotent tacho start failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
     let st2 = store.load().unwrap();
     assert_eq!(st2.worktrees.get("feat-alpha").unwrap().port, p1);
 
@@ -253,7 +258,12 @@ fn test_kit_job_wait_and_kill() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(wait_out.status.success());
+    assert!(
+        wait_out.status.success(),
+        "tacho wait db failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&wait_out.stdout),
+        String::from_utf8_lossy(&wait_out.stderr)
+    );
     assert!(String::from_utf8_lossy(&wait_out.stdout).contains("hello-job"));
 
     // 2. Long-running job returns exit code 3 on timeout, and `tacho kill` terminates its process group
@@ -263,7 +273,12 @@ fn test_kit_job_wait_and_kill() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(bg_out.status.success());
+    assert!(
+        bg_out.status.success(),
+        "tacho job srv failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&bg_out.stdout),
+        String::from_utf8_lossy(&bg_out.stderr)
+    );
 
     let wait_timeout = Command::new(tacho_bin())
         .args(["wait", "srv", "--timeout", "1"])
@@ -279,7 +294,12 @@ fn test_kit_job_wait_and_kill() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(kill_out.status.success());
+    assert!(
+        kill_out.status.success(),
+        "tacho kill srv --now failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&kill_out.stdout),
+        String::from_utf8_lossy(&kill_out.stderr)
+    );
 }
 
 #[test]
@@ -379,7 +399,12 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(todo_out.status.success());
+    assert!(
+        todo_out.status.success(),
+        "tacho todo failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&todo_out.stdout),
+        String::from_utf8_lossy(&todo_out.stderr)
+    );
     let store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
     let st = store.load().unwrap();
     assert_eq!(st.todo.len(), 2);
@@ -489,7 +514,12 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(train_out.status.success());
+    assert!(
+        train_out.status.success(),
+        "tacho train failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&train_out.stdout),
+        String::from_utf8_lossy(&train_out.stderr)
+    );
 
     let land_out = Command::new(tacho_bin())
         .args(["land"])
@@ -548,7 +578,12 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(start_out.status.success());
+    assert!(
+        start_out.status.success(),
+        "tacho start dirty-wt failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&start_out.stdout),
+        String::from_utf8_lossy(&start_out.stderr)
+    );
     let wt_dir = wt_root.join("dirty-wt");
     fs::write(wt_dir.join("uncommitted.txt"), "precious work\n").unwrap();
 
@@ -587,7 +622,12 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(todo_out.status.success());
+    assert!(
+        todo_out.status.success(),
+        "tacho todo auto-task failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&todo_out.stdout),
+        String::from_utf8_lossy(&todo_out.stderr)
+    );
 
     let tick1 = Command::new(tacho_bin())
         .args(["tick"])
@@ -596,7 +636,12 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .env("TACHO_AGENT_CMD", "echo 'Working...' && echo 'PR: #42'")
         .output()
         .unwrap();
-    assert!(tick1.status.success());
+    assert!(
+        tick1.status.success(),
+        "tick1 failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&tick1.stdout),
+        String::from_utf8_lossy(&tick1.stderr)
+    );
 
     // Wait for the mock agent to exit via its pidfd (no inotify needed): once
     // the process is gone its log is complete.
@@ -618,7 +663,12 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(tick2.status.success());
+    assert!(
+        tick2.status.success(),
+        "tick2 failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&tick2.stdout),
+        String::from_utf8_lossy(&tick2.stderr)
+    );
 
     let store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
     let st = store.load().unwrap();
@@ -718,6 +768,10 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
                 .nth(19)
                 .and_then(|v| v.parse::<u64>().ok())
         });
+    let now_live = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     store
         .mutate(None, |st| {
             st.agents.insert(
@@ -728,12 +782,13 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
                     starttime: my_starttime,
                     provider: "claude".to_string(),
                     worktree: wt_root.join("db-wt").to_string_lossy().to_string(),
-                    started_at: 1000,
+                    started_at: now_live,
                     ..Default::default()
                 },
             );
         })
         .unwrap();
+    drop(store);
 
     let tell_out = Command::new(tacho_bin())
         .args(["tell", "live-worker", "Please also add a migration test"])
@@ -741,7 +796,13 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(tell_out.status.success());
+    assert!(
+        tell_out.status.success(),
+        "tacho tell live-worker failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&tell_out.stdout),
+        String::from_utf8_lossy(&tell_out.stderr)
+    );
+    let mut store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
     let inbox_file = tacho_home.join("inbox").join("live-worker.txt");
     assert!(
         inbox_file.is_file(),
@@ -962,7 +1023,12 @@ fn test_status_sections_staleness_needs_and_scrubber() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(sec_json_out.status.success());
+    assert!(
+        sec_json_out.status.success(),
+        "status --section failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&sec_json_out.stdout),
+        String::from_utf8_lossy(&sec_json_out.stderr)
+    );
     let sec_parsed: serde_json::Value = serde_json::from_slice(&sec_json_out.stdout).unwrap();
     assert!(sec_parsed.get("headline").is_some());
     assert!(sec_parsed.get("machine").is_some());
@@ -976,7 +1042,12 @@ fn test_status_sections_staleness_needs_and_scrubber() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(needs_out.status.success());
+    assert!(
+        needs_out.status.success(),
+        "tacho needs failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&needs_out.stdout),
+        String::from_utf8_lossy(&needs_out.stderr)
+    );
     let needs_txt = String::from_utf8_lossy(&needs_out.stdout);
     assert!(
         needs_txt.to_ascii_lowercase().contains("needs you"),
@@ -990,7 +1061,12 @@ fn test_status_sections_staleness_needs_and_scrubber() {
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(status_txt_out.status.success());
+    assert!(
+        status_txt_out.status.success(),
+        "tacho status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&status_txt_out.stdout),
+        String::from_utf8_lossy(&status_txt_out.stderr)
+    );
     let status_txt = String::from_utf8_lossy(&status_txt_out.stdout);
     assert!(
         !status_txt.contains(secret_token),
@@ -1116,7 +1192,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(ver_out.status.success());
+    assert!(
+        ver_out.status.success(),
+        "version --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ver_out.stdout),
+        String::from_utf8_lossy(&ver_out.stderr)
+    );
     let ver_json: serde_json::Value = serde_json::from_slice(&ver_out.stdout).unwrap();
     assert_eq!(ver_json["running_commit"], main_sha);
     assert!(ver_json["rule"].as_str().unwrap().contains("Auto-updates"));
@@ -1128,7 +1209,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(setup_dry.status.success());
+    assert!(
+        setup_dry.status.success(),
+        "setup --dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&setup_dry.stdout),
+        String::from_utf8_lossy(&setup_dry.stderr)
+    );
     assert!(!tacho_home.join("fleet.env").exists());
 
     let setup_real = Command::new(tacho_bin())
@@ -1137,7 +1223,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(setup_real.status.success());
+    assert!(
+        setup_real.status.success(),
+        "setup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&setup_real.stdout),
+        String::from_utf8_lossy(&setup_real.stderr)
+    );
     assert!(tacho_home.join("fleet.env").is_file());
 
     // 3. `tacho db <name> [checkout]` and `tacho db <name> --rm`
@@ -1147,7 +1238,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(db_up.status.success());
+    assert!(
+        db_up.status.success(),
+        "db feat-db failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&db_up.stdout),
+        String::from_utf8_lossy(&db_up.stderr)
+    );
     let env_txt = fs::read_to_string(repo_dir.join(".tachoenv")).unwrap();
     assert!(env_txt.contains("DATABASE_URL=postgres://"));
 
@@ -1157,7 +1253,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(db_rm.status.success());
+    assert!(
+        db_rm.status.success(),
+        "db feat-db --rm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&db_rm.stdout),
+        String::from_utf8_lossy(&db_rm.stderr)
+    );
     let env_after_rm = fs::read_to_string(repo_dir.join(".tachoenv")).unwrap();
     assert!(!env_after_rm.contains("DATABASE_URL="));
 
@@ -1176,7 +1277,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(sess_set.status.success());
+    assert!(
+        sess_set.status.success(),
+        "session set failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&sess_set.stdout),
+        String::from_utf8_lossy(&sess_set.stderr)
+    );
     let store = FleetStore::open(&tacho_home.join("events.sqlite")).unwrap();
     let st_sess = store.load().unwrap();
     assert_eq!(st_sess.default_provider, "gemini");
@@ -1192,7 +1298,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(sess_clear.status.success());
+    assert!(
+        sess_clear.status.success(),
+        "session --clear failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&sess_clear.stdout),
+        String::from_utf8_lossy(&sess_clear.stderr)
+    );
     let st_cleared = store.load().unwrap();
     assert_eq!(st_cleared.default_provider, "claude");
     assert!(st_cleared.default_model.is_none());
@@ -1204,7 +1315,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(todo_add.status.success());
+    assert!(
+        todo_add.status.success(),
+        "todo task-retire failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&todo_add.stdout),
+        String::from_utf8_lossy(&todo_add.stderr)
+    );
 
     let hold_why = Command::new(tacho_bin())
         .args(["hold", "task-retire", "--why", "waiting on upstream API"])
@@ -1212,7 +1328,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(hold_why.status.success());
+    assert!(
+        hold_why.status.success(),
+        "hold task-retire failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&hold_why.stdout),
+        String::from_utf8_lossy(&hold_why.stderr)
+    );
     assert_eq!(
         store.load().unwrap().holds["task-retire"].reason,
         "waiting on upstream API"
@@ -1224,7 +1345,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(retire_why.status.success());
+    assert!(
+        retire_why.status.success(),
+        "retire task-retire failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&retire_why.stdout),
+        String::from_utf8_lossy(&retire_why.stderr)
+    );
 
     let todo_retired = Command::new(tacho_bin())
         .args(["todo", "--retired", "--json"])
@@ -1232,7 +1358,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(todo_retired.status.success());
+    assert!(
+        todo_retired.status.success(),
+        "todo --retired --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&todo_retired.stdout),
+        String::from_utf8_lossy(&todo_retired.stderr)
+    );
     let retired_list: Vec<String> = serde_json::from_slice(&todo_retired.stdout).unwrap();
     assert!(retired_list.contains(&"task-retire".to_string()));
 
@@ -1243,7 +1374,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(ev_ok.status.success());
+    assert!(
+        ev_ok.status.success(),
+        "events --since 1h failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ev_ok.stdout),
+        String::from_utf8_lossy(&ev_ok.stderr)
+    );
     let ev_arr: Vec<serde_json::Value> = serde_json::from_slice(&ev_ok.stdout).unwrap();
     assert!(!ev_arr.is_empty() && ev_arr.len() <= 5);
 
@@ -1333,7 +1469,12 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         .env("TACHO_HOME", &tacho_home)
         .output()
         .unwrap();
-    assert!(tidy_stale.status.success());
+    assert!(
+        tidy_stale.status.success(),
+        "tidy --stale-runs 7 failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&tidy_stale.stdout),
+        String::from_utf8_lossy(&tidy_stale.stderr)
+    );
     assert!(store.load().unwrap().retired.contains("ancient-run"));
 
     // 8. `tacho train [prs]... --max`, `tacho land [train] --dry-run`, `tacho release-train [pr] --approve`, and `tacho decide-replay`

@@ -98,12 +98,7 @@ impl DaemonClient {
 
         ensure_dir_0700(&self.home_dir)?;
         ensure_dir_0700(&self.runtime_dir)?;
-        let inotify = watch_dir(&self.runtime_dir).ok_or_else(|| {
-            io::Error::other(format!(
-                "inotify unavailable for watching runtime directory {:?}",
-                self.runtime_dir
-            ))
-        })?;
+        let inotify = watch_dir(&self.runtime_dir);
 
         // 2. Daemon not responding; spawn it detached
         let mut spawned_child = self.spawn_daemon_detached()?;
@@ -114,7 +109,7 @@ impl DaemonClient {
             (raw >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
         });
 
-        // 3. Block on kernel inotify events for api.sock or child pidfd exit (no timed poll).
+        // 3. Block on kernel inotify events for api.sock or child pidfd exit.
         loop {
             if let Ok(stream) = UnixStream::connect(&sock) {
                 return Ok(stream);
@@ -143,7 +138,7 @@ impl DaemonClient {
             }
             let mut pfds = [
                 libc::pollfd {
-                    fd: inotify.as_raw_fd(),
+                    fd: inotify.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -153,8 +148,9 @@ impl DaemonClient {
                     revents: 0,
                 },
             ];
-            // SAFETY: valid pollfd array; negative fd in pfds[1] is ignored by poll.
-            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+            let timeout_ms = if inotify.is_some() { -1 } else { 5 };
+            // SAFETY: valid pollfd array; negative fd is ignored by poll.
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout_ms) };
             if rc < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -162,10 +158,12 @@ impl DaemonClient {
                 }
                 return Err(err);
             }
-            let mut buf = [0u8; 4096];
-            // SAFETY: reading into a local buffer from a non-blocking fd we own.
-            while unsafe { libc::read(inotify.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0
-            {
+            if let Some(ref ino) = inotify {
+                let mut buf = [0u8; 4096];
+                // SAFETY: reading into a local buffer from a non-blocking fd we own.
+                while unsafe { libc::read(ino.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0
+                {
+                }
             }
         }
     }

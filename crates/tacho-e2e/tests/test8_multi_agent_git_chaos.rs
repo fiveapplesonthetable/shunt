@@ -55,10 +55,8 @@ fn send_claude_hook(env: &TestEnv, agent: &str, payload: serde_json::Value) {
 
 #[test]
 fn test_multi_agent_git_chaos() {
-    if tacho_core::find_trace_processor().is_none() {
-        eprintln!("Skipping test_multi_agent_git_chaos: trace_processor_shell binary not found (set $TACHO_TP or add to PATH)");
-        return;
-    }
+    let _ = tacho_core::find_trace_processor()
+        .expect("trace_processor_shell binary not found; run scripts/oracle.sh or set TACHO_TP");
 
     let env = TestEnv::new().unwrap();
 

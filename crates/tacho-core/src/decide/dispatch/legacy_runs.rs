@@ -189,6 +189,8 @@ pub struct PullFacts {
     pub additions: u64,
     #[serde(default)]
     pub deletions: u64,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 fn default_open_state() -> String {

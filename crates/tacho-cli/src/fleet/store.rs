@@ -67,215 +67,28 @@ pub fn emit_decision_event(track: &str, name: &str, because: &str) {
     }
 }
 
-/// Returns `true` if `pid` exists, `/proc/<pid>/stat` is readable, and the process is not a zombie (`Z`).
-///
-/// Fails closed (`false`) if `/proc/<pid>/stat` cannot be read or parsed.
-pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    if rc != 0 {
-        return false;
-    }
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let Some(rparen) = stat.rfind(')') else {
-        return false;
-    };
-    !stat[rparen + 1..].trim_start().starts_with('Z')
-}
-
-/// Returns `true` if `pid` is alive in `/proc/<pid>/stat`, not a zombie, and matches
-/// `expected_starttime` (which must be `Some(st)` with `st > 0`).
-///
-/// Fails closed (`false`) if `expected_starttime` is missing/zero or `/proc/<pid>/stat` cannot be read.
-pub fn pid_alive_matching(pid: u32, expected_starttime: Option<u64>) -> bool {
-    let Some(expected_st) = expected_starttime.filter(|&st| st > 0) else {
-        return false;
-    };
-    if !pid_alive(pid) {
-        return false;
-    }
-    let Some(actual_st) = proc_pid_starttime(pid) else {
-        return false;
-    };
-    actual_st == expected_st
-}
-
-/// Reads field 22 (`starttime` in clock ticks since boot) of `/proc/<pid>/stat`.
-pub fn proc_pid_starttime(pid: u32) -> Option<u64> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let content = fs::read_to_string(&stat_path).ok()?;
-    let rparen = content.rfind(')')?;
-    let rest = &content[rparen + 2..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    fields.get(19).and_then(|s| s.parse::<u64>().ok())
-}
-
-/// Reads `/proc/<pid>/cgroup` for strong process identity verification.
-pub fn proc_pid_cgroup(pid: u32) -> Option<String> {
-    let cgroup_path = format!("/proc/{pid}/cgroup");
-    let content = fs::read_to_string(&cgroup_path).ok()?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
+pub use tacho_daemon::exec::identity::{
+    classify_agent_process, kill_stopped_and_wait, pid_alive, pid_alive_matching, proc_pid_cgroup,
+    proc_pid_starttime, proc_pid_state, send_signal, verify_pid, wait_for_pid_exit_event,
+    AgentProcess, Identity,
+};
+pub use tacho_daemon::exec::tidy::git_stdout;
 
 /// Verify that a PID on the system actually belongs to the target process before signalling.
-///
-/// Requires at least one strong identity (`expected_starttime` > 0 or non-empty `expected_cgroup`)
-/// recorded at spawn time. Never falls back to `/proc/<pid>/environ` or `/proc/<pid>/cmdline`.
 pub(crate) fn verify_agent_pid(
     pid: u32,
     agent_key: &str,
     expected_cgroup: Option<&str>,
     expected_starttime: Option<u64>,
 ) -> bool {
-    let has_valid_st = expected_starttime.is_some_and(|st| st > 0);
-    let has_valid_cg = expected_cgroup.is_some_and(|cg| !cg.is_empty());
-    if !has_valid_st && !has_valid_cg {
-        eprintln!(
-            "[tacho-safety] PID {pid} for '{agent_key}' has neither recorded starttime nor cgroup; refusing signal without identity"
-        );
-        return false;
-    }
-
-    if !pid_alive(pid) {
-        return false;
-    }
-
-    let Some(actual_st) = proc_pid_starttime(pid) else {
-        return false;
-    };
-
-    if let Some(expected_st) = expected_starttime {
-        if expected_st == 0 || actual_st != expected_st {
-            eprintln!(
-                "[tacho-safety] PID {pid} starttime ({actual_st}) does not match recorded ({expected_st}); refusing signal to reused PID"
-            );
-            return false;
-        }
-    }
-
-    if let Some(cg) = expected_cgroup.filter(|s| !s.is_empty()) {
-        let cgroup_path = format!("/proc/{pid}/cgroup");
-        let Ok(actual_cg) = fs::read_to_string(&cgroup_path) else {
-            return false;
-        };
-        if !actual_cg.contains(cg) {
-            eprintln!(
-                "[tacho-safety] PID {pid} cgroup does not contain expected '{cg}' for '{agent_key}'; refusing signal"
-            );
-            return false;
-        }
-    }
-
-    true
-}
-
-/// What is known about the process recorded for an agent, for deciding whether a resume is safe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentProcess {
-    /// No process exists for the recorded identity: no pid, the pid is gone or a zombie,
-    /// or the pid was reused (recorded starttime differs from the live one).
-    Gone,
-    /// The recorded process is alive, its identity is verified, and it is job-control stopped.
-    Stopped(u32),
-    /// The recorded process is alive, its identity is verified, and it is running.
-    Running,
-    /// A process is alive at the recorded pid but no identity was recorded to prove it is ours.
-    Unverified,
-}
-
-/// Classifies the process recorded for `agent_key` without signalling it.
-pub(crate) fn classify_agent_process(
-    pid: Option<u32>,
-    agent_key: &str,
-    expected_cgroup: Option<&str>,
-    expected_starttime: Option<u64>,
-) -> AgentProcess {
-    let Some(pid) = pid else {
-        return AgentProcess::Gone;
-    };
-    if !pid_alive(pid) {
-        return AgentProcess::Gone;
-    }
-    if let Some(expected) = expected_starttime.filter(|&st| st > 0) {
-        if proc_pid_starttime(pid).is_some_and(|actual| actual != expected) {
-            // The pid now names a different process, so the recorded one has exited.
-            return AgentProcess::Gone;
-        }
-    }
-    if !verify_agent_pid(pid, agent_key, expected_cgroup, expected_starttime) {
-        return AgentProcess::Unverified;
-    }
-    if proc_pid_state(pid).is_some_and(|s| s == 'T' || s == 't') {
-        AgentProcess::Stopped(pid)
-    } else {
-        AgentProcess::Running
-    }
-}
-
-/// Reads field 3 (process state letter) of `/proc/<pid>/stat`.
-pub fn proc_pid_state(pid: u32) -> Option<char> {
-    let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rparen = content.rfind(')')?;
-    content[rparen + 1..].trim_start().chars().next()
-}
-
-pub use crate::kit::procs::send_signal;
-
-/// SIGKILLs the process group of a verified, stopped agent and blocks until its leader exits.
-///
-/// A stopped process cannot run, so SIGKILL is delivered immediately; the wait is on the
-/// pidfd exit event, not a timer.
-pub(crate) fn kill_stopped_and_wait(pid: u32) -> io::Result<()> {
-    send_signal(-(pid as i32), libc::SIGKILL)?;
-    wait_for_pid_exit_event(pid)
-}
-
-/// Blocks until `pid` exits, waiting on its pidfd. Returns immediately if it is already gone.
-pub(crate) fn wait_for_pid_exit_event(pid: u32) -> io::Result<()> {
-    // SAFETY: pidfd_open takes plain integers and returns a new fd or -1.
-    let pidfd =
-        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as libc::c_int;
-    if pidfd < 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        return Err(io::Error::new(
-            err.kind(),
-            format!("pidfd_open({pid}) failed: {err}"),
-        ));
-    }
-    let mut pfd = libc::pollfd {
-        fd: pidfd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let rc = loop {
-        // SAFETY: `pfd` is a valid pollfd for the duration of the call.
-        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
-        if rc >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            break rc;
-        }
-    };
-    let poll_err = io::Error::last_os_error();
-    // SAFETY: `pidfd` is an fd we own and close exactly once.
-    unsafe { libc::close(pidfd) };
-    if rc < 0 {
-        return Err(io::Error::new(
-            poll_err.kind(),
-            format!("poll on pidfd for {pid} failed: {poll_err}"),
-        ));
-    }
-    Ok(())
+    verify_pid(
+        &Identity {
+            pid,
+            starttime: expected_starttime,
+            cgroup: expected_cgroup,
+        },
+        agent_key,
+    )
 }
 
 /// Wait up to `timeout` for `pid` to exit using Linux `pidfd_open` + `libc::poll`
@@ -512,30 +325,6 @@ pub fn load_fleet_env(env_file_override: Option<&Path>) -> BTreeMap<String, Stri
         merged.insert(k, v);
     }
     merged
-}
-
-/// Runs `git -C <dir> <args>` and returns trimmed stdout, failing on a non-zero exit so callers
-/// never act on a half-done git step.
-pub fn git_stdout(dir: &Path, args: &[&str]) -> io::Result<String> {
-    // Never let git block on a prompt, an editor, or a pager: stdin is closed and every
-    // interactive hook is disabled, so a git call either completes or fails.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_EDITOR", "true")
-        .env("GIT_PAGER", "cat")
-        .output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "git {} failed: {}",
-            args.first().copied().unwrap_or(""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Resolves the live `main` SHA from `origin` (`refs/heads/main`), falling back to local `refs/heads/main` or `HEAD`.

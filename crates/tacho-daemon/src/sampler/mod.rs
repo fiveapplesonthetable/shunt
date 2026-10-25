@@ -105,6 +105,7 @@ pub struct ProcSampler {
     cgroup_enabled: bool,
     worktree_scan_secs: u64,
     home_dir: Option<std::path::PathBuf>,
+    fleet_store: Option<crate::fleet::FleetStore>,
     /// `AppenderHandle::decide_seq` at the last decide pass (`None` before the first).
     last_decide_seq: Option<u64>,
     last_decide_ns: u64,
@@ -144,6 +145,7 @@ impl ProcSampler {
             cgroup_enabled: true,
             worktree_scan_secs: 30,
             home_dir: None,
+            fleet_store: None,
             last_decide_seq: None,
             last_decide_ns: 0,
             decide_refresh_ns: 60 * 1_000_000_000,
@@ -164,7 +166,13 @@ impl ProcSampler {
     /// Sets `$TACHO_HOME` so sampling ticks also run autonomous `decide` passes when one is
     /// due (see [`ProcSampler::decide_due`]).
     pub fn set_home_dir(&mut self, home_dir: std::path::PathBuf) {
+        self.fleet_store = None;
         self.home_dir = Some(home_dir);
+    }
+
+    /// Returns `$TACHO_HOME` if configured on this sampler.
+    pub fn home_dir(&self) -> Option<&std::path::Path> {
+        self.home_dir.as_deref()
     }
 
     /// Sets the coarse refresh interval for time-based decide rules.
@@ -497,10 +505,30 @@ impl ProcSampler {
                 self.last_decide_seq = Some(decide_seq);
                 self.last_decide_ns = now_ns;
                 let latest_live = appender.live_state();
-                if let Err(e) =
-                    crate::fleet::run_autonomous_decide_tick_with_live(home_dir, &latest_live)
-                {
-                    eprintln!("[tacho-daemon] autonomous decide tick failed: {}", e);
+                if self.fleet_store.is_none() {
+                    match crate::fleet::FleetStore::open(&home_dir.join("events.sqlite")) {
+                        Ok(s) => self.fleet_store = Some(s),
+                        Err(e) => {
+                            eprintln!("[tacho-daemon] failed to open FleetStore: {e}");
+                            return;
+                        }
+                    }
+                }
+                if let Some(ref mut store) = self.fleet_store {
+                    let mut hands = crate::fleet::DaemonHands {
+                        home: home_dir.clone(),
+                        live_state: (*latest_live).clone(),
+                        appender: Some(appender.clone()),
+                    };
+                    let mut opts = crate::exec::TickOptions::new(&latest_live);
+                    for run in active_runs.iter() {
+                        if run.pid > 0 {
+                            opts.run_pids.insert(run.agent_id.clone(), run.pid);
+                        }
+                    }
+                    if let Err(e) = crate::exec::run_tick(home_dir, store, &mut hands, opts) {
+                        eprintln!("[tacho-daemon] autonomous decide tick failed: {e}");
+                    }
                 }
             }
         }

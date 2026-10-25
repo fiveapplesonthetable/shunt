@@ -14,9 +14,9 @@ use tacho_core::{AgentRole, Event, Input, Kind, LiveState, Recorder, SessionKey,
 use crate::log::EventLog;
 
 /// How long a producer waits for queue space before the input is rejected as "queue full".
-const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long [`AppenderHandle::flush`] waits for the appender to confirm a commit.
-const FLUSH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const FLUSH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on how long one burst of already-queued inputs is gathered into a single
 /// SQLite transaction. The appender never waits for more input to arrive: it drains what is
 /// queued and commits, so this only caps latency under a continuous flood.

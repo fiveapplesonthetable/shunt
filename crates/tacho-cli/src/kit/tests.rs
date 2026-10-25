@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -671,15 +672,24 @@ fn test_starve_plan_4_burners_per_cpu_one_eighth_fleet_cap_and_highest_4_default
 
 #[test]
 fn test_starve_registered_burner_verification_and_preemption() {
-    // Spawn a real `yes` process in its own process group with TACHO_STARVE=1
+    // Spawn a real `yes` process in its own process group with TACHO_STARVE=1.
+    // Pipe stdout and read 1 byte so the kernel guarantees `execve("yes")` has completed
+    // (and `/proc/<pid>/cmdline` is `"yes"`, not the forked test runner) even under load 100.
     let mut burner = Command::new("yes")
         .env("TACHO_STARVE", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
         .unwrap();
+    let mut one_byte = [0u8; 1];
+    burner
+        .stdout
+        .as_mut()
+        .expect("piped stdout")
+        .read_exact(&mut one_byte)
+        .expect("yes must write to stdout after execve");
     let pid = burner.id();
     let st = proc_pid_starttime(pid);
 

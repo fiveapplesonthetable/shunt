@@ -376,6 +376,9 @@ pub struct MainCiRun {
     pub sha: String,
     pub title: String,
     pub age_seconds: Option<i64>,
+    /// When the run completed (forge timestamp, e.g. RFC 3339); empty when unknown.
+    #[serde(default)]
+    pub completed_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

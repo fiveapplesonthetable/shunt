@@ -46,6 +46,9 @@ pub struct ProgressSample {
     pub head_sha: String,
     pub dirty_files: u32,
     pub cpu_ticks: u64,
+    /// Newest file mtime (epoch seconds) in the agent's worktree; `None` when not observed.
+    #[serde(default)]
+    pub newest_mtime: Option<i64>,
 }
 
 /// Progress verdict for a live agent (legacy uppercase serde format).
@@ -235,6 +238,10 @@ pub struct AttentionItem {
 }
 
 /// Append a new [`ProgressSample`] to `samples`, keeping at most `max_samples` (default 60).
+///
+/// Sub-minute identical samples are coalesced, and repeated quiet heartbeats update the
+/// trailing quiet sample in place so the initial baseline timestamp at `samples[0]` is never
+/// pushed out of the window during long idle periods.
 pub fn take_sample(
     samples: &[ProgressSample],
     sample: ProgressSample,
@@ -242,10 +249,30 @@ pub fn take_sample(
 ) -> Vec<ProgressSample> {
     let cap = max_samples.max(2);
     let mut out: Vec<ProgressSample> = samples.to_vec();
+    let same_metrics = |a: &ProgressSample, b: &ProgressSample| {
+        a.log_bytes == b.log_bytes
+            && a.head_sha == b.head_sha
+            && a.dirty_files == b.dirty_files
+            && a.cpu_ticks == b.cpu_ticks
+            && a.newest_mtime == b.newest_mtime
+    };
+    if let Some(last) = out.last() {
+        if same_metrics(last, &sample) {
+            if sample.ts.saturating_sub(last.ts) < 60 {
+                return out;
+            }
+            if out.len() >= 2 && same_metrics(&out[out.len() - 2], last) {
+                if let Some(tail) = out.last_mut() {
+                    tail.ts = sample.ts;
+                }
+                return out;
+            }
+        }
+    }
     out.push(sample);
     if out.len() > cap {
         let drop_n = out.len() - cap;
-        out.drain(0..drop_n);
+        out.drain(1..=drop_n);
     }
     out
 }
@@ -266,6 +293,7 @@ pub fn verdict(samples: &[ProgressSample], now: i64) -> (Verdict, i64) {
         if b.log_bytes.saturating_sub(a.log_bytes) >= 64
             || b.head_sha != a.head_sha
             || b.dirty_files != a.dirty_files
+            || matches!((a.newest_mtime, b.newest_mtime), (Some(x), Some(y)) if y > x)
         {
             last_work_ts = b.ts;
         }

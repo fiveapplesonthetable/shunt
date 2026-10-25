@@ -44,25 +44,27 @@ pub use start::execute_start;
 pub use starve::execute_starve;
 
 /// Event-driven watcher using Linux `inotify` + `pidfd_open` + `poll` so wait loops
-/// wake immediately on file changes or process exit via kernel events.
+/// wake immediately on file changes or process exit via kernel events, degrading cleanly
+/// to `pidfd` + `poll` when the host is out of inotify instances.
 pub(crate) struct FdEventWatcher {
-    inotify_fd: OwnedFd,
+    inotify_fd: Option<OwnedFd>,
     pid_fds: Vec<OwnedFd>,
 }
 
 impl FdEventWatcher {
     pub fn new() -> io::Result<Self> {
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let inotify_fd = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) });
         Ok(Self {
-            inotify_fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            inotify_fd,
             pid_fds: Vec::new(),
         })
     }
 
     pub fn watch_path(&self, path: &Path) {
+        let Some(ref inotify_fd) = self.inotify_fd else {
+            return;
+        };
         if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
             let mask = libc::IN_MODIFY
                 | libc::IN_CREATE
@@ -72,7 +74,7 @@ impl FdEventWatcher {
                 | libc::IN_ATTRIB;
             unsafe {
                 let _ = libc::inotify_add_watch(
-                    std::os::unix::io::AsRawFd::as_raw_fd(&self.inotify_fd),
+                    std::os::unix::io::AsRawFd::as_raw_fd(inotify_fd),
                     c_path.as_ptr(),
                     mask,
                 );
@@ -96,13 +98,14 @@ impl FdEventWatcher {
 
     /// Blocks until an inotify event, pidfd exit, or `timeout_ms` elapses.
     pub fn wait_ms(&self, timeout_ms: i32) {
-        let ino_raw = std::os::unix::io::AsRawFd::as_raw_fd(&self.inotify_fd);
         let mut fds = Vec::with_capacity(1 + self.pid_fds.len());
-        fds.push(libc::pollfd {
-            fd: ino_raw,
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        if let Some(ref ino) = self.inotify_fd {
+            fds.push(libc::pollfd {
+                fd: std::os::unix::io::AsRawFd::as_raw_fd(ino),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         for pfd in &self.pid_fds {
             fds.push(libc::pollfd {
                 fd: std::os::unix::io::AsRawFd::as_raw_fd(pfd),
@@ -111,13 +114,26 @@ impl FdEventWatcher {
             });
         }
 
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
-        if rc > 0 && (fds[0].revents & libc::POLLIN) != 0 {
-            let mut buf = [0u8; 1024];
-            loop {
-                let n = unsafe { libc::read(ino_raw, buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n <= 0 {
-                    break;
+        let effective_timeout = if self.inotify_fd.is_some() {
+            timeout_ms
+        } else {
+            timeout_ms.clamp(1, 10)
+        };
+        let ptr = if fds.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            fds.as_mut_ptr()
+        };
+        let rc = unsafe { libc::poll(ptr, fds.len() as libc::nfds_t, effective_timeout) };
+        if let Some(ref ino) = self.inotify_fd {
+            if rc > 0 && (fds[0].revents & libc::POLLIN) != 0 {
+                let ino_raw = std::os::unix::io::AsRawFd::as_raw_fd(ino);
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = unsafe { libc::read(ino_raw, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n <= 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -155,26 +171,27 @@ pub(crate) fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// Records a decision event on the daemon timeline.
+/// Records a decision event on the running daemon timeline if a daemon is active.
 ///
-/// The event is best effort (the decision itself is already persisted by the caller), but a
-/// delivery failure is reported on stderr rather than silently dropped.
+/// The decision and state band are already persisted directly in `events.sqlite` by the caller;
+/// this notifies an already-running daemon without spawning an orphaned background daemon.
 pub(crate) fn emit_decision_event(track: &str, name: &str, because: &str) {
     let client = DaemonClient::new();
-    let sent = client.send_request(&serde_json::json!({
-        "input": {
-            "type": "custom",
-            "source_ts_ns": now_ns(),
-            "track": track,
-            "name": name,
-            "op": "instant",
-            "args": {
-                "because": because,
+    if client.try_connect_api_fast().is_ok() {
+        if let Err(e) = client.send_request(&serde_json::json!({
+            "input": {
+                "type": "custom",
+                "source_ts_ns": now_ns(),
+                "track": track,
+                "name": name,
+                "op": "instant",
+                "args": {
+                    "because": because,
+                }
             }
+        })) {
+            eprintln!("[tacho] could not record decision event {track}/{name}: {e}");
         }
-    }));
-    if let Err(e) = sent {
-        eprintln!("[tacho] could not record decision event {track}/{name}: {e}");
     }
 }
 
@@ -287,84 +304,4 @@ pub(crate) fn resolve_base_sha_for_worktree(
     Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
 
-/// Computes the exact git tree hash of the entire working tree (tracked + untracked files,
-/// excluding `.tachoproof/`, `.tachorun/`, and `.tachoenv`) using a temporary git index file
-/// without mutating the user's real git index.
-pub fn tree_of_worktree(root: &Path) -> io::Result<String> {
-    let tmp_dir = tempfile::tempdir()?;
-    let tmp_index = tmp_dir.path().join("index");
-
-    let head_tree_out = Command::new("git")
-        .args(["rev-parse", "--verify", "-q", "HEAD^{tree}"])
-        .current_dir(root)
-        .output()?;
-    if head_tree_out.status.success() {
-        let head_tree = String::from_utf8_lossy(&head_tree_out.stdout)
-            .trim()
-            .to_string();
-        if !head_tree.is_empty() {
-            let rt_out = Command::new("git")
-                .args(["read-tree", &head_tree])
-                .current_dir(root)
-                .env("GIT_INDEX_FILE", &tmp_index)
-                .output()?;
-            if !rt_out.status.success() {
-                return Err(io::Error::other(format!(
-                    "git read-tree {head_tree} in temp index failed: {}",
-                    String::from_utf8_lossy(&rt_out.stderr).trim()
-                )));
-            }
-        }
-    }
-
-    let add_out = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(root)
-        .env("GIT_INDEX_FILE", &tmp_index)
-        .output()?;
-    if !add_out.status.success() {
-        return Err(io::Error::other(format!(
-            "git add -A in temp index failed: {}",
-            String::from_utf8_lossy(&add_out.stderr).trim()
-        )));
-    }
-
-    // Remove internal kit files from temporary index so writing `.tachoproof` never invalidates the proof tree
-    let rm_out = Command::new("git")
-        .args([
-            "rm",
-            "-r",
-            "--cached",
-            "--ignore-unmatch",
-            "-q",
-            "--",
-            ".tachoproof",
-            ".tachorun",
-            ".tacho-proof",
-            ".tacho-run",
-            ".tachoenv",
-            ".tachoenv.tmp",
-        ])
-        .current_dir(root)
-        .env("GIT_INDEX_FILE", &tmp_index)
-        .output()?;
-    if !rm_out.status.success() {
-        return Err(io::Error::other(format!(
-            "git rm --cached in temp index failed: {}",
-            String::from_utf8_lossy(&rm_out.stderr).trim()
-        )));
-    }
-
-    let wt_out = Command::new("git")
-        .args(["write-tree"])
-        .current_dir(root)
-        .env("GIT_INDEX_FILE", &tmp_index)
-        .output()?;
-    if !wt_out.status.success() {
-        return Err(io::Error::other(format!(
-            "git write-tree failed: {}",
-            String::from_utf8_lossy(&wt_out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&wt_out.stdout).trim().to_string())
-}
+pub use tacho_daemon::exec::tidy::tree_of_worktree;

@@ -192,7 +192,12 @@ pub fn can_rerun_on_red(
     true
 }
 
-/// R23: pure decision for stale visual golden auto-refresh when pixel areas fail on a single PR.
+/// R23: pure decision for non-golden screenshot refresh on top of a passing (`green`) train.
+///
+/// Golden screenshots are strict: a golden pixel diff fails the check (`rc != 0`) and is blamed
+/// as a real failure, never auto-refreshed on red. Only a passing batch (`rc == 0`) commits
+/// non-golden screenshots redrawn on its merged tree on top of the last PR in the train and
+/// invalidates the old head proof (`shots-updated`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StaleShotsAction {
     NotApplicable {
@@ -206,33 +211,30 @@ pub enum StaleShotsAction {
     },
 }
 
-/// R23: decide whether a failed run on `cand` should trigger a visual-golden refresh (`shots-updated`).
+/// R23: decide whether a passing (`green`) run on `passed` should commit redrawn non-golden
+/// screenshots on top of the train and invalidate the old head proof (`shots-updated`).
 pub fn stale_shots_step(
-    cand: &[u64],
+    passed: &[u64],
     heads: &BTreeMap<u64, String>,
-    failed_areas: &[String],
+    proved_areas: &[String],
     pr_files: &[String],
     cfg: &VerifyConfig,
 ) -> StaleShotsAction {
-    if cand.len() != 1 {
+    let Some(&pr) = passed.last() else {
         return StaleShotsAction::NotApplicable {
-            reason: "screenshot refresh only runs on single-PR candidates".to_string(),
+            reason: "screenshot refresh only runs on passing candidates".to_string(),
         };
-    }
-    let pr = cand[0];
-    let fset: BTreeSet<String> = failed_areas.iter().cloned().collect();
-    if fset.is_empty() || !fset.is_subset(&cfg.areas.pixel_areas) {
+    };
+    let pset: BTreeSet<String> = proved_areas.iter().cloned().collect();
+    if pset.is_empty() || pset.is_disjoint(&cfg.areas.pixel_areas) {
         return StaleShotsAction::NotApplicable {
-            reason: format!(
-                "failed areas {:?} are not exclusively pixel areas",
-                failed_areas
-            ),
+            reason: format!("proved areas {:?} include no pixel areas", proved_areas),
         };
     }
     let redraw = super::areas::redraw_areas(pr_files, &cfg.areas);
     if redraw.is_empty() {
         return StaleShotsAction::NotApplicable {
-            reason: "PR touches no pixel-input files".to_string(),
+            reason: "train touches no pixel-input files".to_string(),
         };
     }
     let sha = heads.get(&pr).cloned().unwrap_or_default();
@@ -241,8 +243,8 @@ pub fn stale_shots_step(
         sha,
         redraw_areas: redraw.into_iter().collect(),
         reason: format!(
-            "single-PR #{pr} failed only in pixel areas {:?}; refreshing goldens and invalidating proof for new commit",
-            failed_areas
+            "passing train {passed:?} redrew non-golden screenshots in pixel areas {:?}; committing on top of PR #{pr} and invalidating proof for new commit",
+            proved_areas
         ),
     }
 }
@@ -587,6 +589,29 @@ pub(super) fn complete_green_run(
             format!("{reason_prefix}: missing structured proof for area(s) {missing:?} (R27)"),
         )
     } else {
+        let proved_keys: Vec<String> = proved.keys().cloned().collect();
+        let touched: Vec<String> = merged
+            .iter()
+            .filter_map(|p| ctx.pr_files.get(p))
+            .flat_map(|f| f.iter().cloned())
+            .collect();
+        if matches!(outcome_base, Outcome::Green) {
+            if let StaleShotsAction::RefreshAndInvalidate {
+                pr,
+                sha,
+                redraw_areas,
+                reason,
+            } = stale_shots_step(&merged, &st.heads, &proved_keys, &touched, &ctx.cfg)
+            {
+                extra_actions.push(VerifyAction::RefreshStaleShots {
+                    pr,
+                    sha,
+                    areas: redraw_areas,
+                    reason,
+                });
+                return (st, extra_actions);
+            }
+        }
         let outcome = outcome_base.skips_adjusted(&st.all_skipped);
         let skip_note = if st.all_skipped.is_empty() {
             String::new()

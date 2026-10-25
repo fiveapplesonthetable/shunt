@@ -571,38 +571,21 @@ fn log_tail(path: &Path, n: usize) -> String {
     }
 }
 
-/// An inotify instance watching the parent directory of each awaited path.
+/// An inotify instance watching the parent directory of each awaited path,
+/// falling back cleanly to `libc::poll` if the host has exhausted `fs.inotify.max_user_instances`.
 struct DirWatch {
-    fd: std::os::fd::OwnedFd,
+    fd: Option<std::os::fd::OwnedFd>,
 }
 
 impl DirWatch {
     /// Watches the exact parent directory of every path in `awaited`.
-    ///
-    /// # Panics
-    ///
-    /// With an actionable message naming `what`, the awaited paths and
-    /// `fs.inotify.max_user_instances` if no inotify instance is available,
-    /// or if a parent directory cannot be watched.
-    fn new(awaited: &[&Path], what: &str) -> Self {
+    fn new(awaited: &[&Path], _what: &str) -> Self {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
-        let names = || {
-            awaited
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         // SAFETY: plain syscall.
         let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if raw < 0 {
-            panic!(
-                "cannot wait for {what} ({}): inotify_init1 failed ({}); the user is out of \
-                 inotify instances, raise fs.inotify.max_user_instances",
-                names(),
-                io::Error::last_os_error()
-            );
+            return Self { fd: None };
         }
         // SAFETY: `raw` is a fresh fd we own.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -619,28 +602,34 @@ impl DirWatch {
             // SAFETY: valid fd and NUL-terminated path.
             let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c_dir.as_ptr(), mask) };
             if wd < 0 {
-                panic!(
-                    "cannot wait for {what}: inotify_add_watch({}) failed ({}); the directory \
-                     must exist (raise fs.inotify.max_user_watches if ENOSPC)",
-                    dir.display(),
-                    io::Error::last_os_error()
-                );
+                return Self { fd: None };
             }
         }
-        Self { fd }
+        Self { fd: Some(fd) }
     }
 
     /// Blocks until an event arrives (then drains the queue) or `deadline`
     /// passes. Returns `false` only on deadline expiry.
     fn wait_event(&self, deadline: Instant) -> bool {
         use std::os::fd::AsRawFd;
-        if !poll_readable(self.fd.as_raw_fd(), Some(deadline)) {
+        let Some(ref fd) = self.fd else {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let rem_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .clamp(1, 5) as libc::c_int;
+            unsafe { libc::poll(std::ptr::null_mut(), 0, rem_ms) };
+            return Instant::now() < deadline;
+        };
+        if !poll_readable(fd.as_raw_fd(), Some(deadline)) {
             return false;
         }
         let mut buf = [0u8; 4096];
         // SAFETY: valid fd and buffer; the fd is non-blocking, so this drains
         // pending events and stops at EAGAIN.
-        while unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
         true
     }
 }

@@ -104,8 +104,34 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
             println!("Would land train {}: PRs {:?}", open.id, open.prs);
             return Ok(());
         }
+        let gh_forge = std::env::var("TACHO_GH_REPO")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(tacho_core::decide::plugin::GitHubForge::new);
+        let post_merge_tree = if let Some(ref forge) = gh_forge {
+            use tacho_core::decide::plugin::ForgePlugin;
+            for &pr in &open.prs {
+                let _ = forge.mark_pr_ready(pr);
+                forge.merge_pr(pr).map_err(io::Error::other)?;
+            }
+            let _ = Command::new("git")
+                .args(["fetch", "-q", "origin", "main"])
+                .current_dir(&cwd)
+                .status();
+            Command::new("git")
+                .args(["rev-parse", "origin/main^{tree}"])
+                .current_dir(&cwd)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| current_tree.clone())
+        } else {
+            current_tree.clone()
+        };
         let mut landed = finished(&open);
-        if let Some(err) = mismatch(&landed, &current_tree) {
+        if let Some(err) = mismatch(&landed, &post_merge_tree) {
             landed.status = "mismatch".to_string();
             store.mutate(Some(("land", "train_mismatch", &open.id, &err)), |st| {
                 for t in &mut st.trains {
@@ -122,6 +148,14 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
                 now_ns(),
             )?;
             emit_decision_event(&format!("train:{}", open.id), "land:mismatch", &err);
+            let _ = tacho_core::decide::plugin::notify_owner_command(
+                &format!("[tacho] train {} mismatch", open.id),
+                &err,
+            );
+            if let Some(ref forge) = gh_forge {
+                use tacho_core::decide::plugin::ForgePlugin;
+                let _ = forge.set_issue(&format!("train {} mismatch", open.id), &err);
+            }
             return Err(io::Error::other(err));
         }
         let because = format!("landed train {} (PRs {:?})", open.id, open.prs);

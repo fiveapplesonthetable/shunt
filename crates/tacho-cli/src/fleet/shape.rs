@@ -234,15 +234,36 @@ pub fn replay_pr_branch(
                 String::from_utf8_lossy(&br_out.stderr).trim()
             )));
         }
-        let _ = Command::new("git")
-            .args([
-                "push",
-                "--force-with-lease",
-                "origin",
-                &format!("{new_head}:refs/heads/{}", pr.branch),
-            ])
+        let has_origin = Command::new("git")
+            .args(["remote", "get-url", "origin"])
             .current_dir(repo_dir)
-            .output();
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if has_origin {
+            let lease = if pr.head.is_empty() {
+                "--force-with-lease".to_string()
+            } else {
+                format!("--force-with-lease={}:{}", pr.branch, pr.head)
+            };
+            let push_out = Command::new("git")
+                .args([
+                    "push",
+                    "-q",
+                    "--no-verify",
+                    &lease,
+                    "origin",
+                    &format!("{new_head}:refs/heads/{}", pr.branch),
+                ])
+                .current_dir(repo_dir)
+                .output()?;
+            if !push_out.status.success() {
+                return Err(io::Error::other(format!(
+                    "git push --no-verify {lease} origin {new_head}:refs/heads/{} failed: {}",
+                    pr.branch,
+                    String::from_utf8_lossy(&push_out.stderr).trim()
+                )));
+            }
+        }
         let because = format!(
             "replayed PR #{} ({}) onto {} -> {}",
             pr.number,
@@ -433,4 +454,111 @@ pub fn execute_replay(args: ReplayArgs) -> io::Result<()> {
         io::ErrorKind::NotFound,
         format!("batch, PR, or decision tick '{}' not found", args.batch_id),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_pr_branch_force_with_lease_rejects_stale_remote_and_preserves_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin_dir = dir.path().join("origin.git");
+        let repo_dir = dir.path().join("repo");
+        let other_dir = dir.path().join("other");
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let run = |cwd: &Path, args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} in {} failed", cwd.display());
+        };
+        run(&origin_dir, &["init", "--bare", "-q", "-b", "main"]);
+        run(&repo_dir, &["init", "-q", "-b", "main"]);
+        run(&repo_dir, &["config", "user.email", "t@example.com"]);
+        run(&repo_dir, &["config", "user.name", "Tester"]);
+        run(
+            &repo_dir,
+            &["remote", "add", "origin", origin_dir.to_str().unwrap()],
+        );
+
+        std::fs::write(repo_dir.join("base.txt"), "v1\n").unwrap();
+        run(&repo_dir, &["add", "base.txt"]);
+        run(&repo_dir, &["commit", "-q", "-m", "init"]);
+        run(&repo_dir, &["push", "-q", "-u", "origin", "main"]);
+
+        // Create PR branch `feat/lease`
+        run(&repo_dir, &["checkout", "-q", "-b", "feat/lease"]);
+        std::fs::write(repo_dir.join("feat.txt"), "feature v1\n").unwrap();
+        run(&repo_dir, &["add", "feat.txt"]);
+        run(&repo_dir, &["commit", "-q", "-m", "feat 1"]);
+        let old_pr_head = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).unwrap();
+        run(&repo_dir, &["push", "-q", "-u", "origin", "feat/lease"]);
+
+        // Advance `main` cleanly
+        run(&repo_dir, &["checkout", "-q", "main"]);
+        std::fs::write(repo_dir.join("base.txt"), "v2\n").unwrap();
+        run(&repo_dir, &["add", "base.txt"]);
+        run(&repo_dir, &["commit", "-q", "-m", "advance main"]);
+        run(&repo_dir, &["push", "-q", "origin", "main"]);
+
+        // Clone into `other_dir` and advance `origin/feat/lease` behind `repo_dir`'s back!
+        run(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin_dir.to_str().unwrap(),
+                other_dir.to_str().unwrap(),
+            ],
+        );
+        run(&other_dir, &["config", "user.email", "o@example.com"]);
+        run(&other_dir, &["config", "user.name", "Other"]);
+        run(
+            &other_dir,
+            &["checkout", "-q", "-b", "feat/lease", "origin/feat/lease"],
+        );
+        std::fs::write(other_dir.join("feat.txt"), "concurrent push\n").unwrap();
+        run(&other_dir, &["add", "feat.txt"]);
+        run(&other_dir, &["commit", "-q", "-m", "concurrent commit"]);
+        run(&other_dir, &["push", "-q", "origin", "feat/lease"]);
+
+        let mut store = FleetStore::open(&dir.path().join("events.sqlite")).unwrap();
+        let pr = PullFacts {
+            number: 77,
+            title: "Feature lease".to_string(),
+            branch: "feat/lease".to_string(),
+            base: "main".to_string(),
+            head: old_pr_head.clone(),
+            state: "OPEN".to_string(),
+            mergeable: "CONFLICTING".to_string(),
+            files: vec!["feat.txt".to_string()],
+            ..Default::default()
+        };
+        store
+            .mutate(None, |st| {
+                st.open_prs_cache.push(pr.clone());
+            })
+            .unwrap();
+
+        let res = replay_pr_branch(&mut store, &repo_dir, &pr, false);
+        assert!(
+            res.is_err(),
+            "replay_pr_branch must fail when --force-with-lease detects moved remote branch"
+        );
+        let st = store.load().unwrap();
+        assert!(
+            !st.rebase_attempts.contains_key(&77),
+            "store.rebase_attempts must not be mutated when push fails"
+        );
+        assert_eq!(
+            st.open_prs_cache[0].head, old_pr_head,
+            "store.open_prs_cache head must remain untouched when push fails"
+        );
+        assert_eq!(st.open_prs_cache[0].mergeable, "CONFLICTING");
+    }
 }

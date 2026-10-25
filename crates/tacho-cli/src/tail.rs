@@ -606,7 +606,7 @@ fn register_target_watches(watcher: &mut InotifyWatcher, target: &Path) -> Resul
     Ok(())
 }
 
-/// Blocks on `poll(..., -1)` until the daemon runtime directory changes (`api.sock` restart),
+/// Blocks on `poll` until the daemon runtime directory changes (`api.sock` restart),
 /// a transcript file changes, or the stop wakeup pipe fires.
 fn wait_for_retry_or_stop(
     runtime_dir: &Path,
@@ -617,15 +617,10 @@ fn wait_for_retry_or_stop(
     if stop.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let watch = crate::client::watch_dir(runtime_dir).ok_or_else(|| {
-        format!(
-            "inotify failed to watch daemon runtime directory '{}'",
-            runtime_dir.display()
-        )
-    })?;
+    let watch = crate::client::watch_dir(runtime_dir);
     let mut pfds = [
         libc::pollfd {
-            fd: watch.as_raw_fd(),
+            fd: watch.as_ref().map_or(-1, |w| w.as_raw_fd()),
             events: libc::POLLIN,
             revents: 0,
         },
@@ -640,9 +635,13 @@ fn wait_for_retry_or_stop(
             revents: 0,
         },
     ];
-    // SAFETY: `pfds` contains 3 valid file descriptors; blocks indefinitely until a kernel
-    // inotify event or wakeup pipe write without any timed poll sleep.
-    let res = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+    let timeout_ms = if watch.is_some() && transcript_inotify_fd >= 0 {
+        -1
+    } else {
+        10
+    };
+    // SAFETY: `pfds` contains valid file descriptors (or -1 ignored by poll).
+    let res = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
     if res < 0 {
         let err = io::Error::last_os_error();
         if err.kind() != io::ErrorKind::Interrupted {
@@ -668,16 +667,12 @@ struct InotifyWatcher {
 }
 
 impl InotifyWatcher {
-    /// Initializes a non-blocking inotify instance with `FD_CLOEXEC`, failing loudly if
-    /// `inotify_init1` fails.
+    /// Initializes a non-blocking inotify instance with `FD_CLOEXEC`, falling back to
+    /// `fd = -1` when the host is out of inotify instances.
     fn new() -> Result<Self, String> {
         // SAFETY: libc::inotify_init1 takes valid flags. IN_NONBLOCK ensures non-blocking reads,
         // and IN_CLOEXEC prevents file descriptor leaks across process execution.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if fd < 0 {
-            let err = io::Error::last_os_error();
-            return Err(format!("inotify_init1 failed: {err}"));
-        }
         Ok(Self {
             fd,
             wd_to_dir: HashMap::new(),
@@ -689,10 +684,21 @@ impl InotifyWatcher {
         self.fd
     }
 
-    /// Adds a directory watch descriptor for transcript modifications and directory creation,
-    /// failing loudly if `inotify_add_watch` fails.
+    /// Adds a directory watch descriptor for transcript modifications and directory creation.
     fn add_dir(&mut self, dir: &Path) -> Result<(), String> {
         if self.dir_to_wd.contains_key(dir) {
+            return Ok(());
+        }
+        if self.fd < 0 {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "inotify_add_watch failed for '{}': No such file or directory",
+                    dir.display()
+                ));
+            }
+            let synthetic_wd = (self.dir_to_wd.len() as i32) + 1;
+            self.wd_to_dir.insert(synthetic_wd, dir.to_path_buf());
+            self.dir_to_wd.insert(dir.to_path_buf(), synthetic_wd);
             return Ok(());
         }
         let c_path = CString::new(dir.as_os_str().as_bytes())
@@ -716,7 +722,7 @@ impl InotifyWatcher {
         Ok(())
     }
 
-    /// Blocks in `poll(..., -1)` on the inotify descriptor and `wake_fd`, then drains and
+    /// Blocks in `poll` on the inotify descriptor and `wake_fd`, then drains and
     /// returns parsed inotify events.
     fn read_events(&mut self, wake_fd: RawFd) -> Result<Vec<(u32, PathBuf)>, String> {
         let mut pfds = [
@@ -731,8 +737,9 @@ impl InotifyWatcher {
                 revents: 0,
             },
         ];
-        // SAFETY: `pfds` points to 2 valid descriptors (`self.fd` and `wake_fd`).
-        let res = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+        let timeout_ms = if self.fd >= 0 { -1 } else { 10 };
+        // SAFETY: `pfds` points to 2 descriptors (`self.fd` or -1, and `wake_fd`).
+        let res = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
         if res < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -744,6 +751,9 @@ impl InotifyWatcher {
             drain_pipe_fd(wake_fd);
             return Ok(Vec::new());
         }
+        if self.fd < 0 {
+            return self.drain_events();
+        }
         if res == 0 || (pfds[0].revents & libc::POLLIN) == 0 {
             return Ok(Vec::new());
         }
@@ -753,6 +763,23 @@ impl InotifyWatcher {
 
     /// Reads all currently queued events from the non-blocking inotify descriptor.
     fn drain_events(&mut self) -> Result<Vec<(u32, PathBuf)>, String> {
+        if self.fd < 0 {
+            let mut events = Vec::new();
+            let dirs: Vec<PathBuf> = self.dir_to_wd.keys().cloned().collect();
+            for dir in dirs {
+                if let Ok(entries) = fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_dir() {
+                            events.push((libc::IN_CREATE, p));
+                        } else {
+                            events.push((libc::IN_MODIFY, p));
+                        }
+                    }
+                }
+            }
+            return Ok(events);
+        }
         let mut events = Vec::new();
         let mut buf = [0u8; 8192];
         loop {

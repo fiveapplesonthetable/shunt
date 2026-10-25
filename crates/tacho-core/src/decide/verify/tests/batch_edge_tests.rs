@@ -232,6 +232,7 @@ fn test_redraw_areas_and_stale_shots_invalidation() {
 
     let mut cfg = VerifyConfig::default();
     cfg.areas = cfg_areas;
+    cfg.reruns = 0;
     let heads = heads_for(&[7]);
     assert!(matches!(
         stale_shots_step(
@@ -244,14 +245,48 @@ fn test_redraw_areas_and_stale_shots_invalidation() {
         StaleShotsAction::RefreshAndInvalidate { pr: 7, .. }
     ));
 
-    let st = make_state(&[7], &["gate", "pixel"]);
+    // Golden pixel failure on red is a strict test failure (Outcome::Red), never auto-refreshed on red.
+    let st_red = make_state(&[7], &["gate", "pixel"]);
+    let mut pr_files = BTreeMap::new();
+    pr_files.insert(7, vec!["apps/console/src/App.tsx".to_string()]);
     let ctx = VerifyCtx {
         cfg,
+        pr_files,
         ..Default::default()
     };
+    let (_, red_verdict, red_acts) =
+        run_batch_to_verdict(st_red, &ctx, 1000, |members, _, _, _| {
+            let m: Vec<u64> = members.iter().map(|m| m.pr).collect();
+            red_check(
+                &m,
+                &["gate"],
+                &["pixel"],
+                "golden pixel mismatch",
+                Some("t-red"),
+            )
+        });
+    assert_eq!(red_verdict.outcome, Outcome::Red);
+    assert!(!red_acts
+        .iter()
+        .any(|a| matches!(a, VerifyAction::RefreshStaleShots { .. })));
+
+    // Passing (green) batch that touches pixel inputs triggers RefreshStaleShots and invalidates proof (ShotsUpdated).
+    let st = make_state(&[7], &["gate", "pixel"]);
     let (st2, _) = step(&st, &VerifyEvent::Start { now: 1000 }, &ctx);
-    let (_, acts) = step(
+    let (st3, green_acts) = step(
         &st2,
+        &VerifyEvent::RunCompleted {
+            run_label: st.batch_id.clone(),
+            result: green_check(&[7], &["gate", "pixel"], Some("t-green")),
+            now: 1005,
+        },
+        &ctx,
+    );
+    assert!(green_acts
+        .iter()
+        .any(|a| matches!(a, VerifyAction::RefreshStaleShots { pr: 7, .. })));
+    let (_, acts) = step(
+        &st3,
         &VerifyEvent::ShotsRefreshed {
             pr: 7,
             new_sha: "sha7-refreshed".to_string(),

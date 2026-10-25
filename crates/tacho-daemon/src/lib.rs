@@ -4,6 +4,7 @@ pub mod appender;
 pub mod cgroup;
 pub mod config;
 pub mod daemon;
+pub mod exec;
 pub mod fleet;
 pub mod log;
 pub mod paths;

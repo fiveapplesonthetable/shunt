@@ -3,74 +3,22 @@
 //! checks, and `--stale-runs DAYS`.
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::io;
-use std::path::Path;
-use std::process::Command;
 
 use tacho_core::decide::dispatch::retire;
-use tacho_core::decide::watch::{
-    decide_tidy, stale_runs, zombie_lines, ProcEntry, TidyDecision, TidySnapshot, WorktreeCandidate,
-};
+use tacho_core::decide::watch::{decide_tidy, stale_runs, zombie_lines, TidySnapshot};
 use tacho_core::decide::{decide, DecisionState, WorldObservation};
+pub use tacho_daemon::exec::tidy::{
+    apply_tidy_decisions, rescue_worktree, scan_live_process_holds, LiveProcessHolds,
+};
 use tacho_daemon::{FleetState, FleetStore};
 
 use crate::cli::TidyArgs;
 
 use super::store::{
-    git_stdout, live_agent_keys, mutate_fleet_meta, now_secs, open_fleet_store, pid_alive_matching,
-    RetiredMeta,
+    live_agent_keys, mutate_fleet_meta, now_secs, open_fleet_store, pid_alive_matching, RetiredMeta,
 };
 use super::watch::scan_procs;
-
-/// Paths and ports held open by live processes on the host (`cwd`, `argv`, `/proc/<pid>/fd`).
-#[derive(Debug, Clone, Default)]
-pub struct LiveProcessHolds {
-    pub paths: BTreeSet<String>,
-    pub ports: BTreeSet<u16>,
-}
-
-/// Scans `/proc` and `procs` for any worktree paths referenced by live process `cwd`, `argv`,
-/// or open file descriptors (`/proc/<pid>/fd/*`).
-pub fn scan_live_process_holds(
-    procs: &[ProcEntry],
-    candidate_paths: &[String],
-) -> LiveProcessHolds {
-    let mut holds = LiveProcessHolds::default();
-    if candidate_paths.is_empty() {
-        return holds;
-    }
-
-    for p in procs {
-        for cand in candidate_paths {
-            if cand.is_empty() {
-                continue;
-            }
-            if (!p.cwd.is_empty() && (p.cwd == *cand || p.cwd.starts_with(&format!("{cand}/"))))
-                || p.args.contains(cand)
-            {
-                holds.paths.insert(cand.clone());
-            }
-        }
-        let fd_dir = format!("/proc/{}/fd", p.pid);
-        if let Ok(entries) = fs::read_dir(&fd_dir) {
-            for entry in entries.flatten() {
-                if let Ok(target) = fs::read_link(entry.path()) {
-                    let target_str = target.to_string_lossy();
-                    for cand in candidate_paths {
-                        if !cand.is_empty()
-                            && (target_str == *cand || target_str.starts_with(&format!("{cand}/")))
-                        {
-                            holds.paths.insert(cand.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    holds
-}
 
 /// Builds a [`TidySnapshot`] from [`FleetState`] and live process holds.
 pub fn build_tidy_snapshot(
@@ -78,164 +26,12 @@ pub fn build_tidy_snapshot(
     live_keys: &BTreeSet<String>,
     now: i64,
 ) -> TidySnapshot {
-    let mut live_wt = BTreeSet::new();
-    let mut held_ports = BTreeSet::new();
-    for a in state.agents.values() {
-        if live_keys.contains(&a.key) && !a.worktree.is_empty() {
-            live_wt.insert(a.worktree.clone());
-        }
-    }
-    for wt in state.worktrees.values() {
-        if live_wt.contains(&wt.path) {
-            for p in wt.port..=wt.port_last {
-                held_ports.insert(p);
-            }
-        }
-    }
-
-    let mut wt_candidates = Vec::new();
-    for wt in state.worktrees.values() {
-        let p = Path::new(&wt.path);
-        if !p.exists() {
-            continue;
-        }
-        let dirty = Command::new("git")
-            .args(["-C", &wt.path, "status", "--porcelain"])
-            .output()
-            .ok()
-            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-            .unwrap_or(false);
-        let unpushed = Command::new("git")
-            .args([
-                "-C",
-                &wt.path,
-                "rev-list",
-                "--count",
-                &format!("{}..HEAD", wt.base_sha),
-            ])
-            .output()
-            .ok()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        let pr_merged_or_closed = state
-            .agents
-            .get(&wt.slug)
-            .and_then(|a| a.pr)
-            .is_some_and(|pr| state.merged_prs.contains(&pr) || state.closed_prs.contains(&pr));
-        wt_candidates.push(WorktreeCandidate {
-            path: wt.path.clone(),
-            branch: wt.branch.clone(),
-            age_secs: (now - wt.created_at).max(0),
-            dirty,
-            unpushed_commits: unpushed,
-            pr_merged_or_closed,
-        });
-    }
-
-    TidySnapshot {
+    tacho_daemon::exec::observe::build_tidy_snapshot(
+        state,
+        &tacho_core::LiveState::default(),
+        live_keys,
         now,
-        worktrees: wt_candidates,
-        checkouts: Vec::new(),
-        containers: Vec::new(),
-        networks: Vec::new(),
-        live_agent_worktrees: live_wt,
-        live_batch_worktrees: BTreeSet::new(),
-        held_paths: BTreeSet::new(),
-        held_ports,
-    }
-}
-
-/// Executes [`TidyDecision`] items against the worktree filesystem and [`FleetStore`].
-pub fn apply_tidy_decisions(
-    store: &mut FleetStore,
-    decisions: &[TidyDecision],
-    now: i64,
-    dry_run: bool,
-) -> io::Result<()> {
-    for d in decisions {
-        match d {
-            TidyDecision::RemoveTree {
-                path,
-                rescue,
-                because,
-            } => {
-                println!(
-                    "{}RemoveTree {path} (rescue={rescue}): {because}",
-                    if dry_run { "[dry-run] " } else { "" }
-                );
-                if !dry_run {
-                    if *rescue {
-                        if let Err(e) = rescue_worktree(store, Path::new(path), now) {
-                            let msg = format!("keeping worktree {path}: rescue failed: {e}");
-                            eprintln!("[tacho-fleet] {msg}");
-                            store.record_decision("watch", "rescue_failed", path, &msg)?;
-                            continue;
-                        }
-                    }
-                    remove_worktree(store, path, because)?;
-                }
-            }
-            other => {
-                println!("{}{:?}", if dry_run { "[dry-run] " } else { "" }, other);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Removes a worktree and forgets it, reporting (not swallowing) failures. The store entry is
-/// kept when git refuses, so a later tidy retries instead of leaking an untracked directory.
-fn remove_worktree(store: &mut FleetStore, path: &str, because: &str) -> io::Result<()> {
-    let out = Command::new("git")
-        .args(["worktree", "remove", "--force", path])
-        .output()?;
-    if !out.status.success() && Path::new(path).exists() {
-        return Err(io::Error::other(format!(
-            "git worktree remove {path} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    store.mutate(Some(("watch", "remove_worktree", path, because)), |st| {
-        st.worktrees.retain(|_, w| w.path != path);
-    })
-}
-
-/// Archives a worktree's full state (tracked, untracked, unpushed) as a commit under
-/// `refs/heads/rescue/<slug>-<now>` (and `refs/tacho/rescue/<slug>-<now>`) without touching
-/// `git stash` or the real git index.
-pub fn rescue_worktree(store: &mut FleetStore, wt_p: &Path, now: i64) -> io::Result<String> {
-    let slug = wt_p
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("worktree");
-    let tree_sha = crate::kit::tree_of_worktree(wt_p)?;
-    // An unborn branch has no HEAD, so the snapshot becomes a root commit; any other
-    // rev-parse failure would silently drop history from the rescue, so it is reported.
-    let has_head = git_stdout(wt_p, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).is_ok();
-    let parent_sha = if has_head {
-        git_stdout(wt_p, &["rev-parse", "HEAD"])?
-    } else {
-        String::new()
-    };
-    let message = format!("tacho rescue snapshot for {slug}");
-    let mut commit_args = vec!["commit-tree", tree_sha.as_str()];
-    if !parent_sha.is_empty() {
-        commit_args.extend(["-p", parent_sha.as_str()]);
-    }
-    commit_args.extend(["-m", message.as_str()]);
-    let commit_sha = git_stdout(wt_p, &commit_args)?;
-    let rescue_branch_ref = format!("refs/heads/rescue/{slug}-{now}");
-    let rescue_tacho_ref = format!("refs/tacho/rescue/{slug}-{now}");
-    git_stdout(wt_p, &["update-ref", &rescue_branch_ref, &commit_sha])?;
-    git_stdout(wt_p, &["update-ref", &rescue_tacho_ref, &commit_sha])?;
-    let because = format!("archived dirty/unpushed worktree to {rescue_branch_ref} ({commit_sha})");
-    store.record_decision("watch", "rescue_worktree", slug, &because)?;
-    Ok(rescue_branch_ref)
+    )
 }
 
 /// Retires unfinished/stopped agent runs older than `days` (`>= 1`) that have no open PR.

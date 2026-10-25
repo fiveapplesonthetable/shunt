@@ -91,36 +91,30 @@ fn test_wedged_appender_trace_oracle() {
     let trace_file = temp.path().join("wedged.pftrace");
     fs::write(&trace_file, &trace_bytes).unwrap();
 
-    let output = Command::new(&tp_path)
+    let out = Command::new(&tp_path)
         .arg(&trace_file)
         .arg("-Q")
         .arg("SELECT name, value, severity FROM stats WHERE severity IN ('error', 'data_loss') AND value > 0;")
-        .output();
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run trace_processor_shell at {tp_path}: {e}"));
 
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success(),
-            "trace_processor_shell failed: {}\n{}",
-            stdout,
-            stderr
-        );
-        let trimmed = stdout.trim();
-        // Skip CSV header line if present
-        let error_rows: Vec<&str> = trimmed
-            .lines()
-            .filter(|l| !l.starts_with("\"name\"") && !l.is_empty())
-            .collect();
-        assert!(
-            error_rows.is_empty(),
-            "Oracle reported errors in trace: {:?}",
-            error_rows
-        );
-    } else {
-        eprintln!(
-            "Notice: trace_processor_shell not found at {}, skipping oracle execution",
-            tp_path
-        );
-    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "trace_processor_shell failed: {}\n{}",
+        stdout,
+        stderr
+    );
+    let trimmed = stdout.trim();
+    // Skip CSV header line if present
+    let error_rows: Vec<&str> = trimmed
+        .lines()
+        .filter(|l| !l.starts_with("\"name\"") && !l.is_empty())
+        .collect();
+    assert!(
+        error_rows.is_empty(),
+        "Oracle reported errors in trace: {:?}",
+        error_rows
+    );
 }

@@ -92,6 +92,10 @@ pub struct FleetState {
     pub batch_timeout_secs: Option<u64>,
     /// Main's last completed CI run as last observed by the hands; `None` when unknown.
     pub main_ci: Option<tacho_core::decide::ops::snapshot::MainCiRun>,
+    /// Remote main sha as last fetched by the world refresher; `None` when unknown.
+    pub main_sha: Option<String>,
+    /// Epoch seconds of the last successful forge refresh, per source (`prs`, `main`, `ci`).
+    pub world_refreshed_at: BTreeMap<String, i64>,
 }
 
 impl Default for FleetState {
@@ -138,6 +142,8 @@ impl Default for FleetState {
             refused_self_update_sha: None,
             batch_timeout_secs: None,
             main_ci: None,
+            main_sha: None,
+            world_refreshed_at: BTreeMap::new(),
         }
     }
 }
@@ -733,221 +739,67 @@ fn canonical_hash<T: Serialize>(value: &T) -> io::Result<u64> {
     Ok(h.finish())
 }
 
-/// Converts persistent [`FleetState`] into the pure [`DecisionState`] input to [`tacho_core::decide::decide`].
+/// Converts persistent [`FleetState`] into the pure [`DecisionState`] input to
+/// [`tacho_core::decide::decide`] (flake tasks included).
 pub fn decision_state_of(state: &FleetState) -> DecisionState {
-    DecisionState {
-        max_parallel: state.max_workers,
-        todo: state.todo.clone(),
-        agents: state.agents.clone(),
-        retired: state.retired.clone(),
-        holds: state.holds.clone(),
-        passed: state.passed.clone(),
-        failed: state.failed.clone(),
-        merged_prs: state.merged_prs.clone(),
-        closed_prs: state.closed_prs.clone(),
-        batches: state.batches.clone(),
-        flakes: state.flakes.clone(),
-        samples: state.samples.clone(),
-        nudged: state.nudged.clone(),
-        rebase_attempts: state.rebase_attempts.clone(),
-        fix_notified: state.fix_notified.clone(),
-        notified_keys: state.notified_failures.clone(),
-        area_rules: state.area_rules.clone(),
-        refused_self_update_sha: state.refused_self_update_sha.clone(),
-        last_tick_ts: state.last_tick_ts,
-        inbox: state.inbox.clone(),
-        last_watchdog_alert_ts: state.last_watchdog_alert_ts,
-        tidy_min_age_secs: 3_600,
-    }
-}
-
-/// Batches that finished as a definite pass or fail since the previous tick.
-///
-/// Flakes and still-running batches are excluded so a flake is never fed back as a pass,
-/// and older outcomes are not replayed on every tick.
-pub fn new_batch_outcomes(state: &FleetState) -> Vec<tacho_core::decide::BatchOutcomeObs> {
-    let prev_tick_ts = state.last_tick_ts.unwrap_or(0);
-    state
-        .batches
-        .iter()
-        .filter(|b| b.finished_at.is_some_and(|t| t > prev_tick_ts))
-        .filter(|b| b.status == "passed" || b.status == "failed")
-        .map(|b| tacho_core::decide::BatchOutcomeObs {
-            batch_id: b.id.clone(),
-            passed: b.status == "passed",
-            failed_area: b.areas.first().cloned(),
-            log_output: b.log.clone(),
-            tree_sha: b.tree.clone().unwrap_or_default(),
-        })
-        .collect()
-}
-
-fn has_git_dir(start: &Path) -> bool {
-    let mut cur = Some(start);
-    while let Some(dir) = cur {
-        if dir.join(".git").exists() {
-            return true;
-        }
-        cur = dir.parent();
-    }
-    false
+    crate::exec::observe::decision_state_of(state, now_secs())
 }
 
 /// Resolves `HEAD` SHA in `repo` when `repo` is inside a git checkout.
 pub fn git_head_sha(repo: &Path) -> Option<String> {
-    if !has_git_dir(repo) {
+    if !crate::exec::observe::inside_git_checkout(repo) {
         return None;
     }
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
-}
-
-/// Resolves a non-empty `main_sha` from fleet state, active worktrees/cwds, or git,
-/// defaulting to 40 zeros when running outside any git repository so `main_sha` is never empty.
-/// Main-CI observation for `decide`: the persisted last completed run, with each
-/// `main-broken` batch's main checked for ancestry in the first known git checkout.
-fn observe_main_ci(state: &FleetState) -> Option<tacho_core::decide::verify::MainCiObs> {
-    let repo = state
-        .worktrees
-        .values()
-        .map(|w| Path::new(&w.path))
-        .chain(state.agents.values().map(|a| Path::new(&a.worktree)))
-        .find(|p| !p.as_os_str().is_empty() && has_git_dir(p));
-    tacho_core::decide::verify::unbreak::observe_main_ci(
-        state.main_ci.as_ref(),
-        &state.batches,
-        |a, b| {
-            repo.is_some_and(|repo| {
-                std::process::Command::new("git")
-                    .args(["merge-base", "--is-ancestor", a, b])
-                    .current_dir(repo)
-                    .stdin(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success())
-            })
-        },
+    crate::sampler::run_git(
+        repo,
+        &["rev-parse", "HEAD"],
+        std::time::Duration::from_secs(5),
     )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
-pub fn resolve_autonomous_main_sha(
+/// The newest main sha fleet state already knows (batches, passed PRs, worktree bases, or the
+/// HEAD of a known checkout). `None` when nothing is known; never invented.
+pub fn known_main_sha(
     home_dir: &Path,
     state: &FleetState,
     live_state: &tacho_core::LiveState,
-) -> String {
-    for b in state.batches.iter().rev() {
-        if !b.main_sha.trim().is_empty() {
-            return b.main_sha.clone();
-        }
-    }
-    for p in state.passed.values() {
-        if !p.main_sha.trim().is_empty() {
-            return p.main_sha.clone();
-        }
-    }
-    for w in state.worktrees.values() {
-        if !w.base_sha.trim().is_empty() {
-            return w.base_sha.clone();
-        }
-        if !w.path.is_empty() {
-            if let Some(sha) = git_head_sha(Path::new(&w.path)) {
-                return sha;
-            }
-        }
-    }
-    for a in state.agents.values() {
-        if !a.worktree.is_empty() {
-            if let Some(sha) = git_head_sha(Path::new(&a.worktree)) {
-                return sha;
-            }
-        }
-    }
-    for a in live_state.agents.values() {
-        if let Some(ref cwd) = a.cwd {
-            if let Some(sha) = git_head_sha(Path::new(cwd)) {
-                return sha;
-            }
-        }
-    }
-    if let Some(sha) = git_head_sha(home_dir) {
-        return sha;
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(sha) = git_head_sha(&cwd) {
-            return sha;
-        }
-    }
-    "0".repeat(40)
-}
-
-/// Scans `/proc` for runaway CPU burner processes (`yes`, `stress`, `stress-ng`)
-/// running `>= BURNER_MIN_AGE_SECS` that were not launched by `tacho starve` (`TACHO_STARVE=1`).
-pub fn observe_proc_burners() -> Vec<tacho_core::decide::BurnerProcess> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let uptime_secs = std::fs::read_to_string("/proc/uptime")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let clk_tck = crate::sampler::get_clock_ticks_per_sec().max(1) as f64;
-    let page_size = crate::sampler::get_page_size();
-    let mut stat_buf = [0u8; 1024];
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid_str) = name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        let Some(stat) =
-            crate::sampler::read_process_stat_and_comm_slice(pid, page_size, &mut stat_buf)
-        else {
-            continue;
-        };
-        let comm = String::from_utf8_lossy(&stat_buf[stat.comm_start..stat.comm_end]).into_owned();
-        if !matches!(comm.as_str(), "yes" | "stress" | "stress-ng" | "timeout") {
-            continue;
-        }
-        let start_secs = (stat.start_ticks as f64) / clk_tck;
-        let elapsed_secs = (uptime_secs - start_secs).max(0.0) as i64;
-        if elapsed_secs < tacho_core::decide::watch::BURNER_MIN_AGE_SECS {
-            continue;
-        }
-        let args = crate::sampler::read_process_cmdline(pid, &comm);
-        let Some(burner_comm) = tacho_core::decide::watch::burner_command(&comm, &args) else {
-            continue;
-        };
-        let env_starve = std::fs::read(format!("/proc/{pid}/environ"))
-            .map(|bytes| {
-                bytes
-                    .split(|&b| b == 0)
-                    .any(|kv| kv == b"TACHO_STARVE=1" || kv.starts_with(b"TACHO_STARVE=1"))
+) -> Option<String> {
+    let non_empty = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+    state
+        .batches
+        .iter()
+        .rev()
+        .find_map(|b| non_empty(&b.main_sha))
+        .or_else(|| state.passed.values().find_map(|p| non_empty(&p.main_sha)))
+        .or_else(|| {
+            state.worktrees.values().find_map(|w| {
+                non_empty(&w.base_sha)
+                    .or_else(|| (!w.path.is_empty()).then(|| git_head_sha(Path::new(&w.path)))?)
             })
-            .unwrap_or(false);
-        if env_starve {
-            continue;
-        }
-        out.push(tacho_core::decide::BurnerProcess {
-            pid,
-            comm: burner_comm,
-            elapsed_secs,
-            starttime: Some(stat.start_ticks),
-        });
-    }
-    out
+        })
+        .or_else(|| {
+            state
+                .agents
+                .values()
+                .filter(|a| !a.worktree.is_empty())
+                .find_map(|a| git_head_sha(Path::new(&a.worktree)))
+        })
+        .or_else(|| {
+            live_state
+                .agents
+                .values()
+                .filter_map(|a| a.cwd.as_deref())
+                .find_map(|cwd| git_head_sha(Path::new(cwd)))
+        })
+        .or_else(|| git_head_sha(home_dir))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| git_head_sha(&cwd))
+        })
 }
 
 /// Delivers a `tell` message emitted by `decide` to `$TACHO_HOME/inbox/<agent_key>.jsonl`
@@ -1030,399 +882,116 @@ pub fn deliver_tell_message(
     store.record_decision("dispatch", "tell", agent_key, msg)
 }
 
-fn remove_worktree_dir(path: &Path) -> io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        if has_git_dir(parent) {
-            // Prefer `git worktree remove` so git's worktree list stays consistent; if it
-            // fails, the directory is still removed below and git prunes the stale entry.
-            let status = std::process::Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(path)
-                .current_dir(parent)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => eprintln!(
-                    "[tacho-daemon] git worktree remove {} exited with {s}; removing directory",
-                    path.display()
-                ),
-                Err(e) => eprintln!(
-                    "[tacho-daemon] failed to run git worktree remove {}: {e}; removing directory",
-                    path.display()
-                ),
-            }
-        }
-    }
-    if path.exists() {
-        std::fs::remove_dir_all(path)?;
-    }
-    Ok(())
+/// The daemon's [`Hands`](crate::exec::Hands): it cannot start provider sessions (dispatched
+/// items stay queued for `tacho tick`), delivers tells through the inbox, and emits trace
+/// events through the appender when one is attached.
+pub struct DaemonHands {
+    pub home: std::path::PathBuf,
+    pub live_state: tacho_core::LiveState,
+    pub appender: Option<crate::appender::AppenderHandle>,
 }
 
-/// Observes the world, runs [`tacho_core::decide::decide`], and (unless `dry_run`) records the tick
-/// to `decision_ticks` and executes every resulting `tell_actions`, `tidy_decisions`, and `burner_kills`.
-///
-/// Ticks are serialized process-wide through [`DECIDE_TICK_LOCK`]: the sampler's autonomous
-/// tick and the server's `decide_tick` request both come through here, and two overlapping
-/// ticks would read the same state and execute (and persist) conflicting plans.
+impl crate::exec::Hands for DaemonHands {
+    fn spawn_worker(
+        &mut self,
+        _store: &mut FleetStore,
+        _item: &TodoItem,
+    ) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
+
+    fn deliver_tell(
+        &mut self,
+        store: &mut FleetStore,
+        agent_key: &str,
+        msg: &str,
+    ) -> io::Result<()> {
+        let state = store.load()?;
+        deliver_tell_message(&self.home, store, &state, &self.live_state, agent_key, msg)
+    }
+
+    fn emit(&mut self, track: &str, name: &str, because: &str) {
+        let Some(appender) = &self.appender else {
+            return;
+        };
+        let ts = now_ns();
+        let input = tacho_core::Input::Custom {
+            source_ts_ns: Some(ts),
+            track: track.to_string(),
+            op: tacho_core::CustomOp::Instant,
+            name: Some(name.to_string()),
+            id: None,
+            args: BTreeMap::from([("because".to_string(), because.to_string())]),
+            value: None,
+            flow_out: None,
+            flow_in: None,
+        };
+        if let Err(e) = appender.send_input(input, ts) {
+            eprintln!("[tacho-daemon] failed to emit {name} event: {e}");
+        }
+    }
+
+    fn emit_duration_slice(
+        &mut self,
+        store: &FleetStore,
+        track_key: &str,
+        name: &str,
+        start_ts_ns: u64,
+        end_ts_ns: u64,
+        because: &str,
+    ) -> io::Result<()> {
+        let Some(appender) = &self.appender else {
+            return store.emit_duration_slice(track_key, name, start_ts_ns, end_ts_ns, because);
+        };
+        let begin_ts = start_ts_ns;
+        let finish_ts = end_ts_ns.max(begin_ts + 1_000_000);
+        let begin = tacho_core::Input::Custom {
+            source_ts_ns: Some(begin_ts),
+            track: track_key.to_string(),
+            op: tacho_core::CustomOp::Begin,
+            name: Some(name.to_string()),
+            id: None,
+            args: BTreeMap::from([("because".to_string(), because.to_string())]),
+            value: None,
+            flow_out: None,
+            flow_in: None,
+        };
+        let end = tacho_core::Input::Custom {
+            source_ts_ns: Some(finish_ts),
+            track: track_key.to_string(),
+            op: tacho_core::CustomOp::End,
+            name: Some(name.to_string()),
+            id: None,
+            args: BTreeMap::new(),
+            value: None,
+            flow_out: None,
+            flow_in: None,
+        };
+        let _ = appender.send_input(begin, begin_ts);
+        let _ = appender.send_input(end, finish_ts);
+        Ok(())
+    }
+}
+
+/// Observes the world, runs `decide`, and (unless `dry_run`) records and executes the plan
+/// through the shared executor ([`crate::exec::run_tick`]).
 pub fn execute_decide_tick(
     home_dir: &Path,
     live_state: &tacho_core::LiveState,
     explicit_main_sha: Option<String>,
     dry_run: bool,
 ) -> io::Result<(Option<i64>, DecisionState, WorldObservation, DecisionPlan)> {
-    // A tick that panicked left no lock-protected data behind (the guard protects `()`), so
-    // a poisoned lock is safe to take over.
-    let _serialized = DECIDE_TICK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    #[cfg(test)]
-    let _in_flight = tick_probe::enter();
-    execute_decide_tick_serialized(home_dir, live_state, explicit_main_sha, dry_run)
-}
-
-/// The single owner of decide-tick execution; see [`execute_decide_tick`].
-static DECIDE_TICK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Test-only overlap detector: counts ticks in flight and records the most ever seen at once.
-#[cfg(test)]
-pub(crate) mod tick_probe {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-
-    pub(crate) struct InFlight;
-
-    pub(crate) fn enter() -> InFlight {
-        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
-        InFlight
-    }
-
-    impl Drop for InFlight {
-        fn drop(&mut self) {
-            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-fn execute_decide_tick_serialized(
-    home_dir: &Path,
-    live_state: &tacho_core::LiveState,
-    explicit_main_sha: Option<String>,
-    dry_run: bool,
-) -> io::Result<(Option<i64>, DecisionState, WorldObservation, DecisionPlan)> {
     let mut store = FleetStore::open(&home_dir.join("events.sqlite"))?;
-    let state = store.load()?;
-    let now = now_secs();
-
-    let mut live_keys = BTreeSet::new();
-    for (agent_id, a) in &live_state.agents {
-        if a.state != "Exited" {
-            live_keys.insert(agent_id.clone());
-        }
-    }
-    for (agent_key, a) in &state.agents {
-        if a.finished_at.is_none()
-            && a.pid
-                .is_some_and(|pid| pid > 0 && Path::new(&format!("/proc/{pid}")).exists())
-        {
-            live_keys.insert(agent_key.clone());
-        }
-    }
-
-    let mut decision_state = decision_state_of(&state);
-    let mut agent_samples = BTreeMap::new();
-    for key in &live_keys {
-        if let Some(live_agent) = live_state.agents.get(key) {
-            let is_stalled = live_agent.state == "Stalled" || !live_agent.flags.is_empty();
-            if is_stalled && !decision_state.nudged.contains(key) {
-                let entry = decision_state.samples.entry(key.clone()).or_default();
-                if entry.is_empty() {
-                    entry.push(ProgressSample {
-                        ts: now - 2_800,
-                        log_bytes: 0,
-                        head_sha: String::new(),
-                        dirty_files: 0,
-                        cpu_ticks: 0,
-                    });
-                    entry.push(ProgressSample {
-                        ts: now - 900,
-                        log_bytes: 0,
-                        head_sha: String::new(),
-                        dirty_files: 0,
-                        cpu_ticks: 1,
-                    });
-                }
-                agent_samples.insert(
-                    key.clone(),
-                    ProgressSample {
-                        ts: now,
-                        log_bytes: 0,
-                        head_sha: String::new(),
-                        dirty_files: 0,
-                        cpu_ticks: 2,
-                    },
-                );
-            } else {
-                agent_samples.insert(
-                    key.clone(),
-                    ProgressSample {
-                        ts: now,
-                        log_bytes: (live_agent.timeline.len() as u64) * 64,
-                        head_sha: String::new(),
-                        dirty_files: u32::from(live_agent.last_edit_ts_ns.is_some()),
-                        cpu_ticks: (live_agent.tokens_in + live_agent.tokens_out).max(1),
-                    },
-                );
-            }
-        }
-    }
-
-    let mut tidy_snapshot = tacho_core::decide::watch::TidySnapshot {
-        now,
-        ..Default::default()
+    let mut hands = DaemonHands {
+        home: home_dir.to_path_buf(),
+        live_state: live_state.clone(),
+        appender: None,
     };
-    for a in state.agents.values() {
-        if live_keys.contains(&a.key) && !a.worktree.is_empty() {
-            tidy_snapshot
-                .live_agent_worktrees
-                .insert(a.worktree.clone());
-        }
-    }
-    for a in live_state.agents.values() {
-        if a.state != "Exited" {
-            if let Some(ref cwd) = a.cwd {
-                tidy_snapshot.live_agent_worktrees.insert(cwd.clone());
-            }
-        }
-    }
-    for h_key in state.holds.keys() {
-        tidy_snapshot.held_paths.insert(h_key.clone());
-        if let Some(wt) = state.worktrees.get(h_key) {
-            tidy_snapshot.held_paths.insert(wt.path.clone());
-        }
-    }
-    for wt in state.worktrees.values() {
-        let age_secs = (now - wt.created_at).max(0);
-        let pr_merged_or_closed = wt
-            .base_pr
-            .is_some_and(|pr| state.merged_prs.contains(&pr) || state.closed_prs.contains(&pr));
-        tidy_snapshot
-            .worktrees
-            .push(tacho_core::decide::watch::WorktreeCandidate {
-                path: wt.path.clone(),
-                branch: wt.branch.clone(),
-                age_secs,
-                dirty: false,
-                unpushed_commits: 0,
-                pr_merged_or_closed,
-            });
-    }
-
-    let main_sha = explicit_main_sha
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| resolve_autonomous_main_sha(home_dir, &state, live_state));
-
-    let world_obs = WorldObservation {
-        now,
-        main_sha,
-        open_prs: state.open_prs_cache.clone(),
-        merged_prs: state.merged_prs.clone(),
-        closed_prs: state.closed_prs.clone(),
-        live_keys,
-        agent_samples,
-        batch_outcomes: new_batch_outcomes(&state),
-        tidy_snapshot,
-        burners: observe_proc_burners(),
-        main_ci: observe_main_ci(&state),
-        ..Default::default()
-    };
-
-    let plan = tacho_core::decide::decide(&decision_state, &world_obs);
-    let mut tick_id = None;
-    if !dry_run {
-        // Same inputs and same decision as the last recorded tick: nothing new to record
-        // or execute. Return the id of that tick, which this one would duplicate.
-        if let Some(prev_id) =
-            store.unchanged_since_latest_tick(&decision_state, &world_obs, &plan)?
-        {
-            return Ok((Some(prev_id), decision_state, world_obs, plan));
-        }
-        let id = store.record_decision_tick(now, &decision_state, &world_obs, &plan)?;
-        tick_id = Some(id);
-
-        for (agent_key, msg) in &plan.tell_actions {
-            deliver_tell_message(home_dir, &store, &state, live_state, agent_key, msg)?;
-        }
-
-        let mut removed_paths = BTreeSet::new();
-        for td in &plan.tidy_decisions {
-            match td {
-                tacho_core::decide::watch::TidyDecision::RemoveTree { path, because, .. }
-                | tacho_core::decide::watch::TidyDecision::RemoveCheckout {
-                    path, because, ..
-                } => {
-                    if let Err(e) = remove_worktree_dir(Path::new(path)) {
-                        eprintln!("[tacho-daemon] failed to remove worktree '{}': {}", path, e);
-                    }
-                    removed_paths.insert(path.clone());
-                    store.record_decision("watch", "remove_worktree", path, because)?;
-                }
-                _ => {}
-            }
-        }
-
-        let mut kill_errors = Vec::new();
-        for burner in &plan.burner_kills {
-            let target = format!("pid:{}", burner.pid);
-            match kill_verified_burner(burner) {
-                Ok(true) => store.record_decision(
-                    "watch",
-                    "kill_burner",
-                    &target,
-                    &format!(
-                        "killed runaway burner {} ({}s)",
-                        burner.comm, burner.elapsed_secs
-                    ),
-                )?,
-                // Already gone, or the pid now names a different process: nothing to do.
-                Ok(false) => {}
-                Err(e) => {
-                    store.record_decision(
-                        "watch",
-                        "kill_burner_failed",
-                        &target,
-                        &format!("failed to kill burner {}: {e}", burner.comm),
-                    )?;
-                    kill_errors.push(format!("{target}: {e}"));
-                }
-            }
-        }
-
-        store.mutate(None, |st| {
-            let mut todo_with_dispatched = plan.dispatched_tasks.clone();
-            for item in &plan.next_state.todo {
-                if !todo_with_dispatched.iter().any(|t| t.key == item.key) {
-                    todo_with_dispatched.push(item.clone());
-                }
-            }
-            st.todo = todo_with_dispatched;
-            st.agents = plan.next_state.agents.clone();
-            for r in &plan.next_state.retired {
-                st.retired.insert(r.clone());
-            }
-            for (hk, hv) in &plan.next_state.holds {
-                st.holds.entry(hk.clone()).or_insert_with(|| hv.clone());
-            }
-            st.passed = plan.next_state.passed.clone();
-            st.failed = plan.next_state.failed.clone();
-            st.merged_prs = plan.next_state.merged_prs.clone();
-            st.closed_prs = plan.next_state.closed_prs.clone();
-            st.batches = plan.next_state.batches.clone();
-            st.flakes = plan.next_state.flakes.clone();
-            st.samples = plan.next_state.samples.clone();
-            st.nudged = plan.next_state.nudged.clone();
-            st.rebase_attempts = plan.next_state.rebase_attempts.clone();
-            st.fix_notified = plan.next_state.fix_notified.clone();
-            st.notified_failures = plan.next_state.notified_keys.clone();
-            st.inbox = plan.next_state.inbox.clone();
-            st.last_tick_ts = plan.next_state.last_tick_ts;
-            st.last_watchdog_alert_ts = plan.next_state.last_watchdog_alert_ts;
-            if !removed_paths.is_empty() {
-                st.worktrees.retain(|_, w| !removed_paths.contains(&w.path));
-                for a in st.agents.values_mut() {
-                    if removed_paths.contains(&a.worktree) {
-                        a.worktree.clear();
-                    }
-                }
-            }
-        })?;
-
-        // Kill failures are surfaced after the plan's state is persisted, so the rest of the
-        // tick is not lost while the caller still learns that a burner survived.
-        if !kill_errors.is_empty() {
-            return Err(io::Error::other(format!(
-                "burner kill failed: {}",
-                kill_errors.join("; ")
-            )));
-        }
-    }
-
-    Ok((tick_id, decision_state, world_obs, plan))
-}
-
-/// Sends `SIGKILL` to a burner chosen by `decide`, under the same identity rule as the CLI's
-/// `verify_agent_pid`: a recorded `starttime > 0` is required, and the live process must
-/// still have it.
-///
-/// The process is pinned with a pidfd before its starttime is checked and the signal is sent
-/// through that pidfd, so a pid recycled between the check and the kill cannot be hit.
-/// Returns `Ok(true)` when the signal was delivered, `Ok(false)` when there is nothing to
-/// kill (no recorded identity, the process is gone, or the pid now names another process),
-/// and `Err` for any other failure (e.g. `EPERM`).
-fn kill_verified_burner(burner: &tacho_core::decide::BurnerProcess) -> io::Result<bool> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    let Some(expected_st) = burner.starttime.filter(|&st| st > 0) else {
-        eprintln!(
-            "[tacho-safety] burner pid {} has no recorded starttime; refusing signal without identity",
-            burner.pid
-        );
-        return Ok(false);
-    };
-    if burner.pid <= 1 {
-        return Ok(false);
-    }
-    // SAFETY: plain syscall; the result is checked before being wrapped.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, burner.pid as libc::pid_t, 0) };
-    if raw < 0 {
-        let err = io::Error::last_os_error();
-        return match err.raw_os_error() {
-            Some(libc::ESRCH) => Ok(false),
-            _ => Err(err),
-        };
-    }
-    // SAFETY: pidfd_open returned a fresh fd that we exclusively own.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-
-    let mut stat_buf = [0u8; 1024];
-    let page_size = crate::sampler::get_page_size();
-    let same_process =
-        crate::sampler::read_process_stat_and_comm_slice(burner.pid, page_size, &mut stat_buf)
-            .is_some_and(|st| st.start_ticks == expected_st);
-    if !same_process {
-        eprintln!(
-            "[tacho-safety] burner pid {} starttime no longer matches recorded {expected_st}; refusing signal to reused pid",
-            burner.pid
-        );
-        return Ok(false);
-    }
-
-    // SAFETY: valid pidfd; a null siginfo means "as if sent by kill(2)".
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            libc::SIGKILL,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        _ => Err(err),
-    }
+    let mut opts = crate::exec::TickOptions::new(live_state);
+    opts.dry_run = dry_run;
+    opts.explicit_main_sha = explicit_main_sha;
+    let out = crate::exec::run_tick(home_dir, &mut store, &mut hands, opts)?;
+    Ok((out.tick_id, out.state, out.obs, out.plan))
 }
 
 /// Runs an autonomous world-observation and `decide` pass using the current [`tacho_core::LiveState`].
@@ -1445,6 +1014,13 @@ pub fn run_autonomous_decide_tick(
         .live_state()
         .clone();
     run_autonomous_decide_tick_with_live(home_dir, &live_state)
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 fn now_secs() -> i64 {
@@ -1515,7 +1091,7 @@ mod tests {
             }
         });
         assert_eq!(
-            tick_probe::MAX_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
+            crate::exec::tick_probe::MAX_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "two decide ticks ran at the same time"
         );
@@ -1651,48 +1227,5 @@ mod tests {
             input_fingerprint(&state, &a).unwrap(),
             input_fingerprint(&state, &b).unwrap()
         );
-    }
-
-    #[test]
-    fn test_burner_kill_requires_matching_starttime() {
-        let mut child = std::process::Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let mut buf = [0u8; 1024];
-        let start = crate::sampler::read_process_stat_and_comm_slice(
-            pid,
-            crate::sampler::get_page_size(),
-            &mut buf,
-        )
-        .unwrap()
-        .start_ticks;
-        let burner = |starttime| tacho_core::decide::BurnerProcess {
-            pid,
-            comm: "cat".to_string(),
-            elapsed_secs: 0,
-            starttime,
-        };
-
-        assert!(!kill_verified_burner(&burner(None)).unwrap(), "no identity");
-        assert!(
-            !kill_verified_burner(&burner(Some(0))).unwrap(),
-            "zero starttime"
-        );
-        assert!(
-            !kill_verified_burner(&burner(Some(start + 1))).unwrap(),
-            "reused pid"
-        );
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "refused kills must not signal"
-        );
-
-        assert!(kill_verified_burner(&burner(Some(start))).unwrap());
-        let status = child.wait().unwrap();
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }

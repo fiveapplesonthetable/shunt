@@ -68,12 +68,10 @@ fn wait_for_paths(dir: &std::path::Path, paths: &[&std::path::Path]) {
     // SAFETY: plain syscall.
     let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
     if raw < 0 {
-        panic!(
-            "cannot wait for {}: inotify_init1 failed ({}); the user is out of inotify \
-             instances, raise fs.inotify.max_user_instances",
-            awaited(),
-            std::io::Error::last_os_error()
-        );
+        while !paths.iter().all(|p| p.exists()) {
+            unsafe { libc::poll(std::ptr::null_mut(), 0, 5) };
+        }
+        return;
     }
     // SAFETY: `raw` is a fresh fd we own; closed on drop.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };

@@ -192,6 +192,13 @@ fn run_sampler_loop(
     let ticker = IntervalTimer::new(interval);
 
     while !stop_flag.load(Ordering::Acquire) {
+        if let Some(home) = proc_sampler.home_dir() {
+            if !home.exists() {
+                stop_flag.store(true, Ordering::Release);
+                unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+                break;
+            }
+        }
         let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

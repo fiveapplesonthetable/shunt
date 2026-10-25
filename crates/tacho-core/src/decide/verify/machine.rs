@@ -10,8 +10,8 @@ use super::result::{
 use super::status::{pending_status, CommitStatusPost};
 use super::verdict::{
     complete_green_run, finish_batch, make_blame, record_skips, reusable_batch_id,
-    run_check_action, stale_shots_step, wall_clock_expired, BatchState, BatchVerdict, Outcome,
-    Phase, StaleShotsAction, UntiedRecord, VerifyAction, VerifyCtx, VerifyEvent,
+    run_check_action, wall_clock_expired, BatchState, BatchVerdict, Outcome, Phase, UntiedRecord,
+    VerifyAction, VerifyCtx, VerifyEvent,
 };
 use std::collections::BTreeMap;
 
@@ -133,18 +133,6 @@ pub fn step(
 
             let merged = result.merged.clone();
             let failed_areas = failed_areas_of(result, &st.areas);
-            if let StaleShotsAction::RefreshAndInvalidate { pr, sha, redraw_areas, reason } =
-                stale_shots_step(
-                    &merged,
-                    &st.heads,
-                    &failed_areas,
-                    ctx.pr_files.get(&merged[0]).map(Vec::as_slice).unwrap_or(&[]),
-                    &ctx.cfg,
-                )
-            {
-                return (st, vec![VerifyAction::RefreshStaleShots { pr, sha, areas: redraw_areas, reason }]);
-            }
-
             let only_no_rerun =
                 !failed_areas.is_empty() && failed_areas.iter().all(|a| ctx.cfg.no_rerun_areas.contains(a));
             let allow_rerun = st.reruns_used < ctx.cfg.reruns
