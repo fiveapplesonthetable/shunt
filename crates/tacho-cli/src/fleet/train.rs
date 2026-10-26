@@ -362,16 +362,53 @@ pub fn assemble_train(
     }
 
     let mut shas = BTreeMap::new();
+    let mut changed_union = BTreeSet::new();
     for &pr_num in &accepted_prs {
-        let sha = state
-            .open_prs_cache
-            .iter()
-            .find(|p| p.number == pr_num)
-            .map(|p| p.head.clone())
-            .or_else(|| state.passed.get(&pr_num).map(|r| r.sha.clone()))
-            .unwrap_or_else(|| base_sha.clone());
-        shas.insert(pr_num, sha);
+        if let Some(p) = state.open_prs_cache.iter().find(|p| p.number == pr_num) {
+            shas.insert(pr_num, p.head.clone());
+            for f in &p.files {
+                changed_union.insert(f.clone());
+            }
+        } else {
+            let sha = state
+                .passed
+                .get(&pr_num)
+                .map(|r| r.sha.clone())
+                .unwrap_or_else(|| base_sha.clone());
+            shas.insert(pr_num, sha);
+        }
     }
+
+    let live_main_after = resolve_live_main_sha(cwd);
+    let live_pr_shas_after = resolve_live_pr_heads(cwd, &accepted_prs, &shas, &state);
+    if let Some(moved_reason) =
+        batch_refs_moved(&base_sha, &live_main_after, &shas, &live_pr_shas_after)
+    {
+        let _ = store.record_decision("land", "abort_train_head_moved", "train", &moved_reason);
+        return Err(io::Error::other(format!(
+            "Train assembly refused because refs moved during compilation: {moved_reason}"
+        )));
+    }
+
+    if let Some(report_dir) = std::env::var("TACHO_SHOT_REPORT_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let p = cwd.join(".tachoshots");
+            p.is_dir().then_some(p)
+        })
+    {
+        let changed_vec: Vec<String> = changed_union.into_iter().collect();
+        let _ = stage_and_commit_merged_screenshots(
+            cwd,
+            &report_dir,
+            "train",
+            &changed_vec,
+            true,
+            &ShotRules::default(),
+        )?;
+    }
+
     let tree_sha = crate::kit::tree_of_worktree(cwd).unwrap_or_else(|_| base_sha.clone());
     let synth_batch = BatchRun {
         id: format!("b{:03}", state.batches.len() + 1),

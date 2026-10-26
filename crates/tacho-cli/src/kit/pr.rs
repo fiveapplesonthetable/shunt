@@ -367,7 +367,12 @@ pub fn execute_pr(args: PrArgs) -> io::Result<()> {
         .collect();
 
     let diff_out = Command::new("git")
-        .args(["diff", "--name-only", &format!("{base_sha}..HEAD")])
+        .args([
+            "diff",
+            "--no-renames",
+            "--name-only",
+            &format!("{base_sha}..HEAD"),
+        ])
         .current_dir(&root)
         .output()?;
     let changed_files: Vec<String> = String::from_utf8_lossy(&diff_out.stdout)

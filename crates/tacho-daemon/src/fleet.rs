@@ -445,21 +445,6 @@ impl FleetStore {
         because: &str,
         ts_ns: u64,
     ) -> io::Result<()> {
-        let next_seq: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |r| {
-                r.get(0)
-            })
-            .map_err(sql_err)?;
-        let last_ts: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(ts_ns), 0) FROM events WHERE track_key = ?1",
-                params![track_key],
-                |r| r.get(0),
-            )
-            .map_err(sql_err)?;
-        let eff_ts = (ts_ns as i64).max(last_ts + 1_000);
         let proto_state: tacho::TaskStatus = status.into();
         let ev_body = tacho::Event {
             body: Some(tacho::event::Body::TaskState(tacho::TaskState {
@@ -471,21 +456,53 @@ impl FleetStore {
         ev_body
             .encode(&mut buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.conn
-            .execute(
-                "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, ?6)",
-                params![
-                    next_seq,
-                    eff_ts,
-                    Kind::TaskState as u32,
-                    track_key,
-                    &buf,
-                    label
-                ],
-            )
-            .map_err(sql_err)?;
-        Ok(())
+
+        let started_tx = self.conn.is_autocommit();
+        if started_tx {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(sql_err)?;
+        }
+        let res = (|| -> io::Result<()> {
+            let next_seq: i64 = self
+                .conn
+                .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |r| {
+                    r.get(0)
+                })
+                .map_err(sql_err)?;
+            let last_ts: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(MAX(ts_ns), 0) FROM events WHERE track_key = ?1",
+                    params![track_key],
+                    |r| r.get(0),
+                )
+                .map_err(sql_err)?;
+            let eff_ts = (ts_ns as i64).max(last_ts + 1_000);
+            self.conn
+                .execute(
+                    "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, ?6)",
+                    params![
+                        next_seq,
+                        eff_ts,
+                        Kind::TaskState as u32,
+                        track_key,
+                        &buf,
+                        label
+                    ],
+                )
+                .map_err(sql_err)?;
+            Ok(())
+        })();
+        if started_tx {
+            if res.is_ok() {
+                self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+            } else {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        res
     }
 
     /// Appends a paired duration slice (`Kind::Custom` + `Kind::CustomEnded`) on `track_key`
@@ -499,22 +516,6 @@ impl FleetStore {
         end_ts_ns: u64,
         because: &str,
     ) -> io::Result<()> {
-        let next_seq: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |r| {
-                r.get(0)
-            })
-            .map_err(sql_err)?;
-        let last_ts: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(ts_ns), 0) FROM events WHERE track_key = ?1",
-                params![track_key],
-                |r| r.get(0),
-            )
-            .map_err(sql_err)?;
-        let begin_ts = (start_ts_ns as i64).max(last_ts + 1_000);
-        let finish_ts = (end_ts_ns as i64).max(begin_ts + 1_000_000); // minimum 1ms visible slice
         let begin_body = tacho::Event {
             body: Some(tacho::event::Body::Custom(tacho::Custom {
                 name: Some(name.chars().take(128).collect()),
@@ -541,35 +542,67 @@ impl FleetStore {
             .encode(&mut end_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        self.conn
-            .execute(
-                "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, ?6)",
-                params![
-                    next_seq,
-                    begin_ts,
-                    Kind::Custom as u32,
-                    track_key,
-                    &begin_buf,
-                    name
-                ],
-            )
-            .map_err(sql_err)?;
-        self.conn
-            .execute(
-                "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, NULL)",
-                params![
-                    next_seq + 1,
-                    finish_ts,
-                    Kind::CustomEnded as u32,
-                    track_key,
-                    next_seq,
-                    &end_buf
-                ],
-            )
-            .map_err(sql_err)?;
-        Ok(())
+        let started_tx = self.conn.is_autocommit();
+        if started_tx {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(sql_err)?;
+        }
+        let res = (|| -> io::Result<()> {
+            let next_seq: i64 = self
+                .conn
+                .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |r| {
+                    r.get(0)
+                })
+                .map_err(sql_err)?;
+            let last_ts: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(MAX(ts_ns), 0) FROM events WHERE track_key = ?1",
+                    params![track_key],
+                    |r| r.get(0),
+                )
+                .map_err(sql_err)?;
+            let begin_ts = (start_ts_ns as i64).max(last_ts + 1_000);
+            let finish_ts = (end_ts_ns as i64).max(begin_ts + 1_000_000); // minimum 1ms visible slice
+            self.conn
+                .execute(
+                    "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, ?6)",
+                    params![
+                        next_seq,
+                        begin_ts,
+                        Kind::Custom as u32,
+                        track_key,
+                        &begin_buf,
+                        name
+                    ],
+                )
+                .map_err(sql_err)?;
+            self.conn
+                .execute(
+                    "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, NULL)",
+                    params![
+                        next_seq + 1,
+                        finish_ts,
+                        Kind::CustomEnded as u32,
+                        track_key,
+                        next_seq,
+                        &end_buf
+                    ],
+                )
+                .map_err(sql_err)?;
+            Ok(())
+        })();
+        if started_tx {
+            if res.is_ok() {
+                self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+            } else {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        res
     }
 
     /// Records a complete orchestrator decision tick with both its input state and its output plan
@@ -856,6 +889,7 @@ pub fn deliver_tell_message(
         .open(&inbox_path)?;
     f.write_all(&line)?;
 
+    let fleet_main = crate::exec::observe::fleet_main_checkout(state, None);
     let worktree_dir = state
         .agents
         .get(agent_key)
@@ -877,7 +911,14 @@ pub fn deliver_tell_message(
         });
     if let Some(wt) = worktree_dir {
         let wt_path = Path::new(wt);
-        if wt_path.is_dir() {
+        if crate::exec::observe::resolves_to_fleet_main_checkout(wt_path, fleet_main.as_deref()) {
+            let reason = format!(
+                "refusing tell to {agent_key}: worktree '{wt}' resolves to the main checkout"
+            );
+            store.record_decision("watch", "tell_refused", agent_key, &reason)?;
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
+        if crate::exec::observe::verify_worker_worktree(wt_path).is_ok() {
             // The inbox `.jsonl` written above is the delivery of record; the worktree copy is
             // a convenience for agents that read their checkout, so its failure is only logged.
             let md_path = wt_path.join(".tacho-inbox.md");

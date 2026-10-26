@@ -477,7 +477,8 @@ pub fn check_root_disk(total_bytes: u64, avail_bytes: u64) -> RootDiskAction {
     const GIB: u64 = 1024 * 1024 * 1024;
     let used_bytes = total_bytes.saturating_sub(avail_bytes);
     let used_percent = if total_bytes > 0 {
-        ((used_bytes as u128 * 100) / (total_bytes as u128)).min(100) as u8
+        let total = total_bytes as u128;
+        ((used_bytes as u128 * 100).saturating_add(total - 1) / total).min(100) as u8
     } else {
         0
     };

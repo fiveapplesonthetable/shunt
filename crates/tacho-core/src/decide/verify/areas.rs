@@ -357,6 +357,9 @@ pub fn select_costly_areas<S1: AsRef<str>, S2: AsRef<str>>(
     };
     for a in found {
         let a = a.as_ref();
+        if a == "android-release" || a == "console-browser" {
+            continue;
+        }
         if a != "image" || wanted_image {
             push_unique(a);
         }
@@ -364,12 +367,16 @@ pub fn select_costly_areas<S1: AsRef<str>, S2: AsRef<str>>(
     if pull_request && wanted_image {
         push_unique("image");
     }
-    let has_android = found.iter().any(|a| a.as_ref() == "android");
+    let has_android = found
+        .iter()
+        .any(|a| matches!(a.as_ref(), "android" | "android-release"));
     let and_re = android_release_inputs_re();
     if has_android && (full || paths.iter().any(|p| and_re.is_match(p.as_ref()))) {
         push_unique("android-release");
     }
-    let has_console = found.iter().any(|a| a.as_ref() == "console");
+    let has_console = found
+        .iter()
+        .any(|a| matches!(a.as_ref(), "console" | "console-browser"));
     let idle_re = console_browser_idle_re();
     let console_paths: Vec<&str> = paths
         .iter()

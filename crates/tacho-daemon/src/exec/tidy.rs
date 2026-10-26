@@ -183,23 +183,40 @@ pub fn apply_tidy_decisions(
     Ok(removed)
 }
 
-/// Checks whether a lock file (`slot-N.lock`) is currently held by an active `flock`.
-fn is_flock_held(lock_path: &Path) -> bool {
+struct HeldFlock(#[allow(dead_code)] fs::File);
+
+impl Drop for HeldFlock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Attempts to acquire a non-blocking exclusive `flock` on `lock_path` if `lock_path` exists.
+/// Returns `Ok(Some(HeldFlock))` when the lock file exists and was locked by us, `Ok(None)` when
+/// the lock file does not exist, and `Err(())` when another process holds the `flock`.
+fn try_acquire_existing_flock(lock_path: &Path) -> Result<Option<HeldFlock>, ()> {
     use std::os::unix::io::AsRawFd;
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(lock_path)
     else {
-        return false;
+        return Ok(None);
     };
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        false
+        Ok(Some(HeldFlock(file)))
     } else {
-        true
+        Err(())
     }
+}
+
+/// Checks whether a lock file (`slot-N.lock`) is currently held by an active `flock`.
+fn is_flock_held(lock_path: &Path) -> bool {
+    try_acquire_existing_flock(lock_path).is_err()
 }
 
 fn dir_size_and_mtime(dir: &Path) -> (u64, u64) {
@@ -340,6 +357,17 @@ pub fn prune_runner_pool_and_warm_caches(
         tacho_core::decide::verify::shrink_plan(&area_entries, &locked_slots, max_warm_bytes);
     for del_name in to_delete {
         let p = warm_dir.join(&del_name);
+        let Ok(_lock_a) = try_acquire_existing_flock(&locks_dir.join(format!("{del_name}.lock")))
+        else {
+            continue;
+        };
+        let Ok(_lock_b) = try_acquire_existing_flock(&warm_dir.join(format!("{del_name}.lock")))
+        else {
+            continue;
+        };
+        let Ok(_lock_c) = try_acquire_existing_flock(&p.join(".lock")) else {
+            continue;
+        };
         let (del_bytes, _) = dir_size_and_mtime(&p);
         if p.is_dir() {
             let _ = fs::remove_dir_all(&p);

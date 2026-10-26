@@ -237,6 +237,12 @@ pub fn execute_events_with(args: EventsOptions) -> io::Result<()> {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(2);
+        let watcher = crate::kit::FdEventWatcher::new().ok();
+        if let Some(ref w) = watcher {
+            w.watch_path(store.home());
+            w.watch_path(&store.home().join("events.sqlite"));
+            w.watch_path(&store.home().join("events.sqlite-wal"));
+        }
         let deadline = Instant::now() + Duration::from_secs(max_follow);
         while Instant::now() < deadline {
             if let Ok(latest) =
@@ -253,7 +259,18 @@ pub fn execute_events_with(args: EventsOptions) -> io::Result<()> {
                     }
                 }
             }
-            std::thread::yield_now();
+            let rem_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(250) as i32;
+            if rem_ms <= 0 {
+                break;
+            }
+            if let Some(ref w) = watcher {
+                w.wait_ms(rem_ms);
+            } else {
+                break;
+            }
         }
     }
     Ok(())

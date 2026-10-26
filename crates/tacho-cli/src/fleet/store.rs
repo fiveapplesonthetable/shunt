@@ -269,6 +269,28 @@ pub fn mutate_fleet_meta<F, R>(f: F) -> io::Result<R>
 where
     F: FnOnce(&mut FleetMeta) -> R,
 {
+    use std::os::unix::io::AsRawFd;
+    let home = crate::paths::resolve_home();
+    crate::paths::ensure_dir_0700(&home)?;
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.join("fleet_meta.lock"))?;
+    let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct UnlockGuard(fs::File);
+    impl Drop for UnlockGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+    let _guard = UnlockGuard(lock_file);
     let mut meta = load_fleet_meta().unwrap_or_default();
     let out = f(&mut meta);
     save_fleet_meta(&meta)?;

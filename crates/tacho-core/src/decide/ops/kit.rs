@@ -660,8 +660,10 @@ pub fn plan_template_migrations(
         paths.push(p.clone());
         by_path.insert(p.clone(), sql.clone());
     }
+    let max_applied = applied_checksums.keys().max().copied();
     let ordered = migration_order(&paths);
     let mut steps = Vec::new();
+    let mut prev_version: Option<i64> = None;
     for path in ordered {
         let base = path.rsplit('/').next().unwrap_or(&path);
         let Some(stem) = base.strip_suffix(".sql") else {
@@ -675,6 +677,14 @@ pub fn plan_template_migrations(
         let version: i64 = ver_str
             .parse()
             .map_err(|_| format!("invalid migration version '{ver_str}' in '{base}'"))?;
+        if let Some(prev) = prev_version {
+            if version <= prev {
+                return Err(format!(
+                    "duplicate or out-of-order migration version {version} in '{base}' (after {prev})"
+                ));
+            }
+        }
+        prev_version = Some(version);
         let description = desc_raw.replace('_', " ");
         let sql = by_path.get(&path).cloned().unwrap_or_default();
         let checksum_hex = sha384_hex(sql.as_bytes());
@@ -685,6 +695,13 @@ pub fn plan_template_migrations(
                 ));
             }
             continue;
+        }
+        if let Some(max_ver) = max_applied {
+            if version < max_ver {
+                return Err(format!(
+                    "out-of-order unapplied migration {version} ({base}) precedes already-applied migration {max_ver}"
+                ));
+            }
         }
         steps.push(SqlxMigrationStep {
             version,

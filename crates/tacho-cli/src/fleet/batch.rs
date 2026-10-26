@@ -411,7 +411,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
     }
 
     let batch_id = new_batch_id(&state.batches);
-    let tree_sha = crate::kit::tree_of_worktree(&cwd).unwrap_or_else(|_| main_sha.clone());
+    let mut tree_sha = crate::kit::tree_of_worktree(&cwd).unwrap_or_else(|_| main_sha.clone());
 
     if opts.dry_run {
         println!("Batch ID: {batch_id}");
@@ -581,7 +581,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         {
             let fix_shots = opts.origin == BatchOrigin::Train
                 || std::env::var("TACHO_FIX_SHOTS").ok().as_deref() == Some("1");
-            if let Err(shot_err) = super::train::stage_and_commit_merged_screenshots(
+            match super::train::stage_and_commit_merged_screenshots(
                 &cwd,
                 &report_dir,
                 &batch_id,
@@ -589,11 +589,19 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 fix_shots,
                 &tacho_core::decide::land::ShotRules::default(),
             ) {
-                ok = false;
-                if !log_text.is_empty() {
-                    log_text.push('\n');
+                Ok(Some(_new_commit)) => {
+                    if let Ok(updated_tree) = crate::kit::tree_of_worktree(&cwd) {
+                        tree_sha = updated_tree;
+                    }
                 }
-                log_text.push_str(&shot_err.to_string());
+                Ok(None) => {}
+                Err(shot_err) => {
+                    ok = false;
+                    if !log_text.is_empty() {
+                        log_text.push('\n');
+                    }
+                    log_text.push_str(&shot_err.to_string());
+                }
             }
         }
     }

@@ -989,7 +989,7 @@ fn start_worker_whose_directory_is_main_checkout_never_runs() {
     );
 
     // 3. Attempt to start without a recorded worktree when cwd is an ambient checkout outside the fleet root:
-    // the provisioning fallback must refuse outside the fleet root.
+    // the provisioning fallback must refuse outside the fleet root (both when `repo_root` is set and when it is unset).
     let item3 = tacho_core::decide::dispatch::TodoItem {
         key: "bad-worker-ambient".to_string(),
         brief: "Attempt ambient cwd fallback outside fleet root".to_string(),
@@ -1002,6 +1002,29 @@ fn start_worker_whose_directory_is_main_checkout_never_runs() {
         "worktree provisioning fallback must refuse outside the fleet root"
     );
     assert!(!marker.exists());
+
+    store
+        .mutate(None, |st| {
+            st.repo_root = None;
+        })
+        .unwrap();
+    let item3b = tacho_core::decide::dispatch::TodoItem {
+        key: "bad-worker-sibling".to_string(),
+        brief: "Attempt sibling ambient cwd fallback when repo_root is unset".to_string(),
+        provider: Some("touch-marker".to_string()),
+        ..Default::default()
+    };
+    let res3b = super::spawn_worker_in_dir(&mut store, &item3b, None);
+    assert!(
+        res3b.is_err(),
+        "worktree provisioning fallback must refuse sibling ambient checkout even when repo_root is unset"
+    );
+    assert!(!marker.exists());
+    store
+        .mutate(None, |st| {
+            st.repo_root = Some(main_str.clone());
+        })
+        .unwrap();
 
     // 4. Attempt to resume (`deliver_tell_action` ResumeWithMessage) an exited worker whose
     // recorded worktree is the main checkout: must refuse before spawning, place a hold, and record `tell_refused`.
@@ -1497,4 +1520,91 @@ fn test_runner_pool_setup_50_tmp_conf_prune_skips_locked_slots_and_shrinks_warm_
     assert_eq!(remaining_bytes, 8000);
 
     unsafe { libc::flock(lock1_file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[test]
+fn test_train_and_batch_refuse_when_head_moves_during_compile_or_check() {
+    use super::train::{assemble_train, TrainOptions};
+    use tacho_core::decide::dispatch::PullFacts;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let run_git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.email", "t@example.com"]);
+    run_git(&["config", "user.name", "Tester"]);
+    std::fs::write(repo.join("lib.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-q", "-m", "initial"]);
+
+    run_git(&["checkout", "-q", "-b", "feat/pr7"]);
+    std::fs::write(repo.join("pr7.rs"), "pub fn pr7() -> u32 { 7 }\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-q", "-m", "pr 7"]);
+    let pr7_sha = run_git(&["rev-parse", "HEAD"]);
+    run_git(&["checkout", "-q", "main"]);
+
+    let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+    store
+        .mutate(None, |st| {
+            st.repo_root = Some(repo.display().to_string());
+            st.open_prs_cache = vec![PullFacts {
+                number: 7,
+                title: "PR 7".to_string(),
+                branch: "feat/pr7".to_string(),
+                base: "main".to_string(),
+                head: pr7_sha.clone(),
+                state: "OPEN".to_string(),
+                mergeable: "MERGEABLE".to_string(),
+                files: vec!["pr7.rs".to_string()],
+                ..Default::default()
+            }];
+        })
+        .unwrap();
+
+    // While `compile_cmd` runs inside the temporary train worktree, advance `refs/heads/main` in `repo`.
+    let repo_str = repo.display().to_string();
+    let move_main_cmd =
+        format!("git -C '{repo_str}' commit --allow-empty -q -m 'concurrent main advance'");
+    let err = assemble_train(
+        &mut store,
+        &repo,
+        &TrainOptions {
+            prs: vec![7],
+            compile_cmd: Some(move_main_cmd),
+            run_batch: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("assemble_train must refuse when main advances during compile");
+    assert!(
+        err.to_string().contains("refs moved"),
+        "unexpected error: {err}"
+    );
+    let decisions = store.recent_decisions(10, None, None).unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.action == "abort_train_head_moved"),
+        "expected abort_train_head_moved decision, got: {:?}",
+        decisions
+    );
 }

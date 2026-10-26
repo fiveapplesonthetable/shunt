@@ -842,15 +842,25 @@ pub fn execute_tell_with(store: &mut FleetStore, args: TellArgs) -> io::Result<(
         inbox,
         ..Default::default()
     };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let resolved_main_sha = tacho_daemon::fleet::known_main_sha(
+        store.home(),
+        &state,
+        &tacho_core::LiveState::default(),
+    )
+    .unwrap_or_else(|| super::store::resolve_live_main_sha(&cwd));
     let world_obs = WorldObservation {
         now,
+        main_sha: resolved_main_sha.clone(),
         live_keys,
         ..Default::default()
     };
     let plan = decide(&decision_state, &world_obs);
-    store
-        .record_decision_tick(now, &decision_state, &world_obs, &plan)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    if crate::kit::start::is_full_hex_sha(&resolved_main_sha) {
+        store
+            .record_decision_tick(now, &decision_state, &world_obs, &plan)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
 
     for (agent_key, msg) in &plan.tell_actions {
         if agent_key == &last.key {

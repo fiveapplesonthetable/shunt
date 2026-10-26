@@ -898,9 +898,10 @@ impl ForgePlugin for CliForgePlugin {
     }
 }
 
-/// Returns `true` when executing inside a test harness (`cargo test`, `cargo nextest`, or a `deps/` test binary).
+/// Returns `true` when executing inside a test harness (`cargo test`, `cargo nextest`, or a `target/` / `deps/` test binary).
 pub fn running_in_test_harness() -> bool {
     if cfg!(test)
+        || std::env::var_os("TACHO_TEST_HARNESS").is_some()
         || std::env::var_os("RUST_TEST_THREADS").is_some()
         || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
         || std::env::var_os("CARGO_MANIFEST_DIR").is_some()
@@ -909,7 +910,19 @@ pub fn running_in_test_harness() -> bool {
     }
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().and_then(|d| d.file_name()).map(|n| n == "deps"))
+        .map(|p| {
+            let in_deps = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .is_some_and(|n| n == "deps");
+            let in_target_debug = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .is_some_and(|n| n == "debug")
+                && p.components().any(|c| c.as_os_str() == "target");
+            in_deps
+                || (in_target_debug && std::env::var_os("TACHO_ALLOW_NOTIFY_IN_TARGET").is_none())
+        })
         .unwrap_or(false)
 }
 
