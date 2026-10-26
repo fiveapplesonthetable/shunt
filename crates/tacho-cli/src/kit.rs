@@ -314,3 +314,161 @@ pub(crate) fn resolve_base_sha_for_worktree(
 }
 
 pub use tacho_daemon::exec::tidy::tree_of_worktree;
+
+/// Creates a new SQL migration file in `migrations_dir` stamped with UTC `<YYYYMMDDHHMMSS>_<name>.sql`
+/// using [`tacho_core::decide::ops::kit::format_utc_migration_filename`].
+pub fn create_utc_migration_in_worktree(
+    migrations_dir: &Path,
+    name: &str,
+    utc_epoch_secs: u64,
+) -> io::Result<PathBuf> {
+    let mut existing = Vec::new();
+    if let Ok(entries) = fs::read_dir(migrations_dir) {
+        for e in entries.flatten() {
+            if let Some(n) = e.file_name().to_str() {
+                existing.push(n.to_string());
+            }
+        }
+    }
+    let filename = tacho_core::decide::ops::kit::format_utc_migration_filename(
+        utc_epoch_secs as i64,
+        name,
+        &existing,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    fs::create_dir_all(migrations_dir)?;
+    let path = migrations_dir.join(filename);
+    if !path.exists() {
+        write_atomic(&path, b"-- Add migration SQL here\n")?;
+    }
+    Ok(path)
+}
+
+/// Scans `migrations` directories in `root`, validates that filenames are in strict version order,
+/// and computes the ordered [`tacho_core::decide::ops::kit::SqlxMigrationStep`] plan with SHA-384
+/// digests (`_sqlx_migrations` format).
+pub fn verify_and_plan_worktree_migrations(
+    root: &Path,
+) -> io::Result<Vec<tacho_core::decide::ops::kit::SqlxMigrationStep>> {
+    let mut candidate_dirs = vec![root.join("migrations")];
+    let crates_dir = root.join("crates");
+    if let Ok(entries) = fs::read_dir(&crates_dir) {
+        let mut crate_mig_dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path().join("migrations"))
+            .filter(|p| p.is_dir())
+            .collect();
+        crate_mig_dirs.sort();
+        candidate_dirs.extend(crate_mig_dirs);
+    }
+
+    let mut all_planned = Vec::new();
+    for dir in candidate_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut files: Vec<(String, String)> = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                let text = fs::read_to_string(&path)?;
+                files.push((fname.to_string(), text));
+            }
+        }
+        if files.is_empty() {
+            continue;
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        let ordered = tacho_core::decide::ops::kit::migration_order(&names);
+        if ordered != names {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "migration files in {} are out of version order",
+                    dir.display()
+                ),
+            ));
+        }
+        let planned =
+            tacho_core::decide::ops::kit::plan_template_migrations(&files, &BTreeMap::new())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        for entry in &planned {
+            let expected_hex = tacho_core::decide::ops::kit::sha384_hex(entry.sql.as_bytes());
+            if entry.checksum_hex != expected_hex {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("migration checksum mismatch for {}", entry.filename),
+                ));
+            }
+        }
+        all_planned.extend(planned);
+    }
+    Ok(all_planned)
+}
+
+/// Applies every migration in `migrations_dir` to a template database in version order and records
+/// each entry in `_sqlx_migrations` (`version`, `description`, `success`, `checksum`, `execution_time`),
+/// supporting both direct SQL file reading and `stdin` piping (`docker exec -i`).
+pub fn migrate_template_database<F>(
+    migrations_dir: &Path,
+    stdin_mode: bool,
+    mut run_sql: F,
+) -> io::Result<Vec<tacho_core::decide::ops::kit::SqlxMigrationStep>>
+where
+    F: FnMut(Option<&Path>, Option<&str>) -> io::Result<()>,
+{
+    let mut files: Vec<(String, PathBuf, String)> = Vec::new();
+    if migrations_dir.is_dir() {
+        for entry in fs::read_dir(migrations_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                let text = fs::read_to_string(&path)?;
+                files.push((fname.to_string(), path, text));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let raw_pairs: Vec<(String, String)> = files
+        .iter()
+        .map(|(n, _, t)| (n.clone(), t.clone()))
+        .collect();
+    let planned =
+        tacho_core::decide::ops::kit::plan_template_migrations(&raw_pairs, &BTreeMap::new())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let create_table_sql = "CREATE TABLE IF NOT EXISTS _sqlx_migrations (\
+        version BIGINT PRIMARY KEY, \
+        description TEXT NOT NULL, \
+        installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), \
+        success BOOLEAN NOT NULL, \
+        checksum BYTEA NOT NULL, \
+        execution_time BIGINT NOT NULL\
+    );";
+    run_sql(None, Some(create_table_sql))?;
+
+    for (entry, (_, path, text)) in planned.iter().zip(files.iter()) {
+        if stdin_mode {
+            run_sql(None, Some(text))?;
+        } else {
+            run_sql(Some(path.as_path()), None)?;
+        }
+        let desc_escaped = entry.description.replace('\'', "''");
+        let insert_sql = format!(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES ({}, '{desc_escaped}', TRUE, decode('{}', 'hex'), 0) \
+             ON CONFLICT (version) DO NOTHING;",
+            entry.version, entry.checksum_hex
+        );
+        run_sql(None, Some(&insert_sql))?;
+    }
+    Ok(planned)
+}

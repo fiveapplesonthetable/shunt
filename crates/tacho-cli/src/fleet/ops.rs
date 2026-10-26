@@ -619,7 +619,31 @@ pub fn run_setup_with(
     let mut units_installed = Vec::new();
 
     if !dry_run {
+        use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(home_dir)?;
+        for sub in [
+            "warm",
+            "sccache",
+            "cache/npm",
+            "cache/cargo-registry",
+            "tmp",
+            "runner-tmp",
+        ] {
+            let dir = home_dir.join(sub);
+            fs::create_dir_all(&dir)?;
+            if sub == "tmp" || sub == "runner-tmp" {
+                let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+            }
+        }
+        let runner_dropin_dir = systemd_dir.join("tacho-runner@.service.d");
+        fs::create_dir_all(&runner_dropin_dir)?;
+        let runner_tmp = home_dir.join("runner-tmp");
+        let dropin_content =
+            tacho_core::decide::ops::config::runner_tmp_dropin(&runner_tmp.to_string_lossy());
+        write_atomic(
+            &runner_dropin_dir.join("50-tmp.conf"),
+            dropin_content.as_bytes(),
+        )?;
         if !env_file.exists() {
             let default_env = "# Tachograph fleet environment configuration\nTACHO_MAX_WORKERS=4\n";
             fs::write(&env_file, default_env)?;

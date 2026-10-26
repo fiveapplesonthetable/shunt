@@ -710,6 +710,17 @@ fn test_starve_registered_burner_verification_and_preemption() {
     let right_reg = RegisteredBurner { pid, starttime: st };
     assert!(stop_registered_burner(&right_reg));
     let _ = guard.0.wait();
+    drop(guard);
+
+    let leaked: Vec<u32> = tacho_daemon::exec::observe::scan_procs()
+        .into_iter()
+        .filter(|p| p.comm == "yes" && p.env_starve)
+        .map(|p| p.pid)
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "starve test must leave no yes burner with TACHO_STARVE=1 running, found pids: {leaked:?}"
+    );
 }
 
 #[test]
@@ -746,4 +757,81 @@ fn test_starve_refuses_when_merge_batch_is_running() {
         .batches
         .iter()
         .any(|b| b.status == "running" || b.status == "bisecting"));
+}
+
+#[test]
+fn test_worktree_migrations_utc_stamp_version_order_and_template_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = tmp.path().join("wt");
+    let mig_dir = wt.join("migrations");
+
+    // 1. Create two UTC-stamped migrations in version order
+    let p1 = super::create_utc_migration_in_worktree(&mig_dir, "add_users", 1_700_000_000).unwrap();
+    let p2 =
+        super::create_utc_migration_in_worktree(&mig_dir, "add_sessions", 1_700_000_060).unwrap();
+    assert_eq!(
+        p1.file_name().and_then(|n| n.to_str()),
+        Some("20231114221320_add_users.sql")
+    );
+    assert_eq!(
+        p2.file_name().and_then(|n| n.to_str()),
+        Some("20231114221420_add_sessions.sql")
+    );
+    fs::write(&p1, "CREATE TABLE users (id INT PRIMARY KEY);\n").unwrap();
+    fs::write(&p2, "CREATE TABLE sessions (id INT PRIMARY KEY);\n").unwrap();
+
+    // 2. Verify and plan worktree migrations
+    let planned = super::verify_and_plan_worktree_migrations(&wt).unwrap();
+    assert_eq!(planned.len(), 2);
+    assert_eq!(planned[0].version, 20231114221320);
+    assert_eq!(planned[0].description, "add users");
+    assert_eq!(planned[1].version, 20231114221420);
+    assert_eq!(planned[1].description, "add sessions");
+
+    // 3. Apply migrations in file mode and in stdin mode (`docker exec -i` style)
+    let mut recorded_file_calls = Vec::new();
+    let applied_files = super::migrate_template_database(&mig_dir, false, |file_opt, sql_opt| {
+        recorded_file_calls.push((
+            file_opt.map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            }),
+            sql_opt.map(str::to_string),
+        ));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(applied_files.len(), 2);
+    // 1 table creation + 2 * (migration file + insert_sql) = 5 calls
+    assert_eq!(recorded_file_calls.len(), 5);
+    assert_eq!(
+        recorded_file_calls[1].0.as_deref(),
+        Some("20231114221320_add_users.sql")
+    );
+    assert!(recorded_file_calls[2]
+        .1
+        .as_deref()
+        .unwrap_or("")
+        .contains("INSERT INTO _sqlx_migrations"));
+    assert_eq!(
+        recorded_file_calls[3].0.as_deref(),
+        Some("20231114221420_add_sessions.sql")
+    );
+
+    let mut recorded_stdin_sql = Vec::new();
+    let applied_stdin = super::migrate_template_database(&mig_dir, true, |file_opt, sql_opt| {
+        assert!(
+            file_opt.is_none(),
+            "stdin mode must pipe SQL body instead of host path"
+        );
+        recorded_stdin_sql.push(sql_opt.unwrap_or("").to_string());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(applied_stdin.len(), 2);
+    assert_eq!(recorded_stdin_sql.len(), 5);
+    assert!(recorded_stdin_sql[1].contains("CREATE TABLE users"));
+    assert!(recorded_stdin_sql[3].contains("CREATE TABLE sessions"));
 }

@@ -171,7 +171,186 @@ pub fn apply_tidy_decisions(
             }
         }
     }
+    if !dry_run {
+        let warm_cap: u64 = 80 * (1 << 30);
+        let _ = prune_runner_pool_and_warm_caches(
+            store.home(),
+            warm_cap,
+            now.max(0) as u64,
+            7 * 86_400,
+        );
+    }
     Ok(removed)
+}
+
+/// Checks whether a lock file (`slot-N.lock`) is currently held by an active `flock`.
+fn is_flock_held(lock_path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    else {
+        return false;
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
+    }
+}
+
+fn dir_size_and_mtime(dir: &Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut newest_mtime = fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&cur) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if let Ok(mt) = meta.modified() {
+                if let Ok(d) = mt.duration_since(std::time::UNIX_EPOCH) {
+                    newest_mtime = newest_mtime.max(d.as_secs());
+                }
+            }
+            if meta.is_dir() {
+                stack.push(p);
+            } else if meta.is_file() {
+                bytes = bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    (bytes, newest_mtime)
+}
+
+/// Prunes stale runner caches and shrinks `<home>/warm` to `max_warm_bytes` (oldest mtime first)
+/// using [`tacho_core::decide::ops::tidy::default_caches`] and [`tacho_core::decide::verify::shrink_plan`],
+/// skipping any slot or cache whose lock file in `<home>/locks` or `<home>/warm` is currently held via `flock`.
+pub fn prune_runner_pool_and_warm_caches(
+    home: &Path,
+    max_warm_bytes: u64,
+    now_secs: u64,
+    stale_age_secs: u64,
+) -> io::Result<(Vec<String>, u64)> {
+    let mut removed = Vec::new();
+    let locks_dir = home.join("locks");
+    let warm_dir = home.join("warm");
+    let mut locked_slots = BTreeSet::new();
+    for dir in [&locks_dir, &warm_dir] {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("lock") && is_flock_held(&p) {
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        locked_slots.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut warm_names = Vec::new();
+    if let Ok(entries) = fs::read_dir(&warm_dir) {
+        for entry in entries.flatten() {
+            warm_names.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+
+    // 1. Prune stale top-level caches (`default_caches`) if unlocked and older than `stale_age_secs`
+    let home_str = home.to_string_lossy();
+    let specs = tacho_core::decide::ops::tidy::default_caches(
+        &format!("{home_str}/sccache"),
+        &format!("{home_str}/cache"),
+        &format!("{home_str}/worktrees"),
+        &format!("{home_str}/warm"),
+        &warm_names,
+    );
+    for spec in specs {
+        let cache_dir = Path::new(&spec.path);
+        if !cache_dir.is_dir() {
+            continue;
+        }
+        if !spec.lock_file.is_empty() && is_flock_held(Path::new(&spec.lock_file)) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(cache_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let sub = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if locked_slots.contains(&name)
+                || is_flock_held(&locks_dir.join(format!("{name}.lock")))
+                || is_flock_held(&warm_dir.join(format!("{name}.lock")))
+                || is_flock_held(&sub.join(".lock"))
+            {
+                continue;
+            }
+            let (_, mtime) = dir_size_and_mtime(&sub);
+            if stale_age_secs > 0 && now_secs.saturating_sub(mtime) > stale_age_secs {
+                if sub.is_dir() {
+                    let _ = fs::remove_dir_all(&sub);
+                } else {
+                    let _ = fs::remove_file(&sub);
+                }
+                removed.push(sub.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    // 2. Shrink `<home>/warm` to `max_warm_bytes` (oldest mtime first) using `shrink_plan`,
+    // skipping any slot directory whose lock is held.
+    let mut area_entries = Vec::new();
+    let mut total_warm_bytes = 0u64;
+    if let Ok(entries) = fs::read_dir(&warm_dir) {
+        for entry in entries.flatten() {
+            let sub = entry.path();
+            if !sub.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let (bytes, mtime) = dir_size_and_mtime(&sub);
+            total_warm_bytes = total_warm_bytes.saturating_add(bytes);
+            if is_flock_held(&locks_dir.join(format!("{name}.lock")))
+                || is_flock_held(&warm_dir.join(format!("{name}.lock")))
+                || is_flock_held(&sub.join(".lock"))
+            {
+                locked_slots.insert(name.clone());
+            }
+            area_entries.push(tacho_core::decide::verify::AreaDirEntry {
+                name,
+                bytes,
+                mtime: mtime as i64,
+            });
+        }
+    }
+    let to_delete =
+        tacho_core::decide::verify::shrink_plan(&area_entries, &locked_slots, max_warm_bytes);
+    for del_name in to_delete {
+        let p = warm_dir.join(&del_name);
+        let (del_bytes, _) = dir_size_and_mtime(&p);
+        if p.is_dir() {
+            let _ = fs::remove_dir_all(&p);
+        } else {
+            let _ = fs::remove_file(&p);
+        }
+        total_warm_bytes = total_warm_bytes.saturating_sub(del_bytes);
+        removed.push(p.to_string_lossy().to_string());
+    }
+
+    Ok((removed, total_warm_bytes))
 }
 
 /// Removes a verified linked git worktree (`git worktree add`) and forgets it.

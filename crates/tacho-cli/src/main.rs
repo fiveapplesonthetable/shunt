@@ -90,6 +90,13 @@ fn execute_hook_guard() -> i32 {
         .or_else(|| obj.get("tool"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let under_starve_env = std::env::var("TACHO_STARVE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if let Err(reason) = hook::check_pre_tool_use_guardrails(&val, under_starve_env) {
+        eprintln!("Refused by tacho guard: {reason}");
+        return 2;
+    }
     if !tool_name.eq_ignore_ascii_case("bash")
         && !tool_name.eq_ignore_ascii_case("shell")
         && !tool_name.eq_ignore_ascii_case("run_command")
@@ -222,6 +229,7 @@ fn execute_db(args: DbArgs) -> io::Result<()> {
     }
 
     if checkout.is_dir() {
+        let _ = kit::verify_and_plan_worktree_migrations(&checkout)?;
         let env_path = checkout.join(".tachoenv");
         let mut map = if env_path.is_file() {
             parse_env(&fs::read_to_string(&env_path).unwrap_or_default())

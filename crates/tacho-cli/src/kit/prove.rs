@@ -349,6 +349,38 @@ pub fn plan_prove_checks(
         if !rust_checks.is_empty() {
             return rust_checks;
         }
+        // Check if Python package or console tests in the worktree match via related test discovery
+        if root.join("tools/tacho/tests").is_dir() {
+            let mut test_contents = BTreeMap::new();
+            if let Ok(entries) = fs::read_dir(root.join("tools/tacho/tests")) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("py") {
+                        if let (Some(fname), Ok(txt)) = (
+                            p.file_name().and_then(|n| n.to_str()),
+                            fs::read_to_string(&p),
+                        ) {
+                            test_contents.insert(format!("tools/tacho/tests/{fname}"), txt);
+                        }
+                    }
+                }
+            }
+            let related = tacho_core::decide::verify::related_package_tests(
+                &filtered,
+                &test_contents,
+                "tools/tacho",
+                "tacho",
+            );
+            if !related.is_empty() {
+                planned.push(PlannedCheck {
+                    name: "tacho:unit".to_string(),
+                    cmd: format!("python3 -m unittest {}", related.join(" ")),
+                    area: "tacho".to_string(),
+                    units: related,
+                });
+                return planned;
+            }
+        }
         if root.join("Cargo.toml").is_file() {
             planned.push(PlannedCheck {
                 name: "workspace:cargo-check".to_string(),
@@ -463,6 +495,7 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
             format!("no changed files relative to base {base_sha}"),
         ));
     }
+    let _ = super::verify_and_plan_worktree_migrations(&root)?;
 
     let stray_shots = stray_screenshots_for_files(&root, &changed);
     if !stray_shots.is_empty() {

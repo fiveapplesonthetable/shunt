@@ -806,3 +806,114 @@ fn test_a_changed_config_selects_everything() {
         vec!["*"]
     );
 }
+
+#[test]
+fn test_batch_planner_integrates_costly_area_selection_end_to_end() {
+    let rules = vec![
+        AreaRule {
+            area: "console".to_string(),
+            prefixes: vec!["frontend/admin/".to_string()],
+            unit_prefixes: BTreeMap::new(),
+            checks: Vec::new(),
+            isolate_batch: false,
+            needs_screenshot: false,
+        },
+        AreaRule {
+            area: "android".to_string(),
+            prefixes: vec!["frontend/android/".to_string()],
+            unit_prefixes: BTreeMap::new(),
+            checks: Vec::new(),
+            isolate_batch: false,
+            needs_screenshot: false,
+        },
+        AreaRule {
+            area: "image".to_string(),
+            prefixes: vec!["deploy/Dockerfile".to_string(), "crates/".to_string()],
+            unit_prefixes: BTreeMap::new(),
+            checks: Vec::new(),
+            isolate_batch: false,
+            needs_screenshot: false,
+        },
+    ];
+
+    // 1. Console source PR in `batches(...)` gets `console-browser` added, while a Rust `.rs` source
+    // file (without Cargo.toml or Dockerfile) has `image` pruned:
+    let open_prs = vec![
+        PullFacts {
+            number: 101,
+            branch: "agent/ui".to_string(),
+            head: "a".repeat(40),
+            base: "main".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            mergeable: "MERGEABLE".to_string(),
+            files: vec!["frontend/admin/src/screens/Home.tsx".to_string()],
+            ..Default::default()
+        },
+        PullFacts {
+            number: 102,
+            branch: "agent/svc".to_string(),
+            head: "b".repeat(40),
+            base: "main".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            mergeable: "MERGEABLE".to_string(),
+            files: vec!["crates/api-service/src/main.rs".to_string()],
+            ..Default::default()
+        },
+        PullFacts {
+            number: 103,
+            branch: "agent/manifest".to_string(),
+            head: "c".repeat(40),
+            base: "main".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            mergeable: "MERGEABLE".to_string(),
+            files: vec!["crates/api-service/Cargo.toml".to_string()],
+            ..Default::default()
+        },
+    ];
+
+    let planned = batches(
+        &open_prs,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[],
+        &rules,
+        6,
+    );
+    let console_batch = planned
+        .iter()
+        .find(|b| b.prs.contains(&101))
+        .expect("console batch");
+    assert!(console_batch.areas.contains(&"console".to_string()));
+    assert!(console_batch.areas.contains(&"console-browser".to_string()));
+    assert!(!console_batch.areas.contains(&"image".to_string()));
+
+    // PR 102 alone (only `.rs` source) prunes `image`:
+    let planned_svc_only = batches(
+        &open_prs[1..2],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[],
+        &rules,
+        6,
+    );
+    assert_eq!(planned_svc_only.len(), 1);
+    assert!(!planned_svc_only[0].areas.contains(&"image".to_string()));
+
+    // PR 103 (touches `Cargo.toml`) keeps `image`:
+    let planned_manifest = batches(
+        &open_prs[2..3],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &[],
+        &rules,
+        6,
+    );
+    assert_eq!(planned_manifest.len(), 1);
+    assert!(planned_manifest[0].areas.contains(&"image".to_string()));
+}

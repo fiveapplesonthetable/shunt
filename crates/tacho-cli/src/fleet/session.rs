@@ -144,9 +144,13 @@ pub fn spawn_worker_in_dir(
         .filter(|a| !a.worktree.is_empty())
     {
         PathBuf::from(&prior.worktree)
-    } else if tacho_daemon::exec::observe::verify_worker_worktree(&cwd).is_ok() {
+    } else if crate::kit::start::is_within_fleet_root(&cwd, store.home(), &state)
+        && tacho_daemon::exec::observe::verify_worker_worktree(&cwd).is_ok()
+    {
         cwd.clone()
-    } else if tacho_daemon::exec::observe::inside_git_checkout(&cwd) {
+    } else if crate::kit::start::is_within_fleet_root(&cwd, store.home(), &state)
+        && tacho_daemon::exec::observe::inside_git_checkout(&cwd)
+    {
         let wt_slug = if tacho_core::decide::verify::slug_problem(&item.key).is_none() {
             item.key.clone()
         } else {
@@ -168,7 +172,22 @@ pub fn spawn_worker_in_dir(
         }
         path
     } else {
-        cwd.clone()
+        let reason = format!(
+            "refusing to start worker {} without its own provisioned worktree (cwd '{}' is outside fleet root '{}')",
+            item.key,
+            cwd.display(),
+            store.home().display()
+        );
+        let now = now_secs();
+        let root_for_hold = root_key.clone();
+        let reason_for_store = reason.clone();
+        store.mutate(
+            Some(("dispatch", "start_refused", &item.key, &reason)),
+            move |st| {
+                st.holds = with_hold(&st.holds, &root_for_hold, &reason_for_store, now);
+            },
+        )?;
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
     };
 
     if let Err(reason) = tacho_daemon::exec::observe::verify_worker_worktree(&wt_path) {
@@ -181,13 +200,6 @@ pub fn spawn_worker_in_dir(
                 st.holds = with_hold(&st.holds, &root_for_hold, &reason_for_store, now);
             },
         )?;
-        let _ = tacho_core::decide::plugin::notify_owner_command(
-            &format!(
-                "[tacho] worker {} refused: no worktree of its own",
-                item.key
-            ),
-            &reason,
-        );
         return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
     }
 
@@ -734,10 +746,6 @@ pub fn deliver_tell_action(
                 store.mutate(Some(("watch", "tell_refused", &key, &reason)), move |st| {
                     st.holds = with_hold(&st.holds, &root_for_hold, &reason_for_store, now);
                 })?;
-                let _ = tacho_core::decide::plugin::notify_owner_command(
-                    &format!("[tacho] worker {key} refused: no worktree of its own"),
-                    &reason,
-                );
                 return Err(io::Error::new(RESUME_REFUSED, reason));
             }
             let log_file = fs::OpenOptions::new()

@@ -15,8 +15,8 @@ use tacho_core::decide::verify::{
     area_hang_report, areas_for_files, batch_refs_moved, batches, checks_for_files, classify,
     counterexample, failed_tests, flake_rows, flake_tasks, job_argv, job_for, new_batch_id,
     next_probe, parents, parse_workflow_yaml, record_flakes, reruns_on_red, reusable_batch,
-    service_argv, summary_line, AreaCheck, AreaRule, BatchMode, BatchRun, Bisect, FailedRecord,
-    PassedRecord, ProbeStep,
+    select_costly_areas, service_argv, summary_line, AreaCheck, AreaRule, BatchMode, BatchRun,
+    Bisect, FailedRecord, PassedRecord, ProbeStep,
 };
 use tacho_core::{Scrubber, TaskStatus};
 
@@ -143,6 +143,17 @@ pub fn select_batch_checks(
     area_rules: &[AreaRule],
     requested_areas: Option<&[String]>,
 ) -> (Vec<String>, Vec<AreaCheck>) {
+    select_batch_checks_for_origin(files, area_rules, requested_areas, true, false)
+}
+
+/// Filter `area_rules` and changed `files` with costly-area pruning (`image`, `android-release`, `console-browser`).
+pub fn select_batch_checks_for_origin(
+    files: &[String],
+    area_rules: &[AreaRule],
+    requested_areas: Option<&[String]>,
+    pull_request: bool,
+    train: bool,
+) -> (Vec<String>, Vec<AreaCheck>) {
     if let Some(req) = requested_areas.filter(|a| !a.is_empty()) {
         let req_set: BTreeSet<&str> = req.iter().map(String::as_str).collect();
         let all_checks = checks_for_files(files, area_rules);
@@ -167,9 +178,23 @@ pub fn select_batch_checks(
         }
         return (areas, checks);
     }
-    let checks = checks_for_files(files, area_rules);
-    let areas: Vec<String> = checks.iter().map(|c| c.area.clone()).collect();
-    (areas, checks)
+    let raw_checks = checks_for_files(files, area_rules);
+    let raw_areas: Vec<String> = raw_checks.iter().map(|c| c.area.clone()).collect();
+    let effective_areas = select_costly_areas(&raw_areas, files, pull_request, train);
+    let effective_set: BTreeSet<&str> = effective_areas.iter().map(String::as_str).collect();
+    let mut checks: Vec<AreaCheck> = raw_checks
+        .into_iter()
+        .filter(|c| effective_set.contains(c.area.as_str()))
+        .collect();
+    for area in &effective_areas {
+        if !checks.iter().any(|c| &c.area == area) {
+            checks.push(AreaCheck {
+                area: area.clone(),
+                units: vec!["all".to_string()],
+            });
+        }
+    }
+    (effective_areas, checks)
 }
 
 /// Spawns a detached background batch runner writing to `$TACHO_HOME/logs/batch-<id>.log`,
@@ -360,14 +385,19 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             areas.insert("workspace".to_string());
         }
     }
-    let (selected_areas, checks) =
-        select_batch_checks(&all_files, &state.area_rules, opts.areas.as_deref());
+    let (selected_areas, checks) = select_batch_checks_for_origin(
+        &all_files,
+        &state.area_rules,
+        opts.areas.as_deref(),
+        batch_mode == BatchMode::Presubmit,
+        opts.origin == BatchOrigin::Train,
+    );
     let area_list: Vec<String> = if let Some(req) = opts.areas.as_ref().filter(|a| !a.is_empty()) {
         req.to_vec()
-    } else if !areas.is_empty() {
-        areas.into_iter().collect()
-    } else {
+    } else if !selected_areas.is_empty() {
         selected_areas
+    } else {
+        areas.into_iter().collect()
     };
 
     if let Some(reused) = reusable_batch(&state.batches, &pr_nums, &shas, &main_sha, &area_list) {
@@ -539,7 +569,34 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         Ok((out.status.success(), timed_out, txt, p_start, p_end))
     };
 
-    let (ok, timed_out, mut log_text, p0_start, p0_end) = run_probe(pr_nums.len(), "r0")?;
+    let (mut ok, timed_out, mut log_text, p0_start, p0_end) = run_probe(pr_nums.len(), "r0")?;
+    if ok {
+        if let Some(report_dir) = std::env::var("TACHO_SHOT_REPORT_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                let p = cwd.join(".tachoshots");
+                p.is_dir().then_some(p)
+            })
+        {
+            let fix_shots = opts.origin == BatchOrigin::Train
+                || std::env::var("TACHO_FIX_SHOTS").ok().as_deref() == Some("1");
+            if let Err(shot_err) = super::train::stage_and_commit_merged_screenshots(
+                &cwd,
+                &report_dir,
+                &batch_id,
+                &all_files,
+                fix_shots,
+                &tacho_core::decide::land::ShotRules::default(),
+            ) {
+                ok = false;
+                if !log_text.is_empty() {
+                    log_text.push('\n');
+                }
+                log_text.push_str(&shot_err.to_string());
+            }
+        }
+    }
     store.emit_duration_slice(
         &format!("batch:{batch_id}"),
         &format!("check PRs {:?}", pr_nums),

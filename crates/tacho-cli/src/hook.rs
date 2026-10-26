@@ -17,7 +17,9 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tacho_core::decide::watch::config::WatchConfig;
-use tacho_core::decide::watch::guard::shell_tokens;
+use tacho_core::decide::watch::guard::{
+    loosened_limits_in_diff, shell_tokens, time_based_tests_in_diff, vague_waits_in_diff,
+};
 use tacho_core::{Input, ToolInput};
 use tacho_ingest::hooks::{claude, gemini, jetski, HookEnv};
 
@@ -422,10 +424,124 @@ pub fn no_background_bash_check(tool_input: &serde_json::Value) -> Result<(), St
     Ok(())
 }
 
+/// Runs the three diff guardrails (`loosened_limits_in_diff`, `vague_waits_in_diff`, and
+/// `time_based_tests_in_diff`) against a unified git diff and returns all violations.
+pub fn check_diff_text_guardrails(diff: &str) -> Result<(), Vec<String>> {
+    let mut violations = Vec::new();
+    for v in loosened_limits_in_diff(diff) {
+        violations.push(format!("loosened limit in diff: {v}"));
+    }
+    for v in vague_waits_in_diff(diff) {
+        violations.push(format!("vague wait in test diff: {v}"));
+    }
+    for v in time_based_tests_in_diff(diff) {
+        violations.push(format!("time-based test assertion in diff: {v}"));
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// Computes the unified diff in `worktree` against `base_rev` (or `origin/main` / `main` / `HEAD~1`)
+/// and validates it with [`check_diff_text_guardrails`] for pre-push and PR preflight hooks.
+pub fn check_worktree_diff_guardrails(
+    worktree: &Path,
+    base_rev: Option<&str>,
+) -> Result<(), Vec<String>> {
+    if !worktree.is_dir() {
+        return Ok(());
+    }
+    let resolved_base = base_rev.map(str::to_string).or_else(|| {
+        for cand in ["origin/main", "main", "HEAD~1"] {
+            let ok = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "-q", cand])
+                .current_dir(worktree)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(cand.to_string());
+            }
+        }
+        None
+    });
+    let mut combined_diff = String::new();
+    if let Some(base) = resolved_base {
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["diff", &format!("{base}..HEAD")])
+            .current_dir(worktree)
+            .output()
+        {
+            if out.status.success() {
+                combined_diff.push_str(&String::from_utf8_lossy(&out.stdout));
+                combined_diff.push('\n');
+            }
+        }
+    }
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["diff", "HEAD"])
+        .current_dir(worktree)
+        .output()
+    {
+        if out.status.success() {
+            combined_diff.push_str(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    check_diff_text_guardrails(&combined_diff)
+}
+
+fn synthetic_edit_diff(tool_input: &serde_json::Value) -> Option<String> {
+    let path = tool_input
+        .get("file_path")
+        .or_else(|| tool_input.get("path"))
+        .or_else(|| tool_input.get("Path"))
+        .and_then(|v| v.as_str())?
+        .trim_start_matches("./");
+    let old_text = tool_input
+        .get("old_string")
+        .or_else(|| tool_input.get("Target"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new_text = tool_input
+        .get("new_string")
+        .or_else(|| tool_input.get("content"))
+        .or_else(|| tool_input.get("Content"))
+        .or_else(|| tool_input.get("Replacement"))
+        .and_then(|v| v.as_str())?;
+    let mut diff = format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n");
+    for line in old_text.lines() {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in new_text.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    Some(diff)
+}
+
+fn command_is_git_push_or_pr(command: &str) -> bool {
+    for (stage, _) in split_shell_stages(command) {
+        let toks = shell_tokens(stage);
+        for pair in toks.windows(2) {
+            let bin = pair[0].rsplit('/').next().unwrap_or(&pair[0]);
+            if (bin == "git" && pair[1] == "push") || (bin == "tacho" && pair[1] == "pr") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Validate a PreToolUse / BeforeTool JSON payload against all active worker guardrails:
 /// 1. `no-background-bash` (`run_in_background` refusal)
 /// 2. `burner-guard` (`yes`, `stress`, `stress-ng` refusal including wrappers & `sh -c`)
 /// 3. Git & workflow hygiene (`git stash`, `git commit/push --no-verify`, `Co-Authored-By:` trailers)
+/// 4. Diff guardrails (no loosened limits, no vague waits, no time-based test assertions) on edits and pre-push
 pub fn check_pre_tool_use_guardrails(
     val: &serde_json::Value,
     under_starve: bool,
@@ -443,11 +559,50 @@ pub fn check_pre_tool_use_guardrails(
         return Ok(());
     }
 
+    if let Some(explicit_diff) = val.get("diff").and_then(|v| v.as_str()) {
+        if let Err(violations) = check_diff_text_guardrails(explicit_diff) {
+            return Err(format!(
+                "Refused by diff guardrails:\n  - {}",
+                violations.join("\n  - ")
+            ));
+        }
+    }
+
     let tool_name = val
         .get("tool_name")
         .or_else(|| val.get("tool"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+
+    let Some(tool_input) = val.get("tool_input") else {
+        return Ok(());
+    };
+
+    if let Some(input_diff) = tool_input.get("diff").and_then(|v| v.as_str()) {
+        if let Err(violations) = check_diff_text_guardrails(input_diff) {
+            return Err(format!(
+                "Refused by diff guardrails:\n  - {}",
+                violations.join("\n  - ")
+            ));
+        }
+    }
+
+    let is_edit = matches!(
+        tool_name,
+        "Write" | "Edit" | "MultiEdit" | "write_file" | "edit_file"
+    );
+    if is_edit {
+        if let Some(syn_diff) = synthetic_edit_diff(tool_input) {
+            if let Err(violations) = check_diff_text_guardrails(&syn_diff) {
+                return Err(format!(
+                    "Refused by diff guardrails:\n  - {}",
+                    violations.join("\n  - ")
+                ));
+            }
+        }
+        return Ok(());
+    }
+
     let is_shell = matches!(
         tool_name,
         "Bash" | "bash" | "run_shell_command" | "run_command" | "shell"
@@ -455,10 +610,6 @@ pub fn check_pre_tool_use_guardrails(
     if !is_shell {
         return Ok(());
     }
-
-    let Some(tool_input) = val.get("tool_input") else {
-        return Ok(());
-    };
 
     no_background_bash_check(tool_input)?;
 
@@ -474,6 +625,21 @@ pub fn check_pre_tool_use_guardrails(
     let cmd_stays_starved = under_starve || contains_tacho_starve(cmd);
     let sanitized_cmd = cmd.replace("yes |", "true |").replace("yes|", "true|");
     tacho_core::decide::dispatch::guard_bash_tool(false, &sanitized_cmd, cmd_stays_starved)?;
+
+    if command_is_git_push_or_pr(cmd) {
+        if let Some(cwd_str) = val
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .or_else(|| tool_input.get("cwd").and_then(|v| v.as_str()))
+        {
+            if let Err(violations) = check_worktree_diff_guardrails(Path::new(cwd_str), None) {
+                return Err(format!(
+                    "Refused by pre-push diff guardrails:\n  - {}",
+                    violations.join("\n  - ")
+                ));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -858,5 +1024,97 @@ mod tests {
         ] {
             let _ = check_pre_tool_use_guardrails(&weird, false);
         }
+    }
+
+    #[test]
+    fn test_diff_guards_in_worker_edit_and_pre_push_hooks() {
+        // 1. Worker Edit hook refuses loosened limits in non-test code
+        let edit_loosened = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "src/server.rs",
+                "old_string": "const TIMEOUT_MS: u64 = 1000;",
+                "new_string": "const TIMEOUT_MS: u64 = 5000;"
+            }
+        });
+        let err_limit = check_pre_tool_use_guardrails(&edit_loosened, false).unwrap_err();
+        assert!(err_limit.contains("loosened limit in diff"), "{err_limit}");
+
+        // 2. Worker Write hook refuses vague waits in test files
+        let write_wait = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "tests/ui.spec.ts",
+                "content": "await page.waitForTimeout(500);\n"
+            }
+        });
+        let err_wait = check_pre_tool_use_guardrails(&write_wait, false).unwrap_err();
+        assert!(err_wait.contains("vague wait in test diff"), "{err_wait}");
+
+        // 3. Worker Edit hook refuses time-based test assertions in test files
+        let edit_time_test = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "crates/app/tests/perf_test.rs",
+                "old_string": "assert_eq!(res, 42);",
+                "new_string": "assert!(elapsed.as_millis() < 200);"
+            }
+        });
+        let err_time = check_pre_tool_use_guardrails(&edit_time_test, false).unwrap_err();
+        assert!(
+            err_time.contains("time-based test assertion in diff"),
+            "{err_time}"
+        );
+
+        // 4. Pre-push hook (`git push` / `tacho pr`) in a real git worktree refuses when committed diff violates guards
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "Tester"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/limits.rs"),
+            "pub const MAX_RETRIES: u32 = 3;\n",
+        )
+        .unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+
+        run_git(&["checkout", "-q", "-b", "feat/loosen"]);
+        std::fs::write(
+            repo.join("src/limits.rs"),
+            "pub const MAX_RETRIES: u32 = 10;\n",
+        )
+        .unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "bump retries"]);
+
+        let push_payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": repo.to_string_lossy(),
+            "tool_input": {
+                "command": "git push origin HEAD"
+            }
+        });
+        let err_push = check_pre_tool_use_guardrails(&push_payload, false).unwrap_err();
+        assert!(
+            err_push.contains("Refused by pre-push diff guardrails")
+                && err_push.contains("loosened limit"),
+            "{err_push}"
+        );
     }
 }

@@ -468,6 +468,70 @@ pub fn run_provisioner_bounded(
     }
 }
 
+fn is_shared_system_dir(p: &Path) -> bool {
+    let Ok(canon) = p.canonicalize() else {
+        return true;
+    };
+    if canon == Path::new("/")
+        || canon == Path::new("/tmp")
+        || canon == Path::new("/var")
+        || canon == Path::new("/var/tmp")
+        || canon == Path::new("/home")
+        || canon == Path::new("/Users")
+    {
+        return true;
+    }
+    for var in ["HOME", "TMPDIR"] {
+        if let Some(val) = std::env::var_os(var).filter(|s| !s.is_empty()) {
+            if PathBuf::from(val).canonicalize().ok().as_ref() == Some(&canon) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `dir` lies inside the fleet root (`store_home`, its dedicated fleet holder parent,
+/// `TACHO_HOME`, `TACHO_WORK`, `TACHO_REPO`, or `state.repo_root`).
+///
+/// Prevents worktree provisioning fallbacks from running against an arbitrary ambient checkout
+/// outside the fleet root.
+pub fn is_within_fleet_root(dir: &Path, store_home: &Path, state: &FleetState) -> bool {
+    let Ok(canon) = dir.canonicalize() else {
+        return false;
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if !store_home.as_os_str().is_empty() {
+        roots.push(store_home.to_path_buf());
+        if let Some(parent) = store_home.parent() {
+            if !parent.as_os_str().is_empty() && !is_shared_system_dir(parent) {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    for var in ["TACHO_HOME", "TACHO_WORK", "TACHO_REPO"] {
+        if let Some(val) = std::env::var_os(var).filter(|s| !s.is_empty()) {
+            let pb = PathBuf::from(val);
+            if let Some(parent) = pb.parent() {
+                if !parent.as_os_str().is_empty() && !is_shared_system_dir(parent) {
+                    roots.push(parent.to_path_buf());
+                }
+            }
+            roots.push(pb);
+        }
+    }
+    if let Some(ref repo) = state.repo_root {
+        if !repo.trim().is_empty() {
+            roots.push(PathBuf::from(repo));
+        }
+    }
+    roots.into_iter().any(|r| {
+        r.canonicalize()
+            .map(|rc| canon.starts_with(&rc))
+            .unwrap_or(false)
+    })
+}
+
 /// Core implementation of `tacho start` against an already-opened [`tacho_daemon::FleetStore`],
 /// returning `(worktree_path, exit_code)` (`0` on success, `3` when first install / provisioner
 /// exceeds its timeout cap).
@@ -481,11 +545,25 @@ pub fn provision_worktree_in_store(
 
     let state = store.load()?;
     let cwd = std::env::current_dir()?;
+    if !is_within_fleet_root(&cwd, store.home(), &state) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to provision worktree from '{}': current directory is outside the fleet root '{}'",
+                cwd.display(),
+                store.home().display()
+            ),
+        ));
+    }
 
     let wt_root = args.dir.unwrap_or_else(|| {
-        cwd.parent()
-            .map(|p| p.join("worktrees"))
-            .unwrap_or_else(|| cwd.join(".worktrees"))
+        if let Some(work) = std::env::var_os("TACHO_WORK").filter(|s| !s.is_empty()) {
+            PathBuf::from(work).join("worktrees")
+        } else if !store.home().as_os_str().is_empty() {
+            store.home().join("worktrees")
+        } else {
+            cwd.join(".worktrees")
+        }
     });
     fs::create_dir_all(&wt_root)?;
     let wt_path = wt_root.join(&args.slug);

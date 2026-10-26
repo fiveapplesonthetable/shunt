@@ -99,6 +99,9 @@ pub struct FleetState {
     /// Whether `tacho land` is permitted to run `gh pr merge`. Defaults to `false` (owner merges by hand).
     #[serde(default)]
     pub merge_prs: bool,
+    /// Recorded main repository checkout path for this fleet; `None` when not yet configured.
+    #[serde(default)]
+    pub repo_root: Option<String>,
 }
 
 impl Default for FleetState {
@@ -148,6 +151,7 @@ impl Default for FleetState {
             main_sha: None,
             world_refreshed_at: BTreeMap::new(),
             merge_prs: false,
+            repo_root: None,
         }
     }
 }
@@ -155,6 +159,7 @@ impl Default for FleetState {
 /// SQLite-backed store for [`FleetState`] and [`DecisionRecord`]s sharing `$TACHO_HOME/events.sqlite`.
 pub struct FleetStore {
     conn: Connection,
+    home: std::path::PathBuf,
 }
 
 fn sql_err(e: rusqlite::Error) -> io::Error {
@@ -281,7 +286,13 @@ impl FleetStore {
             .map_err(sql_err)?;
         }
 
-        Ok(Self { conn })
+        let home = db_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Ok(Self { conn, home })
+    }
+
+    /// Directory containing this store's database (`$TACHO_HOME`).
+    pub fn home(&self) -> &Path {
+        &self.home
     }
 
     /// Loads the current [`FleetState`] from SQLite, returning `FleetState::default()` if none exists yet.
@@ -689,6 +700,7 @@ fn input_fingerprint(state: &DecisionState, obs: &WorldObservation) -> io::Resul
     let mut obs = obs.clone();
     obs.now = 0;
     obs.tidy_snapshot.now = 0;
+    obs.root_disk_bytes = None;
     for sample in obs.agent_samples.values_mut() {
         sample.ts = 0;
     }

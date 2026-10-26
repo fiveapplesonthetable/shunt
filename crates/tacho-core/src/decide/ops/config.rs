@@ -460,7 +460,7 @@ pub fn runner_tmp_dropin(tmp_dir: &str) -> String {
 }
 
 /// Action decided by [`check_root_disk`] when inspecting `/` filesystem capacity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RootDiskAction {
     /// True when `/` usage is `>= 80%` or free space is `< 20 GiB`.
     pub warn: bool,

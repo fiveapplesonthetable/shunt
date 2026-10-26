@@ -988,6 +988,55 @@ fn start_worker_whose_directory_is_main_checkout_never_runs() {
         "worker whose directory is the main checkout must never run"
     );
 
+    // 3. Attempt to start without a recorded worktree when cwd is an ambient checkout outside the fleet root:
+    // the provisioning fallback must refuse outside the fleet root.
+    let item3 = tacho_core::decide::dispatch::TodoItem {
+        key: "bad-worker-ambient".to_string(),
+        brief: "Attempt ambient cwd fallback outside fleet root".to_string(),
+        provider: Some("touch-marker".to_string()),
+        ..Default::default()
+    };
+    let res3 = super::spawn_worker_in_dir(&mut store, &item3, None);
+    assert!(
+        res3.is_err(),
+        "worktree provisioning fallback must refuse outside the fleet root"
+    );
+    assert!(!marker.exists());
+
+    // 4. Attempt to resume (`deliver_tell_action` ResumeWithMessage) an exited worker whose
+    // recorded worktree is the main checkout: must refuse before spawning, place a hold, and record `tell_refused`.
+    let resume_marker = tmp.path().join("resume-ran.marker");
+    store
+        .mutate(None, |st| {
+            if let Some(p) = st.providers.get_mut("touch-marker") {
+                p.resume_args = vec![resume_marker.display().to_string()];
+            }
+            st.agents.insert(
+                "exited-in-main".to_string(),
+                AgentRun {
+                    key: "exited-in-main".to_string(),
+                    provider: "touch-marker".to_string(),
+                    session_id: Some("sess-123".to_string()),
+                    worktree: main_str.clone(),
+                    log: home.join("exited.log").to_string_lossy().to_string(),
+                    started_at: 100,
+                    finished_at: Some(200),
+                    exit_code: Some(1),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+    let res_tell = super::session::deliver_tell_action(&mut store, "exited-in-main", "continue");
+    assert!(
+        res_tell.is_err(),
+        "deliver_tell_action must refuse to resume a worker in the main checkout"
+    );
+    assert!(
+        !resume_marker.exists(),
+        "resumed worker in main checkout must never run"
+    );
+
     let st = store.load().unwrap();
     assert!(
         st.holds.contains_key("bad-worker"),
@@ -996,6 +1045,14 @@ fn start_worker_whose_directory_is_main_checkout_never_runs() {
     assert!(
         st.holds.contains_key("bad-worker-2"),
         "refused worker must be placed on hold"
+    );
+    assert!(
+        st.holds.contains_key("bad-worker-ambient"),
+        "ambient-cwd refused worker must be placed on hold"
+    );
+    assert!(
+        st.holds.contains_key("exited-in-main"),
+        "refused resume in main checkout must place task on hold"
     );
     assert!(
         !st.agents.contains_key("bad-worker") && !st.agents.contains_key("bad-worker-2"),
@@ -1009,4 +1066,435 @@ fn start_worker_whose_directory_is_main_checkout_never_runs() {
         "expected start_refused decision for bad-worker, got: {:?}",
         decisions
     );
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.action == "tell_refused" && d.target == "exited-in-main"),
+        "expected tell_refused decision for exited-in-main, got: {:?}",
+        decisions
+    );
+}
+
+#[test]
+fn test_train_merged_screenshots_redraw_commits_beyond_noise_and_fails_on_unfixed_golden() {
+    use tacho_core::decide::land::{encode_rgba_png, ShotRules, GOLDEN_MOVED_MARKER};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "Tester"]);
+
+    let rules = ShotRules::default();
+    let shot_rel = "frontend/admin/screenshots/home.png";
+    let golden_rel = "frontend/admin/screenshots/login.png";
+    std::fs::create_dir_all(repo.join("frontend/admin/screenshots")).unwrap();
+    std::fs::write(
+        repo.join("frontend/admin/screenshots/.golden"),
+        "login.png\ndashboard.png\nsettings.png\n",
+    )
+    .unwrap();
+
+    let base_png = encode_rgba_png(20, 20, |_, _| [100, 100, 100, 255]);
+    // Sub-threshold antialiasing noise: 1 pixel channel differs by +5 (edge threshold is 24)
+    let noisy_png = encode_rgba_png(20, 20, |x, y| {
+        if x == 0 && y == 0 {
+            [105, 100, 100, 255]
+        } else {
+            [100, 100, 100, 255]
+        }
+    });
+    // Visibly moved screenshot: all pixels changed to [220, 40, 40, 255]
+    let moved_png = encode_rgba_png(20, 20, |_, _| [220, 40, 40, 255]);
+
+    std::fs::write(repo.join(shot_rel), &base_png).unwrap();
+    std::fs::write(repo.join(golden_rel), &base_png).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "initial shots"]);
+
+    // 1. Sub-threshold pixel noise is ignored (no commit created)
+    let report_noise = tmp.path().join("report-noise");
+    std::fs::create_dir_all(report_noise.join("console/before/frontend/admin/screenshots"))
+        .unwrap();
+    std::fs::create_dir_all(report_noise.join("console/after/frontend/admin/screenshots")).unwrap();
+    std::fs::write(
+        report_noise.join("console/before").join(shot_rel),
+        &base_png,
+    )
+    .unwrap();
+    std::fs::write(
+        report_noise.join("console/after").join(shot_rel),
+        &noisy_png,
+    )
+    .unwrap();
+    std::fs::write(
+        report_noise.join("console/changed.txt"),
+        format!("changed\t{shot_rel}\n"),
+    )
+    .unwrap();
+
+    let touched = vec!["frontend/admin/src/screens/Home.tsx".to_string()];
+    let res_noise = super::train::stage_and_commit_merged_screenshots(
+        &repo,
+        &report_noise,
+        "t001",
+        &touched,
+        true,
+        &rules,
+    )
+    .unwrap();
+    assert!(
+        res_noise.is_none(),
+        "sub-threshold pixel noise must not create a commit"
+    );
+
+    // 2. Screenshot moved beyond noise for a touched screen is staged and committed once
+    let report_moved = tmp.path().join("report-moved");
+    std::fs::create_dir_all(report_moved.join("console/before/frontend/admin/screenshots"))
+        .unwrap();
+    std::fs::create_dir_all(report_moved.join("console/after/frontend/admin/screenshots")).unwrap();
+    std::fs::write(
+        report_moved.join("console/before").join(shot_rel),
+        &base_png,
+    )
+    .unwrap();
+    std::fs::write(
+        report_moved.join("console/after").join(shot_rel),
+        &moved_png,
+    )
+    .unwrap();
+    std::fs::write(
+        report_moved.join("console/changed.txt"),
+        format!("changed\t{shot_rel}\n"),
+    )
+    .unwrap();
+
+    let commit_sha = super::train::stage_and_commit_merged_screenshots(
+        &repo,
+        &report_moved,
+        "t001",
+        &touched,
+        true,
+        &rules,
+    )
+    .unwrap()
+    .expect("moved screenshot should create a refresh commit");
+    assert_eq!(commit_sha.len(), 40);
+    let log_out = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%B"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let commit_msg = String::from_utf8_lossy(&log_out.stdout);
+    assert!(commit_msg.contains("Screenshots for train t001"));
+    assert!(commit_msg.contains("1 shot moved: home"));
+
+    // 3. Golden-listed screenshot moving on a batch without --fix-shots (`fix_shots = false`) fails
+    let report_golden = tmp.path().join("report-golden");
+    std::fs::create_dir_all(report_golden.join("console/before/frontend/admin/screenshots"))
+        .unwrap();
+    std::fs::create_dir_all(report_golden.join("console/after/frontend/admin/screenshots"))
+        .unwrap();
+    std::fs::write(
+        report_golden.join("console/before").join(golden_rel),
+        &base_png,
+    )
+    .unwrap();
+    std::fs::write(
+        report_golden.join("console/after").join(golden_rel),
+        &moved_png,
+    )
+    .unwrap();
+    std::fs::write(
+        report_golden.join("console/changed.txt"),
+        format!("changed\t{golden_rel}\n"),
+    )
+    .unwrap();
+
+    let err_no_fix = super::train::stage_and_commit_merged_screenshots(
+        &repo,
+        &report_golden,
+        "b001",
+        &["frontend/admin/src/screens/Login.tsx".to_string()],
+        false,
+        &rules,
+    )
+    .unwrap_err();
+    assert!(
+        err_no_fix.to_string().contains(GOLDEN_MOVED_MARKER),
+        "expected GOLDEN_MOVED_MARKER, got: {err_no_fix}"
+    );
+
+    // 4. Even with `fix_shots = true`, a golden that drifted without its screen being touched fails
+    let err_drift = super::train::stage_and_commit_merged_screenshots(
+        &repo,
+        &report_golden,
+        "t001",
+        &["frontend/admin/src/screens/Home.tsx".to_string()],
+        true,
+        &rules,
+    )
+    .unwrap_err();
+    assert!(
+        err_drift.to_string().contains(GOLDEN_MOVED_MARKER),
+        "expected GOLDEN_MOVED_MARKER on drift, got: {err_drift}"
+    );
+}
+
+#[test]
+fn test_owner_mail_ready_train_dedup_retry_and_secret_redaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = FleetStore::open(&tmp.path().join("events.sqlite")).unwrap();
+    let notifier = super::ops::Notifier::new();
+
+    // 1. Ready train notification includes merge command, scrubs secrets, retries on failure,
+    // and never sends twice once recorded.
+    let secret_token = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    let subject = format!("Train #42 ready to merge ({secret_token})");
+    let body = "Run `gh pr merge 42 --merge` to land the train.\nCredentials: postgres://admin:supersecret@db.internal:5432/prod".to_string();
+
+    // First attempt fails -> not marked in `notified_failures`, so next tick retries:
+    let fail_res = notifier.notify_owner(&mut store, "train-ready:42", &subject, &body, |_, _| {
+        Err("smtp temporary failure".to_string())
+    });
+    assert!(fail_res.is_err());
+    assert!(!store
+        .load()
+        .unwrap()
+        .notified_failures
+        .contains("train-ready:42"));
+
+    // Second attempt succeeds -> receives scrubbed subject & body with merge command, and records dedup key:
+    let mut delivered = Vec::new();
+    let sent = notifier
+        .notify_owner(&mut store, "train-ready:42", &subject, &body, |s, b| {
+            delivered.push((s.to_string(), b.to_string()));
+            Ok(())
+        })
+        .unwrap();
+    assert!(sent);
+    assert_eq!(delivered.len(), 1);
+    assert!(
+        !delivered[0].0.contains(&secret_token),
+        "secret token must be redacted from subject: {}",
+        delivered[0].0
+    );
+    assert!(
+        delivered[0].1.contains("gh pr merge 42 --merge"),
+        "ready train email must include merge command: {}",
+        delivered[0].1
+    );
+    assert!(
+        !delivered[0].1.contains("supersecret"),
+        "database password must be redacted from body: {}",
+        delivered[0].1
+    );
+
+    // Third attempt with same key is deduplicated (`Ok(false)`) and never invokes callback again:
+    let sent_again = notifier
+        .notify_owner(&mut store, "train-ready:42", &subject, &body, |_, _| {
+            panic!("must never email twice for the same notification key");
+        })
+        .unwrap();
+    assert!(!sent_again);
+}
+
+#[test]
+fn test_stall_watch_counts_child_processes_git_commits_and_file_changes() {
+    use tacho_core::decide::watch::{ProgressSample, SuperviseAction};
+    use tacho_core::decide::{decide, WorldObservation};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = FleetStore::open(&tmp.path().join("events.sqlite")).unwrap();
+    let baseline = ProgressSample {
+        ts: 100,
+        log_bytes: 500,
+        head_sha: "base111".to_string(),
+        dirty_files: 0,
+        cpu_ticks: 100,
+        newest_mtime: Some(100),
+    };
+    store
+        .mutate(None, |st| {
+            st.agents.insert(
+                "worker-1".to_string(),
+                AgentRun {
+                    key: "worker-1".to_string(),
+                    pid: Some(12345),
+                    worktree: "/tmp/wt-1".to_string(),
+                    started_at: 100,
+                    ..Default::default()
+                },
+            );
+            st.samples.insert("worker-1".to_string(), vec![baseline]);
+            // Mark as already nudged so the next stalled step escalates
+            st.nudged.insert("worker-1".to_string());
+        })
+        .unwrap();
+
+    let state = store.load().unwrap();
+    let dec_state = tacho_core::decide::DecisionState {
+        max_parallel: state.max_workers,
+        agents: state.agents.clone(),
+        samples: state.samples.clone(),
+        nudged: state.nudged.clone(),
+        ..Default::default()
+    };
+
+    // 1. At t=3500 (3400s elapsed > STALLED_SECS=2700), if the worker has a new git commit, dirty file,
+    // newest file mtime, or active child process CPU ticks, it is MOVING (not stalled):
+    let mut obs_active = WorldObservation {
+        now: 3500,
+        live_keys: BTreeSet::from(["worker-1".to_string()]),
+        ..Default::default()
+    };
+    obs_active.agent_samples.insert(
+        "worker-1".to_string(),
+        ProgressSample {
+            ts: 3500,
+            log_bytes: 500,
+            head_sha: "newcommit222".to_string(),
+            dirty_files: 2,
+            cpu_ticks: 50_000,
+            newest_mtime: Some(3450),
+        },
+    );
+    let plan_active = decide(&dec_state, &obs_active);
+    assert!(
+        !plan_active
+            .supervision_actions
+            .iter()
+            .any(|a| matches!(a, SuperviseAction::Escalate { key, .. } if key == "worker-1")),
+        "worker with recent child process CPU, git commit, or file change must not be escalated as stalled"
+    );
+
+    // 2. When log, git head, working tree files, and child process CPU are all quiet past `STALLED_SECS`,
+    // `decide` emits `SuperviseAction::Escalate` and an `OwnerNotification` (`stalled`):
+    let mut obs_quiet = WorldObservation {
+        now: 3500,
+        live_keys: BTreeSet::from(["worker-1".to_string()]),
+        ..Default::default()
+    };
+    obs_quiet.agent_samples.insert(
+        "worker-1".to_string(),
+        ProgressSample {
+            ts: 3500,
+            log_bytes: 500,
+            head_sha: "base111".to_string(),
+            dirty_files: 0,
+            cpu_ticks: 102,
+            newest_mtime: Some(100),
+        },
+    );
+    let plan_stalled = decide(&dec_state, &obs_quiet);
+    assert!(plan_stalled
+        .supervision_actions
+        .iter()
+        .any(|a| matches!(a, SuperviseAction::Escalate { key, .. } if key == "worker-1")));
+    assert!(plan_stalled
+        .owner_notifications
+        .iter()
+        .any(|n| n.key.starts_with("attention:stalled:worker-1:") && n.kind == "stalled"));
+}
+
+#[test]
+fn test_runner_pool_setup_50_tmp_conf_prune_skips_locked_slots_and_shrinks_warm_cache() {
+    use std::os::unix::io::AsRawFd;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("tacho-home");
+    let systemd_dir = tmp.path().join("systemd-user");
+
+    // 1. Setup writes `tacho-runner@.service.d/50-tmp.conf` and creates warm/cache directories
+    let report =
+        super::ops::run_setup_with(&home, &systemd_dir, &["git"], false).expect("setup ok");
+    assert!(report.env_created);
+    let dropin_path = systemd_dir.join("tacho-runner@.service.d/50-tmp.conf");
+    assert!(dropin_path.is_file(), "50-tmp.conf drop-in must be written");
+    let dropin_txt = std::fs::read_to_string(&dropin_path).unwrap();
+    assert!(dropin_txt.contains("Environment=\"TMPDIR="));
+    assert!(dropin_txt.contains("JAVA_TOOL_OPTIONS=-Djava.io.tmpdir="));
+    for sub in [
+        "warm",
+        "sccache",
+        "cache/npm",
+        "cache/cargo-registry",
+        "runner-tmp",
+    ] {
+        assert!(home.join(sub).is_dir(), "expected directory {sub} to exist");
+    }
+
+    // 2. Populate 3 warm slot directories:
+    // - `slot-1` (4000 bytes, oldest mtime, but LOCKED via flock on `locks/slot-1.lock`)
+    // - `slot-2` (4000 bytes, older mtime, unlocked)
+    // - `slot-3` (4000 bytes, newest mtime, unlocked)
+    let locks_dir = home.join("locks");
+    std::fs::create_dir_all(&locks_dir).unwrap();
+    let lock1_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(locks_dir.join("slot-1.lock"))
+        .unwrap();
+    let rc = unsafe { libc::flock(lock1_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "must acquire flock on slot-1.lock");
+
+    let slot1 = home.join("warm/slot-1");
+    let slot2 = home.join("warm/slot-2");
+    let slot3 = home.join("warm/slot-3");
+    std::fs::create_dir_all(&slot1).unwrap();
+    std::fs::create_dir_all(&slot2).unwrap();
+    std::fs::create_dir_all(&slot3).unwrap();
+    std::fs::write(slot1.join("a.bin"), vec![1u8; 4000]).unwrap();
+    std::fs::write(slot2.join("b.bin"), vec![2u8; 4000]).unwrap();
+    std::fs::write(slot3.join("c.bin"), vec![3u8; 4000]).unwrap();
+
+    // Set deterministic mtimes on slot-1 (t=100), slot-2 (t=200), slot-3 (t=300)
+    let set_mtime = |path: &std::path::Path, secs: i64| {
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        unsafe {
+            libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
+        }
+    };
+    set_mtime(&slot1.join("a.bin"), 100);
+    set_mtime(&slot1, 100);
+    set_mtime(&slot2.join("b.bin"), 200);
+    set_mtime(&slot2, 200);
+    set_mtime(&slot3.join("c.bin"), 300);
+    set_mtime(&slot3, 300);
+
+    // Shrink warm cache to a budget of 8000 bytes:
+    // - `slot-1` (4000B) is locked -> must be skipped!
+    // - Remaining unlocked budget is 4000B -> `slot-2` (oldest unlocked, t=200) is deleted, `slot-3` (t=300) is kept!
+    let (removed, remaining_bytes) =
+        tacho_daemon::exec::tidy::prune_runner_pool_and_warm_caches(&home, 8000, 1000, 86_400)
+            .unwrap();
+    assert!(
+        slot1.exists(),
+        "locked slot-1 must never be deleted by prune"
+    );
+    assert!(
+        !slot2.exists(),
+        "oldest unlocked slot-2 must be deleted first to fit within warm budget"
+    );
+    assert!(
+        slot3.exists(),
+        "newest unlocked slot-3 must be retained within budget"
+    );
+    assert_eq!(removed.len(), 1);
+    assert_eq!(remaining_bytes, 8000);
+
+    unsafe { libc::flock(lock1_file.as_raw_fd(), libc::LOCK_UN) };
 }

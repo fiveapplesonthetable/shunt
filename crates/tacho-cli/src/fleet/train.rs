@@ -8,8 +8,10 @@ use std::process::Command;
 
 use tacho_core::decide::dispatch::{PullFacts, TodoItem};
 use tacho_core::decide::land::{
-    drop_breakers, eligible, make_train, open_for, order_train_prs, queue, settle, waiting_for,
-    with_train, TrainPrState, TrainRecord,
+    classify_moved_goldens, drop_breakers, eligible, golden_names, make_train, moved,
+    moved_summary, open_for, order_train_prs, queue, read_report_goldens, refresh_commit_subject,
+    settle, shots_fix_lines, shots_fix_verdict, waiting_for, with_train, ShotRules, TrainPrState,
+    TrainRecord, GOLDEN_MOVED_MARKER,
 };
 use tacho_core::decide::verify::{batch_refs_moved, parents, BatchMode, BatchRun};
 use tacho_core::TaskStatus;
@@ -812,6 +814,29 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
         }
     }
 
+    if let Some(report_dir) = std::env::var("TACHO_SHOT_REPORT_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let p = cwd.join(".tachoshots");
+            p.is_dir().then_some(p)
+        })
+    {
+        let label = state
+            .train_pr
+            .as_ref()
+            .map(|t| t.branch.as_str())
+            .unwrap_or("release/train");
+        let _ = stage_and_commit_merged_screenshots(
+            &cwd,
+            &report_dir,
+            label,
+            &changed_vec,
+            true,
+            &ShotRules::default(),
+        )?;
+    }
+
     let head = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&cwd)
@@ -894,4 +919,171 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Loads the set of golden screenshot paths from `.golden` manifests in `cwd`.
+pub fn load_worktree_golden_set(cwd: &Path, rules: &ShotRules) -> BTreeSet<String> {
+    let mut golden_files: Vec<String> = Vec::new();
+    for (_, d) in &rules.shot_dirs {
+        let base = d.trim_end_matches('/');
+        golden_files.push(format!("{base}.golden"));
+        golden_files.push(format!("{base}/.golden"));
+    }
+    for extra in [
+        "screenshots.golden",
+        "screenshots/.golden",
+        "shots.golden",
+        "shots/.golden",
+    ] {
+        if !golden_files.contains(&extra.to_string()) {
+            golden_files.push(extra.to_string());
+        }
+    }
+    let mut set = golden_names(&golden_files, |rel| {
+        std::fs::read_to_string(cwd.join(rel)).unwrap_or_default()
+    });
+    if let Ok(root_golden) = std::fs::read_to_string(cwd.join(".golden")) {
+        for line in root_golden.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                set.insert(trimmed.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// Stages and commits merged-tree screenshots from `shots_report_dir` into `cwd`:
+/// - Ignores sub-threshold font and antialiasing pixel noise (`moved(before, after, is_golden) == false`).
+/// - Fails with [`GOLDEN_MOVED_MARKER`] if a golden-listed screenshot moved on a batch without `fix_shots`,
+///   or if `classify_moved_goldens` classifies any moved golden as `Canvas` or `Drift`.
+/// - Commits moved screenshots once with subject `Screenshots for train <label>` and summary body.
+pub fn stage_and_commit_merged_screenshots(
+    cwd: &Path,
+    shots_report_dir: &Path,
+    label: &str,
+    touched_files: &[String],
+    fix_shots: bool,
+    rules: &ShotRules,
+) -> io::Result<Option<String>> {
+    let golden_set = load_worktree_golden_set(cwd, rules);
+    let report_goldens = read_report_goldens(shots_report_dir, &golden_set, rules);
+
+    let mut all_verdicts = Vec::new();
+    for (area, (moved_goldens, moved_total)) in &report_goldens {
+        if moved_goldens.is_empty() {
+            continue;
+        }
+        let catalogue = golden_set
+            .iter()
+            .filter(|g| {
+                rules
+                    .area_roots
+                    .iter()
+                    .any(|(a, r)| a == area && g.starts_with(r.as_str()))
+            })
+            .count()
+            .max(moved_goldens.len());
+        let verdicts =
+            classify_moved_goldens(moved_goldens, *moved_total, catalogue, touched_files, rules);
+        all_verdicts.extend(verdicts);
+    }
+
+    if !all_verdicts.is_empty() {
+        if !fix_shots {
+            let lines = shots_fix_lines(&all_verdicts).join("\n");
+            return Err(io::Error::other(format!(
+                "{GOLDEN_MOVED_MARKER}: golden screenshot(s) moved without --fix-shots:\n{lines}"
+            )));
+        }
+        let (verdict_msg, code) = shots_fix_verdict(&all_verdicts);
+        if code != 0 {
+            let lines = shots_fix_lines(&all_verdicts).join("\n");
+            return Err(io::Error::other(format!(
+                "{GOLDEN_MOVED_MARKER}: {verdict_msg}\n{lines}"
+            )));
+        }
+    }
+
+    let mut moved_paths: Vec<String> = Vec::new();
+    for (area, _) in &rules.area_roots {
+        let changed_file = shots_report_dir.join(area).join("changed.txt");
+        let Ok(content) = std::fs::read_to_string(&changed_file) else {
+            continue;
+        };
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let mut parts = line.split('\t');
+            let (Some(state), Some(rel_path)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let rel_path = rel_path.trim();
+            let before =
+                std::fs::read(shots_report_dir.join(area).join("before").join(rel_path)).ok();
+            let after =
+                std::fs::read(shots_report_dir.join(area).join("after").join(rel_path)).ok();
+            let did_move = if state != "changed" {
+                true
+            } else {
+                moved(
+                    before.as_deref(),
+                    after.as_deref(),
+                    golden_set.contains(rel_path),
+                )
+            };
+            if !did_move {
+                continue;
+            }
+            let dst = cwd.join(rel_path);
+            if state == "gone" {
+                let _ = std::fs::remove_file(&dst);
+            } else if let Some(ref bytes) = after {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dst, bytes)?;
+            }
+            if !moved_paths.contains(&rel_path.to_string()) {
+                moved_paths.push(rel_path.to_string());
+            }
+        }
+    }
+
+    if moved_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut add_cmd = Command::new("git");
+    add_cmd
+        .arg("add")
+        .arg("--")
+        .args(&moved_paths)
+        .current_dir(cwd);
+    let add_out = add_cmd.output()?;
+    if !add_out.status.success() {
+        return Err(io::Error::other(format!(
+            "git add screenshots failed: {}",
+            String::from_utf8_lossy(&add_out.stderr).trim()
+        )));
+    }
+
+    let subject = refresh_commit_subject(label);
+    let summary = moved_summary(&moved_paths);
+    let msg = format!("{subject}\n\n{summary}");
+    let commit_out = Command::new("git")
+        .args(["commit", "--no-verify", "-m", &msg])
+        .current_dir(cwd)
+        .output()?;
+    if !commit_out.status.success() {
+        return Err(io::Error::other(format!(
+            "git commit screenshots failed: {}",
+            String::from_utf8_lossy(&commit_out.stderr).trim()
+        )));
+    }
+    let sha_out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()?;
+    Ok(Some(
+        String::from_utf8_lossy(&sha_out.stdout).trim().to_string(),
+    ))
 }

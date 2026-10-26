@@ -74,6 +74,11 @@ pub trait Hands {
     fn publish(&mut self, _store: &FleetStore) -> io::Result<()> {
         Ok(())
     }
+
+    /// Delivers an owner notification (`subject`, `body`).
+    fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
+        tacho_core::decide::plugin::notify_owner_command(subject, body)
+    }
 }
 
 /// Inputs of one tick besides fleet state.
@@ -94,6 +99,8 @@ pub struct TickOptions<'a> {
     pub refresh_timeout: std::time::Duration,
     /// Optional explicit epoch timestamp (seconds) for deterministic testing without sleeping.
     pub now_override: Option<i64>,
+    /// Optional explicit `(total_bytes, avail_bytes)` of `/` for root-disk checks.
+    pub root_disk_bytes: Option<(u64, u64)>,
 }
 
 impl<'a> TickOptions<'a> {
@@ -108,6 +115,7 @@ impl<'a> TickOptions<'a> {
             forge: None,
             refresh_timeout: std::time::Duration::from_secs(10),
             now_override: None,
+            root_disk_bytes: None,
         }
     }
 }
@@ -289,6 +297,13 @@ pub fn run_tick(
         None => observe::scan_procs(),
     };
     let main_sha = resolve_main_sha(&state, &opts, home);
+    let root_disk_bytes = opts.root_disk_bytes.or_else(|| {
+        if opts.procs.is_none() && !tacho_core::decide::plugin::running_in_test_harness() {
+            observe::statvfs_root_disk()
+        } else {
+            None
+        }
+    });
     let host = observe::HostObs {
         now,
         live_state: opts.live_state,
@@ -296,6 +311,7 @@ pub fn run_tick(
         run_pids: opts.run_pids.clone(),
         repo: opts.repo.as_deref(),
         main_sha,
+        root_disk_bytes,
     };
     let (decision_state, world_obs) = observe::observe(&state, &host);
     let plan = tacho_core::decide::decide(&decision_state, &world_obs);
@@ -338,7 +354,9 @@ pub fn run_tick(
         hands,
         errors: refresh_errors,
     };
-    execute_actions(home, store, &mut f, &state, &plan, opts.forge, now)?;
+    execute_actions(
+        home, store, &mut f, &state, &world_obs, &plan, opts.forge, now,
+    )?;
 
     let summary = format!(
         "active={}, dispatched={}, reaped={}",
@@ -523,11 +541,13 @@ fn batch_identities(home: &Path) -> BTreeMap<String, RecordedIdentity> {
         .batch_identities
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_actions(
     home: &Path,
     store: &mut FleetStore,
     f: &mut Failures<'_>,
     state: &FleetState,
+    obs: &WorldObservation,
     plan: &DecisionPlan,
     forge: Option<&dyn tacho_core::decide::plugin::ForgePlugin>,
     now: i64,
@@ -688,57 +708,87 @@ fn execute_actions(
             }
             SuperviseAction::Escalate { key, because } => {
                 println!("Supervise: {because}");
-                if let Some(a) = state.agents.get(key) {
-                    if let Some(pid) = a.pid {
-                        let id = Identity {
-                            pid,
-                            starttime: a.starttime,
-                            cgroup: a.cgroup.as_deref(),
-                        };
-                        match identity::signal_verified(&id, key, libc::SIGTERM) {
-                            Ok(Signalled::Delivered | Signalled::Gone) => {
-                                store.mutate(Some(("watch", "supervise", key, because)), |st| {
-                                    if let Some(ag) = st.agents.get_mut(key) {
-                                        ag.finished_at.get_or_insert(now);
-                                        ag.exit_code.get_or_insert(143);
-                                        ag.status_note = "stopped: escalated".to_string();
-                                    }
-                                    st.holds = tacho_core::decide::dispatch::with_hold(
-                                        &st.holds,
-                                        base_key(key),
-                                        because,
-                                        now,
-                                    );
-                                })?;
+                if obs.main_checkout_workers.contains_key(key) {
+                    if let Some(a) = state.agents.get(key) {
+                        if let Some(pid) = a.pid {
+                            let id = Identity {
+                                pid,
+                                starttime: a.starttime,
+                                cgroup: a.cgroup.as_deref(),
+                            };
+                            match identity::signal_verified(&id, key, libc::SIGTERM) {
+                                Ok(Signalled::Delivered) => {
+                                    // Also signal the verified leader's process group so its children die too.
+                                    let _ = identity::send_signal(-(pid as i32), libc::SIGTERM);
+                                    store.mutate(
+                                        Some(("watch", "supervise", key, because)),
+                                        |st| {
+                                            if let Some(ag) = st.agents.get_mut(key) {
+                                                ag.finished_at.get_or_insert(now);
+                                                ag.exit_code.get_or_insert(143);
+                                                ag.status_note =
+                                                    "stopped: directory resolves to main checkout"
+                                                        .to_string();
+                                            }
+                                            st.holds = tacho_core::decide::dispatch::with_hold(
+                                                &st.holds,
+                                                base_key(key),
+                                                because,
+                                                now,
+                                            );
+                                        },
+                                    )?;
+                                }
+                                Ok(Signalled::Gone) => {
+                                    store.mutate(
+                                        Some(("watch", "supervise", key, because)),
+                                        |st| {
+                                            if let Some(ag) = st.agents.get_mut(key) {
+                                                ag.finished_at.get_or_insert(now);
+                                                ag.exit_code.get_or_insert(143);
+                                            }
+                                            st.holds = tacho_core::decide::dispatch::with_hold(
+                                                &st.holds,
+                                                base_key(key),
+                                                because,
+                                                now,
+                                            );
+                                        },
+                                    )?;
+                                }
+                                Ok(Signalled::Refused) => {
+                                    f.record(
+                                        store,
+                                        "watch",
+                                        "supervise_stop_refused",
+                                        key,
+                                        &format!(
+                                            "refused to stop main-checkout worker {key}: identity not verified"
+                                        ),
+                                        false,
+                                    )?;
+                                }
+                                Err(e) => {
+                                    f.record(
+                                        store,
+                                        "watch",
+                                        "supervise_stop_failed",
+                                        key,
+                                        &format!("failed to stop main-checkout worker {key}: {e}"),
+                                        true,
+                                    )?;
+                                }
                             }
-                            Ok(Signalled::Refused) => {
-                                f.record(
-                                    store,
-                                    "watch",
-                                    "supervise_stop_refused",
-                                    key,
-                                    &format!(
-                                        "refused to stop escalated worker {key}: identity not verified"
-                                    ),
-                                    false,
-                                )?;
-                            }
-                            Err(e) => {
-                                f.record(
-                                    store,
-                                    "watch",
-                                    "supervise_stop_failed",
-                                    key,
-                                    &format!("failed to stop escalated worker {key}: {e}"),
-                                    true,
-                                )?;
-                            }
+                        } else {
+                            store.record_decision("watch", "supervise", key, because)?;
                         }
                     } else {
                         store.record_decision("watch", "supervise", key, because)?;
                     }
                 } else {
-                    store.record_decision("watch", "supervise", key, because)?;
+                    // Ordinary stall escalation: notify the owner (via plan.owner_notifications)
+                    // without killing the worker or holding the task.
+                    store.record_decision("watch", "supervise_escalate", key, because)?;
                 }
                 f.hands
                     .emit(&format!("agent:{key}"), "watch:supervise", because);
@@ -823,13 +873,24 @@ fn execute_actions(
         tidy::apply_tidy_decisions(store, &plan.tidy_decisions, now, false)?;
     }
 
+    if let Some(ref disk) = plan.root_disk_action {
+        if disk.prune_docker_volumes {
+            store.record_decision(
+                "watch",
+                "prune_root_disk_volumes",
+                "root-disk",
+                &disk.summary,
+            )?;
+        }
+    }
+
     if let Some(target) = &plan.self_update.target_sha {
         println!("Self-update: {}", plan.self_update.because);
         store.record_decision("watch", "self_update", target, &plan.self_update.because)?;
     }
     for n in &plan.owner_notifications {
         let mut notify_failed = false;
-        if let Err(e) = tacho_core::decide::plugin::notify_owner_command(&n.subject, &n.body) {
+        if let Err(e) = f.hands.notify_owner(&n.subject, &n.body) {
             notify_failed = true;
             f.record(
                 store,
@@ -868,7 +929,7 @@ fn execute_actions(
     }
     if let Some(alert) = &plan.watchdog_alert {
         let mut alert_failed = false;
-        if let Err(e) = tacho_core::decide::plugin::notify_owner_command("tacho is down", alert) {
+        if let Err(e) = f.hands.notify_owner("tacho is down", alert) {
             alert_failed = true;
             f.record(
                 store,
@@ -1628,6 +1689,7 @@ mod tests {
 
     #[test]
     fn test_worker_running_in_main_checkout_is_stopped_with_page() {
+        use std::io::BufRead;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -1641,13 +1703,18 @@ mod tests {
             .unwrap();
         assert!(st.success());
 
-        // Spawn a background worker process whose recorded worktree is the main checkout.
+        // Spawn a background worker process group leader that also spawns a child in its group,
+        // whose recorded worktree is the main checkout.
         let mut child = unsafe {
             use std::os::unix::process::CommandExt;
             std::process::Command::new("bash")
-                .args(["-c", "read -r _ || true"])
+                .args([
+                    "-c",
+                    "{ cat >/dev/null; } <&0 & sub=$!; echo $sub; wait $sub",
+                ])
                 .current_dir(&main_checkout)
                 .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
                 .pre_exec(|| {
                     libc::setpgid(0, 0);
                     Ok(())
@@ -1656,6 +1723,12 @@ mod tests {
                 .unwrap()
         };
         let _child_stdin = child.stdin.take();
+        let mut child_stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut sub_pid_line = String::new();
+        child_stdout.read_line(&mut sub_pid_line).unwrap();
+        let sub_pid: u32 = sub_pid_line.trim().parse().expect("sub-child pid");
+        assert!(identity::pid_alive(sub_pid), "sub-child must be alive");
+
         let pid = child.id();
         let starttime = identity::proc_pid_starttime(pid).expect("child starttime");
 
@@ -1663,6 +1736,7 @@ mod tests {
         let main_str = main_checkout.to_string_lossy().to_string();
         store
             .mutate(None, |s| {
+                s.repo_root = Some(main_str.clone());
                 s.agents.insert(
                     "rogue-worker".to_string(),
                     AgentRun {
@@ -1687,7 +1761,13 @@ mod tests {
         let mut opts = TickOptions::new(&live);
         opts.explicit_main_sha = Some("a".repeat(40));
         opts.forge = Some(&forge);
-        opts.procs = Some(Vec::new());
+        opts.procs = Some(vec![ProcEntry {
+            pid,
+            ppid: 1,
+            pgid: pid,
+            state: "S".to_string(),
+            ..Default::default()
+        }]);
         opts.now_override = Some(1_010);
 
         let out = run_tick(&home, &mut store, &mut hands, opts).unwrap();
@@ -1695,6 +1775,11 @@ mod tests {
         assert!(
             !wait_status.success(),
             "worker in main checkout must be terminated by supervision"
+        );
+        identity::wait_for_pid_exit_event(sub_pid).unwrap();
+        assert!(
+            !identity::pid_alive(sub_pid),
+            "child process in main-checkout worker's process group must also be terminated"
         );
         assert!(
             out.plan.supervision_actions.iter().any(
@@ -1713,5 +1798,255 @@ mod tests {
             "rogue-worker must be placed on hold"
         );
         assert_eq!(final_state.agents["rogue-worker"].finished_at, Some(1_010));
+    }
+
+    #[test]
+    fn test_holder_directory_worker_is_not_mistaken_for_main_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let fleet_main = dir.path().join("fleet-repo");
+        std::fs::create_dir_all(&fleet_main).unwrap();
+        let holder = dir.path().join("holder");
+        let child_repo = holder.join("sub-repo");
+        std::fs::create_dir_all(&child_repo).unwrap();
+
+        for repo in [&fleet_main, &child_repo] {
+            let st = std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        assert!(
+            !observe::resolves_to_main_checkout(&holder),
+            "a holder directory containing a child repo must not resolve to main checkout"
+        );
+
+        let mut child = std::process::Command::new("cat")
+            .current_dir(&holder)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let _stdin = child.stdin.take();
+        let pid = child.id();
+        let starttime = identity::proc_pid_starttime(pid).expect("child starttime");
+
+        let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+        store
+            .mutate(None, |s| {
+                s.repo_root = Some(fleet_main.to_string_lossy().to_string());
+                s.agents.insert(
+                    "holder-worker".to_string(),
+                    AgentRun {
+                        key: "holder-worker".to_string(),
+                        pid: Some(pid),
+                        starttime: Some(starttime),
+                        worktree: holder.to_string_lossy().to_string(),
+                        started_at: 1_000,
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        let live = tacho_core::LiveState::default();
+        let mut hands = DaemonHands {
+            home: home.clone(),
+            live_state: live.clone(),
+            appender: None,
+        };
+        let mut opts = TickOptions::new(&live);
+        opts.explicit_main_sha = Some("a".repeat(40));
+        opts.procs = Some(vec![ProcEntry {
+            pid,
+            ppid: 1,
+            pgid: pid,
+            state: "S".to_string(),
+            ..Default::default()
+        }]);
+        opts.now_override = Some(1_010);
+
+        let out = run_tick(&home, &mut store, &mut hands, opts).unwrap();
+        assert!(
+            out.obs.main_checkout_workers.is_empty(),
+            "holder directory must not be flagged as fleet main checkout"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "worker in holder directory must not be killed"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_ordinary_stall_escalation_notifies_owner_without_killing_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let wt = dir.path().join("wt-1");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let mut child = std::process::Command::new("cat")
+            .current_dir(&wt)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let _stdin = child.stdin.take();
+        let pid = child.id();
+        let starttime = identity::proc_pid_starttime(pid).expect("child starttime");
+
+        let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+        store
+            .mutate(None, |s| {
+                s.agents.insert(
+                    "stalled-worker".to_string(),
+                    AgentRun {
+                        key: "stalled-worker".to_string(),
+                        pid: Some(pid),
+                        starttime: Some(starttime),
+                        worktree: wt.to_string_lossy().to_string(),
+                        started_at: 1_000,
+                        ..Default::default()
+                    },
+                );
+                s.nudged.insert("stalled-worker".to_string());
+                s.samples.insert(
+                    "stalled-worker".to_string(),
+                    vec![tacho_core::decide::watch::ProgressSample {
+                        ts: 1_000,
+                        log_bytes: 0,
+                        head_sha: String::new(),
+                        dirty_files: 0,
+                        cpu_ticks: 100,
+                        newest_mtime: None,
+                    }],
+                );
+            })
+            .unwrap();
+
+        let live = tacho_core::LiveState::default();
+        let mut hands = DaemonHands {
+            home: home.clone(),
+            live_state: live.clone(),
+            appender: None,
+        };
+        let t_escalate = 1_000 + STALLED_SECS + 120;
+        let mut opts = TickOptions::new(&live);
+        opts.explicit_main_sha = Some("a".repeat(40));
+        opts.now_override = Some(t_escalate);
+        opts.procs = Some(vec![ProcEntry {
+            pid,
+            ppid: 1,
+            pgid: pid,
+            state: "S".to_string(),
+            cpu_ticks: 105, // alive (>100) but idle (< 5 ticks/s)
+            ..Default::default()
+        }]);
+
+        let out = run_tick(&home, &mut store, &mut hands, opts).unwrap();
+        assert!(
+            out.plan.supervision_actions.iter().any(
+                |a| matches!(a, SuperviseAction::Escalate { key, .. } if key == "stalled-worker")
+            ),
+            "expected Escalate for already-nudged stalled worker, got: {:?}",
+            out.plan.supervision_actions
+        );
+        assert!(
+            out.plan
+                .owner_notifications
+                .iter()
+                .any(|n| n.kind == "stalled" && n.subject.contains("stalled-worker")),
+            "expected owner notification for escalated stall, got: {:?}",
+            out.plan.owner_notifications
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "ordinary stall escalation must NOT kill the worker"
+        );
+        let st = store.load().unwrap();
+        assert!(
+            !st.holds.contains_key("stalled-worker"),
+            "ordinary stall escalation must NOT hold the task"
+        );
+        assert!(
+            st.agents["stalled-worker"].finished_at.is_none(),
+            "ordinary stall escalation must leave the worker running"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_root_disk_check_in_tick_warns_and_prunes_volumes_and_clears_on_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+        let live = tacho_core::LiveState::default();
+        let mut hands = DaemonHands {
+            home: home.clone(),
+            live_state: live.clone(),
+            appender: None,
+        };
+        let gib = 1024 * 1024 * 1024u64;
+
+        // 1. Critical root disk (85% used, 15 GiB free): warns owner and records prune_root_disk_volumes.
+        let mut opts1 = TickOptions::new(&live);
+        opts1.explicit_main_sha = Some("a".repeat(40));
+        opts1.now_override = Some(2_000);
+        opts1.procs = Some(Vec::new());
+        opts1.root_disk_bytes = Some((100 * gib, 15 * gib));
+        let out1 = run_tick(&home, &mut store, &mut hands, opts1).unwrap();
+        assert!(out1.plan.root_disk_action.as_ref().unwrap().warn);
+        assert!(
+            out1.plan
+                .root_disk_action
+                .as_ref()
+                .unwrap()
+                .prune_docker_volumes
+        );
+        assert!(
+            out1.plan
+                .owner_notifications
+                .iter()
+                .any(|n| n.kind == "root-disk" && n.body.contains("The root disk is filling")),
+            "expected root-disk owner notification, got: {:?}",
+            out1.plan.owner_notifications
+        );
+        let decisions = store.recent_decisions(10, None, None).unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.action == "prune_root_disk_volumes" && d.target == "root-disk"),
+            "expected prune_root_disk_volumes decision, got: {:?}",
+            decisions
+        );
+
+        // 2. Recovery (50% used, 50 GiB free): clears root-disk attention and resets notification latch.
+        let mut opts2 = TickOptions::new(&live);
+        opts2.explicit_main_sha = Some("a".repeat(40));
+        opts2.now_override = Some(2_060);
+        opts2.procs = Some(Vec::new());
+        opts2.root_disk_bytes = Some((100 * gib, 50 * gib));
+        let out2 = run_tick(&home, &mut store, &mut hands, opts2).unwrap();
+        assert!(!out2.plan.root_disk_action.as_ref().unwrap().warn);
+        assert!(!out2
+            .plan
+            .attention_items
+            .iter()
+            .any(|a| a.kind == "root-disk"));
+        let st2 = store.load().unwrap();
+        assert!(
+            !st2.notified_failures
+                .iter()
+                .any(|k| k.starts_with("attention:root-disk:")),
+            "recovery must clear root-disk notification latch"
+        );
     }
 }

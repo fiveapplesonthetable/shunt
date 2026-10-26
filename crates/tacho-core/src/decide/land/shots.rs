@@ -676,11 +676,18 @@ pub fn golden_names<S: AsRef<str>>(
     let mut out = BTreeSet::new();
     for gf in golden_files {
         let gf = gf.as_ref();
-        let dir = gf.strip_suffix(".golden").unwrap_or(gf);
+        let dir = gf
+            .strip_suffix(".golden")
+            .unwrap_or(gf)
+            .trim_end_matches('/');
         for line in read(gf).lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                out.insert(format!("{dir}/{trimmed}"));
+                if dir.is_empty() {
+                    out.insert(trimmed.to_string());
+                } else {
+                    out.insert(format!("{dir}/{trimmed}"));
+                }
             }
         }
     }

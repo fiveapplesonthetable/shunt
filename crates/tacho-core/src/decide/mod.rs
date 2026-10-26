@@ -119,6 +119,9 @@ pub struct WorldObservation {
     /// Live workers whose directory resolves to the repository's main checkout (`key -> path`).
     #[serde(default)]
     pub main_checkout_workers: BTreeMap<String, String>,
+    /// Root filesystem (`/`) `(total_bytes, avail_bytes)` capacity snapshot, when observed.
+    #[serde(default)]
+    pub root_disk_bytes: Option<(u64, u64)>,
 }
 
 /// An observed runaway burner process (e.g. stress, yes).
@@ -183,6 +186,9 @@ pub struct DecisionPlan {
     /// Running batches that duplicate an older one (same group / PR set) and must be aborted.
     #[serde(default)]
     pub duplicate_batch_aborts: Vec<String>,
+    /// Root-disk capacity verdict (`warn` / `prune_docker_volumes`) evaluated by [`ops::config::check_root_disk`].
+    #[serde(default)]
+    pub root_disk_action: Option<crate::decide::ops::config::RootDiskAction>,
 }
 
 /// Replayable pure decision function `(DecisionState, WorldObservation) -> DecisionPlan`.
@@ -632,6 +638,37 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
             command_hint: format!("tacho start {}", base_key(key)),
         });
     }
+    for act in &supervision_actions {
+        if let SuperviseAction::Escalate { key, because } = act {
+            if !obs.main_checkout_workers.contains_key(key) {
+                attention_items.push(AttentionItem {
+                    kind: "stalled".to_string(),
+                    target: key.clone(),
+                    summary: because.clone(),
+                    command_hint: format!("tacho tell {key} \"...\""),
+                });
+            }
+        }
+    }
+    let root_disk_action = obs
+        .root_disk_bytes
+        .map(|(total, avail)| crate::decide::ops::config::check_root_disk(total, avail));
+    if let Some(ref disk) = root_disk_action {
+        if disk.warn {
+            attention_items.push(AttentionItem {
+                kind: "root-disk".to_string(),
+                target: "root-disk".to_string(),
+                summary: format!(
+                    "The root disk is filling: {}% used, {} GiB free",
+                    disk.used_percent, disk.avail_gib
+                ),
+                command_hint: "tacho tidy".to_string(),
+            });
+        } else {
+            next.notified_keys
+                .retain(|k| !k.starts_with("attention:root-disk:"));
+        }
+    }
     let self_update = decide_self_update(
         obs.detached_checkout,
         &obs.behind_commits,
@@ -723,6 +760,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         burner_kills,
         tell_actions,
         duplicate_batch_aborts: crate::decide::watch::duplicate_batches(&state.batches),
+        root_disk_action,
     }
 }
 

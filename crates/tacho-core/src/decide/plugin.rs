@@ -898,21 +898,45 @@ impl ForgePlugin for CliForgePlugin {
     }
 }
 
-/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and, when `$TACHO_NOTIFY` is set to a
-/// non-empty command, runs `sh -c "$TACHO_NOTIFY"` with `TACHO_NOTIFY_SUBJECT` and
-/// `TACHO_NOTIFY_BODY` environment variables and stdin populated with the scrubbed body.
-pub fn notify_owner_command(subject: &str, body: &str) -> Result<bool, String> {
+/// Returns `true` when executing inside a test harness (`cargo test`, `cargo nextest`, or a `deps/` test binary).
+pub fn running_in_test_harness() -> bool {
+    if cfg!(test)
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
+        || std::env::var_os("CARGO_MANIFEST_DIR").is_some()
+    {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().and_then(|d| d.file_name()).map(|n| n == "deps"))
+        .unwrap_or(false)
+}
+
+/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and runs `cmd_override` (or `$TACHO_NOTIFY`
+/// when outside a test harness) with `TACHO_NOTIFY_SUBJECT` and `TACHO_NOTIFY_BODY` environment
+/// variables and stdin populated with the scrubbed body.
+pub fn notify_owner_command_with(
+    cmd_override: Option<&str>,
+    subject: &str,
+    body: &str,
+) -> Result<bool, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     let scrubber = Scrubber::enabled();
     let clean_subject = scrubber.scrub(subject);
     let clean_body = scrubber.scrub(body);
-    let Some(cmd_str) = std::env::var("TACHO_NOTIFY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
+    let resolved_cmd = match cmd_override {
+        Some(cmd) => Some(cmd.trim().to_string()),
+        None if running_in_test_harness() => std::env::var("TACHO_TEST_NOTIFY_CMD")
+            .ok()
+            .map(|s| s.trim().to_string()),
+        None => std::env::var("TACHO_NOTIFY")
+            .ok()
+            .map(|s| s.trim().to_string()),
+    };
+    let Some(cmd_str) = resolved_cmd.filter(|s| !s.is_empty()) else {
         return Ok(false);
     };
 
@@ -939,6 +963,14 @@ pub fn notify_owner_command(subject: &str, body: &str) -> Result<bool, String> {
         ));
     }
     Ok(true)
+}
+
+/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and, when `$TACHO_NOTIFY` is set to a
+/// non-empty command (outside test harnesses), runs `sh -c "$TACHO_NOTIFY"` with
+/// `TACHO_NOTIFY_SUBJECT` and `TACHO_NOTIFY_BODY` environment variables and stdin populated with
+/// the scrubbed body.
+pub fn notify_owner_command(subject: &str, body: &str) -> Result<bool, String> {
+    notify_owner_command_with(None, subject, body)
 }
 
 // ============================================================================

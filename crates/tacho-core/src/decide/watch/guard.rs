@@ -172,7 +172,7 @@ static VAGUE_WAIT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SPEED_ASSERT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?:\.elapsed\(\)\s*[<]=?\s*Duration::from_|assert!\([^)]*elapsed\(\)\s*<|expect\([^)]*elapsed[^)]*\)\.toBeLessThan)",
+        r"(?:\.elapsed\(\)(?:\.as_(?:millis|secs|micros|nanos)\(\))?\s*[<]=?\s*(?:Duration::from_|\d+)|assert!\([^)]*\belapsed(?:\(\))?(?:\.as_(?:millis|secs|micros|nanos)\(\))?\s*[<]=?|expect\([^)]*elapsed[^)]*\)\.toBeLessThan)",
     )
     .unwrap()
 });

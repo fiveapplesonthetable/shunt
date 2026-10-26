@@ -117,7 +117,18 @@ pub fn check_forbidden_attribution(source: &str, text: &str, errors: &mut Vec<St
 
 /// Validate all PR preflight invariants and return every refusal reason at once.
 pub fn validate_pr_preflight(input: &PrPreflightInput) -> Vec<String> {
+    validate_pr_preflight_with_diff(input, "")
+}
+
+/// Validate all PR preflight invariants plus unified diff guardrails (loosened limits,
+/// vague waits, and time-based test assertions).
+pub fn validate_pr_preflight_with_diff(input: &PrPreflightInput, diff_text: &str) -> Vec<String> {
     let mut errors = Vec::new();
+    if !diff_text.is_empty() {
+        if let Err(diff_violations) = crate::hook::check_diff_text_guardrails(diff_text) {
+            errors.extend(diff_violations);
+        }
+    }
 
     if input.title.trim().is_empty() {
         errors.push("PR title cannot be empty".to_string());
@@ -409,6 +420,12 @@ pub fn execute_pr(args: PrArgs) -> io::Result<()> {
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
+    let full_diff_out = Command::new("git")
+        .args(["diff", &format!("{base_sha}..HEAD")])
+        .current_dir(&root)
+        .output()?;
+    let full_diff_text = String::from_utf8_lossy(&full_diff_out.stdout).to_string();
+
     let body_desc = args.message;
     let preflight_input = PrPreflightInput {
         title: args.title.clone(),
@@ -426,7 +443,7 @@ pub fn execute_pr(args: PrArgs) -> io::Result<()> {
         shots_anyway,
     };
 
-    let errors = validate_pr_preflight(&preflight_input);
+    let errors = validate_pr_preflight_with_diff(&preflight_input, &full_diff_text);
     if !errors.is_empty() {
         let joined = errors.join("\n  - ");
         let because = format!("pr preflight refused: {}", errors.join("; "));

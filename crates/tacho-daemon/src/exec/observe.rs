@@ -458,31 +458,109 @@ pub fn is_linked_worktree(dir: &Path) -> bool {
     }
 }
 
-/// Whether `dir` resolves to a repository's main checkout (or a subdirectory inside the main checkout,
-/// or a parent directory holding a main checkout).
-pub fn resolves_to_main_checkout(dir: &Path) -> bool {
+/// Resolves the main repository checkout path that owns `dir` (either `dir` itself when
+/// `dir/.git` is a directory, or the parent of `--git-common-dir` when `dir` is a linked worktree).
+pub fn owning_main_checkout(dir: &Path) -> Option<std::path::PathBuf> {
     if dir.as_os_str().is_empty() || !dir.exists() {
-        return false;
+        return None;
     }
-    if is_linked_worktree(dir) {
-        return false;
-    }
-    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let canon = dir.canonicalize().ok()?;
     for anc in canon.ancestors() {
         let dot_git = anc.join(".git");
-        if dot_git.exists() {
-            return dot_git.is_dir() || !is_linked_worktree(anc);
+        if dot_git.is_dir() {
+            return Some(anc.to_path_buf());
+        }
+        if dot_git.is_file() {
+            let out = crate::sampler::run_git_in_worktree(
+                anc,
+                &["rev-parse", "--git-common-dir"],
+                GIT_CAP,
+            )
+            .ok()?;
+            let common = anc.join(out.trim()).canonicalize().ok()?;
+            return common.parent().map(Path::to_path_buf);
         }
     }
-    if let Ok(entries) = fs::read_dir(&canon) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.join(".git").is_dir() {
-                return true;
+    None
+}
+
+/// Resolves the fleet's recorded main checkout path from `state` (`repo_root`, `worktrees`,
+/// or `agents`), `TACHO_REPO`, or `repo`.
+pub fn fleet_main_checkout(state: &FleetState, repo: Option<&Path>) -> Option<std::path::PathBuf> {
+    if let Some(root) = state.repo_root.as_deref().filter(|s| !s.is_empty()) {
+        let p = Path::new(root);
+        if let Some(m) = owning_main_checkout(p).or_else(|| p.canonicalize().ok()) {
+            return Some(m);
+        }
+    }
+    if let Some(env_repo) = std::env::var_os("TACHO_REPO").filter(|s| !s.is_empty()) {
+        let p = Path::new(&env_repo);
+        if let Some(m) = owning_main_checkout(p).or_else(|| p.canonicalize().ok()) {
+            return Some(m);
+        }
+    }
+    if let Some(r) = repo {
+        if let Some(m) = owning_main_checkout(r).or_else(|| r.canonicalize().ok()) {
+            return Some(m);
+        }
+    }
+    for wt in state.worktrees.values() {
+        if let Some(m) = owning_main_checkout(Path::new(&wt.path)) {
+            return Some(m);
+        }
+    }
+    for a in state.agents.values() {
+        let p = Path::new(&a.worktree);
+        if is_linked_worktree(p) {
+            if let Some(m) = owning_main_checkout(p) {
+                return Some(m);
             }
         }
     }
-    false
+    for a in state.agents.values() {
+        let p = Path::new(&a.worktree);
+        if p.join(".git").is_dir() {
+            if let Ok(c) = p.canonicalize() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `dir` resolves to the fleet's recorded main checkout (or, when `fleet_main` is `None`,
+/// whether `dir`'s enclosing git checkout is a main checkout rather than a linked worktree).
+///
+/// Never scans child directories, so a holder directory that contains a repository as a child
+/// is never mistaken for the main checkout.
+pub fn resolves_to_fleet_main_checkout(dir: &Path, fleet_main: Option<&Path>) -> bool {
+    if dir.as_os_str().is_empty() || !dir.exists() || is_linked_worktree(dir) {
+        return false;
+    }
+    let Ok(canon) = dir.canonicalize() else {
+        return false;
+    };
+    let Some(enclosing) = canon.ancestors().find(|anc| anc.join(".git").exists()) else {
+        return false;
+    };
+    if !enclosing.join(".git").is_dir() && is_linked_worktree(enclosing) {
+        return false;
+    }
+    if let Some(main_root) = fleet_main {
+        let main_canon = main_root
+            .canonicalize()
+            .unwrap_or_else(|_| main_root.to_path_buf());
+        return enclosing == main_canon;
+    }
+    enclosing.join(".git").is_dir()
+}
+
+/// Whether `dir` resolves to the repository's main checkout (or a subdirectory inside it).
+pub fn resolves_to_main_checkout(dir: &Path) -> bool {
+    let env_main = std::env::var_os("TACHO_REPO")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    resolves_to_fleet_main_checkout(dir, env_main.as_deref())
 }
 
 /// Validates that `dir` is an isolated linked git worktree on a named branch other than `main`/`master`.
@@ -667,6 +745,26 @@ pub struct HostObs<'a> {
     /// Checkout the tick runs against (git observations, ancestry); `None` = unknown.
     pub repo: Option<&'a Path>,
     pub main_sha: String,
+    /// Optional `(total_bytes, avail_bytes)` of `/` observed for this tick.
+    pub root_disk_bytes: Option<(u64, u64)>,
+}
+
+/// Reads `(total_bytes, avail_bytes)` of the root filesystem (`/`) via `statvfs(3)`.
+pub fn statvfs_root_disk() -> Option<(u64, u64)> {
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c"/".as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        let frsize = if st.f_frsize > 0 {
+            st.f_frsize
+        } else {
+            st.f_bsize
+        };
+        let total = st.f_blocks.saturating_mul(frsize);
+        let avail = st.f_bavail.saturating_mul(frsize);
+        (total > 0).then_some((total, avail))
+    }
 }
 
 /// Agent progress samples for every live agent, from real observations only.
@@ -753,6 +851,7 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
     tidy_snapshot.held_paths.extend(live_holds.paths);
     tidy_snapshot.held_ports.extend(live_holds.ports);
 
+    let fleet_main = fleet_main_checkout(state, host.repo);
     let mut main_checkout_workers = BTreeMap::new();
     for key in &live_keys {
         let dir = state
@@ -768,11 +867,15 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
                     .filter(|w| !w.is_empty())
             });
         if let Some(d) = dir {
-            if resolves_to_main_checkout(Path::new(d)) {
+            if resolves_to_fleet_main_checkout(Path::new(d), fleet_main.as_deref()) {
                 main_checkout_workers.insert(key.clone(), d.to_string());
             }
         }
     }
+
+    let root_disk_bytes = host
+        .root_disk_bytes
+        .or_else(|| env_json::<(u64, u64)>("TACHO_ROOT_DISK_BYTES_JSON"));
 
     let world = WorldObservation {
         now,
@@ -793,6 +896,7 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
         burners,
         main_ci: observe_main_ci(state, host.repo),
         main_checkout_workers,
+        root_disk_bytes,
     };
     (decision_state_of(state, now), world)
 }

@@ -391,8 +391,22 @@ pub fn batches(
         }
         next_num += 1;
         let id = format!("b{next_num:03}");
-        let areas: Vec<String> = area_set.into_iter().collect();
-        let checks = checks_for_files(&all_files, rules);
+        let raw_areas: Vec<String> = area_set.into_iter().collect();
+        let areas = select_costly_areas(&raw_areas, &all_files, true, false);
+        let raw_checks = checks_for_files(&all_files, rules);
+        let area_lookup: BTreeSet<&str> = areas.iter().map(String::as_str).collect();
+        let mut checks: Vec<AreaCheck> = raw_checks
+            .into_iter()
+            .filter(|c| area_lookup.contains(c.area.as_str()))
+            .collect();
+        for a in &areas {
+            if !checks.iter().any(|c| &c.area == a) {
+                checks.push(AreaCheck {
+                    area: a.clone(),
+                    units: vec!["all".to_string()],
+                });
+            }
+        }
         plans.push(BatchPlan {
             id,
             group: group.clone(),
