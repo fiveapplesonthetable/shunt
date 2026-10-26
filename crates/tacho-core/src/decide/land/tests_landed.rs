@@ -277,6 +277,7 @@ fn plan_ready_queue_siblings_and_drafts() {
         drafts_to_ready(&kept, &BTreeSet::from([10]), false),
         vec![10]
     );
+    assert!(drafts_to_ready(&[10, 11], &BTreeSet::from([10, 11]), false).is_empty());
     assert!(drafts_to_ready(&kept, &BTreeSet::from([10]), true).is_empty());
     assert!(grew(&[10], &[10, 11]));
     assert!(queue_issue_body("tacho", &[10], "tr1").contains("tacho land tr1"));

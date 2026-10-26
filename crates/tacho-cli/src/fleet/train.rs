@@ -8,16 +8,16 @@ use std::process::Command;
 
 use tacho_core::decide::dispatch::{PullFacts, TodoItem};
 use tacho_core::decide::land::{
-    classify_moved_goldens, drop_breakers, eligible, golden_names, make_train, moved,
-    moved_summary, open_for, order_train_prs, queue, read_report_goldens, refresh_commit_subject,
-    settle, shots_fix_lines, shots_fix_verdict, waiting_for, with_train, ShotRules, TrainPrState,
-    TrainRecord, GOLDEN_MOVED_MARKER,
+    accept_run_shots_command, classify_moved_goldens, drop_breakers, eligible, golden_names,
+    make_train, moved, moved_summary, open_for, order_train_prs, plan_accept_run_shots, queue,
+    read_report_goldens, refresh_commit_subject, settle, shots_fix_lines, shots_fix_verdict,
+    waiting_for, with_train, ShotRules, TrainPrState, TrainRecord, GOLDEN_MOVED_MARKER,
 };
 use tacho_core::decide::verify::{batch_refs_moved, parents, BatchMode, BatchRun};
 use tacho_core::TaskStatus;
 use tacho_daemon::{FleetState, FleetStore};
 
-use crate::cli::{QueueArgs, ReleaseTrainArgs, TrainArgs};
+use crate::cli::{QueueArgs, ReleaseTrainArgs, ShotsArgs, ShotsSubcommands, TrainArgs};
 
 use super::batch::{execute_batch_with, BatchOptions, BatchOrigin};
 use super::store::{
@@ -1029,8 +1029,9 @@ pub fn stage_and_commit_merged_screenshots(
     if !all_verdicts.is_empty() {
         if !fix_shots {
             let lines = shots_fix_lines(&all_verdicts).join("\n");
+            let cmd = accept_run_shots_command("tacho", label);
             return Err(io::Error::other(format!(
-                "{GOLDEN_MOVED_MARKER}: golden screenshot(s) moved without --fix-shots:\n{lines}"
+                "{GOLDEN_MOVED_MARKER}: golden screenshot(s) moved without --fix-shots (run `{cmd}` to accept):\n{lines}"
             )));
         }
         let (verdict_msg, code) = shots_fix_verdict(&all_verdicts);
@@ -1123,4 +1124,180 @@ pub fn stage_and_commit_merged_screenshots(
     Ok(Some(
         String::from_utf8_lossy(&sha_out.stdout).trim().to_string(),
     ))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let p = entry.path();
+        let target = dst.join(entry.file_name());
+        if p.is_dir() {
+            copy_dir_recursive(&p, &target)?;
+        } else if p.is_file() {
+            std::fs::copy(&p, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Persists a batch run's `shots_report_dir` under `$TACHO_HOME/runs/<run_id>/shots/`
+/// and records `head_sha` so `tacho shots accept <run_id>` can inspect and stage it.
+pub fn persist_shot_report_to_run_dir(
+    shots_report_dir: &Path,
+    run_id: &str,
+    head_sha: &str,
+) -> io::Result<std::path::PathBuf> {
+    let dst = crate::paths::resolve_home()
+        .join("runs")
+        .join(run_id)
+        .join("shots");
+    if shots_report_dir != dst {
+        copy_dir_recursive(shots_report_dir, &dst)?;
+    } else {
+        std::fs::create_dir_all(&dst)?;
+    }
+    if !head_sha.trim().is_empty() {
+        std::fs::write(dst.join("head_sha"), format!("{}\n", head_sha.trim()))?;
+    }
+    Ok(dst)
+}
+
+fn locate_run_shots_dir(cwd: &Path, run_id: &str) -> io::Result<std::path::PathBuf> {
+    let direct = Path::new(run_id);
+    if direct.is_dir() {
+        return Ok(direct.to_path_buf());
+    }
+    let home_dir = crate::paths::resolve_home()
+        .join("runs")
+        .join(run_id)
+        .join("shots");
+    if home_dir.is_dir() {
+        return Ok(home_dir);
+    }
+    let cwd_dir = cwd.join("runs").join(run_id).join("shots");
+    if cwd_dir.is_dir() {
+        return Ok(cwd_dir);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no saved screenshots found for run '{run_id}' under runs/{run_id}/shots"),
+    ))
+}
+
+/// Executes `tacho shots accept <run> [--all]` in `cwd`:
+/// copies the run's `after` images into the branch and stages them (goldens by default, all moved with `--all`),
+/// refusing when the run was drawn from another `HEAD`.
+pub fn execute_shots_accept_in(cwd: &Path, run_id: &str, all: bool) -> io::Result<Vec<String>> {
+    let run_shots_dir = locate_run_shots_dir(cwd, run_id)?;
+    let current_head = super::store::git_stdout(cwd, &["rev-parse", "HEAD"]).unwrap_or_default();
+
+    let mut recorded_head: Option<String> = std::fs::read_to_string(run_shots_dir.join("head_sha"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if recorded_head.is_none() {
+        if let Ok(store) = open_fleet_store() {
+            if let Ok(state) = store.load() {
+                if let Some(batch) = state.batches.iter().rev().find(|b| b.id == run_id) {
+                    recorded_head = batch.shas.values().next().cloned();
+                }
+            }
+        }
+    }
+
+    let rules = ShotRules::default();
+    let golden_set = load_worktree_golden_set(cwd, &rules);
+    let plan = plan_accept_run_shots(
+        &run_shots_dir,
+        recorded_head.as_deref(),
+        &current_head,
+        all,
+        &golden_set,
+        &rules,
+    )
+    .map_err(io::Error::other)?;
+
+    let mut staged = Vec::new();
+    for (src, rel) in &plan.copy_after {
+        let dst = cwd.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, &dst)?;
+        staged.push(rel.clone());
+    }
+    for rel in &plan.remove_paths {
+        let dst = cwd.join(rel);
+        let _ = std::fs::remove_file(&dst);
+        staged.push(rel.clone());
+    }
+
+    if !staged.is_empty() {
+        let out = Command::new("git")
+            .arg("add")
+            .arg("--")
+            .args(&staged)
+            .current_dir(cwd)
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+    }
+
+    if staged.is_empty() {
+        println!("no screenshot moved");
+    } else {
+        for p in &staged {
+            println!("staged {p}");
+        }
+    }
+    Ok(staged)
+}
+
+/// Executes `tacho shots` CLI subcommands (`accept` and `fix`).
+pub fn execute_shots(args: ShotsArgs) -> io::Result<()> {
+    let cwd = std::env::current_dir()?;
+    match args.subcommand {
+        ShotsSubcommands::Accept(acc) => {
+            let _ = execute_shots_accept_in(&cwd, &acc.run, acc.all)?;
+            Ok(())
+        }
+        ShotsSubcommands::Fix(fix_args) => {
+            let report_dir = locate_run_shots_dir(&cwd, &fix_args.target).or_else(|_| {
+                let dot = cwd.join(".tachoshots");
+                if dot.is_dir() {
+                    Ok(dot)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no shot report found for '{}'", fix_args.target),
+                    ))
+                }
+            })?;
+            let diff_out = super::store::git_stdout(&cwd, &["diff", "--name-only", "HEAD~1..HEAD"])
+                .unwrap_or_default();
+            let touched: Vec<String> = diff_out
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let _ = stage_and_commit_merged_screenshots(
+                &cwd,
+                &report_dir,
+                &fix_args.target,
+                &touched,
+                true,
+                &ShotRules::default(),
+            )?;
+            Ok(())
+        }
+    }
 }

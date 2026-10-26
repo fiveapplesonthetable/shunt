@@ -458,6 +458,26 @@ fn decode_huffman_block(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenTagCap {
+    pub max_tags: usize,
+    pub max_per_row: usize,
+    pub max_in_header: usize,
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl Default for ScreenTagCap {
+    fn default() -> Self {
+        Self {
+            max_tags: 4,
+            max_per_row: 1,
+            max_in_header: 1,
+            reason: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShotRules {
     pub area_roots: Vec<(String, String)>,
     pub shot_dirs: Vec<(String, String)>,
@@ -466,6 +486,10 @@ pub struct ShotRules {
     pub shared_compose: BTreeSet<String>,
     pub screenshot_tests_marker: String,
     pub screen_dirs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub default_tag_cap: ScreenTagCap,
+    #[serde(default)]
+    pub screen_tag_caps: BTreeMap<String, ScreenTagCap>,
 }
 
 impl Default for ShotRules {
@@ -502,8 +526,61 @@ impl Default for ShotRules {
             ]),
             screenshot_tests_marker: "/screenshot/".into(),
             screen_dirs: BTreeMap::from([("console".into(), "frontend/admin/src/screens".into())]),
+            default_tag_cap: ScreenTagCap::default(),
+            screen_tag_caps: BTreeMap::new(),
         }
     }
+}
+
+/// Validates that any per-screen tag cap raising a limit above `default_tag_cap` carries a non-empty written `reason`.
+pub fn validate_screen_tag_caps(rules: &ShotRules) -> Result<(), String> {
+    let base = &rules.default_tag_cap;
+    for (screen, cap) in &rules.screen_tag_caps {
+        let raised = cap.max_tags > base.max_tags
+            || cap.max_per_row > base.max_per_row
+            || cap.max_in_header > base.max_in_header;
+        if raised && cap.reason.trim().is_empty() {
+            return Err(format!(
+                "screen '{screen}' raises status tag limits above default ({}/{}/{}) without a written reason in config",
+                cap.max_tags, cap.max_per_row, cap.max_in_header
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks a non-golden screen's status tag counts (`total`, `max_per_row`, `in_header`) against its cap in `rules`.
+pub fn check_screen_tags(
+    screen: &str,
+    total_tags: usize,
+    max_row_tags: usize,
+    header_tags: usize,
+    rules: &ShotRules,
+) -> Result<(), String> {
+    validate_screen_tag_caps(rules)?;
+    let cap = rules
+        .screen_tag_caps
+        .get(screen)
+        .unwrap_or(&rules.default_tag_cap);
+    if total_tags > cap.max_tags {
+        return Err(format!(
+            "{screen}: {total_tags} status tags on screen exceeds cap {} (raise only with a written reason in config)",
+            cap.max_tags
+        ));
+    }
+    if max_row_tags > cap.max_per_row {
+        return Err(format!(
+            "{screen}: {max_row_tags} status tags in one row exceeds cap {} (raise only with a written reason in config)",
+            cap.max_per_row
+        ));
+    }
+    if header_tags > cap.max_in_header {
+        return Err(format!(
+            "{screen}: {header_tags} status tags in header exceeds cap {} (raise only with a written reason in config)",
+            cap.max_in_header
+        ));
+    }
+    Ok(())
 }
 
 fn moves_no_pixel_re() -> &'static Regex {
@@ -1025,4 +1102,213 @@ pub fn read_report_goldens(
         found.insert(area, (goldens, total));
     }
     found
+}
+
+/// Returns the exact CLI command a batch prints when it fails on a moved golden (`tacho shots accept <run>`).
+pub fn accept_run_shots_command(tool: &str, run_id: &str) -> String {
+    format!("{tool} shots accept {run_id}")
+}
+
+/// Saves a batch run's `before` and `after` screenshot artifacts under
+/// `<runs_root>/<run_id>/shots/<area>/{before,after}/<repo_path>`, writes `<area>/changed.txt`,
+/// and records `<runs_root>/<run_id>/shots/head_sha`.
+pub fn save_run_shot_artifacts(
+    runs_root: &std::path::Path,
+    run_id: &str,
+    head_sha: &str,
+    area: &str,
+    before_files: &BTreeMap<String, Vec<u8>>,
+    after_files: &BTreeMap<String, Vec<u8>>,
+) -> std::io::Result<std::path::PathBuf> {
+    let shots_root = runs_root.join(run_id).join("shots");
+    std::fs::create_dir_all(&shots_root)?;
+    if !head_sha.trim().is_empty() {
+        std::fs::write(
+            shots_root.join("head_sha"),
+            format!("{}\n", head_sha.trim()),
+        )?;
+    }
+    let area_dir = shots_root.join(area);
+    let before_dir = area_dir.join("before");
+    let after_dir = area_dir.join("after");
+    std::fs::create_dir_all(&before_dir)?;
+    std::fs::create_dir_all(&after_dir)?;
+
+    let all_paths: BTreeSet<&String> = before_files.keys().chain(after_files.keys()).collect();
+    let mut changed_lines = Vec::new();
+    for path in all_paths {
+        let rel = path.trim_start_matches('/');
+        if rel.is_empty() || rel.split('/').any(|p| p == "..") {
+            continue;
+        }
+        let b = before_files.get(path);
+        let a = after_files.get(path);
+        if let Some(bytes) = b {
+            let dst = before_dir.join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(dst, bytes)?;
+        }
+        if let Some(bytes) = a {
+            let dst = after_dir.join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(dst, bytes)?;
+        }
+        match (b, a) {
+            (None, Some(_)) => changed_lines.push(format!("new\t{rel}")),
+            (Some(_), None) => changed_lines.push(format!("gone\t{rel}")),
+            (Some(bb), Some(ab)) if bb != ab => changed_lines.push(format!("changed\t{rel}")),
+            _ => {}
+        }
+    }
+    std::fs::write(
+        area_dir.join("changed.txt"),
+        if changed_lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", changed_lines.join("\n"))
+        },
+    )?;
+    Ok(shots_root)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AcceptShotsPlan {
+    /// `(source_after_file_in_run, repo_relative_path)` pairs to copy into the branch and stage.
+    pub copy_after: Vec<(std::path::PathBuf, String)>,
+    /// Repo-relative paths that were removed in `after` and should be removed and staged.
+    pub remove_paths: Vec<String>,
+}
+
+/// Plans `tacho shots accept <run> [--all]`:
+/// - Refuses when `recorded_head` differs from `current_head` ("the run was drawn from another HEAD").
+/// - Inspects `<run_shots_dir>/<area>/{before,after}/<repo_path>` (via `changed.txt` or directory walk).
+/// - By default selects only the goldens that moved (`moved(..., true)`); with `all = true` selects every image that moved (`moved(..., is_golden)`).
+pub fn plan_accept_run_shots(
+    run_shots_dir: &std::path::Path,
+    recorded_head: Option<&str>,
+    current_head: &str,
+    all: bool,
+    golden: &BTreeSet<String>,
+    rules: &ShotRules,
+) -> Result<AcceptShotsPlan, String> {
+    let recorded = recorded_head
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::fs::read_to_string(run_shots_dir.join("head_sha"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let cur = current_head.trim();
+    if let Some(rec) = &recorded {
+        if !cur.is_empty() && rec != cur {
+            let r_short = &rec[..rec.len().min(12)];
+            let c_short = &cur[..cur.len().min(12)];
+            return Err(format!(
+                "refusing to accept screenshots: run was drawn from HEAD {r_short}, but branch is now at {c_short}"
+            ));
+        }
+    }
+
+    let mut areas: BTreeSet<String> = rules.area_roots.iter().map(|(a, _)| a.clone()).collect();
+    if let Ok(entries) = std::fs::read_dir(run_shots_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    areas.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    let mut plan = AcceptShotsPlan::default();
+    let mut seen = BTreeSet::new();
+
+    for area in areas {
+        let area_dir = run_shots_dir.join(&area);
+        if !area_dir.is_dir() {
+            continue;
+        }
+        let before_root = area_dir.join("before");
+        let after_root = area_dir.join("after");
+
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        if let Ok(content) = std::fs::read_to_string(area_dir.join("changed.txt")) {
+            for line in content.lines().filter(|l| !l.is_empty()) {
+                let mut parts = line.split('\t');
+                if let (Some(state), Some(path)) = (parts.next(), parts.next()) {
+                    candidates.push((state.to_string(), path.to_string()));
+                }
+            }
+        } else {
+            let mut rels = BTreeSet::new();
+            collect_relative_pngs(&before_root, &before_root, &mut rels);
+            collect_relative_pngs(&after_root, &after_root, &mut rels);
+            for rel in rels {
+                let b_exists = before_root.join(&rel).is_file();
+                let a_exists = after_root.join(&rel).is_file();
+                let state = match (b_exists, a_exists) {
+                    (false, true) => "new",
+                    (true, false) => "gone",
+                    _ => "changed",
+                };
+                candidates.push((state.to_string(), rel));
+            }
+        }
+
+        for (state, path) in candidates {
+            let rel = path.trim_start_matches('/').to_string();
+            if rel.is_empty() || rel.split('/').any(|p| p == "..") || !seen.insert(rel.clone()) {
+                continue;
+            }
+            let is_golden = golden.contains(&rel);
+            if !all && !is_golden {
+                continue;
+            }
+            let before_bytes = std::fs::read(before_root.join(&rel)).ok();
+            let after_path = after_root.join(&rel);
+            let after_bytes = std::fs::read(&after_path).ok();
+            let did_move = match state.as_str() {
+                "new" => after_bytes.is_some(),
+                "gone" => before_bytes.is_some(),
+                _ => moved(before_bytes.as_deref(), after_bytes.as_deref(), is_golden),
+            };
+            if !did_move {
+                continue;
+            }
+            if after_bytes.is_some() {
+                plan.copy_after.push((after_path, rel));
+            } else if state == "gone" {
+                plan.remove_paths.push(rel);
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
+fn collect_relative_pngs(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut BTreeSet<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_relative_pngs(root, &p, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("png") {
+            if let Ok(rel) = p.strip_prefix(root) {
+                out.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
 }

@@ -191,6 +191,11 @@ jobs:
     assert!(script.contains("chown -R 1000:1000 /w /cargo /target/rust"));
     assert!(!script.contains("/ro-data"));
     assert!(script.contains("trap 'kill -TERM -$$"));
+    // Runner temp files live outside /w and chown surfaces real errors while ignoring missing paths:
+    assert!(script.contains("runner_files=$(mktemp -d -t github-runner.XXXXXX)"));
+    assert!(script.contains("export GITHUB_OUTPUT=\"$runner_files/output\""));
+    assert!(script.contains("export GITHUB_STEP_SUMMARY=\"$runner_files/summary\""));
+    assert!(script.contains("grep -v ': No such file or directory$'"));
 }
 
 #[test]

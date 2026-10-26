@@ -24,10 +24,10 @@ pub use legacy::*;
 
 // Re-export Wave 1 types and non-colliding functions at `decide::land::*`.
 pub use assemble::{
-    body, compile_error_excerpt, dropped_line, fix_brief, green_at_head, left_out, left_out_reason,
-    next_branch, nothing_to_land_reason, order, rebase_brief, red_fix_tasks, resolution_lines,
-    shot_screens, source_heads, title, train_tasks, truncate_max, BatchSummary, BodyParts,
-    Candidate, LandTask, MainCi, OpenPr, Settlement, CI_NOTICE,
+    body, ci_proof_areas, compile_error_excerpt, dropped_line, fix_brief, green_at_head, left_out,
+    left_out_reason, next_branch, nothing_to_land_reason, order, rebase_brief, red_fix_tasks,
+    resolution_lines, shot_screens, source_heads, title, train_tasks, truncate_max, BatchSummary,
+    BodyParts, Candidate, LandTask, MainCi, OpenPr, Settlement, CI_NOTICE, COSTLY_PARTS,
 };
 pub use config::LandConfig;
 pub use decide::{
@@ -53,10 +53,12 @@ pub use release::{
     ProvedBatch, StatusRow, TrainBatchSummary, Waiting,
 };
 pub use shots::{
-    android_redraw_command, canvas_line, classify_moved_goldens, decode_png, encode_rgba_png,
-    format_redraw_failure, golden_names, moved, moved_summary, pixel_moved, read_report_goldens,
-    refresh_commit_subject, share_changed, shot_stem, shots_fix_lines, shots_fix_verdict, size_of,
-    stale_shots_step, stray_refusal, stray_shots, DecodedPng, MovedGolden, ShotFixKind,
+    accept_run_shots_command, android_redraw_command, canvas_line, check_screen_tags,
+    classify_moved_goldens, decode_png, encode_rgba_png, format_redraw_failure, golden_names,
+    moved, moved_summary, pixel_moved, plan_accept_run_shots, read_report_goldens,
+    refresh_commit_subject, save_run_shot_artifacts, share_changed, shot_stem, shots_fix_lines,
+    shots_fix_verdict, size_of, stale_shots_step, stray_refusal, stray_shots,
+    validate_screen_tag_caps, AcceptShotsPlan, DecodedPng, MovedGolden, ScreenTagCap, ShotFixKind,
     ShotFixVerdict, ShotRules, StaleShotsStep, DEFAULT_PIXEL_EDGE, DEFAULT_PIXEL_SHARE_PPM,
     GOLDEN_MOVED_MARKER, MOST_CATALOGUE_SHARE, PNG_SIGNATURE,
 };

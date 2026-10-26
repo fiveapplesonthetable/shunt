@@ -1608,3 +1608,87 @@ fn test_train_and_batch_refuse_when_head_moves_during_compile_or_check() {
         decisions
     );
 }
+
+#[test]
+fn test_execute_shots_accept_in_stages_goldens_or_all_and_refuses_moved_head() {
+    use tacho_core::decide::land::{encode_rgba_png, save_run_shot_artifacts};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let run_git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.email", "t@example.com"]);
+    run_git(&["config", "user.name", "Tester"]);
+
+    let golden_shot = "frontend/admin/screenshots/home.png";
+    let other_shot = "frontend/admin/screenshots/other.png";
+    std::fs::write(repo.join(".golden"), format!("{golden_shot}\n")).unwrap();
+
+    let old_png = encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let new_png = encode_rgba_png(40, 80, |_, _| [200, 10, 10, 255]);
+
+    for p in [golden_shot, other_shot] {
+        let full = repo.join(p);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, &old_png).unwrap();
+    }
+    run_git(&["add", "."]);
+    run_git(&["commit", "-q", "-m", "initial shots"]);
+    let head_sha = run_git(&["rev-parse", "HEAD"]);
+
+    let before_map = std::collections::BTreeMap::from([
+        (golden_shot.to_string(), old_png.clone()),
+        (other_shot.to_string(), old_png.clone()),
+    ]);
+    let after_map = std::collections::BTreeMap::from([
+        (golden_shot.to_string(), new_png.clone()),
+        (other_shot.to_string(), new_png.clone()),
+    ]);
+    save_run_shot_artifacts(
+        &repo.join("runs"),
+        "batch-77",
+        &head_sha,
+        "console",
+        &before_map,
+        &after_map,
+    )
+    .unwrap();
+
+    // 1. Default (`all = false`): only moved golden is copied and staged.
+    let staged_default = super::execute_shots_accept_in(&repo, "batch-77", false).unwrap();
+    assert_eq!(staged_default, vec![golden_shot.to_string()]);
+    assert_eq!(std::fs::read(repo.join(golden_shot)).unwrap(), new_png);
+    assert_eq!(std::fs::read(repo.join(other_shot)).unwrap(), old_png);
+    let cached_diff = run_git(&["diff", "--cached", "--name-only"]);
+    assert_eq!(cached_diff, golden_shot);
+
+    // 2. `--all` (`all = true`): every moved image is copied and staged.
+    let staged_all = super::execute_shots_accept_in(&repo, "batch-77", true).unwrap();
+    assert_eq!(
+        staged_all,
+        vec![golden_shot.to_string(), other_shot.to_string()]
+    );
+    assert_eq!(std::fs::read(repo.join(other_shot)).unwrap(), new_png);
+
+    // 3. Advancing HEAD causes `tacho shots accept` to refuse.
+    run_git(&["commit", "-q", "-m", "advance head"]);
+    let err = super::execute_shots_accept_in(&repo, "batch-77", false)
+        .expect_err("must refuse when run was drawn from another HEAD");
+    assert!(err.to_string().contains("HEAD"), "unexpected error: {err}");
+}

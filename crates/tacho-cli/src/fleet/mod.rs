@@ -72,8 +72,9 @@ pub use tidy::{
 };
 pub use train::{
     assemble_train, candidate_screens, classify_train_conflict, execute_queue,
-    execute_release_train, execute_release_train_with, execute_train, execute_train_with,
-    is_frontend_path, order_train_candidates, select_default_train_prs, transition_release_notice,
+    execute_release_train, execute_release_train_with, execute_shots, execute_shots_accept_in,
+    execute_train, execute_train_with, is_frontend_path, order_train_candidates,
+    persist_shot_report_to_run_dir, select_default_train_prs, transition_release_notice,
     ReleaseTrainOptions, TrainConflictResolution, TrainOptions,
 };
 pub use watch::{

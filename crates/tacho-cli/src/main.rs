@@ -745,5 +745,10 @@ fn main() {
                 exit_io_err(e);
             }
         }
+        Commands::Shots(args) => {
+            if let Err(e) = fleet::execute_shots(args) {
+                exit_io_err(e);
+            }
+        }
     }
 }

@@ -53,11 +53,19 @@ pub fn compile_job_script(
 ) -> String {
     let mut lines = vec![
         "set -eo pipefail".to_string(),
-        "export GITHUB_PATH=$(mktemp)".to_string(),
-        "export GITHUB_ENV=$(mktemp)".to_string(),
+        "runner_files=$(mktemp -d -t github-runner.XXXXXX)".to_string(),
+        "export GITHUB_PATH=\"$runner_files/path\"".to_string(),
+        "export GITHUB_ENV=\"$runner_files/env\"".to_string(),
+        "export GITHUB_OUTPUT=\"$runner_files/output\"".to_string(),
+        "export GITHUB_STEP_SUMMARY=\"$runner_files/summary\"".to_string(),
+        ": >\"$GITHUB_PATH\" >\"$GITHUB_ENV\" >\"$GITHUB_OUTPUT\" >\"$GITHUB_STEP_SUMMARY\""
+            .to_string(),
     ];
 
-    let mut cleanup_parts = vec!["rm -f \"$GITHUB_PATH\" \"$GITHUB_ENV\"".to_string()];
+    let mut cleanup_parts = vec![
+        "status=$?".to_string(),
+        "rm -rf \"$runner_files\"".to_string(),
+    ];
     if let Some((uid, gid)) = host_uid_gid {
         let mut chown_paths = vec!["/w".to_string()];
         for m in writable_mounts {
@@ -68,7 +76,7 @@ pub fn compile_job_script(
             }
         }
         cleanup_parts.push(format!(
-            "chown -R {uid}:{gid} {} 2>/dev/null || true",
+            "handback=0; refused=$(LC_ALL=C chown -R {uid}:{gid} {} 2>&1 >/dev/null) || handback=$?; refused=$(printf '%s\\n' \"$refused\" | grep -v ': No such file or directory$' || true); if [ -n \"$refused\" ]; then printf '%s\\n' \"$refused\" >&2; [ \"$status\" -eq 0 ] && exit \"$handback\"; fi",
             chown_paths.join(" ")
         ));
     }

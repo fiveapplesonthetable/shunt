@@ -319,7 +319,7 @@ fn android_release_inputs_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"^frontend/android/(.*\.gradle(\.kts)?|gradle\.properties|gradle/.*|.*proguard.*|.*consumer-rules\.pro|.*/AndroidManifest\.xml|.*/src/release/.*|scripts/(apk-|release-version).*)$|^scripts/areas/android\.sh$",
+            r"^frontend/android/(.*\.gradle(\.kts)?|gradle\.properties|gradle/.*|.*proguard.*|.*consumer-rules\.pro|.*/AndroidManifest\.xml|.*/src/release/.*|scripts/(apk-|release-version).*)$|^scripts/areas/android\.sh$|^\.github/workflows/ci\.yaml$",
         )
         .expect("static regex")
     })
@@ -338,8 +338,9 @@ fn console_browser_idle_re() -> &'static Regex {
 /// Filter `found` areas with the release image and costly parts (`android-release`, `console-browser`)
 /// set for this run (`selection/since.py::costly`).
 ///
-/// `main` (`!pull_request`) and a `train` run all of them; any other pull request runs `"image"`,
-/// `"android-release"`, and `"console-browser"` only when a touched path is something they are built from.
+/// `main` (`!pull_request`) runs all of them; a `train` runs `"image"` and `"console-browser"` and
+/// leaves `"android-release"` to main; any other pull request runs `"image"`, `"android-release"`,
+/// and `"console-browser"` only when a touched path is something they are built from.
 pub fn select_costly_areas<S1: AsRef<str>, S2: AsRef<str>>(
     found: &[S1],
     paths: &[S2],
@@ -371,7 +372,9 @@ pub fn select_costly_areas<S1: AsRef<str>, S2: AsRef<str>>(
         .iter()
         .any(|a| matches!(a.as_ref(), "android" | "android-release"));
     let and_re = android_release_inputs_re();
-    if has_android && (full || paths.iter().any(|p| and_re.is_match(p.as_ref()))) {
+    if has_android
+        && (!pull_request || (!train && paths.iter().any(|p| and_re.is_match(p.as_ref()))))
+    {
         push_unique("android-release");
     }
     let has_console = found
@@ -389,11 +392,30 @@ pub fn select_costly_areas<S1: AsRef<str>, S2: AsRef<str>>(
     out
 }
 
-/// Select `tests.<module>` names to run for a change under `root_prefix` (e.g. `"tools/fleet"`),
-/// or `["*"]` when a touched path under `root_prefix` is not a module or test (`selection/related.py::fleet`).
+/// Select `tests.<module>` names to run for a change under `root_prefix` (e.g. `"tools/fleet"`).
+/// Delegates to [`related_package_tests_with_modules`] with an empty module source map.
 pub fn related_package_tests<S: AsRef<str>>(
     paths: &[S],
     tests: &std::collections::BTreeMap<String, String>,
+    root_prefix: &str,
+    pkg_name: &str,
+) -> Vec<String> {
+    related_package_tests_with_modules(
+        paths,
+        tests,
+        &std::collections::BTreeMap::new(),
+        root_prefix,
+        pkg_name,
+    )
+}
+
+/// Select `tests.<module>` names to run for a change under `root_prefix` (e.g. `"tools/fleet"`),
+/// following transitive intra-package module imports in `modules` and selecting tests that mention
+/// non-module script files by relative path or file name (`selection/related.py::fleet`).
+pub fn related_package_tests_with_modules<S: AsRef<str>>(
+    paths: &[S],
+    tests: &std::collections::BTreeMap<String, String>,
+    modules: &std::collections::BTreeMap<String, String>,
     root_prefix: &str,
     pkg_name: &str,
 ) -> Vec<String> {
@@ -417,6 +439,60 @@ pub fn related_package_tests<S: AsRef<str>>(
             .find_iter(text)
             .any(|m| word_re.is_match(m.as_str()))
     };
+    let mod_name_of = |rest: &str| -> Option<String> {
+        let first = rest.split('/').next().unwrap_or("");
+        let stem = first.strip_suffix(".py").unwrap_or(first);
+        if !stem.is_empty()
+            && stem != "__init__"
+            && stem != "__main__"
+            && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            Some(stem.to_string())
+        } else {
+            None
+        }
+    };
+    let names_file = |text: &str, rel_under_root: &str| -> bool {
+        let name = rel_under_root
+            .rsplit_once('/')
+            .map_or(rel_under_root, |(_, b)| b);
+        if text.contains(rel_under_root) {
+            return true;
+        }
+        if name.is_empty() || name == pkg_name {
+            return false;
+        }
+        Regex::new(&format!(r"(?:\b|/){}\b", regex::escape(name)))
+            .map(|re| re.is_match(text))
+            .unwrap_or(false)
+    };
+
+    let mut mod_texts: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (mpath, mtext) in modules {
+        let rel = mpath.strip_prefix(&pkg_prefix).unwrap_or(mpath.as_str());
+        if let Some(mname) = mod_name_of(rel) {
+            let entry = mod_texts.entry(mname).or_default();
+            if !entry.is_empty() {
+                entry.push('\n');
+            }
+            entry.push_str(mtext);
+        }
+    }
+
+    let importers = |start: &str| -> BTreeSet<String> {
+        let mut seen = BTreeSet::from([start.to_string()]);
+        let mut pending = vec![start.to_string()];
+        while let Some(cur) = pending.pop() {
+            for (mod_name, text) in &mod_texts {
+                if !seen.contains(mod_name) && imports_module(text, &cur) {
+                    seen.insert(mod_name.clone());
+                    pending.push(mod_name.clone());
+                }
+            }
+        }
+        seen
+    };
 
     let mut chosen = BTreeSet::new();
     for raw in paths {
@@ -436,27 +512,195 @@ pub fn related_package_tests<S: AsRef<str>>(
             }
         } else if let Some(rest) = path.strip_prefix(&pkg_prefix) {
             if rest.ends_with(".py") {
-                let first = rest.split('/').next().unwrap_or("");
-                let mod_name = first.strip_suffix(".py").unwrap_or(first);
-                if !mod_name.is_empty()
-                    && mod_name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    for (t, text) in tests {
-                        if imports_module(text, mod_name) {
-                            chosen.insert(test_name(t));
+                if let Some(m) = mod_name_of(rest) {
+                    for mod_name in importers(&m) {
+                        for (t, text) in tests {
+                            if imports_module(text, &mod_name) {
+                                chosen.insert(test_name(t));
+                            }
                         }
                     }
                     continue;
                 }
             }
-            return vec![EVERYTHING_TESTS.to_string()];
+            let rel = path.strip_prefix(&root).unwrap_or(path);
+            for (t, text) in tests {
+                if names_file(text, rel) {
+                    chosen.insert(test_name(t));
+                }
+            }
         } else {
-            return vec![EVERYTHING_TESTS.to_string()];
+            let rel = path.strip_prefix(&root).unwrap_or(path);
+            for (t, text) in tests {
+                if names_file(text, rel) {
+                    chosen.insert(test_name(t));
+                }
+            }
         }
     }
     chosen.into_iter().map(|n| format!("tests.{n}")).collect()
+}
+
+/// Computes the incremental Rust crate/test targets affected by `paths` given workspace crate
+/// manifests (`crate_name -> Cargo.toml text`), matching `selection/changed_tests.py::rust_targets`:
+/// - `crate` for each crate reached by source changes (including reverse-dependency closure),
+/// - `crate --test binary` when only `crates/<crate>/tests/<binary>.rs` changed and `<crate>` is not in `whole`,
+/// - `["*"]` when a migration (`.../migrations/...`), workspace root file (`Cargo.toml`, `Cargo.lock`), or unknown crate is touched.
+pub fn affected_rust_targets_from_manifests<S: AsRef<str>>(
+    paths: &[S],
+    manifests: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    static SECTION_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static DEP_SECTION_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static KEY_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static PKG_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+    let section_re =
+        SECTION_RE.get_or_init(|| Regex::new(r"^\s*\[([^\]]+)\]\s*$").expect("static regex"));
+    let dep_section_re = DEP_SECTION_RE.get_or_init(|| {
+        Regex::new(r"^(?:target\.[^\]]+\.)?(?:dev-|build-)?dependencies(?:\.([A-Za-z0-9_-]+))?$")
+            .expect("static regex")
+    });
+    let key_re =
+        KEY_RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z0-9_-]+)\s*=").expect("static regex"));
+    let pkg_re = PKG_RE
+        .get_or_init(|| Regex::new(r#"package\s*=\s*"([A-Za-z0-9_-]+)""#).expect("static regex"));
+
+    let crates: BTreeSet<&str> = manifests.keys().map(String::as_str).collect();
+    let mut above: std::collections::BTreeMap<String, BTreeSet<String>> = crates
+        .iter()
+        .map(|&c| (c.to_string(), BTreeSet::new()))
+        .collect();
+
+    for (name, text) in manifests {
+        let mut in_dep_section = false;
+        for raw_line in text.lines() {
+            let line = raw_line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(cap) = section_re.captures(line) {
+                let sec = cap[1].trim();
+                if let Some(dcap) = dep_section_re.captures(sec) {
+                    in_dep_section = true;
+                    if let Some(inline_dep) = dcap.get(1).map(|m| m.as_str()) {
+                        if crates.contains(inline_dep) && inline_dep != name {
+                            above
+                                .entry(inline_dep.to_string())
+                                .or_default()
+                                .insert(name.clone());
+                        }
+                    }
+                } else {
+                    in_dep_section = false;
+                }
+                continue;
+            }
+            if !in_dep_section {
+                continue;
+            }
+            if let Some(cap) = key_re.captures(line) {
+                let dep_key = &cap[1];
+                if crates.contains(dep_key) && dep_key != name {
+                    above
+                        .entry(dep_key.to_string())
+                        .or_default()
+                        .insert(name.clone());
+                }
+            }
+            if let Some(cap) = pkg_re.captures(line) {
+                let pkg_name = &cap[1];
+                if crates.contains(pkg_name) && pkg_name != name {
+                    above
+                        .entry(pkg_name.to_string())
+                        .or_default()
+                        .insert(name.clone());
+                }
+            }
+        }
+    }
+
+    let reaching = |start: &str| -> BTreeSet<String> {
+        let mut seen = BTreeSet::from([start.to_string()]);
+        let mut queue = vec![start.to_string()];
+        while let Some(cur) = queue.pop() {
+            if let Some(dependents) = above.get(&cur) {
+                for dep in dependents {
+                    if seen.insert(dep.clone()) {
+                        queue.push(dep.clone());
+                    }
+                }
+            }
+        }
+        seen
+    };
+
+    let mut whole: BTreeSet<String> = BTreeSet::new();
+    let mut only_test: std::collections::BTreeMap<String, BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+
+    for raw in paths {
+        let path = raw.as_ref();
+        if !path.starts_with("crates/") {
+            if path == "Cargo.toml" || path == "Cargo.lock" {
+                return vec![EVERYTHING_TESTS.to_string()];
+            }
+            continue;
+        }
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() < 3 {
+            return vec![EVERYTHING_TESTS.to_string()];
+        }
+        let crate_name = parts[1];
+        if !crates.contains(crate_name) {
+            return vec![EVERYTHING_TESTS.to_string()];
+        }
+        if parts.contains(&"migrations") {
+            return vec![EVERYTHING_TESTS.to_string()];
+        }
+        if parts[2] == "tests" && parts.len() == 4 && parts[3].ends_with(".rs") {
+            let bin = parts[3].trim_end_matches(".rs").to_string();
+            only_test
+                .entry(crate_name.to_string())
+                .or_default()
+                .insert(bin);
+        } else {
+            whole.extend(reaching(crate_name));
+        }
+    }
+
+    let mut targets: Vec<String> = whole.iter().cloned().collect();
+    for (crate_name, bins) in only_test {
+        if !whole.contains(&crate_name) {
+            for binary in bins {
+                targets.push(format!("{crate_name} --test {binary}"));
+            }
+        }
+    }
+    targets
+}
+
+/// Reads `crates/*/Cargo.toml` under `repo_root` and returns [`affected_rust_targets_from_manifests`].
+pub fn affected_rust_targets<S: AsRef<str>>(
+    repo_root: &std::path::Path,
+    paths: &[S],
+) -> Vec<String> {
+    let mut manifests = std::collections::BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir(repo_root.join("crates")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let toml_path = p.join("Cargo.toml");
+                if let (Some(name), Ok(text)) = (
+                    p.file_name().and_then(|n| n.to_str()),
+                    std::fs::read_to_string(toml_path),
+                ) {
+                    manifests.insert(name.to_string(), text);
+                }
+            }
+        }
+    }
+    affected_rust_targets_from_manifests(paths, &manifests)
 }
 
 fn normalise_rel_path(path: &str) -> String {
@@ -569,4 +813,162 @@ pub fn related_console_tests<S: AsRef<str>>(
         .into_iter()
         .map(|p| p.strip_prefix(&admin).unwrap_or(&p).to_string())
         .collect()
+}
+
+fn screen_stem(filename: &str) -> Option<String> {
+    static SCREEN_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re =
+        SCREEN_RE.get_or_init(|| Regex::new(r"^([A-Za-z0-9]+)Screen\.tsx$").expect("static regex"));
+    let cap = re.captures(filename)?;
+    let mut word = cap[1].to_ascii_lowercase();
+    if word.len() > 3 && word.ends_with('s') {
+        word.pop();
+    }
+    Some(word)
+}
+
+/// Select the Playwright spec files (`e2e/<name>.spec.ts`) for a console change, or `["*"]`
+/// when shared code, shell, or fixtures changed (`selection/related.py::console_specs`).
+pub fn related_console_specs<S: AsRef<str>>(
+    paths: &[S],
+    specs: &std::collections::BTreeMap<String, String>,
+    admin_prefix: &str,
+) -> Vec<String> {
+    let admin = format!("{}/", admin_prefix.trim_end_matches('/'));
+    let e2e_prefix = format!("{admin}e2e/");
+    let screens_prefix = format!("{admin}src/screens/");
+    let changed: Vec<&str> = paths
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|p| p.starts_with(&admin))
+        .collect();
+    if changed.is_empty() {
+        return Vec::new();
+    }
+    let mut chosen = BTreeSet::new();
+    let mut stems = BTreeSet::new();
+    for path in changed {
+        if let Some(rest) = path.strip_prefix(&e2e_prefix) {
+            if !rest.contains('/') && rest.ends_with(".spec.ts") {
+                chosen.insert(format!("e2e/{rest}"));
+                continue;
+            }
+            return vec![EVERYTHING_TESTS.to_string()];
+        }
+        if let Some(rest) = path.strip_prefix(&screens_prefix) {
+            if !rest.contains('/') {
+                if let Some(stem) = screen_stem(rest) {
+                    stems.insert(stem);
+                    continue;
+                }
+            }
+            return vec![EVERYTHING_TESTS.to_string()];
+        }
+        return vec![EVERYTHING_TESTS.to_string()];
+    }
+    for (spec, text) in specs {
+        let rel = spec.strip_prefix(&admin).unwrap_or(spec.as_str());
+        let base = rel
+            .rsplit_once('/')
+            .map_or(rel, |(_, b)| b)
+            .to_ascii_lowercase();
+        let lower = text.to_ascii_lowercase();
+        if stems
+            .iter()
+            .any(|s| base.contains(s.as_str()) || lower.contains(s.as_str()))
+        {
+            chosen.insert(rel.to_string());
+        }
+    }
+    chosen.into_iter().collect()
+}
+
+/// Rule mapping a deploy/scripts path regex to the deploy check names it exercises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployCheckSpec<'a> {
+    pub pattern: &'a str,
+    pub checks: &'a [&'a str],
+}
+
+/// Default deploy check rules (`selection/related.py::_DEPLOY_CHECKS`).
+pub const DEFAULT_DEPLOY_CHECKS: &[DeployCheckSpec<'static>] = &[
+    DeployCheckSpec {
+        pattern: r"^deploy/(prometheus|alertmanager|grafana)/|^scripts/validate-observability\.sh$",
+        checks: &["observability"],
+    },
+    DeployCheckSpec {
+        pattern: r"^deploy/Dockerfile$|^scripts/verify-dockerfile\.sh$",
+        checks: &["dockerfile"],
+    },
+    DeployCheckSpec {
+        pattern: r"^deploy/docker-compose\.prod\.ya?ml$|^scripts/verify-prod-compose\.sh$",
+        checks: &["prod-compose", "observability"],
+    },
+    DeployCheckSpec {
+        pattern: r"^deploy/helm/|^scripts/validate-helm\.sh$",
+        checks: &["helm", "network-policies"],
+    },
+    DeployCheckSpec {
+        pattern: r"^scripts/verify-network-policies\.sh$",
+        checks: &["network-policies"],
+    },
+    DeployCheckSpec {
+        pattern: r"^deploy/terraform/|^scripts/validate-terraform\.sh$",
+        checks: &["terraform"],
+    },
+    DeployCheckSpec {
+        pattern: r"^scripts/verify-runbooks\.sh$",
+        checks: &["runbooks"],
+    },
+    DeployCheckSpec {
+        pattern: r"^scripts/(backup|restore|offsite).*\.sh$",
+        checks: &["backup-syntax", "restore-drill"],
+    },
+    DeployCheckSpec {
+        pattern: r"^scripts/(deploy|rollback|smoke-test|rotate-keys|verify-backup)\.sh$",
+        checks: &["backup-syntax"],
+    },
+];
+
+/// Select the deploy check names to run for a change under `deploy/` or `scripts/`, or `["*"]`
+/// when `scripts/areas/deploy.sh` or an unmatched deploy/scripts path is touched.
+pub fn related_deploy_checks<S: AsRef<str>>(
+    paths: &[S],
+    rules: &[DeployCheckSpec<'_>],
+) -> Vec<String> {
+    let mut chosen = BTreeSet::new();
+    let compiled: Vec<(Regex, &[&str])> = rules
+        .iter()
+        .filter_map(|r| Regex::new(r.pattern).ok().map(|re| (re, r.checks)))
+        .collect();
+    for raw in paths {
+        let path = raw.as_ref();
+        if !(path.starts_with("deploy/") || path.starts_with("scripts/")) {
+            continue;
+        }
+        if path == "scripts/areas/deploy.sh" {
+            return vec![EVERYTHING_TESTS.to_string()];
+        }
+        let mut matched = false;
+        for (re, names) in &compiled {
+            if re.is_match(path) {
+                for &n in *names {
+                    chosen.insert(n.to_string());
+                }
+                matched = true;
+            }
+        }
+        if !matched {
+            return vec![EVERYTHING_TESTS.to_string()];
+        }
+    }
+    let mut order = Vec::new();
+    for r in rules {
+        for &n in r.checks {
+            if chosen.contains(n) && !order.iter().any(|x| x == n) {
+                order.push(n.to_string());
+            }
+        }
+    }
+    order
 }

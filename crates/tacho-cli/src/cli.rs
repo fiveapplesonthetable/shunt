@@ -263,6 +263,11 @@ pub enum Commands {
     ///
     /// Example: tacho watchdog
     Watchdog(WatchdogArgs),
+
+    /// Accept or classify redrawn screenshots from a batch run (`tacho shots accept <run> [--all]`).
+    ///
+    /// Example: tacho shots accept batch-123
+    Shots(ShotsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1127,4 +1132,33 @@ pub struct WatchdogArgs {
     /// Alert cooldown in seconds (default: 3600).
     #[arg(long)]
     pub cooldown: Option<i64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShotsArgs {
+    #[command(subcommand)]
+    pub subcommand: ShotsSubcommands,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ShotsSubcommands {
+    /// Copy a batch run's `after` screenshots into the branch and stage them (goldens by default, `--all` for every moved shot).
+    Accept(ShotsAcceptArgs),
+    /// Classify and commit intended golden screenshot changes from a run or `.tachoshots` directory.
+    Fix(ShotsFixArgs),
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct ShotsAcceptArgs {
+    /// Batch or run ID whose `runs/<run>/shots/<area>/after/<repo_path>` artifacts to accept.
+    pub run: String,
+    /// Copy every image that moved (by default only moved goldens are copied).
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct ShotsFixArgs {
+    /// Batch run ID, PR number, or shot-report directory to inspect.
+    pub target: String,
 }

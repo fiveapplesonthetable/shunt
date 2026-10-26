@@ -579,6 +579,16 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 p.is_dir().then_some(p)
             })
         {
+            let recorded_head = if shas.len() == 1 {
+                shas.values().next().cloned().unwrap_or_default()
+            } else {
+                super::store::git_stdout(&cwd, &["rev-parse", "HEAD"]).unwrap_or_default()
+            };
+            let _ = super::train::persist_shot_report_to_run_dir(
+                &report_dir,
+                &batch_id,
+                &recorded_head,
+            );
             let fix_shots = opts.origin == BatchOrigin::Train
                 || std::env::var("TACHO_FIX_SHOTS").ok().as_deref() == Some("1");
             match super::train::stage_and_commit_merged_screenshots(

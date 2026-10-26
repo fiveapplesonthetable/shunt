@@ -574,7 +574,7 @@ fn eval_costly(paths: &[&str], pull_request: bool, train: bool) -> BTreeSet<Stri
         if p.starts_with("frontend/admin/") {
             found.push("console");
         }
-        if p.starts_with("frontend/android/") {
+        if p.starts_with("frontend/android/") || p == ".github/workflows/ci.yaml" {
             found.push("android");
         }
         if p.starts_with("crates/") {
@@ -633,6 +633,12 @@ fn test_an_android_build_script_change_assembles_the_release() {
 }
 
 #[test]
+fn test_a_ci_workflow_change_assembles_the_release() {
+    let got = eval_costly(&[".github/workflows/ci.yaml"], true, false);
+    assert!(got.contains("android-release"));
+}
+
+#[test]
 fn test_console_screenshots_alone_run_no_browser_suite() {
     let got = eval_costly(&["frontend/admin/screenshots/home.png"], true, false);
     assert!(got.contains("console"));
@@ -653,7 +659,7 @@ fn test_a_console_source_beside_screenshots_runs_the_browser_suite() {
 }
 
 #[test]
-fn test_a_train_builds_all_three() {
+fn test_a_train_builds_the_image_and_the_browser_suite_and_leaves_the_release_to_main() {
     let got = eval_costly(
         &[
             "frontend/admin/src/a.ts",
@@ -663,8 +669,8 @@ fn test_a_train_builds_all_three() {
         true,
     );
     assert!(got.contains("image"));
-    assert!(got.contains("android-release"));
     assert!(got.contains("console-browser"));
+    assert!(!got.contains("android-release"));
 }
 
 #[test]
@@ -736,11 +742,51 @@ fn test_a_changed_test_selects_itself() {
 }
 
 #[test]
-fn test_a_script_outside_the_package_selects_everything() {
-    let tests = fixture_fleet_tests();
+fn test_a_script_selects_the_tests_that_name_it_and_never_everything() {
+    let mut tests = fixture_fleet_tests();
+    tests.insert(
+        "tools/tacho/tests/test_cli.py".to_string(),
+        "cmd = ['bin/tacho', '--help']\n".to_string(),
+    );
     assert_eq!(
         related_package_tests(&["tools/tacho/bin/tacho"], &tests, "tools/tacho", "tacho"),
-        vec!["*"]
+        vec!["tests.test_cli"]
+    );
+    assert!(related_package_tests(
+        &["tools/tacho/bin/unmentioned.sh"],
+        &tests,
+        "tools/tacho",
+        "tacho"
+    )
+    .is_empty());
+}
+
+#[test]
+fn test_a_module_selects_the_tests_of_the_modules_that_import_it() {
+    let tests = fixture_fleet_tests();
+    let modules = BTreeMap::from([
+        (
+            "tools/tacho/tacho/gh.py".to_string(),
+            "def call(): pass\n".to_string(),
+        ),
+        (
+            "tools/tacho/tacho/plan.py".to_string(),
+            "from tacho import gh\n".to_string(),
+        ),
+        (
+            "tools/tacho/tacho/mail.py".to_string(),
+            "def send(): pass\n".to_string(),
+        ),
+    ]);
+    assert_eq!(
+        related_package_tests_with_modules(
+            &["tools/tacho/tacho/gh.py"],
+            &tests,
+            &modules,
+            "tools/tacho",
+            "tacho"
+        ),
+        vec!["tests.test_plan", "tests.test_runs"]
     );
 }
 
@@ -916,4 +962,114 @@ fn test_batch_planner_integrates_costly_area_selection_end_to_end() {
     );
     assert_eq!(planned_manifest.len(), 1);
     assert!(planned_manifest[0].areas.contains(&"image".to_string()));
+}
+
+#[test]
+fn test_affected_rust_targets_from_manifests_computes_reverse_closure_and_test_binaries() {
+    let manifests = BTreeMap::from([
+        (
+            "core-types".to_string(),
+            "[package]\nname = \"core-types\"\n".to_string(),
+        ),
+        (
+            "domain-lib".to_string(),
+            "[package]\nname = \"domain-lib\"\n[dependencies]\ncore-types = { path = \"../core-types\" }\n".to_string(),
+        ),
+        (
+            "api-service".to_string(),
+            "[package]\nname = \"api-service\"\n[dependencies]\ndomain-lib = { path = \"../domain-lib\" }\n".to_string(),
+        ),
+        (
+            "isolated-tool".to_string(),
+            "[package]\nname = \"isolated-tool\"\n".to_string(),
+        ),
+    ]);
+
+    // 1. Leaf crate source change selects only that crate:
+    assert_eq!(
+        affected_rust_targets_from_manifests(&["crates/api-service/src/lib.rs"], &manifests),
+        vec!["api-service"]
+    );
+
+    // 2. Foundation crate source change selects its transitive dependents (`core-types`, `domain-lib`, `api-service`), not `isolated-tool`:
+    let closure =
+        affected_rust_targets_from_manifests(&["crates/core-types/src/lib.rs"], &manifests);
+    assert_eq!(closure, vec!["api-service", "core-types", "domain-lib"]);
+
+    // 3. A single integration test binary change selects `crate --test <binary>`:
+    assert_eq!(
+        affected_rust_targets_from_manifests(&["crates/api-service/tests/http.rs"], &manifests),
+        vec!["api-service --test http"]
+    );
+
+    // 4. Shared test helper (`tests/common/mod.rs`) runs the whole crate and its dependents:
+    assert_eq!(
+        affected_rust_targets_from_manifests(
+            &["crates/api-service/tests/common/mod.rs"],
+            &manifests
+        ),
+        vec!["api-service"]
+    );
+
+    // 5. Migrations or workspace Cargo.toml select `["*"]`:
+    assert_eq!(
+        affected_rust_targets_from_manifests(
+            &["crates/core-types/migrations/0001_init.sql"],
+            &manifests
+        ),
+        vec!["*"]
+    );
+    assert_eq!(
+        affected_rust_targets_from_manifests(&["Cargo.toml"], &manifests),
+        vec!["*"]
+    );
+}
+
+#[test]
+fn test_related_console_specs_and_related_deploy_checks() {
+    let specs = BTreeMap::from([
+        (
+            "frontend/admin/e2e/disputes.spec.ts".to_string(),
+            "test('disputes screen', async ({ page }) => { await page.goto('/disputes') })\n"
+                .to_string(),
+        ),
+        (
+            "frontend/admin/e2e/treasury.spec.ts".to_string(),
+            "test('treasury screen', async ({ page }) => { await page.goto('/treasury') })\n"
+                .to_string(),
+        ),
+    ]);
+    assert_eq!(
+        related_console_specs(
+            &["frontend/admin/src/screens/DisputesScreen.tsx"],
+            &specs,
+            "frontend/admin"
+        ),
+        vec!["e2e/disputes.spec.ts"]
+    );
+    assert_eq!(
+        related_console_specs(
+            &["frontend/admin/e2e/treasury.spec.ts"],
+            &specs,
+            "frontend/admin"
+        ),
+        vec!["e2e/treasury.spec.ts"]
+    );
+    assert_eq!(
+        related_console_specs(&["frontend/admin/src/App.tsx"], &specs, "frontend/admin"),
+        vec!["*"]
+    );
+
+    assert_eq!(
+        related_deploy_checks(&["deploy/prometheus/alerts.yml"], DEFAULT_DEPLOY_CHECKS),
+        vec!["observability"]
+    );
+    assert_eq!(
+        related_deploy_checks(&["deploy/helm/Chart.yaml"], DEFAULT_DEPLOY_CHECKS),
+        vec!["helm", "network-policies"]
+    );
+    assert_eq!(
+        related_deploy_checks(&["scripts/areas/deploy.sh"], DEFAULT_DEPLOY_CHECKS),
+        vec!["*"]
+    );
 }

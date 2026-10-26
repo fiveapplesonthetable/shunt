@@ -609,3 +609,139 @@ fn test_a_noise_move_of_a_non_golden_shot_is_not_reported() {
         ("no golden screenshot moved".to_string(), 0)
     );
 }
+
+#[test]
+fn test_an_unproven_pipeline_change_requires_a_full_batch_for_the_repair() {
+    let all_areas = BTreeSet::from([
+        "rust".to_string(),
+        "console".to_string(),
+        "android".to_string(),
+    ]);
+    let is_anc = |a: &str, b: &str| a == b || (a == "c1" && b == "c2");
+    let red_main = MainCi {
+        sha: "c1".into(),
+        ok: false,
+    };
+    let need =
+        super::assemble::ci_proof_areas(Some("c1"), &red_main, is_anc, &all_areas, "compile");
+    for a in &all_areas {
+        assert!(need.contains(a));
+    }
+    assert!(need.contains("android-release"));
+    assert!(need.contains("console-browser"));
+    assert!(need.contains("compile"));
+
+    let green_main = MainCi {
+        sha: "c2".into(),
+        ok: true,
+    };
+    assert!(super::assemble::ci_proof_areas(
+        Some("c1"),
+        &green_main,
+        is_anc,
+        &all_areas,
+        "compile",
+    )
+    .is_empty());
+}
+
+#[test]
+fn test_plan_accept_run_shots_copies_goldens_by_default_all_when_requested_and_refuses_moved_head()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let old = super::shots::encode_rgba_png(40, 80, |_, _| [10, 10, 200, 255]);
+    let red = super::shots::encode_rgba_png(40, 80, |_, _| [200, 10, 10, 255]);
+    let other_shot = format!("{ANDROID_SHOTS_DIR}09-other.png");
+    let before_files = BTreeMap::from([
+        (HOME_SHOT.to_string(), old.clone()),
+        (other_shot.clone(), old.clone()),
+    ]);
+    let after_files = BTreeMap::from([
+        (HOME_SHOT.to_string(), red.clone()),
+        (other_shot.clone(), red.clone()),
+    ]);
+    let shots_dir = super::shots::save_run_shot_artifacts(
+        tmp.path(),
+        "batch-42",
+        "aaaa1111bbbb2222",
+        "android",
+        &before_files,
+        &after_files,
+    )
+    .unwrap();
+
+    let golden = BTreeSet::from([HOME_SHOT.to_string()]);
+    let rules = super::shots::ShotRules::default();
+
+    // Default: only moved golden is accepted.
+    let plan_default = super::shots::plan_accept_run_shots(
+        &shots_dir,
+        None,
+        "aaaa1111bbbb2222",
+        false,
+        &golden,
+        &rules,
+    )
+    .unwrap();
+    assert_eq!(plan_default.copy_after.len(), 1);
+    assert_eq!(plan_default.copy_after[0].1, HOME_SHOT);
+
+    // --all: both golden and non-golden moved images are accepted.
+    let plan_all = super::shots::plan_accept_run_shots(
+        &shots_dir,
+        None,
+        "aaaa1111bbbb2222",
+        true,
+        &golden,
+        &rules,
+    )
+    .unwrap();
+    let paths: Vec<_> = plan_all
+        .copy_after
+        .iter()
+        .map(|(_, p)| p.as_str())
+        .collect();
+    assert_eq!(paths, vec![HOME_SHOT, other_shot.as_str()]);
+
+    // Refuses when branch HEAD moved.
+    let err = super::shots::plan_accept_run_shots(
+        &shots_dir,
+        None,
+        "cccc3333dddd4444",
+        false,
+        &golden,
+        &rules,
+    )
+    .unwrap_err();
+    assert!(err.contains("HEAD"), "unexpected err: {err}");
+    assert_eq!(
+        super::shots::accept_run_shots_command("tacho", "batch-42"),
+        "tacho shots accept batch-42"
+    );
+}
+
+#[test]
+fn test_screen_tag_caps_require_written_reason_when_raised_and_enforce_limits() {
+    let mut rules = super::shots::ShotRules::default();
+    assert!(super::shots::check_screen_tags("treasury", 4, 1, 1, &rules).is_ok());
+    assert!(super::shots::check_screen_tags("treasury", 5, 1, 1, &rules).is_err());
+    assert!(super::shots::check_screen_tags("treasury", 3, 2, 1, &rules).is_err());
+
+    // Raising the cap without a written reason is rejected.
+    rules.screen_tag_caps.insert(
+        "treasury".into(),
+        super::shots::ScreenTagCap {
+            max_tags: 6,
+            max_per_row: 2,
+            max_in_header: 1,
+            reason: String::new(),
+        },
+    );
+    assert!(super::shots::validate_screen_tag_caps(&rules).is_err());
+
+    // Raising with a written reason succeeds.
+    rules.screen_tag_caps.get_mut("treasury").unwrap().reason =
+        "multi-rail settlement table shows both rail and payout state".into();
+    assert!(super::shots::validate_screen_tag_caps(&rules).is_ok());
+    assert!(super::shots::check_screen_tags("treasury", 6, 2, 1, &rules).is_ok());
+}

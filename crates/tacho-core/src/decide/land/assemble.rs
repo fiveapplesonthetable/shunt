@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Shown in the PR body and the letter of a train that changes how checks run.
-pub const CI_NOTICE: &str = "This changes how checks run, so it is batched alone. Once it merges, \
-one real run of main's ci must pass before any other change lands.";
+pub const CI_NOTICE: &str = "This changes how checks run, so it is batched alone. Until main's \
+CI passes it, each following train needs a full batch pass on its exact merged tree.";
+
+/// Costly verification parts required alongside all areas when an unproven pipeline change is on main.
+pub const COSTLY_PARTS: [&str; 2] = ["android-release", "console-browser"];
 
 /// A PR the train may take.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +111,32 @@ pub fn ci_proof_pending(
         "{} changed how ci runs and no main ci run has passed since; nothing else lands until one does",
         short(ci_sha, 8)
     ))
+}
+
+/// Extra areas every train must prove until a main CI run passes at or after `ci_sha`.
+/// When main is red after a pipeline change, a repair train still forms and lands once its own
+/// full batch (`all_areas` + `COSTLY_PARTS` + `gate`) passes on the exact merged tree.
+pub fn ci_proof_areas(
+    ci_sha: Option<&str>,
+    main_ci: &MainCi,
+    is_ancestor: impl Fn(&str, &str) -> bool,
+    all_areas: &BTreeSet<String>,
+    gate: &str,
+) -> BTreeSet<String> {
+    let Some(ci_sha) = ci_sha.filter(|s| !s.is_empty()) else {
+        return BTreeSet::new();
+    };
+    if main_ci.ok && !main_ci.sha.is_empty() && is_ancestor(ci_sha, &main_ci.sha) {
+        return BTreeSet::new();
+    }
+    let mut required = all_areas.clone();
+    for part in COSTLY_PARTS {
+        required.insert(part.to_string());
+    }
+    if !gate.trim().is_empty() {
+        required.insert(gate.to_string());
+    }
+    required
 }
 
 fn screens(c: &Candidate, cfg: &LandConfig) -> BTreeSet<String> {

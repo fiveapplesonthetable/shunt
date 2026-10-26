@@ -185,9 +185,10 @@ pub fn sibling_rebases(
         .collect()
 }
 
-/// Ready drafts to mark ready for review (none in dry-run).
+/// Ready drafts to mark ready for review (only a lone PR: a member of a train is made ready when
+/// the train lands; marking ready starts a full CI run).
 pub fn drafts_to_ready(queue: &[u64], drafts: &BTreeSet<u64>, dry_run: bool) -> Vec<u64> {
-    if dry_run {
+    if dry_run || queue.len() != 1 {
         return Vec::new();
     }
     queue
