@@ -81,6 +81,7 @@ fn kp1_to_kp7_proof_problems_and_check_environment() {
         &rust_cache,
         "gradle-slot",
         "TACHO_GRADLE_SLOT",
+        "base",
     );
     assert_eq!(
         env1.get("RUSTC_WRAPPER").map(String::as_str),
@@ -99,6 +100,7 @@ fn kp1_to_kp7_proof_problems_and_check_environment() {
         &rust_cache,
         "gradle-slot",
         "TACHO_GRADLE_SLOT",
+        "base",
     );
     assert_eq!(
         env2.get("RUSTC_WRAPPER").map(String::as_str),
@@ -108,6 +110,17 @@ fn kp1_to_kp7_proof_problems_and_check_environment() {
         env2.get("TACHO_GRADLE_SLOT").map(String::as_str),
         Some("gradle-slot")
     );
+
+    // KP8: every check is told the base the change is proved against
+    let env3 = check_environment(
+        &cons_check,
+        &inherited,
+        &BTreeMap::new(),
+        "",
+        "TACHO_GRADLE_SLOT",
+        "abc123",
+    );
+    assert_eq!(env3.get("TACHO_BASE").map(String::as_str), Some("abc123"));
 }
 
 #[test]

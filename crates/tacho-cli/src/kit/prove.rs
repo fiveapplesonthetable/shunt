@@ -485,9 +485,10 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
     let state = store.load()?;
     let cwd = std::env::current_dir()?;
     let root = find_worktree_root(&cwd);
-    let env_map = load_worktree_env(&root);
+    let mut env_map = load_worktree_env(&root);
 
     let base_sha = resolve_base_sha_for_worktree(&root, args.base.as_deref(), &env_map, &state)?;
+    env_map.insert("TACHO_BASE".to_string(), base_sha.clone());
     let changed = changed_files_since(&root, &base_sha)?;
     if changed.is_empty() {
         return Err(io::Error::new(

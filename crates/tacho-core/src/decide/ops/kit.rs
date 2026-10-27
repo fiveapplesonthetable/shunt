@@ -303,16 +303,18 @@ pub fn proof_problems(
     out
 }
 
-/// Adds `rust_cache` for `cargo` / `"conservative checks"` and `gradle_slot` only for
-/// `"conservative checks"` (KP6, KP7).
+/// Adds `TACHO_BASE=base`, `rust_cache` for `cargo` / `"conservative checks"`, and `gradle_slot`
+/// only for `"conservative checks"` (KP6, KP7, KP8).
 pub fn check_environment(
     check: &ProofCheck,
     inherited: &BTreeMap<String, String>,
     rust_cache: &BTreeMap<String, String>,
     gradle_slot: &str,
     gradle_slot_var: &str,
+    base: &str,
 ) -> BTreeMap<String, String> {
     let mut env = inherited.clone();
+    env.insert("TACHO_BASE".to_string(), base.to_string());
     let is_cargo = check.cmd.first().is_some_and(|c| c == "cargo");
     if is_cargo || check.name == "conservative checks" {
         for (k, v) in rust_cache {
