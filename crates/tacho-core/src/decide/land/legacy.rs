@@ -599,16 +599,25 @@ pub fn waiting_for_with_ci_proof(
             .iter()
             .rev()
             .find(|b| b.status == "passed" && b.tree.as_deref() == Some(train_pr.tree.as_str()));
-        if let Some(b) = matching_batch {
-            let covered: BTreeSet<&str> = b.areas.iter().map(String::as_str).collect();
-            let missing: Vec<String> = proof_areas
-                .into_iter()
-                .filter(|a| !covered.contains(a.as_str()))
-                .collect();
-            if !missing.is_empty() {
+        match matching_batch {
+            Some(b) => {
+                let covered: BTreeSet<&str> = b.areas.iter().map(String::as_str).collect();
+                let missing: Vec<String> = proof_areas
+                    .into_iter()
+                    .filter(|a| !covered.contains(a.as_str()))
+                    .collect();
+                if !missing.is_empty() {
+                    reasons.push(format!(
+                        "batch {} did not cover CI-proof areas {:?}",
+                        b.id, missing
+                    ));
+                }
+            }
+            None => {
                 reasons.push(format!(
-                    "batch {} did not cover CI-proof areas {:?}",
-                    b.id, missing
+                    "CI-proof areas {:?} require a passed batch on tree {}",
+                    proof_areas,
+                    &train_pr.tree[..train_pr.tree.len().min(12)]
                 ));
             }
         }

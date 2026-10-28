@@ -30,7 +30,7 @@ use super::start::{
     resolve_pinned_base_sha, run_provisioner_bounded, PORT_BASE, PORT_BLOCK_SIZE,
 };
 use super::starve::{
-    configure_burner_process, parse_cpu_list_str, plan_starve_slice, stop_registered_burner,
+    parse_cpu_list_str, plan_starve_slice, spawn_burner_with_lifeline, stop_registered_burner,
     RegisteredBurner, BURNERS_PER_CPU, STARVE_MAX_SECS,
 };
 use super::tree_of_worktree;
@@ -665,9 +665,10 @@ fn test_starve_plan_4_burners_per_cpu_one_eighth_fleet_cap_and_highest_4_default
 
 #[test]
 fn test_starve_registered_burner_verification_and_preemption() {
-    struct BurnerReapGuard(std::process::Child);
+    struct BurnerReapGuard(std::process::Child, Option<std::process::ChildStdin>);
     impl Drop for BurnerReapGuard {
         fn drop(&mut self) {
+            self.1.take();
             let pid = self.0.id();
             let _ = super::procs::signal_group_and_leader(pid, libc::SIGKILL);
             let _ = self.0.kill();
@@ -676,14 +677,9 @@ fn test_starve_registered_burner_verification_and_preemption() {
     }
 
     if std::env::var_os("TACHO_TEST_SPAWN_BURNER_HOLD").is_some() {
-        let mut b_cmd = Command::new("yes");
-        b_cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        configure_burner_process(&mut b_cmd, 30);
-        let burner = b_cmd.spawn().expect("spawn yes burner");
-        let mut guard = BurnerReapGuard(burner);
+        let (burner, lifeline) =
+            spawn_burner_with_lifeline(&[], 30, Stdio::piped()).expect("spawn yes burner");
+        let mut guard = BurnerReapGuard(burner, Some(lifeline));
         let mut one_byte = [0u8; 1];
         guard
             .0
@@ -701,18 +697,12 @@ fn test_starve_registered_burner_verification_and_preemption() {
         return;
     }
 
-    // 1. Spawn a real `yes` process in its own process group with `configure_burner_process`.
+    // 1. Spawn a real `yes` process in its own process group with `spawn_burner_with_lifeline`.
     // Pipe stdout and read 1 byte so the kernel guarantees `execve("yes")` has completed
     // (and `/proc/<pid>/cmdline` is `"yes"`, not the forked test runner) even under load 100.
     // BurnerReapGuard reaps the process group in every exit path (including panic).
-    let mut b_cmd = Command::new("yes");
-    b_cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    configure_burner_process(&mut b_cmd, 30);
-    let burner = b_cmd.spawn().unwrap();
-    let mut guard = BurnerReapGuard(burner);
+    let (burner, lifeline) = spawn_burner_with_lifeline(&[], 30, Stdio::piped()).unwrap();
+    let mut guard = BurnerReapGuard(burner, Some(lifeline));
     let mut one_byte = [0u8; 1];
     guard
         .0

@@ -65,6 +65,8 @@ pub fn scan_procs() -> Vec<ProcEntry> {
         else {
             continue;
         };
+        let cutime = parse(13).unwrap_or(0);
+        let cstime = parse(14).unwrap_or(0);
         if pid == 2 || ppid == 2 {
             continue;
         }
@@ -93,7 +95,10 @@ pub fn scan_procs() -> Vec<ProcEntry> {
             ppid: ppid as u32,
             pgid: pgid as u32,
             state: fields[0].to_string(),
-            cpu_ticks: utime + stime,
+            cpu_ticks: utime
+                .saturating_add(stime)
+                .saturating_add(cutime)
+                .saturating_add(cstime),
             elapsed_secs,
             comm,
             args,
@@ -837,8 +842,45 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
         ready_trains.push((open.id.clone(), open.prs.clone(), heads));
     }
 
+    let agent_roots: BTreeSet<u32> = live_keys
+        .iter()
+        .filter_map(|k| {
+            state
+                .agents
+                .get(k)
+                .and_then(|a| a.pid)
+                .or_else(|| host.run_pids.get(k).copied())
+                .or_else(|| host.live_state.agents.get(k).and_then(|a| a.pid))
+        })
+        .collect();
+    let known_worktrees: BTreeSet<&str> = state
+        .worktrees
+        .values()
+        .map(|w| w.path.as_str())
+        .chain(state.agents.values().map(|a| a.worktree.as_str()))
+        .filter(|p| !p.is_empty())
+        .collect();
     let burners = tacho_core::decide::watch::burners(host.procs)
         .into_iter()
+        .filter(|b| {
+            let in_agent_tree = agent_roots
+                .iter()
+                .any(|&root| tacho_core::decide::watch::below(root, host.procs).contains(&b.pid));
+            let in_worktree = known_worktrees.iter().any(|wt| {
+                !b.cwd.is_empty()
+                    && (b.cwd == *wt
+                        || b.cwd.starts_with(&format!("{}/", wt.trim_end_matches('/'))))
+            });
+            let in_cgroup = fs::read_to_string(format!("/proc/{}/cgroup", b.pid))
+                .ok()
+                .is_some_and(|cg| {
+                    tacho_core::decide::watch::procs::in_agent_cgroup(
+                        &cg,
+                        &tacho_core::decide::watch::WatchConfig::default(),
+                    ) || cg.contains("tacho-")
+                });
+            in_agent_tree || in_worktree || in_cgroup
+        })
         .map(|b| BurnerProcess {
             pid: b.pid,
             comm: tacho_core::decide::watch::burner_command(&b.comm, &b.args)

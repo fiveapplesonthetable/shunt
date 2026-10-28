@@ -1030,11 +1030,7 @@ impl crate::exec::Hands for DaemonHands {
     }
 
     fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
-        if self.appender.is_some() {
-            tacho_core::decide::plugin::notify_owner_command(subject, body)
-        } else {
-            Ok(false)
-        }
+        tacho_core::decide::plugin::notify_owner_command(subject, body)
     }
 
     fn prune_root_disk_volumes(&mut self) -> Result<String, String> {

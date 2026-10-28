@@ -76,13 +76,13 @@ pub trait Hands {
     }
 
     /// Delivers an owner notification (`subject`, `body`).
-    fn notify_owner(&mut self, _subject: &str, _body: &str) -> Result<bool, String> {
-        Ok(false)
+    fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
+        tacho_core::decide::plugin::notify_owner_command(subject, body)
     }
 
     /// Prunes unused runner Docker volumes when `/` is low on free space (`< 40 GiB`).
     fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
-        Ok(String::new())
+        prune_runner_volumes_command(None)
     }
 }
 

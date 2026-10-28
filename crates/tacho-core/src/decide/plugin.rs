@@ -957,9 +957,37 @@ impl ForgePlugin for CliForgePlugin {
         self.run_cli(&args).map(|_| ())
     }
 
+    fn list_actions_caches(&self) -> Result<Vec<crate::decide::ops::tidy::ActionsCache>, String> {
+        let Some(repo) = self.repo.as_deref().filter(|r| !r.is_empty()) else {
+            return Err("actions-tidy: forge repository is not configured".to_string());
+        };
+        let args = vec![
+            "api".to_string(),
+            "--paginate".to_string(),
+            format!("repos/{repo}/actions/caches?per_page=100"),
+        ];
+        let raw = self.run_cli(&args)?;
+        parse_gh_actions_caches(&raw)
+    }
+
+    fn list_actions_artifacts(
+        &self,
+    ) -> Result<Vec<crate::decide::ops::tidy::ActionsArtifact>, String> {
+        let Some(repo) = self.repo.as_deref().filter(|r| !r.is_empty()) else {
+            return Err("actions-tidy: forge repository is not configured".to_string());
+        };
+        let args = vec![
+            "api".to_string(),
+            "--paginate".to_string(),
+            format!("repos/{repo}/actions/artifacts?per_page=100"),
+        ];
+        let raw = self.run_cli(&args)?;
+        parse_gh_actions_artifacts(&raw)
+    }
+
     fn delete_actions_cache(&self, id: u64) -> Result<(), String> {
         let Some(repo) = self.repo.as_deref().filter(|r| !r.is_empty()) else {
-            return Ok(());
+            return Err("actions-tidy: forge repository is not configured".to_string());
         };
         let args = vec![
             "api".to_string(),
@@ -972,7 +1000,7 @@ impl ForgePlugin for CliForgePlugin {
 
     fn delete_actions_artifact(&self, id: u64) -> Result<(), String> {
         let Some(repo) = self.repo.as_deref().filter(|r| !r.is_empty()) else {
-            return Ok(());
+            return Err("actions-tidy: forge repository is not configured".to_string());
         };
         let args = vec![
             "api".to_string(),
@@ -984,9 +1012,173 @@ impl ForgePlugin for CliForgePlugin {
     }
 }
 
-/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and runs `cmd_override` (or `$TACHO_NOTIFY`)
-/// with `TACHO_NOTIFY_SUBJECT` and `TACHO_NOTIFY_BODY` environment variables and stdin populated
-/// with the scrubbed body.
+/// Parses an integer unix timestamp or ISO-8601 UTC timestamp (`"YYYY-MM-DDTHH:MM:SSZ"`) into unix seconds.
+pub fn parse_github_timestamp(val: &serde_json::Value) -> Option<i64> {
+    if let Some(ts) = val.as_i64() {
+        return Some(ts);
+    }
+    let s = val.as_str()?.trim();
+    if let Ok(ts) = s.parse::<i64>() {
+        return Some(ts);
+    }
+    let year = s.get(0..4)?.parse::<i64>().ok()?;
+    let month = s.get(5..7)?.parse::<u32>().ok()?;
+    let day = s.get(8..10)?.parse::<u32>().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let hour = s
+        .get(11..13)
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let min = s
+        .get(14..16)
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let sec = s
+        .get(17..19)
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + (doe as i64) - 719468;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Parses `gh api --paginate repos/<repo>/actions/caches?per_page=100` JSON output (including
+/// concatenated multi-page objects, arrays, or NDJSON) into [`crate::decide::ops::tidy::ActionsCache`] items.
+pub fn parse_gh_actions_caches(
+    stdout: &str,
+) -> Result<Vec<crate::decide::ops::tidy::ActionsCache>, String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let push_item = |item: &serde_json::Value,
+                     out: &mut Vec<crate::decide::ops::tidy::ActionsCache>| {
+        if let (Some(id), Some(last_accessed_at)) = (
+            item.get("id").and_then(|v| v.as_u64()),
+            item.get("last_accessed_at")
+                .or_else(|| item.get("created_at"))
+                .and_then(parse_github_timestamp),
+        ) {
+            out.push(crate::decide::ops::tidy::ActionsCache {
+                id,
+                last_accessed_at,
+            });
+        }
+    };
+    let stream = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    for res in stream {
+        let val = res.map_err(|e| format!("invalid actions caches JSON: {e}"))?;
+        if let Some(arr) = val.get("actions_caches").and_then(|v| v.as_array()) {
+            for item in arr {
+                push_item(item, &mut out);
+            }
+        } else if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(inner) = item.get("actions_caches").and_then(|v| v.as_array()) {
+                    for sub in inner {
+                        push_item(sub, &mut out);
+                    }
+                } else {
+                    push_item(item, &mut out);
+                }
+            }
+        } else {
+            push_item(&val, &mut out);
+        }
+    }
+    Ok(out)
+}
+
+/// Parses `gh api --paginate repos/<repo>/actions/artifacts?per_page=100` JSON output (including
+/// concatenated multi-page objects, arrays, or NDJSON) into [`crate::decide::ops::tidy::ActionsArtifact`] items.
+pub fn parse_gh_actions_artifacts(
+    stdout: &str,
+) -> Result<Vec<crate::decide::ops::tidy::ActionsArtifact>, String> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let push_item = |item: &serde_json::Value,
+                     out: &mut Vec<crate::decide::ops::tidy::ActionsArtifact>| {
+        if let (Some(id), Some(name), Some(created_at)) = (
+            item.get("id").and_then(|v| v.as_u64()),
+            item.get("name").and_then(|v| v.as_str()),
+            item.get("created_at").and_then(parse_github_timestamp),
+        ) {
+            let expired = item
+                .get("expired")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            out.push(crate::decide::ops::tidy::ActionsArtifact {
+                id,
+                name: name.to_string(),
+                created_at,
+                expired,
+            });
+        }
+    };
+    let stream = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    for res in stream {
+        let val = res.map_err(|e| format!("invalid actions artifacts JSON: {e}"))?;
+        if let Some(arr) = val.get("artifacts").and_then(|v| v.as_array()) {
+            for item in arr {
+                push_item(item, &mut out);
+            }
+        } else if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(inner) = item.get("artifacts").and_then(|v| v.as_array()) {
+                    for sub in inner {
+                        push_item(sub, &mut out);
+                    }
+                } else {
+                    push_item(item, &mut out);
+                }
+            }
+        } else {
+            push_item(&val, &mut out);
+        }
+    }
+    Ok(out)
+}
+
+/// Returns `true` when executing inside a test harness (`cargo test`, `nextest`, or a child
+/// process spawned by a test suite with `RUST_TEST_THREADS` / `TACHO_TEST_MODE`), so tests
+/// never invoke an ambient production `TACHO_NOTIFY` hook unless `TACHO_TEST_NOTIFY_CMD` is set.
+pub fn running_in_test_harness() -> bool {
+    if cfg!(test)
+        || std::env::var_os("TACHO_TEST_MODE").is_some()
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
+    {
+        return true;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let in_deps = exe
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some("deps");
+    let stem = exe.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    let has_hash_suffix = stem.rsplit_once('-').is_some_and(|(_, suffix)| {
+        suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+    });
+    in_deps && has_hash_suffix
+}
+
+/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and runs `cmd_override` (or `$TACHO_NOTIFY`,
+/// or `$TACHO_TEST_NOTIFY_CMD` when [`running_in_test_harness`] is true) with `TACHO_NOTIFY_SUBJECT`
+/// and `TACHO_NOTIFY_BODY` environment variables and stdin populated with the scrubbed body.
 pub fn notify_owner_command_with(
     cmd_override: Option<&str>,
     subject: &str,
@@ -1000,7 +1192,9 @@ pub fn notify_owner_command_with(
     let clean_body = scrubber.scrub(body);
     let resolved_cmd = match cmd_override {
         Some(cmd) => Some(cmd.trim().to_string()),
-        None if cfg!(test) => None,
+        None if running_in_test_harness() => std::env::var("TACHO_TEST_NOTIFY_CMD")
+            .ok()
+            .map(|s| s.trim().to_string()),
         None => std::env::var("TACHO_NOTIFY")
             .ok()
             .map(|s| s.trim().to_string()),

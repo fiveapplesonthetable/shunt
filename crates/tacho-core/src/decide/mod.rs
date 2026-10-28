@@ -43,7 +43,7 @@ use watch::{
     decide_owner_notifications, decide_self_update, decide_tidy, down_alert, down_reason,
     needs_you, supervise_step, take_sample, verdict, AttentionItem, BehindCommit, DeployRunObs,
     OwnerNotification, ProgressSample, SelfUpdateDecision, SuperviseAction, TidyDecision,
-    TidySnapshot,
+    TidySnapshot, Verdict,
 };
 
 /// Complete pure fleet state input to [`decide`].
@@ -280,10 +280,19 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
             let existing = next.samples.get(key).map(Vec::as_slice).unwrap_or(&[]);
             let updated = take_sample(existing, sample.clone(), 60);
             let (v, idle) = verdict(&updated, obs.now);
-            let step = supervise_step(key, v, idle, next.nudged.contains(key));
+            let base = base_key(key);
+            let was_nudged = next.nudged.contains(key) || next.nudged.contains(base);
+            let step = supervise_step(key, v, idle, was_nudged);
             next.samples.insert(key.clone(), updated);
+            if matches!(v, Verdict::Moving) {
+                next.notified_keys.retain(|k| {
+                    !k.starts_with(&format!("attention:stalled:{key}:"))
+                        && !k.starts_with(&format!("attention:stalled:{base}:"))
+                });
+            }
             if matches!(step, SuperviseAction::Nudge { .. }) {
                 next.nudged.insert(key.clone());
+                next.nudged.insert(base.to_string());
             }
             if !matches!(step, SuperviseAction::Ok) {
                 supervision_actions.push(step);

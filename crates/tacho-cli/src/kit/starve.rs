@@ -3,6 +3,8 @@
 //! default highest 4 available CPUs, refuses to start during a merge-check batch, and stops
 //! burners immediately if a merge-check batch starts while running).
 
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -207,9 +209,10 @@ pub fn preempt_registered_burners(home: &Path) -> usize {
     stopped
 }
 
-/// Guard ensuring every spawned burner child and process group is killed and reaped on exit.
+/// Guard ensuring every spawned burner child, its parent-lifeline stdin pipe, and its process group
+/// are killed and reaped on exit.
 struct BurnersGuard {
-    children: Vec<(Child, RegisteredBurner)>,
+    children: Vec<(Child, RegisteredBurner, std::process::ChildStdin)>,
     home: std::path::PathBuf,
 }
 
@@ -222,7 +225,8 @@ impl BurnersGuard {
     }
 
     fn stop_all(&mut self) {
-        for (mut child, reg) in self.children.drain(..) {
+        for (mut child, reg, lifeline_tx) in self.children.drain(..) {
+            drop(lifeline_tx);
             let pid = child.id();
             let should_signal = match reg.starttime {
                 Some(_) => pid_alive_with_starttime(pid, reg.starttime),
@@ -248,30 +252,48 @@ impl Drop for BurnersGuard {
     }
 }
 
-/// Configure a burner or starved child command with an isolated process group (`pgid == pid`),
-/// `TACHO_STARVE=1` / `STARVE=1` environment markers, kernel parent-death `SIGKILL`
-/// (`PR_SET_PDEATHSIG`), and a kernel `SIGALRM` hard cap (`alarm(timeout_secs)`).
-///
-/// Because `PR_SET_PDEATHSIG` and `alarm` are preserved across `execve` (including when
-/// `taskset -c <cpus> yes` execs `yes` in-place), no intermediate `timeout` process sits
-/// between `tacho` and `yes`: if the parent runner or `tacho` process dies for any reason
-/// (including `SIGKILL`), the kernel immediately delivers `SIGKILL` to `yes`.
-pub fn configure_burner_process(cmd: &mut Command, timeout_secs: u64) {
-    let parent_pid = unsafe { libc::getpid() };
-    let cap_secs = timeout_secs.clamp(1, STARVE_MAX_SECS) as u32;
+/// Configure a burner or starved child command with an isolated process group (`pgid == pid`)
+/// and `TACHO_STARVE=1` / `STARVE=1` environment markers, using 100% safe Rust (`#![forbid(unsafe_code)]`).
+pub fn configure_burner_process(cmd: &mut Command, _timeout_secs: u64) {
     cmd.env("TACHO_STARVE", "1")
         .env("STARVE", "1")
         .process_group(0);
-    unsafe {
-        cmd.pre_exec(move || {
-            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            if libc::getppid() != parent_pid {
-                libc::_exit(1);
-            }
-            libc::alarm(cap_secs);
-            Ok(())
-        });
-    }
+}
+
+/// Spawns a `yes` burner process wrapped in an optional CPU-pinning prefix (`wrap`), bound to
+/// a parent-lifeline pipe (`Stdio::piped()` stdin) with zero `unsafe` code:
+/// - The spawned process group leader runs a `bash` wrapper that duplicates the lifeline pipe
+///   to fd 3, starts a background monitor `(read -r -t <cap_secs> _ <&3 || kill -KILL 0)` in the
+///   same process group, and `exec`s `[wrap...] yes` in-place.
+/// - Because `bash` uses `exec`, the process group leader (`pid == pgid`) becomes `yes` in-place
+///   with `TACHO_STARVE=1` in `/proc/<pid>/environ` and `"yes"` in `/proc/<pid>/cmdline`.
+/// - If the parent `tacho` or runner process exits or receives `SIGKILL`, the kernel immediately
+///   closes `lifeline_tx`, delivering EOF on fd 3 so `kill -KILL 0` terminates the entire burner
+///   process group immediately.
+pub fn spawn_burner_with_lifeline(
+    wrap: &[String],
+    timeout_secs: u64,
+    stdout: Stdio,
+) -> io::Result<(Child, std::process::ChildStdin)> {
+    let cap_secs = timeout_secs.clamp(1, STARVE_MAX_SECS);
+    let mut cmd = Command::new("bash");
+    use_private_tmp(&mut cmd, "starve")?;
+    cmd.arg("-c")
+        .arg(format!(
+            "exec 3<&0; (read -r -t {cap_secs} _ <&3 || kill -KILL 0) >/dev/null 2>&1 & exec 3<&- \"$@\" yes </dev/null"
+        ))
+        .arg("tacho-burner")
+        .args(wrap)
+        .stdin(Stdio::piped())
+        .stdout(stdout)
+        .stderr(Stdio::null());
+    configure_burner_process(&mut cmd, timeout_secs);
+    let mut child = cmd.spawn()?;
+    let lifeline_tx = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing burner piped stdin"))?;
+    Ok((child, lifeline_tx))
 }
 
 /// Executes `tacho starve [--cpus 4] [--cpu-set 0-3] [--timeout 300] -- <cmd...>`.
@@ -326,26 +348,19 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
 
     // 2. Spawn `plan.burners` (4 per CPU) pinned to `plan.cpus` in isolated process groups
     for _ in 0..plan.burners {
-        let mut b_cmd = Command::new(&wrap[0]);
-        use_private_tmp(&mut b_cmd, "starve")?;
-        b_cmd
-            .args(&wrap[1..])
-            .arg("yes")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        configure_burner_process(&mut b_cmd, timeout_secs);
-        if let Ok(c) = b_cmd.spawn() {
+        if let Ok((c, lifeline_tx)) = spawn_burner_with_lifeline(wrap, timeout_secs, Stdio::null())
+        {
             let pid = c.id();
             let reg = RegisteredBurner {
                 pid,
                 starttime: proc_pid_starttime(pid),
             };
-            guard.children.push((c, reg));
+            guard.children.push((c, reg, lifeline_tx));
         }
     }
 
-    let reg_list: Vec<RegisteredBurner> = guard.children.iter().map(|(_, r)| r.clone()).collect();
+    let reg_list: Vec<RegisteredBurner> =
+        guard.children.iter().map(|(_, r, _)| r.clone()).collect();
     save_registered_burners(&home, &reg_list)?;
 
     // 3. Spawn the target command pinned to the same CPU slice in its own process group

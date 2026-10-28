@@ -18,6 +18,7 @@ struct ScrubberPatterns {
     anthropic_token: Regex,
     openai_token: Regex,
     slack_token: Regex,
+    slack_webhook: Regex,
     jwt_token: Regex,
     stripe_token: Regex,
     npm_token: Regex,
@@ -85,6 +86,7 @@ static PATTERNS: LazyLock<ScrubberPatterns> = LazyLock::new(|| {
     anthropic_token: Regex::new(r"(?i)\bsk-ant-[a-zA-Z0-9_\-]{32,}\b").unwrap(),
     openai_token: Regex::new(r"(?i)\bsk-(?:proj-|none-)?[a-zA-Z0-9_\-]{32,}\b").unwrap(),
     slack_token: Regex::new(r"(?i)\bxox[abprs]-[0-9a-zA-Z_\-]{10,}\b").unwrap(),
+    slack_webhook: Regex::new(r"(?i)https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+").unwrap(),
     jwt_token: Regex::new(
         r"(?i)\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
     )
@@ -322,6 +324,7 @@ impl Scrubber {
         s = p.anthropic_token.replace_all(&s, "<redacted>").into_owned();
         s = p.openai_token.replace_all(&s, "<redacted>").into_owned();
         s = p.slack_token.replace_all(&s, "<redacted>").into_owned();
+        s = p.slack_webhook.replace_all(&s, "<redacted>").into_owned();
         s = p.jwt_token.replace_all(&s, "<redacted>").into_owned();
         s = p.stripe_token.replace_all(&s, "<redacted>").into_owned();
         s = p.npm_token.replace_all(&s, "<redacted>").into_owned();
@@ -936,7 +939,9 @@ pub fn is_sensitive_name(raw: &str) -> bool {
         | "bearer"
         | "pgpass"
         | "pgpassword"
-        | "whsec" => return true,
+        | "whsec"
+        | "sig"
+        | "signature" => return true,
         _ => {}
     }
 

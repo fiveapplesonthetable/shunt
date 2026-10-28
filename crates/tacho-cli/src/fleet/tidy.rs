@@ -170,9 +170,17 @@ pub fn execute_tidy_with(args: TidyOptions) -> io::Result<()> {
 
     if let Some(days) = args.actions_days {
         let repo = std::env::var("TACHO_GH_REPO")
+            .or_else(|_| std::env::var("REPO"))
+            .or_else(|_| std::env::var("GITHUB_REPOSITORY"))
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_default();
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "actions-tidy: name the repository in TACHO_GH_REPO, REPO, or GITHUB_REPOSITORY",
+                )
+            })?;
         let forge = tacho_core::decide::CliForgePlugin::new(repo);
         let actions_plan = tidy_forge_actions(&forge, days, now, args.dry_run)?;
         if !actions_plan.delete_caches.is_empty() || !actions_plan.delete_artifacts.is_empty() {

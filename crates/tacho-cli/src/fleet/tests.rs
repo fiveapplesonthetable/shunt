@@ -1905,3 +1905,125 @@ fn plan_prove_checks_wires_affected_rust_targets_and_related_test_selectors() {
     assert_eq!(checks_deploy[0].area, "deploy");
     assert_eq!(checks_deploy[0].units, vec!["dockerfile".to_string()]);
 }
+
+#[test]
+fn cli_forge_plugin_parses_paginated_iso8601_actions_caches_and_artifacts_and_deletes_them() {
+    use std::os::unix::fs::PermissionsExt;
+    use tacho_core::decide::{
+        parse_gh_actions_artifacts, parse_gh_actions_caches, parse_github_timestamp, CliForgePlugin,
+    };
+
+    assert_eq!(
+        parse_github_timestamp(&serde_json::json!("2026-01-01T00:00:00Z")),
+        Some(1_767_225_600)
+    );
+    assert_eq!(
+        parse_github_timestamp(&serde_json::json!("2026-01-02T01:02:03.456Z")),
+        Some(1_767_315_723)
+    );
+
+    // Multi-page `--paginate` JSON stream with ISO-8601 timestamps:
+    let raw_caches = r#"{"actions_caches":[{"id":10,"last_accessed_at":"2026-01-01T00:00:00Z"}]}{"actions_caches":[{"id":11,"last_accessed_at":"2026-01-09T00:00:00Z"}]}"#;
+    let parsed_caches = parse_gh_actions_caches(raw_caches).unwrap();
+    assert_eq!(parsed_caches.len(), 2);
+    assert_eq!(parsed_caches[0].id, 10);
+    assert_eq!(parsed_caches[0].last_accessed_at, 1_767_225_600);
+    assert_eq!(parsed_caches[1].id, 11);
+
+    let raw_artifacts = r#"{"artifacts":[{"id":101,"name":"logs","created_at":"2026-01-09T03:00:00Z","expired":false},{"id":102,"name":"logs","created_at":"2026-01-09T02:00:00Z","expired":false}]}{"artifacts":[{"id":103,"name":"logs","created_at":"2026-01-09T01:00:00Z","expired":false},{"id":104,"name":"logs","created_at":"2026-01-08T00:00:00Z","expired":false}]}"#;
+    let parsed_artifacts = parse_gh_actions_artifacts(raw_artifacts).unwrap();
+    assert_eq!(parsed_artifacts.len(), 4);
+    assert_eq!(parsed_artifacts[3].id, 104);
+
+    let dir = tempfile::tempdir().unwrap();
+    let log_file = dir.path().join("gh-calls.log");
+    let gh_script = dir.path().join("fake-gh");
+    let script = format!(
+        "#!/usr/bin/env bash\necho \"$*\" >> '{}'\ncase \"$*\" in\n  *actions/caches?per_page=100*)\n    printf '%s' '{}'\n    ;;\n  *actions/artifacts?per_page=100*)\n    printf '%s' '{}'\n    ;;\n  *DELETE*)\n    exit 0\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
+        log_file.display(),
+        raw_caches,
+        raw_artifacts
+    );
+    std::fs::write(&gh_script, script).unwrap();
+    std::fs::set_permissions(&gh_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let plugin = CliForgePlugin {
+        name: "github".to_string(),
+        cli_bin: gh_script.to_string_lossy().to_string(),
+        repo: Some("acme/widgets".to_string()),
+        allow_merge: false,
+    };
+    let now = 1_767_916_800; // 2026-01-09T00:00:00Z
+    let plan = super::tidy::tidy_forge_actions(&plugin, 7, now, false).unwrap();
+    assert_eq!(plan.delete_caches, vec![10]);
+    assert_eq!(plan.delete_artifacts, vec![104]);
+
+    let logged = std::fs::read_to_string(&log_file).unwrap();
+    assert!(logged.contains("api -X DELETE repos/acme/widgets/actions/caches/10"));
+    assert!(logged.contains("api -X DELETE repos/acme/widgets/actions/artifacts/104"));
+}
+
+#[test]
+fn load_shot_rules_auto_discovers_worktree_layout_and_detect_last_ci_change_sha_queries_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("frontend/admin/screenshots")).unwrap();
+    std::fs::create_dir_all(root.join("frontend/admin/src/screens")).unwrap();
+    std::fs::create_dir_all(root.join("frontend/android/docs/screenshots")).unwrap();
+
+    let rules = super::train::load_shot_rules(root);
+    assert!(
+        rules
+            .area_roots
+            .contains(&("console".to_string(), "frontend/admin/".to_string())),
+        "expected console area root, got: {:?}",
+        rules.area_roots
+    );
+    assert!(
+        rules.shot_dirs.contains(&(
+            "console".to_string(),
+            "frontend/admin/screenshots/".to_string()
+        )),
+        "expected console shot_dir, got: {:?}",
+        rules.shot_dirs
+    );
+    assert!(
+        rules.shot_dirs.contains(&(
+            "android".to_string(),
+            "frontend/android/docs/screenshots/".to_string()
+        )),
+        "expected android shot_dir, got: {:?}",
+        rules.shot_dirs
+    );
+    assert_eq!(
+        rules.screen_dirs.get("console").map(String::as_str),
+        Some("frontend/admin/src/screens")
+    );
+
+    let run_git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.email", "t@example.com"]);
+    run_git(&["config", "user.name", "Tester"]);
+    std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    std::fs::write(root.join(".github/workflows/ci.yml"), "name: CI\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-q", "-m", "ci change"]);
+    let ci_sha = run_git(&["rev-parse", "HEAD"]);
+
+    std::fs::write(root.join("README.md"), "docs\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-q", "-m", "readme change"]);
+
+    assert_eq!(
+        super::train::detect_last_ci_change_sha(root, "HEAD"),
+        Some(ci_sha)
+    );
+}
