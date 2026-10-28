@@ -154,7 +154,11 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
                 now_ns(),
             )?;
             emit_decision_event(&format!("train:{}", open.id), "land:mismatch", &err);
-            let _ = tacho_core::decide::plugin::notify_owner_command(
+            let mut hands = super::watch::CliHands {
+                home: crate::paths::resolve_home(),
+            };
+            let _ = tacho_daemon::exec::Hands::notify_owner(
+                &mut hands,
                 &format!("[tacho] train {} mismatch", open.id),
                 &err,
             );

@@ -76,9 +76,79 @@ pub trait Hands {
     }
 
     /// Delivers an owner notification (`subject`, `body`).
-    fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
-        tacho_core::decide::plugin::notify_owner_command(subject, body)
+    fn notify_owner(&mut self, _subject: &str, _body: &str) -> Result<bool, String> {
+        Ok(false)
     }
+
+    /// Prunes unused runner Docker volumes when `/` is low on free space (`< 40 GiB`).
+    fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+/// Default path of the privileged runner-volume prune helper (`sudo -n /usr/local/sbin/tacho-runner-prune check`).
+pub const DEFAULT_ROOT_PRUNE_HELPER: &str = "/usr/local/sbin/tacho-runner-prune";
+
+/// Runs the root-disk runner-volume prune helper (`cmd_override`, `$TACHO_ROOT_PRUNE`, or
+/// [`DEFAULT_ROOT_PRUNE_HELPER`]) with argument `"check"`.
+pub fn prune_runner_volumes_command(cmd_override: Option<&Path>) -> Result<String, String> {
+    let resolved = match cmd_override {
+        Some(p) => Some(p.to_path_buf()),
+        None => std::env::var_os("TACHO_ROOT_PRUNE")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+    };
+    let (program, args): (String, Vec<String>) = if let Some(custom) = resolved {
+        if !custom.is_file() {
+            return Err(format!(
+                "runner prune helper '{}' does not exist",
+                custom.display()
+            ));
+        }
+        (
+            custom.to_string_lossy().to_string(),
+            vec!["check".to_string()],
+        )
+    } else {
+        let default_path = Path::new(DEFAULT_ROOT_PRUNE_HELPER);
+        if !default_path.is_file() {
+            return Ok(format!(
+                "runner prune skipped: {DEFAULT_ROOT_PRUNE_HELPER} not installed"
+            ));
+        }
+        (
+            "sudo".to_string(),
+            vec![
+                "-n".to_string(),
+                DEFAULT_ROOT_PRUNE_HELPER.to_string(),
+                "check".to_string(),
+            ],
+        )
+    };
+    let out = std::process::Command::new(&program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("runner prune did not run: {e}"))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tail: String = combined
+        .trim()
+        .chars()
+        .rev()
+        .take(500)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let code = out.status.code().unwrap_or(1);
+    if !out.status.success() {
+        return Err(format!("runner prune exited {code}: {tail}"));
+    }
+    Ok(format!("runner prune exited {code}: {tail}"))
 }
 
 /// Inputs of one tick besides fleet state.
@@ -297,12 +367,13 @@ pub fn run_tick(
         None => observe::scan_procs(),
     };
     let main_sha = resolve_main_sha(&state, &opts, home);
+    #[allow(clippy::unnecessary_lazy_evaluations)]
     let root_disk_bytes = opts.root_disk_bytes.or_else(|| {
-        if opts.procs.is_none() && !tacho_core::decide::plugin::running_in_test_harness() {
-            observe::statvfs_root_disk()
-        } else {
-            None
+        #[cfg(not(test))]
+        if opts.procs.is_none() && opts.now_override.is_none() {
+            return observe::statvfs_root_disk();
         }
+        None
     });
     let host = observe::HostObs {
         now,
@@ -875,12 +946,38 @@ fn execute_actions(
 
     if let Some(ref disk) = plan.root_disk_action {
         if disk.prune_docker_volumes {
-            store.record_decision(
-                "watch",
-                "prune_root_disk_volumes",
-                "root-disk",
-                &disk.summary,
-            )?;
+            match f.hands.prune_root_disk_volumes() {
+                Ok(out) => {
+                    let detail = if out.trim().is_empty() {
+                        disk.summary.clone()
+                    } else {
+                        format!("{}: {}", disk.summary, out.trim())
+                    };
+                    store.record_decision(
+                        "watch",
+                        "prune_root_disk_volumes",
+                        "root-disk",
+                        &detail,
+                    )?;
+                }
+                Err(e) => {
+                    f.record(
+                        store,
+                        "watch",
+                        "prune_root_disk_volumes_failed",
+                        "root-disk",
+                        &format!("{}: {e}", disk.summary),
+                        true,
+                    )?;
+                }
+            }
+        }
+        if let Some(forge) = forge {
+            if disk.warn {
+                let _ = forge.set_issue("The root disk is filling", &disk.summary);
+            } else {
+                let _ = forge.close_issue("The root disk is filling", "root disk is comfortable");
+            }
         }
     }
 

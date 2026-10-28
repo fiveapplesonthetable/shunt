@@ -30,8 +30,8 @@ use super::start::{
     resolve_pinned_base_sha, run_provisioner_bounded, PORT_BASE, PORT_BLOCK_SIZE,
 };
 use super::starve::{
-    parse_cpu_list_str, plan_starve_slice, stop_registered_burner, RegisteredBurner,
-    BURNERS_PER_CPU, STARVE_MAX_SECS,
+    configure_burner_process, parse_cpu_list_str, plan_starve_slice, stop_registered_burner,
+    RegisteredBurner, BURNERS_PER_CPU, STARVE_MAX_SECS,
 };
 use super::tree_of_worktree;
 
@@ -675,18 +675,43 @@ fn test_starve_registered_burner_verification_and_preemption() {
         }
     }
 
-    // Spawn a real `yes` process in its own process group with TACHO_STARVE=1.
+    if std::env::var_os("TACHO_TEST_SPAWN_BURNER_HOLD").is_some() {
+        let mut b_cmd = Command::new("yes");
+        b_cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_burner_process(&mut b_cmd, 30);
+        let burner = b_cmd.spawn().expect("spawn yes burner");
+        let mut guard = BurnerReapGuard(burner);
+        let mut one_byte = [0u8; 1];
+        guard
+            .0
+            .stdout
+            .as_mut()
+            .expect("piped stdout")
+            .read_exact(&mut one_byte)
+            .expect("yes must write to stdout after execve");
+        let pid = guard.0.id();
+        let st = proc_pid_starttime(pid).unwrap_or(0);
+        println!("BURNER_READY {pid} {st}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut hold = [0u8; 1];
+        let _ = std::io::stdin().read(&mut hold);
+        return;
+    }
+
+    // 1. Spawn a real `yes` process in its own process group with `configure_burner_process`.
     // Pipe stdout and read 1 byte so the kernel guarantees `execve("yes")` has completed
     // (and `/proc/<pid>/cmdline` is `"yes"`, not the forked test runner) even under load 100.
-    // BurnersGuard / BurnerReapGuard reaps the process group in every exit path (including panic).
-    let burner = Command::new("yes")
-        .env("TACHO_STARVE", "1")
+    // BurnerReapGuard reaps the process group in every exit path (including panic).
+    let mut b_cmd = Command::new("yes");
+    b_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    configure_burner_process(&mut b_cmd, 30);
+    let burner = b_cmd.spawn().unwrap();
     let mut guard = BurnerReapGuard(burner);
     let mut one_byte = [0u8; 1];
     guard
@@ -711,6 +736,62 @@ fn test_starve_registered_burner_verification_and_preemption() {
     assert!(stop_registered_burner(&right_reg));
     let _ = guard.0.wait();
     drop(guard);
+
+    // 2. Verify that if a parent runner process is killed with SIGKILL (bypassing all Drop
+    // handlers and user-space cleanup), the kernel's `PR_SET_PDEATHSIG` immediately kills
+    // the child `yes` burner so no `yes` process can ever outlive a killed parent.
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut runner = Command::new(exe)
+        .args([
+            "--exact",
+            "kit::tests::test_starve_registered_burner_verification_and_preemption",
+            "--nocapture",
+        ])
+        .env("TACHO_TEST_SPAWN_BURNER_HOLD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn child runner");
+
+    let stdout = runner.stdout.take().expect("runner stdout");
+    let reader = std::io::BufReader::new(stdout);
+    let mut grandchild_pid: Option<u32> = None;
+    let mut grandchild_st: Option<u64> = None;
+    for line in std::io::BufRead::lines(reader) {
+        let line = line.expect("read line from runner");
+        if let Some(rest) = line.strip_prefix("BURNER_READY ") {
+            let mut parts = rest.split_whitespace();
+            grandchild_pid = parts.next().and_then(|s| s.parse().ok());
+            grandchild_st = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .filter(|&st| st > 0);
+            break;
+        }
+    }
+    let g_pid = grandchild_pid.expect("runner must report BURNER_READY pid");
+    assert!(
+        pid_alive_with_starttime(g_pid, grandchild_st),
+        "grandchild burner must be alive before parent SIGKILL"
+    );
+
+    let mut watcher = super::FdEventWatcher::new().unwrap();
+    let _ = watcher.register_pid(g_pid);
+
+    // SIGKILL the runner parent directly so only PR_SET_PDEATHSIG can terminate g_pid
+    let _ = runner.kill();
+    let _ = runner.wait();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pid_alive_with_starttime(g_pid, grandchild_st) && std::time::Instant::now() < deadline {
+        watcher.wait_ms(50);
+    }
+    if pid_alive_with_starttime(g_pid, grandchild_st) {
+        let _ = super::procs::signal_group_and_leader(g_pid, libc::SIGKILL);
+        panic!("grandchild burner pid {g_pid} survived parent SIGKILL despite PR_SET_PDEATHSIG");
+    }
 
     let leaked: Vec<u32> = tacho_daemon::exec::observe::scan_procs()
         .into_iter()

@@ -112,6 +112,7 @@ pub struct TidyOptions {
     pub dry_run: bool,
     pub min_age: Option<i64>,
     pub stale_runs_days: Option<i64>,
+    pub actions_days: Option<i64>,
 }
 
 impl From<TidyArgs> for TidyOptions {
@@ -120,11 +121,44 @@ impl From<TidyArgs> for TidyOptions {
             dry_run: args.dry_run,
             min_age: args.min_age,
             stale_runs_days: args.stale_runs,
+            actions_days: args.actions_days,
         }
     }
 }
 
-/// Executes `tacho tidy [--dry-run] [--min-age 3600] [--stale-runs DAYS]`.
+/// Plans and executes GitHub Actions cache and artifact pruning via [`tacho_core::decide::ops::tidy::plan_actions_tidy`].
+pub fn tidy_forge_actions(
+    forge: &dyn tacho_core::decide::ForgePlugin,
+    days: i64,
+    now: i64,
+    dry_run: bool,
+) -> io::Result<tacho_core::decide::ops::tidy::ActionsTidyPlan> {
+    let caches = forge
+        .list_actions_caches()
+        .map_err(|e| io::Error::other(format!("list_actions_caches failed: {e}")))?;
+    let artifacts = forge
+        .list_actions_artifacts()
+        .map_err(|e| io::Error::other(format!("list_actions_artifacts failed: {e}")))?;
+    let plan =
+        tacho_core::decide::ops::tidy::plan_actions_tidy(&caches, &artifacts, now, days, 3, 7200)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    if !dry_run {
+        for &cid in &plan.delete_caches {
+            forge.delete_actions_cache(cid).map_err(|e| {
+                io::Error::other(format!("delete_actions_cache({cid}) failed: {e}"))
+            })?;
+        }
+        for &aid in &plan.delete_artifacts {
+            forge.delete_actions_artifact(aid).map_err(|e| {
+                io::Error::other(format!("delete_actions_artifact({aid}) failed: {e}"))
+            })?;
+        }
+    }
+    Ok(plan)
+}
+
+/// Executes `tacho tidy [--dry-run] [--min-age 3600] [--stale-runs DAYS] [--actions-days DAYS]`.
 pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
     execute_tidy_with(TidyOptions::from(args))
 }
@@ -133,6 +167,23 @@ pub fn execute_tidy(args: TidyArgs) -> io::Result<()> {
 pub fn execute_tidy_with(args: TidyOptions) -> io::Result<()> {
     let mut store = open_fleet_store()?;
     let now = now_secs();
+
+    if let Some(days) = args.actions_days {
+        let repo = std::env::var("TACHO_GH_REPO")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_default();
+        let forge = tacho_core::decide::CliForgePlugin::new(repo);
+        let actions_plan = tidy_forge_actions(&forge, days, now, args.dry_run)?;
+        if !actions_plan.delete_caches.is_empty() || !actions_plan.delete_artifacts.is_empty() {
+            println!(
+                "{}Pruned {} actions cache(s) and {} artifact(s) older than {days}d",
+                if args.dry_run { "[dry-run] " } else { "" },
+                actions_plan.delete_caches.len(),
+                actions_plan.delete_artifacts.len()
+            );
+        }
+    }
 
     if let Some(days) = args.stale_runs_days {
         let retired_keys = retire_stale_runs(&mut store, days, now, args.dry_run)?;

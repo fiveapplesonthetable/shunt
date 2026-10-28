@@ -391,7 +391,29 @@ fn android_screenshots_are_recorded_even_when_gradle_cached_the_test() {
 
 #[test]
 fn shots_scope_summary_and_pixels() {
-    let rules = ShotRules::default();
+    let rules = ShotRules {
+        area_roots: vec![
+            ("console".into(), "frontend/admin/".into()),
+            ("android".into(), "frontend/android/".into()),
+        ],
+        shot_dirs: vec![
+            ("console".into(), "frontend/admin/screenshots/".into()),
+            (
+                "android".into(),
+                "frontend/android/docs/screenshots/".into(),
+            ),
+        ],
+        generated_prefixes: vec![
+            "frontend/admin/screenshots/".into(),
+            "frontend/admin/docs/".into(),
+            "frontend/android/docs/".into(),
+        ],
+        aliases: BTreeMap::from([("home".into(), "dashboard".into())]),
+        shared_compose: BTreeSet::from(["components".into(), "theme".into()]),
+        screenshot_tests_marker: "/screenshot/".into(),
+        screen_dirs: BTreeMap::from([("console".into(), "frontend/admin/src/screens".into())]),
+        ..ShotRules::default()
+    };
     let files = vec![
         "frontend/admin/src/screens/HomeScreen.tsx".to_string(),
         "frontend/admin/screenshots/dashboard-dark.png".to_string(),

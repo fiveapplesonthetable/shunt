@@ -76,7 +76,7 @@ pub fn compile_job_script(
             }
         }
         cleanup_parts.push(format!(
-            "handback=0; refused=$(LC_ALL=C chown -R {uid}:{gid} {} 2>&1 >/dev/null) || handback=$?; refused=$(printf '%s\\n' \"$refused\" | grep -v ': No such file or directory$' || true); if [ -n \"$refused\" ]; then printf '%s\\n' \"$refused\" >&2; [ \"$status\" -eq 0 ] && exit \"$handback\"; fi",
+            "handback=0; raw_refused=$(LC_ALL=C chown -R {uid}:{gid} {} 2>&1 >/dev/null) || handback=$?; refused=$(printf '%s\\n' \"$raw_refused\" | grep -v ': No such file or directory$' | grep -v '^$' || true); if [ -n \"$refused\" ] || {{ [ \"$handback\" -ne 0 ] && [ -z \"$raw_refused\" ]; }}; then [ -n \"$refused\" ] && printf '%s\\n' \"$refused\" >&2; [ \"$status\" -eq 0 ] && exit \"$handback\"; fi",
             chown_paths.join(" ")
         ));
     }

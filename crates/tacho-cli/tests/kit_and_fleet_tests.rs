@@ -633,6 +633,7 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .args(["tick"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
+        .env("TACHO_REPO", &repo_dir)
         .env("TACHO_AGENT_CMD", "echo 'Working...' && echo 'PR: #42'")
         .output()
         .unwrap();
@@ -661,6 +662,7 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         .args(["tick"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
+        .env("TACHO_REPO", &repo_dir)
         .output()
         .unwrap();
     assert!(

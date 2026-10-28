@@ -478,6 +478,7 @@ impl Default for ScreenTagCap {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShotRules {
     pub area_roots: Vec<(String, String)>,
     pub shot_dirs: Vec<(String, String)>,
@@ -486,46 +487,20 @@ pub struct ShotRules {
     pub shared_compose: BTreeSet<String>,
     pub screenshot_tests_marker: String,
     pub screen_dirs: BTreeMap<String, String>,
-    #[serde(default)]
     pub default_tag_cap: ScreenTagCap,
-    #[serde(default)]
     pub screen_tag_caps: BTreeMap<String, ScreenTagCap>,
 }
 
 impl Default for ShotRules {
     fn default() -> Self {
         Self {
-            area_roots: vec![
-                ("console".into(), "frontend/admin/".into()),
-                ("android".into(), "frontend/android/".into()),
-            ],
-            shot_dirs: vec![
-                ("console".into(), "frontend/admin/screenshots/".into()),
-                (
-                    "android".into(),
-                    "frontend/android/docs/screenshots/".into(),
-                ),
-            ],
-            generated_prefixes: vec![
-                "frontend/admin/screenshots/".into(),
-                "frontend/admin/docs/".into(),
-                "frontend/android/docs/".into(),
-            ],
-            aliases: BTreeMap::from([
-                ("home".into(), "dashboard".into()),
-                ("settings".into(), "preferences".into()),
-                ("funding".into(), "treasury".into()),
-                ("provider".into(), "treasury".into()),
-            ]),
-            shared_compose: BTreeSet::from([
-                "components".into(),
-                "theme".into(),
-                "design".into(),
-                "nav".into(),
-                "system".into(),
-            ]),
+            area_roots: Vec::new(),
+            shot_dirs: Vec::new(),
+            generated_prefixes: Vec::new(),
+            aliases: BTreeMap::new(),
+            shared_compose: BTreeSet::new(),
             screenshot_tests_marker: "/screenshot/".into(),
-            screen_dirs: BTreeMap::from([("console".into(), "frontend/admin/src/screens".into())]),
+            screen_dirs: BTreeMap::new(),
             default_tag_cap: ScreenTagCap::default(),
             screen_tag_caps: BTreeMap::new(),
         }
@@ -960,9 +935,33 @@ pub fn classify_moved_goldens<S: AsRef<str>>(
     let empty_golden = BTreeSet::new();
     let mut out = Vec::with_capacity(moved.len());
     for g in moved {
-        let mut check_files: Vec<&str> = touched.iter().map(AsRef::as_ref).collect();
-        check_files.push(g.path.as_str());
-        if g.after.is_some() && stray_shots(&check_files, &empty_golden, rules).is_empty() {
+        let reaches_screen = if !rules.shot_dirs.is_empty() {
+            let mut check_files: Vec<&str> = touched.iter().map(AsRef::as_ref).collect();
+            check_files.push(g.path.as_str());
+            stray_shots(&check_files, &empty_golden, rules).is_empty()
+        } else {
+            let target = normal_alnum(&shot_stem(&g.path));
+            !target.is_empty()
+                && touched.iter().any(|t| {
+                    let f = t.as_ref();
+                    if f == g.path || moves_no_pixel_re().is_match(f) {
+                        return false;
+                    }
+                    let base = f.rsplit_once('/').map_or(f, |(_, b)| b);
+                    let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
+                    let mut w = first_word(stem);
+                    if w.ends_with('s') && w.len() > 1 {
+                        w.pop();
+                    }
+                    let alias = rules.aliases.get(&w).cloned().unwrap_or_else(|| w.clone());
+                    let w_norm = normal_alnum(&w);
+                    let a_norm = normal_alnum(&alias);
+                    (!w_norm.is_empty() && (target.contains(&w_norm) || w_norm.contains(&target)))
+                        || (!a_norm.is_empty()
+                            && (target.contains(&a_norm) || a_norm.contains(&target)))
+                })
+        };
+        if g.after.is_some() && reaches_screen {
             out.push(ShotFixVerdict {
                 path: g.path.clone(),
                 kind: ShotFixKind::Intended,
@@ -1041,9 +1040,21 @@ pub fn read_report_goldens(
         std::fs::read(shots_dir.join(area).join(side).join(path)).ok()
     };
 
+    let mut area_names: BTreeSet<String> =
+        rules.area_roots.iter().map(|(a, _)| a.clone()).collect();
+    if let Ok(entries) = std::fs::read_dir(shots_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    area_names.insert(name.to_string());
+                }
+            }
+        }
+    }
+
     let mut redrawn: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for (area, _) in &rules.area_roots {
-        let Ok(content) = std::fs::read_to_string(shots_dir.join(area).join("changed.txt")) else {
+    for area in area_names {
+        let Ok(content) = std::fs::read_to_string(shots_dir.join(&area).join("changed.txt")) else {
             continue;
         };
         let mut entries = Vec::new();
@@ -1053,7 +1064,7 @@ pub fn read_report_goldens(
                 entries.push((state.to_string(), path.to_string()));
             }
         }
-        redrawn.insert(area.clone(), entries);
+        redrawn.insert(area, entries);
     }
 
     let mut moved_set: BTreeSet<(String, String)> = BTreeSet::new();
@@ -1069,6 +1080,8 @@ pub fn read_report_goldens(
             if did_move {
                 if let Some(owner_area) = area_of(path) {
                     moved_set.insert((owner_area.to_string(), path.clone()));
+                } else if rules.area_roots.is_empty() {
+                    moved_set.insert((area.clone(), path.clone()));
                 }
             }
         }

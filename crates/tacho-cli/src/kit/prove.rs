@@ -345,11 +345,43 @@ pub fn plan_prove_checks(
     }
 
     if planned.is_empty() {
+        if root.join("crates").is_dir() {
+            let affected = tacho_core::decide::verify::affected_rust_targets(root, &filtered);
+            if affected == vec!["*".to_string()] {
+                return vec![PlannedCheck {
+                    name: "workspace:cargo-test".to_string(),
+                    cmd: "cargo test --workspace".to_string(),
+                    area: "workspace".to_string(),
+                    units: vec!["workspace".to_string()],
+                }];
+            }
+            if !affected.is_empty() {
+                let mut checks = Vec::new();
+                for target in affected {
+                    if let Some((krate, bin)) = target.split_once(" --test ") {
+                        checks.push(PlannedCheck {
+                            name: format!("{krate}:test:{bin}"),
+                            cmd: format!("cargo test -p {krate} --test {bin}"),
+                            area: krate.to_string(),
+                            units: vec![format!("{krate}::test::{bin}")],
+                        });
+                    } else {
+                        checks.push(PlannedCheck {
+                            name: format!("{target}:test"),
+                            cmd: format!("cargo test -p {target}"),
+                            area: target.clone(),
+                            units: vec![target],
+                        });
+                    }
+                }
+                return checks;
+            }
+        }
         let rust_checks = plan_rust_unit_checks(&filtered);
         if !rust_checks.is_empty() {
             return rust_checks;
         }
-        // Check if Python package or console tests in the worktree match via related test discovery
+        // Check if Python package, console specs, or deploy checks in the worktree match via related test discovery
         if root.join("tools/tacho/tests").is_dir() {
             let mut test_contents = BTreeMap::new();
             if let Ok(entries) = fs::read_dir(root.join("tools/tacho/tests")) {
@@ -365,9 +397,24 @@ pub fn plan_prove_checks(
                     }
                 }
             }
-            let related = tacho_core::decide::verify::related_package_tests(
+            let mut package_modules = BTreeMap::new();
+            if let Ok(entries) = fs::read_dir(root.join("tools/tacho/tacho")) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("py") {
+                        if let (Some(fname), Ok(txt)) = (
+                            p.file_name().and_then(|n| n.to_str()),
+                            fs::read_to_string(&p),
+                        ) {
+                            package_modules.insert(format!("tools/tacho/tacho/{fname}"), txt);
+                        }
+                    }
+                }
+            }
+            let related = tacho_core::decide::verify::related_package_tests_with_modules(
                 &filtered,
                 &test_contents,
+                &package_modules,
                 "tools/tacho",
                 "tacho",
             );
@@ -380,6 +427,47 @@ pub fn plan_prove_checks(
                 });
                 return planned;
             }
+        }
+        let mut e2e_specs = BTreeMap::new();
+        if let Ok(entries) = fs::read_dir(root.join("frontend/admin/e2e")) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let (Some(fname), Ok(txt)) = (
+                    p.file_name().and_then(|n| n.to_str()),
+                    fs::read_to_string(&p),
+                ) {
+                    if fname.ends_with(".spec.ts") {
+                        e2e_specs.insert(format!("frontend/admin/e2e/{fname}"), txt);
+                    }
+                }
+            }
+        }
+        let console_specs = tacho_core::decide::verify::related_console_specs(
+            &filtered,
+            &e2e_specs,
+            "frontend/admin/",
+        );
+        if !console_specs.is_empty() {
+            planned.push(PlannedCheck {
+                name: "console-browser:specs".to_string(),
+                cmd: format!("npx playwright test {}", console_specs.join(" ")),
+                area: "console-browser".to_string(),
+                units: console_specs,
+            });
+            return planned;
+        }
+        let deploy_checks = tacho_core::decide::verify::related_deploy_checks(
+            &filtered,
+            tacho_core::decide::verify::DEFAULT_DEPLOY_CHECKS,
+        );
+        if !deploy_checks.is_empty() {
+            planned.push(PlannedCheck {
+                name: "deploy:checks".to_string(),
+                cmd: format!("scripts/areas/deploy.sh {}", deploy_checks.join(" ")),
+                area: "deploy".to_string(),
+                units: deploy_checks,
+            });
+            return planned;
         }
         if root.join("Cargo.toml").is_file() {
             planned.push(PlannedCheck {

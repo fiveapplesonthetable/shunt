@@ -1692,3 +1692,216 @@ fn test_execute_shots_accept_in_stages_goldens_or_all_and_refuses_moved_head() {
         .expect_err("must refuse when run was drawn from another HEAD");
     assert!(err.to_string().contains("HEAD"), "unexpected error: {err}");
 }
+
+#[test]
+fn tidy_forge_actions_executes_plan_and_deletes_stale_caches_and_artifacts() {
+    use tacho_core::decide::ops::tidy::{ActionsArtifact, ActionsCache};
+    use tacho_core::decide::MockForge;
+
+    let now = 1_000_000i64;
+    let day = 86_400i64;
+    let forge = MockForge {
+        actions_caches: vec![
+            ActionsCache {
+                id: 10,
+                last_accessed_at: now - 10 * day,
+            },
+            ActionsCache {
+                id: 11,
+                last_accessed_at: now - 2 * day,
+            },
+        ],
+        actions_artifacts: vec![
+            ActionsArtifact {
+                id: 101,
+                name: "build-logs".into(),
+                created_at: now - 3 * 3600,
+                expired: false,
+            },
+            ActionsArtifact {
+                id: 102,
+                name: "build-logs".into(),
+                created_at: now - 4 * 3600,
+                expired: false,
+            },
+            ActionsArtifact {
+                id: 103,
+                name: "build-logs".into(),
+                created_at: now - 5 * 3600,
+                expired: false,
+            },
+            ActionsArtifact {
+                id: 104,
+                name: "build-logs".into(),
+                created_at: now - 6 * 3600,
+                expired: false,
+            },
+            ActionsArtifact {
+                id: 201,
+                name: "ci-proof".into(),
+                created_at: now - 6 * 3600,
+                expired: false,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let plan = super::tidy::tidy_forge_actions(&forge, 7, now, false).unwrap();
+    assert_eq!(plan.delete_caches, vec![10]);
+    assert_eq!(plan.delete_artifacts, vec![104]);
+    assert_eq!(*forge.deleted_caches.lock().unwrap(), vec![10]);
+    assert_eq!(*forge.deleted_artifacts.lock().unwrap(), vec![104]);
+}
+
+#[test]
+fn waiting_for_with_ci_proof_requires_all_and_costly_areas_until_main_ci_passes() {
+    use tacho_core::decide::dispatch::PullFacts;
+    use tacho_core::decide::land::{waiting_for_with_ci_proof, MainCi, TrainPrState};
+    use tacho_core::decide::verify::{AreaRule, BatchMode, BatchRun};
+
+    let rules = vec![
+        AreaRule {
+            area: "rust".into(),
+            prefixes: vec!["crates/".into()],
+            checks: Vec::new(),
+            needs_screenshot: false,
+            isolate_batch: false,
+            unit_prefixes: std::collections::BTreeMap::new(),
+        },
+        AreaRule {
+            area: "console".into(),
+            prefixes: vec!["frontend/admin/".into()],
+            checks: Vec::new(),
+            needs_screenshot: false,
+            isolate_batch: false,
+            unit_prefixes: std::collections::BTreeMap::new(),
+        },
+    ];
+    let prs = vec![PullFacts {
+        number: 1,
+        head: "sha1".into(),
+        state: "OPEN".into(),
+        files: vec!["crates/foo/src/lib.rs".into()],
+        ..Default::default()
+    }];
+    let tpr = TrainPrState {
+        number: Some(99),
+        branch: "release/train".into(),
+        base: "main".into(),
+        head: "train-head".into(),
+        tree: "train-tree".into(),
+        members: vec![1],
+        member_shas: std::collections::BTreeMap::from([(1, "sha1".into())]),
+        dropped: std::collections::BTreeMap::new(),
+        reviewed: Some("train-head".into()),
+        proved_batch: Some("b001".into()),
+        proved_tree: Some("train-tree".into()),
+    };
+    let partial_batch = BatchRun {
+        id: "b001".into(),
+        group: "train".into(),
+        prs: vec![1],
+        shas: std::collections::BTreeMap::new(),
+        main_sha: "main0".into(),
+        areas: vec!["rust".into()],
+        checks: Vec::new(),
+        mode: BatchMode::Presubmit,
+        status: "passed".into(),
+        started_at: 100,
+        finished_at: Some(200),
+        tree: Some("train-tree".into()),
+        pid: None,
+        log: String::new(),
+        culprit: None,
+        skipped: Vec::new(),
+        flakes: Vec::new(),
+    };
+
+    // Unproven CI change on main requires all areas + COSTLY_PARTS + gate:
+    let reasons = waiting_for_with_ci_proof(
+        &tpr,
+        std::slice::from_ref(&partial_batch),
+        &prs,
+        &rules,
+        true,
+        Some("ci-sha-1"),
+        &MainCi {
+            sha: "old-main".into(),
+            ok: true,
+        },
+        |anc, desc| anc == desc,
+    );
+    assert!(
+        reasons.iter().any(|r| r.contains("CI-proof areas")),
+        "expected missing CI-proof areas reason, got: {reasons:?}"
+    );
+
+    // Once main CI passes at or after ci-sha-1, only touched areas (rust) are required:
+    let reasons_proven = waiting_for_with_ci_proof(
+        &tpr,
+        std::slice::from_ref(&partial_batch),
+        &prs,
+        &rules,
+        true,
+        Some("ci-sha-1"),
+        &MainCi {
+            sha: "ci-sha-1".into(),
+            ok: true,
+        },
+        |anc, desc| anc == desc,
+    );
+    assert!(
+        reasons_proven.is_empty(),
+        "expected empty waiting reasons once CI proof passed, got: {reasons_proven:?}"
+    );
+}
+
+#[test]
+fn plan_prove_checks_wires_affected_rust_targets_and_related_test_selectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("crates/alpha/src")).unwrap();
+    std::fs::create_dir_all(root.join("crates/beta/src")).unwrap();
+    std::fs::create_dir_all(root.join("crates/alpha/tests/common")).unwrap();
+    std::fs::write(
+        root.join("crates/alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("crates/beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n[dependencies]\nalpha = { path = \"../alpha\" }\n",
+    )
+    .unwrap();
+
+    // 1. Source change in `alpha` reaches `alpha` and dependent `beta`:
+    let checks_src =
+        crate::kit::prove::plan_prove_checks(root, &["crates/alpha/src/lib.rs".to_string()], &[]);
+    let areas_src: Vec<&str> = checks_src.iter().map(|c| c.area.as_str()).collect();
+    assert_eq!(areas_src, vec!["alpha", "beta"]);
+
+    // 2. Non-top-level test helper in `alpha/tests/common/mod.rs` reaches only `alpha`, not `beta`:
+    let checks_helper = crate::kit::prove::plan_prove_checks(
+        root,
+        &["crates/alpha/tests/common/mod.rs".to_string()],
+        &[],
+    );
+    let areas_helper: Vec<&str> = checks_helper.iter().map(|c| c.area.as_str()).collect();
+    assert_eq!(areas_helper, vec!["alpha"]);
+
+    // 3. Change under `fuzz/` selects workspace-wide cargo test:
+    let checks_fuzz = crate::kit::prove::plan_prove_checks(
+        root,
+        &["fuzz/fuzz_targets/parse.rs".to_string()],
+        &[],
+    );
+    assert_eq!(checks_fuzz.len(), 1);
+    assert_eq!(checks_fuzz[0].cmd, "cargo test --workspace");
+
+    // 4. Deploy script change selects `related_deploy_checks` with `DEFAULT_DEPLOY_CHECKS`:
+    let checks_deploy =
+        crate::kit::prove::plan_prove_checks(root, &["deploy/Dockerfile".to_string()], &[]);
+    assert_eq!(checks_deploy.len(), 1);
+    assert_eq!(checks_deploy[0].area, "deploy");
+    assert_eq!(checks_deploy[0].units, vec!["dockerfile".to_string()]);
+}

@@ -8,10 +8,11 @@ use std::process::Command;
 
 use tacho_core::decide::dispatch::{PullFacts, TodoItem};
 use tacho_core::decide::land::{
-    accept_run_shots_command, classify_moved_goldens, drop_breakers, eligible, golden_names,
-    make_train, moved, moved_summary, open_for, order_train_prs, plan_accept_run_shots, queue,
-    read_report_goldens, refresh_commit_subject, settle, shots_fix_lines, shots_fix_verdict,
-    waiting_for, with_train, ShotRules, TrainPrState, TrainRecord, GOLDEN_MOVED_MARKER,
+    accept_run_shots_command, check_screen_tags, classify_moved_goldens, drop_breakers, eligible,
+    golden_names, make_train, moved, moved_summary, open_for, order_train_prs,
+    plan_accept_run_shots, queue, read_report_goldens, refresh_commit_subject, settle,
+    shots_fix_lines, shots_fix_verdict, validate_screen_tag_caps, with_train, ShotRules,
+    TrainPrState, TrainRecord, GOLDEN_MOVED_MARKER,
 };
 use tacho_core::decide::verify::{batch_refs_moved, parents, BatchMode, BatchRun};
 use tacho_core::TaskStatus;
@@ -870,7 +871,7 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
             label,
             &changed_vec,
             true,
-            &ShotRules::default(),
+            &load_shot_rules(&cwd),
         )?;
     }
 
@@ -907,12 +908,33 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
     if args.approve {
         tpr.reviewed = Some(tpr.head.clone());
     }
-    let waiting = waiting_for(
+    let ci_sha_env = std::env::var("TACHO_CI_PROOF_SHA").ok();
+    let main_ci_state = tacho_core::decide::land::MainCi {
+        sha: state
+            .main_ci
+            .as_ref()
+            .map(|m| m.sha.clone())
+            .unwrap_or_default(),
+        ok: state
+            .main_ci
+            .as_ref()
+            .is_some_and(|m| m.conclusion.eq_ignore_ascii_case("success")),
+    };
+    let waiting = tacho_core::decide::land::waiting_for_with_ci_proof(
         &tpr,
         &state.batches,
         &state.open_prs_cache,
         &state.area_rules,
         true,
+        ci_sha_env.as_deref(),
+        &main_ci_state,
+        |anc, desc| {
+            Command::new("git")
+                .args(["merge-base", "--is-ancestor", anc, desc])
+                .current_dir(&cwd)
+                .status()
+                .is_ok_and(|s| s.success())
+        },
     );
 
     store.mutate(
@@ -958,6 +980,48 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
     Ok(())
 }
 
+fn discover_golden_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.starts_with('.') && name_str != ".golden" {
+            continue;
+        }
+        if p.is_file() && (name_str == ".golden" || name_str.ends_with(".golden")) {
+            if let Ok(rel) = p.strip_prefix(root) {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                if rel_s != ".golden" && !out.contains(&rel_s) {
+                    out.push(rel_s);
+                }
+            }
+        } else if p.is_dir() && name_str != "target" && name_str != "node_modules" {
+            discover_golden_files(root, &p, depth - 1, out);
+        }
+    }
+}
+
+/// Loads project [`ShotRules`] from `.tachoproof/shot-rules.json` or `tacho-shots.json` in `cwd`,
+/// falling back to [`ShotRules::default`].
+pub fn load_shot_rules(cwd: &Path) -> ShotRules {
+    for rel in [".tachoproof/shot-rules.json", "tacho-shots.json"] {
+        if let Ok(raw) = std::fs::read_to_string(cwd.join(rel)) {
+            if let Ok(rules) = serde_json::from_str::<ShotRules>(&raw) {
+                return rules;
+            }
+        }
+    }
+    ShotRules::default()
+}
+
 /// Loads the set of golden screenshot paths from `.golden` manifests in `cwd`.
 pub fn load_worktree_golden_set(cwd: &Path, rules: &ShotRules) -> BTreeSet<String> {
     let mut golden_files: Vec<String> = Vec::new();
@@ -976,6 +1040,7 @@ pub fn load_worktree_golden_set(cwd: &Path, rules: &ShotRules) -> BTreeSet<Strin
             golden_files.push(extra.to_string());
         }
     }
+    discover_golden_files(cwd, cwd, 4, &mut golden_files);
     let mut set = golden_names(&golden_files, |rel| {
         std::fs::read_to_string(cwd.join(rel)).unwrap_or_default()
     });
@@ -990,7 +1055,18 @@ pub fn load_worktree_golden_set(cwd: &Path, rules: &ShotRules) -> BTreeSet<Strin
     set
 }
 
+#[derive(serde::Deserialize)]
+struct ScreenTagCounts {
+    #[serde(default)]
+    total: usize,
+    #[serde(default)]
+    max_per_row: usize,
+    #[serde(default)]
+    in_header: usize,
+}
+
 /// Stages and commits merged-tree screenshots from `shots_report_dir` into `cwd`:
+/// - Validates status tag cap rules (`validate_screen_tag_caps` and `check_screen_tags`).
 /// - Ignores sub-threshold font and antialiasing pixel noise (`moved(before, after, is_golden) == false`).
 /// - Fails with [`GOLDEN_MOVED_MARKER`] if a golden-listed screenshot moved on a batch without `fix_shots`,
 ///   or if `classify_moved_goldens` classifies any moved golden as `Canvas` or `Drift`.
@@ -1003,7 +1079,34 @@ pub fn stage_and_commit_merged_screenshots(
     fix_shots: bool,
     rules: &ShotRules,
 ) -> io::Result<Option<String>> {
+    validate_screen_tag_caps(rules).map_err(io::Error::other)?;
     let golden_set = load_worktree_golden_set(cwd, rules);
+
+    for tag_path in [
+        shots_report_dir.join("screen-tags.json"),
+        cwd.join(".tachoproof/screen-tags.json"),
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(&tag_path) {
+            if let Ok(report) = serde_json::from_str::<BTreeMap<String, ScreenTagCounts>>(&raw) {
+                for (screen, counts) in &report {
+                    let is_golden_screen = golden_set
+                        .iter()
+                        .any(|g| tacho_core::decide::land::shot_stem(g) == *screen);
+                    if !is_golden_screen {
+                        check_screen_tags(
+                            screen,
+                            counts.total,
+                            counts.max_per_row,
+                            counts.in_header,
+                            rules,
+                        )
+                        .map_err(io::Error::other)?;
+                    }
+                }
+            }
+        }
+    }
+
     let report_goldens = read_report_goldens(shots_report_dir, &golden_set, rules);
 
     let mut all_verdicts = Vec::new();
@@ -1011,16 +1114,20 @@ pub fn stage_and_commit_merged_screenshots(
         if moved_goldens.is_empty() {
             continue;
         }
-        let catalogue = golden_set
-            .iter()
-            .filter(|g| {
-                rules
-                    .area_roots
-                    .iter()
-                    .any(|(a, r)| a == area && g.starts_with(r.as_str()))
-            })
-            .count()
-            .max(moved_goldens.len());
+        let catalogue = if rules.area_roots.is_empty() {
+            golden_set.len()
+        } else {
+            golden_set
+                .iter()
+                .filter(|g| {
+                    rules
+                        .area_roots
+                        .iter()
+                        .any(|(a, r)| a == area && g.starts_with(r.as_str()))
+                })
+                .count()
+        }
+        .max(moved_goldens.len());
         let verdicts =
             classify_moved_goldens(moved_goldens, *moved_total, catalogue, touched_files, rules);
         all_verdicts.extend(verdicts);
@@ -1043,8 +1150,20 @@ pub fn stage_and_commit_merged_screenshots(
         }
     }
 
+    let mut area_names: BTreeSet<String> =
+        rules.area_roots.iter().map(|(a, _)| a.clone()).collect();
+    if let Ok(entries) = std::fs::read_dir(shots_report_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    area_names.insert(name.to_string());
+                }
+            }
+        }
+    }
+
     let mut moved_paths: Vec<String> = Vec::new();
-    for (area, _) in &rules.area_roots {
+    for area in &area_names {
         let changed_file = shots_report_dir.join(area).join("changed.txt");
         let Ok(content) = std::fs::read_to_string(&changed_file) else {
             continue;
@@ -1209,7 +1328,7 @@ pub fn execute_shots_accept_in(cwd: &Path, run_id: &str, all: bool) -> io::Resul
         }
     }
 
-    let rules = ShotRules::default();
+    let rules = load_shot_rules(cwd);
     let golden_set = load_worktree_golden_set(cwd, &rules);
     let plan = plan_accept_run_shots(
         &run_shots_dir,
@@ -1295,7 +1414,7 @@ pub fn execute_shots(args: ShotsArgs) -> io::Result<()> {
                 &fix_args.target,
                 &touched,
                 true,
-                &ShotRules::default(),
+                &load_shot_rules(&cwd),
             )?;
             Ok(())
         }

@@ -79,6 +79,8 @@ pub struct LandConfig {
     pub rebase_model: String,
     /// Model tier for fix tasks.
     pub fix_model: String,
+    /// Screenshot scope, redraw, and status-tag cap rules (`[land.shots]`).
+    pub shots: super::shots::ShotRules,
 }
 
 impl Default for LandConfig {
@@ -116,6 +118,7 @@ impl Default for LandConfig {
             pixel_share_ppm: 500,
             rebase_model: "cheap".into(),
             fix_model: "default".into(),
+            shots: super::shots::ShotRules::default(),
         }
     }
 }

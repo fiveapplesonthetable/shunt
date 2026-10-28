@@ -1076,6 +1076,9 @@ pub struct TidyArgs {
     /// Retire unfinished or abandoned runs older than N days with no open PR.
     #[arg(long)]
     pub stale_runs: Option<i64>,
+    /// Prune GitHub Actions caches and artifacts older than N days.
+    #[arg(long)]
+    pub actions_days: Option<i64>,
 }
 
 #[derive(Args, Debug, Default, Clone)]

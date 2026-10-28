@@ -1028,6 +1028,18 @@ impl crate::exec::Hands for DaemonHands {
         let _ = appender.send_input(end, finish_ts);
         Ok(())
     }
+
+    fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
+        if self.appender.is_some() {
+            tacho_core::decide::plugin::notify_owner_command(subject, body)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
+        crate::exec::prune_runner_volumes_command(None)
+    }
 }
 
 /// Observes the world, runs `decide`, and (unless `dry_run`) records and executes the plan

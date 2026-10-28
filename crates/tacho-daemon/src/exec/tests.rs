@@ -805,7 +805,9 @@ fn test_holder_directory_worker_is_not_mistaken_for_main_checkout() {
     let child_repo = holder.join("sub-repo");
     std::fs::create_dir_all(&child_repo).unwrap();
 
-    for repo in [&fleet_main, &child_repo] {
+    // Even when the enclosing temp directory itself sits inside an unrelated git repository
+    // and holder contains a child repo, holder must never resolve to the main checkout.
+    for repo in [dir.path(), fleet_main.as_path(), child_repo.as_path()] {
         let st = std::process::Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .current_dir(repo)
@@ -815,7 +817,15 @@ fn test_holder_directory_worker_is_not_mistaken_for_main_checkout() {
     }
     assert!(
         !observe::resolves_to_main_checkout(&holder),
-        "a holder directory containing a child repo must not resolve to main checkout"
+        "a holder directory containing a child repo or sitting inside an unconfigured enclosing repo must not resolve to main checkout"
+    );
+    assert!(
+        !observe::resolves_to_fleet_main_checkout(&holder, Some(&fleet_main)),
+        "holder directory outside fleet_main must not resolve to fleet_main"
+    );
+    assert!(
+        observe::resolves_to_fleet_main_checkout(&fleet_main, Some(&fleet_main)),
+        "fleet_main itself must resolve to fleet_main"
     );
 
     let mut raw_child = std::process::Command::new("cat")
@@ -854,6 +864,7 @@ fn test_holder_directory_worker_is_not_mistaken_for_main_checkout() {
         appender: None,
     };
     let mut opts = TickOptions::new(&live);
+    opts.repo = Some(fleet_main);
     opts.explicit_main_sha = Some("a".repeat(40));
     opts.procs = Some(vec![ProcEntry {
         pid,
@@ -878,8 +889,26 @@ fn test_holder_directory_worker_is_not_mistaken_for_main_checkout() {
 #[test]
 fn test_ordinary_stall_escalation_notifies_owner_without_killing_worker() {
     let dir = tempfile::tempdir().unwrap();
+    // Initialize the enclosing temp root as an unrelated git repo to prove the fallback
+    // never trusts an enclosing repository it was not told about.
+    let st = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(st.success());
+
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
+    let fleet_main = dir.path().join("fleet-repo");
+    std::fs::create_dir_all(&fleet_main).unwrap();
+    let st = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&fleet_main)
+        .status()
+        .unwrap();
+    assert!(st.success());
+
     let wt = dir.path().join("wt-1");
     std::fs::create_dir_all(&wt).unwrap();
 
@@ -897,6 +926,7 @@ fn test_ordinary_stall_escalation_notifies_owner_without_killing_worker() {
     let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
     store
         .mutate(None, |s| {
+            s.repo_root = Some(fleet_main.to_string_lossy().to_string());
             s.agents.insert(
                 "stalled-worker".to_string(),
                 AgentRun {
@@ -931,6 +961,7 @@ fn test_ordinary_stall_escalation_notifies_owner_without_killing_worker() {
     };
     let t_escalate = 1_000 + STALLED_SECS + 120;
     let mut opts = TickOptions::new(&live);
+    opts.repo = Some(fleet_main);
     opts.explicit_main_sha = Some("a".repeat(40));
     opts.now_override = Some(t_escalate);
     opts.procs = Some(vec![ProcEntry {
@@ -976,19 +1007,65 @@ fn test_ordinary_stall_escalation_notifies_owner_without_killing_worker() {
 
 #[test]
 fn test_root_disk_check_in_tick_warns_and_prunes_volumes_and_clears_on_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
     let live = tacho_core::LiveState::default();
-    let mut hands = DaemonHands {
-        home: home.clone(),
-        live_state: live.clone(),
-        appender: None,
+
+    let prune_marker = dir.path().join("prune-ran.marker");
+    let fake_prune = dir.path().join("fake-runner-prune.sh");
+    std::fs::write(
+        &fake_prune,
+        format!(
+            "#!/bin/sh\necho \"$1\" > '{}'\necho \"pruned 3 unused runner volumes\"\n",
+            prune_marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_prune, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    struct PruneHands {
+        inner: DaemonHands,
+        prune_script: std::path::PathBuf,
+    }
+    impl Hands for PruneHands {
+        fn spawn_worker(
+            &mut self,
+            store: &mut FleetStore,
+            item: &TodoItem,
+        ) -> io::Result<Option<u32>> {
+            self.inner.spawn_worker(store, item)
+        }
+        fn deliver_tell(
+            &mut self,
+            store: &mut FleetStore,
+            agent_key: &str,
+            msg: &str,
+        ) -> io::Result<()> {
+            self.inner.deliver_tell(store, agent_key, msg)
+        }
+        fn emit(&mut self, track: &str, name: &str, because: &str) {
+            self.inner.emit(track, name, because);
+        }
+        fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
+            super::prune_runner_volumes_command(Some(&self.prune_script))
+        }
+    }
+
+    let mut hands = PruneHands {
+        inner: DaemonHands {
+            home: home.clone(),
+            live_state: live.clone(),
+            appender: None,
+        },
+        prune_script: fake_prune,
     };
     let gib = 1024 * 1024 * 1024u64;
 
-    // 1. Critical root disk (85% used, 15 GiB free): warns owner and records prune_root_disk_volumes.
+    // 1. Critical root disk (85% used, 15 GiB free): warns owner, executes runner prune, and records output.
     let mut opts1 = TickOptions::new(&live);
     opts1.explicit_main_sha = Some("a".repeat(40));
     opts1.now_override = Some(2_000);
@@ -1003,6 +1080,11 @@ fn test_root_disk_check_in_tick_warns_and_prunes_volumes_and_clears_on_recovery(
             .unwrap()
             .prune_docker_volumes
     );
+    assert_eq!(
+        std::fs::read_to_string(&prune_marker).unwrap().trim(),
+        "check",
+        "root-disk prune helper must be invoked with 'check'"
+    );
     assert!(
         out1.plan
             .owner_notifications
@@ -1015,8 +1097,10 @@ fn test_root_disk_check_in_tick_warns_and_prunes_volumes_and_clears_on_recovery(
     assert!(
         decisions
             .iter()
-            .any(|d| d.action == "prune_root_disk_volumes" && d.target == "root-disk"),
-        "expected prune_root_disk_volumes decision, got: {:?}",
+            .any(|d| d.action == "prune_root_disk_volumes"
+                && d.target == "root-disk"
+                && d.because.contains("pruned 3 unused runner volumes")),
+        "expected prune_root_disk_volumes decision with prune output, got: {:?}",
         decisions
     );
 

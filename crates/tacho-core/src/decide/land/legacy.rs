@@ -576,3 +576,42 @@ pub fn waiting_for(
 
     reasons
 }
+
+/// Like [`waiting_for`], additionally enforcing [`super::assemble::ci_proof_areas`] when an
+/// unproven pipeline change (`ci_sha`) has not yet been passed by `main_ci`.
+#[allow(clippy::too_many_arguments)]
+pub fn waiting_for_with_ci_proof(
+    train_pr: &TrainPrState,
+    batches: &[BatchRun],
+    open_prs: &[PullFacts],
+    rules: &[AreaRule],
+    require_review: bool,
+    ci_sha: Option<&str>,
+    main_ci: &super::assemble::MainCi,
+    is_ancestor: impl Fn(&str, &str) -> bool,
+) -> Vec<String> {
+    let mut reasons = waiting_for(train_pr, batches, open_prs, rules, require_review);
+    let all_areas: BTreeSet<String> = rules.iter().map(|r| r.area.clone()).collect();
+    let proof_areas =
+        super::assemble::ci_proof_areas(ci_sha, main_ci, is_ancestor, &all_areas, "gate");
+    if !proof_areas.is_empty() {
+        let matching_batch = batches
+            .iter()
+            .rev()
+            .find(|b| b.status == "passed" && b.tree.as_deref() == Some(train_pr.tree.as_str()));
+        if let Some(b) = matching_batch {
+            let covered: BTreeSet<&str> = b.areas.iter().map(String::as_str).collect();
+            let missing: Vec<String> = proof_areas
+                .into_iter()
+                .filter(|a| !covered.contains(a.as_str()))
+                .collect();
+            if !missing.is_empty() {
+                reasons.push(format!(
+                    "batch {} did not cover CI-proof areas {:?}",
+                    b.id, missing
+                ));
+            }
+        }
+    }
+    reasons
+}

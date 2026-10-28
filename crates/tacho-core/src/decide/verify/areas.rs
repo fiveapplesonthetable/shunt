@@ -544,27 +544,32 @@ pub fn related_package_tests_with_modules<S: AsRef<str>>(
 /// Computes the incremental Rust crate/test targets affected by `paths` given workspace crate
 /// manifests (`crate_name -> Cargo.toml text`), matching `selection/changed_tests.py::rust_targets`:
 /// - `crate` for each crate reached by source changes (including reverse-dependency closure),
+/// - `crate` (without reverse dependents) when non-top-level test helper files under `crates/<crate>/tests/...` changed,
 /// - `crate --test binary` when only `crates/<crate>/tests/<binary>.rs` changed and `<crate>` is not in `whole`,
-/// - `["*"]` when a migration (`.../migrations/...`), workspace root file (`Cargo.toml`, `Cargo.lock`), or unknown crate is touched.
+/// - `["*"]` when `fuzz/`, a migration (`.../migrations/...`), workspace root file (`Cargo.toml`, `Cargo.lock`), or unknown crate is touched.
 pub fn affected_rust_targets_from_manifests<S: AsRef<str>>(
     paths: &[S],
     manifests: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
-    static SECTION_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static DEP_SECTION_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static KEY_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static PKG_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let mut parsed_docs: std::collections::BTreeMap<String, toml::Table> =
+        std::collections::BTreeMap::new();
+    let mut pkg_to_crate: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
 
-    let section_re =
-        SECTION_RE.get_or_init(|| Regex::new(r"^\s*\[([^\]]+)\]\s*$").expect("static regex"));
-    let dep_section_re = DEP_SECTION_RE.get_or_init(|| {
-        Regex::new(r"^(?:target\.[^\]]+\.)?(?:dev-|build-)?dependencies(?:\.([A-Za-z0-9_-]+))?$")
-            .expect("static regex")
-    });
-    let key_re =
-        KEY_RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z0-9_-]+)\s*=").expect("static regex"));
-    let pkg_re = PKG_RE
-        .get_or_init(|| Regex::new(r#"package\s*=\s*"([A-Za-z0-9_-]+)""#).expect("static regex"));
+    for (dir_name, text) in manifests {
+        pkg_to_crate.insert(dir_name.clone(), dir_name.clone());
+        if let Ok(doc) = text.parse::<toml::Table>() {
+            if let Some(pkg_name) = doc
+                .get("package")
+                .and_then(|p| p.as_table())
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                pkg_to_crate.insert(pkg_name.to_string(), dir_name.clone());
+            }
+            parsed_docs.insert(dir_name.clone(), doc);
+        }
+    }
 
     let crates: BTreeSet<&str> = manifests.keys().map(String::as_str).collect();
     let mut above: std::collections::BTreeMap<String, BTreeSet<String>> = crates
@@ -572,62 +577,54 @@ pub fn affected_rust_targets_from_manifests<S: AsRef<str>>(
         .map(|&c| (c.to_string(), BTreeSet::new()))
         .collect();
 
-    for (name, text) in manifests {
-        let mut in_dep_section = false;
-        for raw_line in text.lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(cap) = section_re.captures(line) {
-                let sec = cap[1].trim();
-                if let Some(dcap) = dep_section_re.captures(sec) {
-                    in_dep_section = true;
-                    if let Some(inline_dep) = dcap.get(1).map(|m| m.as_str()) {
-                        if crates.contains(inline_dep) && inline_dep != name {
-                            above
-                                .entry(inline_dep.to_string())
-                                .or_default()
-                                .insert(name.clone());
+    let record_dep_table =
+        |name: &str,
+         table: &toml::Table,
+         above: &mut std::collections::BTreeMap<String, BTreeSet<String>>| {
+            for kind in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(deps) = table.get(kind).and_then(|v| v.as_table()) {
+                    for (dep_key, dep_val) in deps {
+                        let candidate = dep_val
+                            .as_table()
+                            .and_then(|t| t.get("package"))
+                            .and_then(|p| p.as_str())
+                            .unwrap_or(dep_key.as_str());
+                        for key in [dep_key.as_str(), candidate] {
+                            if let Some(target_crate) = pkg_to_crate.get(key) {
+                                if target_crate != name {
+                                    above
+                                        .entry(target_crate.clone())
+                                        .or_default()
+                                        .insert(name.to_string());
+                                }
+                            }
                         }
                     }
-                } else {
-                    in_dep_section = false;
-                }
-                continue;
-            }
-            if !in_dep_section {
-                continue;
-            }
-            if let Some(cap) = key_re.captures(line) {
-                let dep_key = &cap[1];
-                if crates.contains(dep_key) && dep_key != name {
-                    above
-                        .entry(dep_key.to_string())
-                        .or_default()
-                        .insert(name.clone());
                 }
             }
-            if let Some(cap) = pkg_re.captures(line) {
-                let pkg_name = &cap[1];
-                if crates.contains(pkg_name) && pkg_name != name {
-                    above
-                        .entry(pkg_name.to_string())
-                        .or_default()
-                        .insert(name.clone());
+        };
+
+    for (name, doc) in &parsed_docs {
+        record_dep_table(name, doc, &mut above);
+        if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
+            for target_val in targets.values() {
+                if let Some(target_table) = target_val.as_table() {
+                    record_dep_table(name, target_table, &mut above);
                 }
             }
         }
     }
 
-    let reaching = |start: &str| -> BTreeSet<String> {
-        let mut seen = BTreeSet::from([start.to_string()]);
-        let mut queue = vec![start.to_string()];
+    let reaching = |starts: &BTreeSet<String>| -> BTreeSet<String> {
+        let mut seen = BTreeSet::new();
+        let mut queue: Vec<String> = starts.iter().cloned().collect();
         while let Some(cur) = queue.pop() {
-            if let Some(dependents) = above.get(&cur) {
-                for dep in dependents {
-                    if seen.insert(dep.clone()) {
-                        queue.push(dep.clone());
+            if seen.insert(cur.clone()) {
+                if let Some(dependents) = above.get(&cur) {
+                    for dep in dependents {
+                        if !seen.contains(dep) {
+                            queue.push(dep.clone());
+                        }
                     }
                 }
             }
@@ -635,27 +632,29 @@ pub fn affected_rust_targets_from_manifests<S: AsRef<str>>(
         seen
     };
 
-    let mut whole: BTreeSet<String> = BTreeSet::new();
+    let mut source: BTreeSet<String> = BTreeSet::new();
+    let mut own: BTreeSet<String> = BTreeSet::new();
     let mut only_test: std::collections::BTreeMap<String, BTreeSet<String>> =
         std::collections::BTreeMap::new();
 
     for raw in paths {
         let path = raw.as_ref();
-        if !path.starts_with("crates/") {
-            if path == "Cargo.toml" || path == "Cargo.lock" {
-                return vec![EVERYTHING_TESTS.to_string()];
-            }
+        if !path.starts_with("crates/")
+            && !path.starts_with("fuzz/")
+            && path != "Cargo.toml"
+            && path != "Cargo.lock"
+        {
             continue;
+        }
+        if !path.starts_with("crates/") {
+            return vec![EVERYTHING_TESTS.to_string()];
         }
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() < 3 {
             return vec![EVERYTHING_TESTS.to_string()];
         }
         let crate_name = parts[1];
-        if !crates.contains(crate_name) {
-            return vec![EVERYTHING_TESTS.to_string()];
-        }
-        if parts.contains(&"migrations") {
+        if !crates.contains(crate_name) || path.contains("/migrations/") {
             return vec![EVERYTHING_TESTS.to_string()];
         }
         if parts[2] == "tests" && parts.len() == 4 && parts[3].ends_with(".rs") {
@@ -664,10 +663,16 @@ pub fn affected_rust_targets_from_manifests<S: AsRef<str>>(
                 .entry(crate_name.to_string())
                 .or_default()
                 .insert(bin);
+        } else if parts[2] == "tests" {
+            // Non-top-level test helper under `crates/<crate>/tests/...`: reaches only its own crate.
+            own.insert(crate_name.to_string());
         } else {
-            whole.extend(reaching(crate_name));
+            source.insert(crate_name.to_string());
         }
     }
+
+    let mut whole = reaching(&source);
+    whole.extend(own);
 
     let mut targets: Vec<String> = whole.iter().cloned().collect();
     for (crate_name, bins) in only_test {

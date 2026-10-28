@@ -477,28 +477,9 @@ pub fn is_within_fleet_root(dir: &Path, store_home: &Path, state: &FleetState) -
     let Ok(canon) = dir.canonicalize() else {
         return false;
     };
-    let has_explicit_repo = state
-        .repo_root
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty())
-        || std::env::var_os("TACHO_REPO")
-            .filter(|s| !s.is_empty())
-            .is_some();
     let mut roots: Vec<PathBuf> = Vec::new();
     if !store_home.as_os_str().is_empty() {
         roots.push(store_home.to_path_buf());
-        if !has_explicit_repo {
-            if let Some(parent) = store_home.parent().filter(|p| !p.as_os_str().is_empty()) {
-                let is_system_root = matches!(
-                    parent.to_str(),
-                    Some("/" | "/tmp" | "/var" | "/var/tmp" | "/home" | "/usr")
-                ) || std::env::var_os("HOME")
-                    .is_some_and(|h| Path::new(&h) == parent);
-                if !is_system_root {
-                    roots.push(parent.to_path_buf());
-                }
-            }
-        }
     }
     for var in ["TACHO_HOME", "TACHO_WORK", "TACHO_REPO"] {
         if let Some(val) = std::env::var_os(var).filter(|s| !s.is_empty()) {

@@ -248,6 +248,32 @@ impl Drop for BurnersGuard {
     }
 }
 
+/// Configure a burner or starved child command with an isolated process group (`pgid == pid`),
+/// `TACHO_STARVE=1` / `STARVE=1` environment markers, kernel parent-death `SIGKILL`
+/// (`PR_SET_PDEATHSIG`), and a kernel `SIGALRM` hard cap (`alarm(timeout_secs)`).
+///
+/// Because `PR_SET_PDEATHSIG` and `alarm` are preserved across `execve` (including when
+/// `taskset -c <cpus> yes` execs `yes` in-place), no intermediate `timeout` process sits
+/// between `tacho` and `yes`: if the parent runner or `tacho` process dies for any reason
+/// (including `SIGKILL`), the kernel immediately delivers `SIGKILL` to `yes`.
+pub fn configure_burner_process(cmd: &mut Command, timeout_secs: u64) {
+    let parent_pid = unsafe { libc::getpid() };
+    let cap_secs = timeout_secs.clamp(1, STARVE_MAX_SECS) as u32;
+    cmd.env("TACHO_STARVE", "1")
+        .env("STARVE", "1")
+        .process_group(0);
+    unsafe {
+        cmd.pre_exec(move || {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
+            }
+            libc::alarm(cap_secs);
+            Ok(())
+        });
+    }
+}
+
 /// Executes `tacho starve [--cpus 4] [--cpu-set 0-3] [--timeout 300] -- <cmd...>`.
 pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
     if args.cmd.is_empty() {
@@ -304,13 +330,11 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
         use_private_tmp(&mut b_cmd, "starve")?;
         b_cmd
             .args(&wrap[1..])
-            .args(["timeout", &timeout_secs.to_string(), "yes"])
-            .env("TACHO_STARVE", "1")
-            .env("STARVE", "1")
+            .arg("yes")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
+            .stderr(Stdio::null());
+        configure_burner_process(&mut b_cmd, timeout_secs);
         if let Ok(c) = b_cmd.spawn() {
             let pid = c.id();
             let reg = RegisteredBurner {
@@ -327,12 +351,8 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
     // 3. Spawn the target command pinned to the same CPU slice in its own process group
     let mut target_cmd = Command::new(&wrap[0]);
     use_private_tmp(&mut target_cmd, "starve")?;
-    target_cmd
-        .args(&wrap[1..])
-        .args(&args.cmd)
-        .env("TACHO_STARVE", "1")
-        .env("STARVE", "1")
-        .process_group(0);
+    target_cmd.args(&wrap[1..]).args(&args.cmd);
+    configure_burner_process(&mut target_cmd, timeout_secs);
 
     let mut child = match target_cmd.spawn() {
         Ok(c) => c,

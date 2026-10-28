@@ -100,8 +100,8 @@ pub fn scan_procs() -> Vec<ProcEntry> {
     tacho_daemon::exec::observe::scan_procs()
 }
 
-struct CliHands {
-    home: PathBuf,
+pub struct CliHands {
+    pub home: PathBuf,
 }
 
 impl tacho_daemon::exec::Hands for CliHands {
@@ -126,6 +126,17 @@ impl tacho_daemon::exec::Hands for CliHands {
         let st = store.load()?;
         let val = serde_json::to_value(&st).map_err(io::Error::other)?;
         write_scrubbed_snapshot(&self.home.join("snapshot.json"), &val)
+    }
+
+    fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
+        if cfg!(test) {
+            return Ok(false);
+        }
+        tacho_core::decide::plugin::notify_owner_command(subject, body)
+    }
+
+    fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
+        tacho_daemon::exec::prune_runner_volumes_command(None)
     }
 }
 
@@ -229,13 +240,17 @@ pub fn execute_watchdog(args: WatchdogArgs) -> io::Result<()> {
     let meta = load_fleet_meta().unwrap_or_default();
     let (step, mut next_issue) =
         run_watchdog_lifecycle(reason.as_deref(), meta.watchdog_issue, now, cooldown);
+    let mut hands = CliHands {
+        home: crate::paths::resolve_home(),
+    };
     let gh_forge = std::env::var("TACHO_GH_REPO")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(tacho_core::decide::plugin::GitHubForge::new);
     match &step {
         WatchdogStep::Open { title, body } => {
-            let _ = tacho_core::decide::plugin::notify_owner_command(title, body);
+            use tacho_daemon::exec::Hands;
+            let _ = hands.notify_owner(title, body);
             if let Some(ref forge) = gh_forge {
                 use tacho_core::decide::plugin::ForgePlugin;
                 if let Ok(Some(num)) = forge.set_issue(title, body) {
@@ -246,7 +261,8 @@ pub fn execute_watchdog(args: WatchdogArgs) -> io::Result<()> {
             }
         }
         WatchdogStep::Update { number, body } => {
-            let _ = tacho_core::decide::plugin::notify_owner_command("tacho is down", body);
+            use tacho_daemon::exec::Hands;
+            let _ = hands.notify_owner("tacho is down", body);
             if let Some(ref forge) = gh_forge {
                 use tacho_core::decide::plugin::ForgePlugin;
                 let _ = forge.comment_issue(*number, body);

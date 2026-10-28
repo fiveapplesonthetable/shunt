@@ -186,12 +186,63 @@ pub fn select_batch_checks_for_origin(
         .into_iter()
         .filter(|c| effective_set.contains(c.area.as_str()))
         .collect();
+    let empty_specs = BTreeMap::new();
     for area in &effective_areas {
         if !checks.iter().any(|c| &c.area == area) {
+            let units = match area.as_str() {
+                "console-browser" => {
+                    let specs = tacho_core::decide::verify::related_console_specs(
+                        files,
+                        &empty_specs,
+                        "frontend/admin/",
+                    );
+                    if specs.is_empty() {
+                        vec!["all".to_string()]
+                    } else {
+                        specs
+                    }
+                }
+                "deploy" => {
+                    let d = tacho_core::decide::verify::related_deploy_checks(
+                        files,
+                        tacho_core::decide::verify::DEFAULT_DEPLOY_CHECKS,
+                    );
+                    if d.is_empty() {
+                        vec!["all".to_string()]
+                    } else {
+                        d
+                    }
+                }
+                _ => vec!["all".to_string()],
+            };
             checks.push(AreaCheck {
                 area: area.clone(),
-                units: vec!["all".to_string()],
+                units,
             });
+        }
+    }
+    for chk in &mut checks {
+        if chk.area == "console-browser"
+            && (chk.units.is_empty() || chk.units == vec!["all".to_string()])
+        {
+            let specs = tacho_core::decide::verify::related_console_specs(
+                files,
+                &empty_specs,
+                "frontend/admin/",
+            );
+            if !specs.is_empty() {
+                chk.units = specs;
+            }
+        } else if chk.area == "deploy"
+            && (chk.units.is_empty() || chk.units == vec!["all".to_string()])
+        {
+            let d = tacho_core::decide::verify::related_deploy_checks(
+                files,
+                tacho_core::decide::verify::DEFAULT_DEPLOY_CHECKS,
+            );
+            if !d.is_empty() {
+                chk.units = d;
+            }
         }
     }
     (effective_areas, checks)
@@ -591,13 +642,14 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             );
             let fix_shots = opts.origin == BatchOrigin::Train
                 || std::env::var("TACHO_FIX_SHOTS").ok().as_deref() == Some("1");
+            let shot_rules = super::train::load_shot_rules(&cwd);
             match super::train::stage_and_commit_merged_screenshots(
                 &cwd,
                 &report_dir,
                 &batch_id,
                 &all_files,
                 fix_shots,
-                &tacho_core::decide::land::ShotRules::default(),
+                &shot_rules,
             ) {
                 Ok(Some(_new_commit)) => {
                     if let Ok(updated_tree) = crate::kit::tree_of_worktree(&cwd) {

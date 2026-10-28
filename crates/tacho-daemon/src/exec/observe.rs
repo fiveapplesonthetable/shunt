@@ -460,26 +460,27 @@ pub fn is_linked_worktree(dir: &Path) -> bool {
 
 /// Resolves the main repository checkout path that owns `dir` (either `dir` itself when
 /// `dir/.git` is a directory, or the parent of `--git-common-dir` when `dir` is a linked worktree).
+///
+/// Never walks parent directories above `dir`, so a directory inside an unrelated enclosing
+/// checkout is never mistaken for a repository root.
 pub fn owning_main_checkout(dir: &Path) -> Option<std::path::PathBuf> {
     if dir.as_os_str().is_empty() || !dir.exists() {
         return None;
     }
     let canon = dir.canonicalize().ok()?;
-    for anc in canon.ancestors() {
-        let dot_git = anc.join(".git");
-        if dot_git.is_dir() {
-            return Some(anc.to_path_buf());
-        }
-        if dot_git.is_file() {
-            let out = crate::sampler::run_git_in_worktree(
-                anc,
-                &["rev-parse", "--git-common-dir"],
-                GIT_CAP,
-            )
-            .ok()?;
-            let common = anc.join(out.trim()).canonicalize().ok()?;
-            return common.parent().map(Path::to_path_buf);
-        }
+    let dot_git = canon.join(".git");
+    if dot_git.is_dir() {
+        return Some(canon);
+    }
+    if dot_git.is_file() {
+        let out = crate::sampler::run_git_in_worktree(
+            &canon,
+            &["rev-parse", "--git-common-dir"],
+            GIT_CAP,
+        )
+        .ok()?;
+        let common = canon.join(out.trim()).canonicalize().ok()?;
+        return common.parent().map(Path::to_path_buf);
     }
     None
 }
@@ -528,11 +529,11 @@ pub fn fleet_main_checkout(state: &FleetState, repo: Option<&Path>) -> Option<st
     None
 }
 
-/// Whether `dir` resolves to the fleet's recorded main checkout (or, when `fleet_main` is `None`,
-/// whether `dir`'s enclosing git checkout is a main checkout rather than a linked worktree).
+/// Whether `dir` resolves to the fleet's recorded main checkout (`fleet_main`), or, when
+/// `fleet_main` is `None`, whether `dir` itself is a `.git` repository root.
 ///
-/// Never scans child directories, so a holder directory that contains a repository as a child
-/// is never mistaken for the main checkout.
+/// Never scans child directories and never trusts an enclosing repository unless it matches
+/// an explicit `fleet_main`.
 pub fn resolves_to_fleet_main_checkout(dir: &Path, fleet_main: Option<&Path>) -> bool {
     if dir.as_os_str().is_empty() || !dir.exists() || is_linked_worktree(dir) {
         return false;
@@ -540,19 +541,25 @@ pub fn resolves_to_fleet_main_checkout(dir: &Path, fleet_main: Option<&Path>) ->
     let Ok(canon) = dir.canonicalize() else {
         return false;
     };
-    let Some(enclosing) = canon.ancestors().find(|anc| anc.join(".git").exists()) else {
-        return false;
-    };
-    if !enclosing.join(".git").is_dir() && is_linked_worktree(enclosing) {
-        return false;
-    }
     if let Some(main_root) = fleet_main {
         let main_canon = main_root
             .canonicalize()
             .unwrap_or_else(|_| main_root.to_path_buf());
+        if !canon.starts_with(&main_canon) {
+            return false;
+        }
+        if canon == main_canon {
+            return true;
+        }
+        let Some(enclosing) = canon.ancestors().find(|anc| anc.join(".git").exists()) else {
+            return true;
+        };
+        if !enclosing.join(".git").is_dir() && is_linked_worktree(enclosing) {
+            return false;
+        }
         return enclosing == main_canon;
     }
-    enclosing.join(".git").is_dir()
+    canon.join(".git").is_dir()
 }
 
 /// Whether `dir` resolves to the repository's main checkout (or a subdirectory inside it).

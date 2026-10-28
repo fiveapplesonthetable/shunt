@@ -199,6 +199,103 @@ jobs:
 }
 
 #[test]
+fn test_compiled_job_script_executes_and_verifies_chown_handback_behavior() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let fake_chown = bin_dir.join("chown");
+    std::fs::write(
+        &fake_chown,
+        r#"#!/usr/bin/env bash
+case "${FAKE_CHOWN_MODE:-ok}" in
+  ok)
+    exit 0
+    ;;
+  missing)
+    echo "chown: cannot access '/target/rust': No such file or directory" >&2
+    exit 1
+    ;;
+  denied)
+    echo "chown: changing ownership of '/w/out': Operation not permitted" >&2
+    exit 1
+    ;;
+  silent_fail)
+    exit 2
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_chown, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let yaml = r#"
+jobs:
+  rust:
+    container: ghcr.io/demo/ci:latest
+    steps:
+      - name: Check
+        run: test -d "$ runner_files" || true; echo "step-ran"
+"#;
+    let job = job_for_yaml(yaml, "rust", "rust", &BTreeMap::new()).unwrap();
+    let script = compile_job_script(
+        &job,
+        "rust",
+        &["/cargo".to_string(), "/target".to_string()],
+        Some((1000, 1000)),
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // 1. Missing path (e.g. /target/rust not created) must NOT fail a green job:
+    let out_missing = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("PATH", &path_env)
+        .env("FAKE_CHOWN_MODE", "missing")
+        .output()
+        .unwrap();
+    assert!(
+        out_missing.status.success(),
+        "missing chown target should not fail green job: stderr={}",
+        String::from_utf8_lossy(&out_missing.stderr)
+    );
+
+    // 2. Real chown failure (Operation not permitted) MUST fail an otherwise green job:
+    let out_denied = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("PATH", &path_env)
+        .env("FAKE_CHOWN_MODE", "denied")
+        .output()
+        .unwrap();
+    assert!(
+        !out_denied.status.success(),
+        "chown permission refusal must fail otherwise green job"
+    );
+    let stderr_denied = String::from_utf8_lossy(&out_denied.stderr);
+    assert!(
+        stderr_denied.contains("Operation not permitted"),
+        "expected refusal stderr, got: {stderr_denied}"
+    );
+
+    // 3. Silent non-zero chown exit MUST also fail an otherwise green job:
+    let out_silent = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("PATH", &path_env)
+        .env("FAKE_CHOWN_MODE", "silent_fail")
+        .output()
+        .unwrap();
+    assert_eq!(out_silent.status.code(), Some(2));
+}
+
+#[test]
 fn test_host_job_plan_wraps_in_systemd_user_scope_and_taskset() {
     let yaml = r#"
 jobs:

@@ -571,24 +571,51 @@ fn test_cgroup_integration_accounting() {
         }
     }
 
-    // Spawn a daemonized burner that escapes the process tree via setsid. It does a fixed
-    // amount of CPU work, announces completion with an atomically created marker, then
-    // idles until its parent dies, so the test waits on the marker instead of on a clock
-    // and nothing outlives the test.
+    // Spawn a daemonized burner that escapes the process tree via setsid AFTER Tick 1
+    // attaches the leader into the systemd scope cgroup. It does a fixed amount of CPU work,
+    // announces completion with an atomically created marker, then blocks on a FIFO until
+    // the test drops its guard, so there is no post-marker exec race even at load > 100.
     let marker_dir = tempfile::tempdir().unwrap();
     let marker = marker_dir.path().join("burned");
+    let hold_fifo = marker_dir.path().join("hold.fifo");
+    let fifo_c = std::ffi::CString::new(hold_fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let _hold_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&hold_fifo)
+        .unwrap();
+
     let script = format!(
-        "setsid sh -c 'i=0; while [ $i -lt 1000000 ]; do i=$((i+1)); done; \
-         touch {m}.tmp; mv {m}.tmp {m}; exec tail --pid=$PPID -f /dev/null' & exec sleep 100000",
+        "read _gate; \
+         setsid sh -c ': cgroup-burner; exec 3<\"{fifo}\"; i=0; while [ $i -lt 1000000 ]; do i=$((i+1)); done; \
+         touch \"{m}.tmp\" && mv \"{m}.tmp\" \"{m}\" && read _hold <&3' </dev/null >/dev/null 2>&1 & \
+         exec sleep 100000 </dev/null",
+        fifo = hold_fifo.display(),
         m = marker.display()
     );
-    let mut child = match Command::new("sh").args(["-c", &script]).spawn() {
+    let parent_pid = unsafe { libc::getpid() };
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &script])
+        .stdin(std::process::Stdio::piped());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(move || {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if libc::getppid() != parent_pid {
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("skipping cgroup integration test: failed to spawn: {}", e);
             return;
         }
     };
+    let gate_stdin = child.stdin.take();
 
     let child_pid = child.id();
     let unit = unit_name("cgroup-worker", 1, child_pid);
@@ -627,7 +654,7 @@ fn test_cgroup_integration_accounting() {
     let mut proc_sampler = ProcSampler::new(&[]);
     let mut buf = String::new();
 
-    // Tick 1: trigger attach
+    // Tick 1: trigger attach while child is waiting on gate_stdin
     proc_sampler.sample_tick(&appender, now_ns + 10_000_000, &mut buf);
     appender.flush();
 
@@ -639,6 +666,9 @@ fn test_cgroup_integration_accounting() {
         }
     };
     assert!(cg.dir.exists(), "scope cgroup dir must exist: {:?}", cg.dir);
+
+    // Release gate so child spawns the setsid burner inside the already-attached cgroup scope.
+    drop(gate_stdin);
 
     // Wait until the burner has finished its fixed CPU work inside the cgroup.
     crate::test_util::wait_for_file(&marker);
@@ -673,7 +703,7 @@ fn test_cgroup_integration_accounting() {
             .starts_with("agent:cgroup-worker/run:1/procs/slot:")
             && e.custom_name
                 .as_deref()
-                .is_some_and(|name| name.contains("tail --pid"))
+                .is_some_and(|name| name.contains("cgroup-burner"))
     });
     assert!(
         has_burner_slice,

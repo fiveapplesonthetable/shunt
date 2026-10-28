@@ -345,6 +345,30 @@ pub trait ForgePlugin: Send + Sync {
         Ok(())
     }
 
+    /// Lists GitHub Actions caches for `plan_actions_tidy`.
+    fn list_actions_caches(&self) -> Result<Vec<crate::decide::ops::tidy::ActionsCache>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Lists GitHub Actions artifacts for `plan_actions_tidy`.
+    fn list_actions_artifacts(
+        &self,
+    ) -> Result<Vec<crate::decide::ops::tidy::ActionsArtifact>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Deletes a GitHub Actions cache by ID.
+    fn delete_actions_cache(&self, id: u64) -> Result<(), String> {
+        let _ = id;
+        Ok(())
+    }
+
+    /// Deletes a GitHub Actions artifact by ID.
+    fn delete_actions_artifact(&self, id: u64) -> Result<(), String> {
+        let _ = id;
+        Ok(())
+    }
+
     /// Resolve a raw mergeable string from the forge API, preserving `was_conflicting` when
     /// the forge transiently reports `"UNKNOWN"` right after a push.
     fn resolve_mergeable(&self, raw: &str, was_conflicting: bool) -> ForgeMergeableState {
@@ -518,6 +542,14 @@ pub struct MockForge {
     pub ready_prs: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     /// Recorded `merge_pr(pr)` calls.
     pub merged_prs: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Configured actions caches returned by `list_actions_caches`.
+    pub actions_caches: Vec<crate::decide::ops::tidy::ActionsCache>,
+    /// Configured actions artifacts returned by `list_actions_artifacts`.
+    pub actions_artifacts: Vec<crate::decide::ops::tidy::ActionsArtifact>,
+    /// Recorded `delete_actions_cache(id)` calls.
+    pub deleted_caches: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Recorded `delete_actions_artifact(id)` calls.
+    pub deleted_artifacts: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
 impl Default for MockForge {
@@ -530,6 +562,10 @@ impl Default for MockForge {
             issue_comments: std::sync::Arc::default(),
             ready_prs: std::sync::Arc::default(),
             merged_prs: std::sync::Arc::default(),
+            actions_caches: Vec::new(),
+            actions_artifacts: Vec::new(),
+            deleted_caches: std::sync::Arc::default(),
+            deleted_artifacts: std::sync::Arc::default(),
         }
     }
 }
@@ -613,6 +649,30 @@ impl ForgePlugin for MockForge {
     fn merge_pr(&self, pr: u64) -> Result<(), String> {
         let mut guard = self.merged_prs.lock().unwrap_or_else(|p| p.into_inner());
         guard.push(pr);
+        Ok(())
+    }
+    fn list_actions_caches(&self) -> Result<Vec<crate::decide::ops::tidy::ActionsCache>, String> {
+        Ok(self.actions_caches.clone())
+    }
+    fn list_actions_artifacts(
+        &self,
+    ) -> Result<Vec<crate::decide::ops::tidy::ActionsArtifact>, String> {
+        Ok(self.actions_artifacts.clone())
+    }
+    fn delete_actions_cache(&self, id: u64) -> Result<(), String> {
+        let mut guard = self
+            .deleted_caches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.push(id);
+        Ok(())
+    }
+    fn delete_actions_artifact(&self, id: u64) -> Result<(), String> {
+        let mut guard = self
+            .deleted_artifacts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.push(id);
         Ok(())
     }
 }
@@ -896,39 +956,37 @@ impl ForgePlugin for CliForgePlugin {
         args.push("--merge".to_string());
         self.run_cli(&args).map(|_| ())
     }
-}
 
-/// Returns `true` when executing inside a test harness (`cargo test`, `cargo nextest`, or a `target/` / `deps/` test binary).
-pub fn running_in_test_harness() -> bool {
-    if cfg!(test)
-        || std::env::var_os("TACHO_TEST_HARNESS").is_some()
-        || std::env::var_os("RUST_TEST_THREADS").is_some()
-        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
-        || std::env::var_os("CARGO_MANIFEST_DIR").is_some()
-    {
-        return true;
+    fn delete_actions_cache(&self, id: u64) -> Result<(), String> {
+        let Some(repo) = self.repo.as_deref().filter(|r| !r.is_empty()) else {
+            return Ok(());
+        };
+        let args = vec![
+            "api".to_string(),
+            "-X".to_string(),
+            "DELETE".to_string(),
+            format!("repos/{repo}/actions/caches/{id}"),
+        ];
+        self.run_cli(&args).map(|_| ())
     }
-    std::env::current_exe()
-        .ok()
-        .map(|p| {
-            let in_deps = p
-                .parent()
-                .and_then(|d| d.file_name())
-                .is_some_and(|n| n == "deps");
-            let in_target_debug = p
-                .parent()
-                .and_then(|d| d.file_name())
-                .is_some_and(|n| n == "debug")
-                && p.components().any(|c| c.as_os_str() == "target");
-            in_deps
-                || (in_target_debug && std::env::var_os("TACHO_ALLOW_NOTIFY_IN_TARGET").is_none())
-        })
-        .unwrap_or(false)
+
+    fn delete_actions_artifact(&self, id: u64) -> Result<(), String> {
+        let Some(repo) = self.repo.as_deref().filter(|r| !r.is_empty()) else {
+            return Ok(());
+        };
+        let args = vec![
+            "api".to_string(),
+            "-X".to_string(),
+            "DELETE".to_string(),
+            format!("repos/{repo}/actions/artifacts/{id}"),
+        ];
+        self.run_cli(&args).map(|_| ())
+    }
 }
 
-/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and runs `cmd_override` (or `$TACHO_NOTIFY`
-/// when outside a test harness) with `TACHO_NOTIFY_SUBJECT` and `TACHO_NOTIFY_BODY` environment
-/// variables and stdin populated with the scrubbed body.
+/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and runs `cmd_override` (or `$TACHO_NOTIFY`)
+/// with `TACHO_NOTIFY_SUBJECT` and `TACHO_NOTIFY_BODY` environment variables and stdin populated
+/// with the scrubbed body.
 pub fn notify_owner_command_with(
     cmd_override: Option<&str>,
     subject: &str,
@@ -942,9 +1000,7 @@ pub fn notify_owner_command_with(
     let clean_body = scrubber.scrub(body);
     let resolved_cmd = match cmd_override {
         Some(cmd) => Some(cmd.trim().to_string()),
-        None if running_in_test_harness() => std::env::var("TACHO_TEST_NOTIFY_CMD")
-            .ok()
-            .map(|s| s.trim().to_string()),
+        None if cfg!(test) => None,
         None => std::env::var("TACHO_NOTIFY")
             .ok()
             .map(|s| s.trim().to_string()),
@@ -979,9 +1035,8 @@ pub fn notify_owner_command_with(
 }
 
 /// Scrubs `subject` and `body` via [`Scrubber::enabled`] and, when `$TACHO_NOTIFY` is set to a
-/// non-empty command (outside test harnesses), runs `sh -c "$TACHO_NOTIFY"` with
-/// `TACHO_NOTIFY_SUBJECT` and `TACHO_NOTIFY_BODY` environment variables and stdin populated with
-/// the scrubbed body.
+/// non-empty command, runs `sh -c "$TACHO_NOTIFY"` with `TACHO_NOTIFY_SUBJECT` and
+/// `TACHO_NOTIFY_BODY` environment variables and stdin populated with the scrubbed body.
 pub fn notify_owner_command(subject: &str, body: &str) -> Result<bool, String> {
     notify_owner_command_with(None, subject, body)
 }
