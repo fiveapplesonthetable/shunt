@@ -530,3 +530,114 @@ fn n4_stale_runs_retirement_validates_days_and_filters_live_or_open_pr_runs() {
     assert_eq!(stale_runs_summary(0), "no stale runs");
     assert_eq!(stale_runs_summary(1), "retired 1 stale run(s)");
 }
+
+#[test]
+fn n5_actions_tidy_deletes_old_caches_settled_fourth_archives_and_keeps_read_later_images() {
+    let now = 100 * 86400;
+    let caches = vec![
+        ActionsCache {
+            id: 11,
+            last_accessed_at: now - 5 * 86400,
+        },
+        ActionsCache {
+            id: 12,
+            last_accessed_at: now - 3600,
+        },
+    ];
+    let artifacts = vec![
+        ActionsArtifact {
+            id: 21,
+            name: "old".into(),
+            created_at: now - 5 * 86400,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 22,
+            name: "old".into(),
+            created_at: now - 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 23,
+            name: "old".into(),
+            created_at: now - 6 * 86400,
+            expired: true,
+        },
+        ActionsArtifact {
+            id: 31,
+            name: "archive".into(),
+            created_at: now - 3 * 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 32,
+            name: "archive".into(),
+            created_at: now - 4 * 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 33,
+            name: "archive".into(),
+            created_at: now - 5 * 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 34,
+            name: "archive".into(),
+            created_at: now - 6 * 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 41,
+            name: "running".into(),
+            created_at: now - 10 * 60,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 42,
+            name: "running".into(),
+            created_at: now - 20 * 60,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 43,
+            name: "running".into(),
+            created_at: now - 30 * 60,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 44,
+            name: "running".into(),
+            created_at: now - 40 * 60,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 51,
+            name: "release-image".into(),
+            created_at: now - 3 * 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 52,
+            name: "release-image".into(),
+            created_at: now - 4 * 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 53,
+            name: "release-image".into(),
+            created_at: now - 5 * 3600,
+            expired: false,
+        },
+        ActionsArtifact {
+            id: 54,
+            name: "release-image".into(),
+            created_at: now - 6 * 3600,
+            expired: false,
+        },
+    ];
+    let plan = plan_actions_tidy(&caches, &artifacts, now, 3, 3, 2 * 3600).unwrap();
+    assert_eq!(plan.delete_caches, vec![11]);
+    assert_eq!(plan.delete_artifacts, vec![21, 34]);
+    assert!(plan_actions_tidy(&caches, &artifacts, now, 0, 3, 2 * 3600).is_err());
+}

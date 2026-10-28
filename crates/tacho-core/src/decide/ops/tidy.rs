@@ -628,3 +628,79 @@ pub fn core_bare_repair(is_bare: Option<bool>) -> Option<String> {
     (is_bare == Some(true))
         .then(|| "core.bare was true on working repository; reset core.bare=false".into())
 }
+
+/// Artifact names read by a later workflow run from the pull-request run that produced them;
+/// only age (`created_at < cutoff`) removes them (`release/actions-tidy.sh`).
+pub const READ_LATER_ARTIFACTS: [&str; 3] = ["release-image", "ci-proof", "verified-image-digest"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsCache {
+    pub id: u64,
+    pub last_accessed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionsArtifact {
+    pub id: u64,
+    pub name: String,
+    pub created_at: i64,
+    pub expired: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ActionsTidyPlan {
+    pub delete_caches: Vec<u64>,
+    pub delete_artifacts: Vec<u64>,
+}
+
+/// Plans deletion of GitHub Actions caches and artifacts (`release/actions-tidy.sh`):
+/// - Caches not accessed for `days` (`last_accessed_at < now - days * 86400`) are deleted.
+/// - Non-expired artifacts older than `days` (`created_at < cutoff`) are deleted.
+/// - Every non-expired artifact past the newest `keep` of its `name` is also deleted once its run
+///   has settled (`created_at < now - settle_secs`, default 2 hours), unless its `name` is in
+///   [`READ_LATER_ARTIFACTS`].
+pub fn plan_actions_tidy(
+    caches: &[ActionsCache],
+    artifacts: &[ActionsArtifact],
+    now: i64,
+    days: i64,
+    keep: usize,
+    settle_secs: i64,
+) -> Result<ActionsTidyPlan, String> {
+    if days < 1 {
+        return Err("actions-tidy: days is a whole number >= 1".into());
+    }
+    let cutoff = now - days * 86400;
+    let settled = now - settle_secs;
+
+    let delete_caches: Vec<u64> = caches
+        .iter()
+        .filter(|c| c.last_accessed_at < cutoff)
+        .map(|c| c.id)
+        .collect();
+
+    let mut active: Vec<&ActionsArtifact> = artifacts.iter().filter(|a| !a.expired).collect();
+    active.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut ranks: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut delete_artifacts = Vec::new();
+    for art in active {
+        let rank = ranks.entry(art.name.as_str()).or_insert(0);
+        *rank += 1;
+        let is_read_later = READ_LATER_ARTIFACTS.contains(&art.name.as_str());
+        if art.created_at < cutoff || (!is_read_later && *rank > keep && art.created_at < settled) {
+            delete_artifacts.push(art.id);
+        }
+    }
+    delete_artifacts.sort_unstable();
+
+    Ok(ActionsTidyPlan {
+        delete_caches,
+        delete_artifacts,
+    })
+}
