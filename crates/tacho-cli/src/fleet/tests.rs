@@ -1964,37 +1964,43 @@ fn cli_forge_plugin_parses_paginated_iso8601_actions_caches_and_artifacts_and_de
 }
 
 #[test]
-fn load_shot_rules_auto_discovers_worktree_layout_and_detect_last_ci_change_sha_queries_git() {
+fn load_shot_rules_requires_explicit_rules_file_and_detect_last_ci_change_sha_queries_git() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("frontend/admin/screenshots")).unwrap();
     std::fs::create_dir_all(root.join("frontend/admin/src/screens")).unwrap();
     std::fs::create_dir_all(root.join("frontend/android/docs/screenshots")).unwrap();
 
+    // Without `.tachoproof/shot-rules.json`, `load_shot_rules` does not guess from layout.
+    let empty_rules = super::train::load_shot_rules(root);
+    assert!(empty_rules.area_roots.is_empty());
+    assert!(empty_rules.shot_dirs.is_empty());
+    assert!(empty_rules.screen_dirs.is_empty());
+
+    // When `.tachoproof/shot-rules.json` is present, `load_shot_rules` loads it faithfully.
+    std::fs::create_dir_all(root.join(".tachoproof")).unwrap();
+    std::fs::write(
+        root.join(".tachoproof/shot-rules.json"),
+        r#"{
+            "area_roots": [["console", "frontend/admin/"], ["android", "frontend/android/"]],
+            "shot_dirs": [["console", "frontend/admin/screenshots/"], ["android", "frontend/android/docs/screenshots/"]],
+            "generated_prefixes": ["frontend/admin/screenshots/", "frontend/android/docs/"],
+            "screen_dirs": {"console": "frontend/admin/src/screens"}
+        }"#,
+    )
+    .unwrap();
     let rules = super::train::load_shot_rules(root);
-    assert!(
-        rules
-            .area_roots
-            .contains(&("console".to_string(), "frontend/admin/".to_string())),
-        "expected console area root, got: {:?}",
-        rules.area_roots
-    );
-    assert!(
-        rules.shot_dirs.contains(&(
-            "console".to_string(),
-            "frontend/admin/screenshots/".to_string()
-        )),
-        "expected console shot_dir, got: {:?}",
-        rules.shot_dirs
-    );
-    assert!(
-        rules.shot_dirs.contains(&(
-            "android".to_string(),
-            "frontend/android/docs/screenshots/".to_string()
-        )),
-        "expected android shot_dir, got: {:?}",
-        rules.shot_dirs
-    );
+    assert!(rules
+        .area_roots
+        .contains(&("console".to_string(), "frontend/admin/".to_string())));
+    assert!(rules.shot_dirs.contains(&(
+        "console".to_string(),
+        "frontend/admin/screenshots/".to_string()
+    )));
+    assert!(rules.shot_dirs.contains(&(
+        "android".to_string(),
+        "frontend/android/docs/screenshots/".to_string()
+    )));
     assert_eq!(
         rules.screen_dirs.get("console").map(String::as_str),
         Some("frontend/admin/src/screens")

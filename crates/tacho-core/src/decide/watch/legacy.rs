@@ -290,8 +290,7 @@ pub fn verdict(samples: &[ProgressSample], now: i64) -> (Verdict, i64) {
     for pair in samples.windows(2) {
         let a = &pair[0];
         let b = &pair[1];
-        if b.log_bytes.saturating_sub(a.log_bytes) >= 64
-            || b.head_sha != a.head_sha
+        if b.head_sha != a.head_sha
             || b.dirty_files != a.dirty_files
             || matches!((a.newest_mtime, b.newest_mtime), (Some(x), Some(y)) if y > x)
         {

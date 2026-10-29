@@ -15,6 +15,14 @@ fn tacho_bin() -> String {
     env!("CARGO_BIN_EXE_tacho").to_string()
 }
 
+fn tacho_cmd() -> Command {
+    let mut cmd = Command::new(tacho_bin());
+    cmd.env("TACHO_TEST_MODE", "1")
+        .env_remove("TACHO_NOTIFY")
+        .env_remove("TACHO_ROOT_PRUNE");
+    cmd
+}
+
 /// Blocks until process `pid` exits, woken by its pidfd. Returns at once if
 /// the process is already gone.
 fn wait_pid_exit(pid: u32) {
@@ -100,7 +108,7 @@ fn test_kit_start_prove_and_pr_preflight() {
         .unwrap();
 
     // 1. Run `tacho start feat-alpha`
-    let out = Command::new(tacho_bin())
+    let out = tacho_cmd()
         .args([
             "start",
             "feat-alpha",
@@ -125,7 +133,7 @@ fn test_kit_start_prove_and_pr_preflight() {
     // Idempotency: re-running `tacho start feat-alpha` reuses the exact same port block
     let st1 = store.load().unwrap();
     let p1 = st1.worktrees.get("feat-alpha").unwrap().port;
-    let out2 = Command::new(tacho_bin())
+    let out2 = tacho_cmd()
         .args(["start", "feat-alpha", "--dir", wt_root.to_str().unwrap()])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -154,7 +162,7 @@ fn test_kit_start_prove_and_pr_preflight() {
         .unwrap();
 
     // 3. `tacho pr --dry-run` BEFORE `tacho prove` must be refused
-    let pr_before_prove = Command::new(tacho_bin())
+    let pr_before_prove = tacho_cmd()
         .args([
             "pr",
             "Update README documentation",
@@ -174,7 +182,7 @@ fn test_kit_start_prove_and_pr_preflight() {
     );
 
     // 4. Run `tacho prove`
-    let prove_out = Command::new(tacho_bin())
+    let prove_out = tacho_cmd()
         .args(["prove"])
         .current_dir(&wt_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -188,7 +196,7 @@ fn test_kit_start_prove_and_pr_preflight() {
     assert!(wt_dir.join(".tachoproof/summary.json").is_file());
 
     // 5. `tacho pr --dry-run` now succeeds and prints the Proof table
-    let pr_ok = Command::new(tacho_bin())
+    let pr_ok = tacho_cmd()
         .args([
             "pr",
             "Update README documentation",
@@ -211,7 +219,7 @@ fn test_kit_start_prove_and_pr_preflight() {
 
     // 6. Dirtying a tracked file invalidates the proof tree and causes `tacho pr` to refuse
     fs::write(wt_dir.join("README.md"), "# Dirty after prove\n").unwrap();
-    let pr_dirty = Command::new(tacho_bin())
+    let pr_dirty = tacho_cmd()
         .args([
             "pr",
             "Update README documentation",
@@ -240,7 +248,7 @@ fn test_kit_job_wait_and_kill() {
     init_git_repo(&repo_dir);
 
     // 1. Short job name `db` (2 chars) is accepted and `tacho wait` streams all output
-    let job_out = Command::new(tacho_bin())
+    let job_out = tacho_cmd()
         .args(["job", "db", "--", "bash", "-c", "echo hello-job && exit 0"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -252,7 +260,7 @@ fn test_kit_job_wait_and_kill() {
         String::from_utf8_lossy(&job_out.stderr)
     );
 
-    let wait_out = Command::new(tacho_bin())
+    let wait_out = tacho_cmd()
         .args(["wait", "db", "--timeout", "10"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -267,7 +275,7 @@ fn test_kit_job_wait_and_kill() {
     assert!(String::from_utf8_lossy(&wait_out.stdout).contains("hello-job"));
 
     // 2. Long-running job returns exit code 3 on timeout, and `tacho kill` terminates its process group
-    let bg_out = Command::new(tacho_bin())
+    let bg_out = tacho_cmd()
         .args(["job", "srv", "--", "sleep", "60"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -280,7 +288,7 @@ fn test_kit_job_wait_and_kill() {
         String::from_utf8_lossy(&bg_out.stderr)
     );
 
-    let wait_timeout = Command::new(tacho_bin())
+    let wait_timeout = tacho_cmd()
         .args(["wait", "srv", "--timeout", "1"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -288,7 +296,7 @@ fn test_kit_job_wait_and_kill() {
         .unwrap();
     assert_eq!(wait_timeout.status.code(), Some(3));
 
-    let kill_out = Command::new(tacho_bin())
+    let kill_out = tacho_cmd()
         .args(["kill", "srv", "--now"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -317,7 +325,7 @@ fn test_hook_guardrails_opt_in_and_passive_default() {
     .to_string();
 
     // 1. Default mode (without TACHO_GUARDRAILS=1) is 100% passive: exits 0 and prints nothing to stdout
-    let mut child_passive = Command::new(tacho_bin())
+    let mut child_passive = tacho_cmd()
         .args(["hook", "claude"])
         .env("TACHO_HOME", &tacho_home)
         .env_remove("TACHO_GUARDRAILS")
@@ -355,7 +363,7 @@ fn test_hook_guardrails_opt_in_and_passive_default() {
             "tool_input": { "command": "git commit --no-verify -m 'wip'" }
         }),
     ] {
-        let mut child = Command::new(tacho_bin())
+        let mut child = tacho_cmd()
             .args(["hook", "claude"])
             .env("TACHO_HOME", &tacho_home)
             .env("TACHO_GUARDRAILS", "1")
@@ -385,7 +393,7 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
     let main_sha = init_git_repo(&repo_dir);
 
     // 1. Queue a compare task (`--compare sonnet,codex`) and verify expansion
-    let todo_out = Command::new(tacho_bin())
+    let todo_out = tacho_cmd()
         .args([
             "todo",
             "opt-cache",
@@ -451,7 +459,7 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
         flake_marker.display(),
         flake_marker.display()
     );
-    let batch_flake = Command::new(tacho_bin())
+    let batch_flake = tacho_cmd()
         .args(["batch", "10", "--cmd", &flake_cmd])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -478,7 +486,7 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
             st.batches.clear();
         })
         .unwrap();
-    let batch_bisect = Command::new(tacho_bin())
+    let batch_bisect = tacho_cmd()
         .args(["batch", "10", "11", "--cmd", bisect_cmd])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -508,7 +516,7 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
         .id
         .clone();
 
-    let train_out = Command::new(tacho_bin())
+    let train_out = tacho_cmd()
         .args(["train", "--from-batch", &green_batch_id])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -521,7 +529,7 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
         String::from_utf8_lossy(&train_out.stderr)
     );
 
-    let land_out = Command::new(tacho_bin())
+    let land_out = tacho_cmd()
         .args(["land"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -537,7 +545,7 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
 
     // 6. Export a Perfetto trace (`tacho trace`) and verify non-empty valid snapshot
     let trace_path = tmp.path().join("fleet.perfetto-trace");
-    let trace_out = Command::new(tacho_bin())
+    let trace_out = tacho_cmd()
         .args(["trace", "-o", trace_path.to_str().unwrap()])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -565,7 +573,7 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
     let main_sha = init_git_repo(&repo_dir);
 
     // 1. Start a worktree and make uncommitted edits, then verify `tacho tidy --min-age 0` rescues it to `refs/tacho/rescue/...`
-    let start_out = Command::new(tacho_bin())
+    let start_out = tacho_cmd()
         .args([
             "start",
             "dirty-wt",
@@ -587,7 +595,7 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
     let wt_dir = wt_root.join("dirty-wt");
     fs::write(wt_dir.join("uncommitted.txt"), "precious work\n").unwrap();
 
-    let tidy_out = Command::new(tacho_bin())
+    let tidy_out = tacho_cmd()
         .args(["tidy", "--min-age", "0"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -610,7 +618,7 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
     );
 
     // 2. Queue a task, run `tacho tick` with a mock `TACHO_AGENT_CMD` that prints `PR: #42`, then run `tacho tick` again to reap it
-    let todo_out = Command::new(tacho_bin())
+    let todo_out = tacho_cmd()
         .args([
             "todo",
             "auto-task",
@@ -629,7 +637,7 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
         String::from_utf8_lossy(&todo_out.stderr)
     );
 
-    let tick1 = Command::new(tacho_bin())
+    let tick1 = tacho_cmd()
         .args(["tick"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -658,7 +666,7 @@ fn test_fleet_tick_dispatch_reap_land_mismatch_and_tidy_rescue() {
     let log = fs::read_to_string(&log_file)
         .unwrap_or_else(|e| panic!("read {}: {e}", log_file.display()));
     assert!(log.contains("PR: #42"), "agent log lacks PR line:\n{log}");
-    let tick2 = Command::new(tacho_bin())
+    let tick2 = tacho_cmd()
         .args(["tick"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -693,7 +701,7 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
     let main_sha = init_git_repo(&repo_dir);
 
     // 1. `tacho start` strictly refuses an unresolvable PR number or revision without falling back to HEAD
-    let bad_pr_start = Command::new(tacho_bin())
+    let bad_pr_start = tacho_cmd()
         .args([
             "start",
             "bad-pr-wt",
@@ -711,7 +719,7 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
         "tacho start with non-existent PR base must fail rather than falling back to HEAD"
     );
 
-    let bad_rev_start = Command::new(tacho_bin())
+    let bad_rev_start = tacho_cmd()
         .args([
             "start",
             "bad-rev-wt",
@@ -727,7 +735,7 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
     assert!(!bad_rev_start.status.success());
 
     // 2. `tacho start` runs per-agent database setup plugin (`TACHO_DB_UP_CMD`) and writes DATABASE_URL into `.tachoenv`
-    let db_start = Command::new(tacho_bin())
+    let db_start = tacho_cmd()
         .args([
             "start",
             "db-wt",
@@ -792,7 +800,7 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
         .unwrap();
     drop(store);
 
-    let tell_out = Command::new(tacho_bin())
+    let tell_out = tacho_cmd()
         .args(["tell", "live-worker", "Please also add a migration test"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -817,7 +825,7 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
         "tool_input": { "file_path": "README.md" }
     })
     .to_string();
-    let mut hook_child = Command::new(tacho_bin())
+    let mut hook_child = tacho_cmd()
         .args(["hook", "claude"])
         .env("TACHO_HOME", &tacho_home)
         .env("TACHO_AGENT", "live-worker")
@@ -869,7 +877,7 @@ fn test_strict_start_base_db_plugin_live_tell_and_batch_head_moved() {
 
     // While the batch command runs, advance branch feat-77 to simulate a force-push mid-batch
     let move_head_cmd = "git commit --allow-empty -m 'moved head' && git branch -f feat-77 HEAD";
-    let batch_moved = Command::new(tacho_bin())
+    let batch_moved = tacho_cmd()
         .args(["batch", "77", "--cmd", move_head_cmd])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -967,7 +975,7 @@ fn test_status_sections_staleness_needs_and_scrubber() {
         .unwrap();
 
     // 1. Full JSON status (`tacho status --json`) includes version=1, all sections, and scrubs secrets
-    let status_json_out = Command::new(tacho_bin())
+    let status_json_out = tacho_cmd()
         .args(["status", "--json"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1010,7 +1018,7 @@ fn test_status_sections_staleness_needs_and_scrubber() {
     assert_eq!(parsed["flakes"].as_array().unwrap().len(), 1);
 
     // 2. Filtered `--section` JSON and human output
-    let sec_json_out = Command::new(tacho_bin())
+    let sec_json_out = tacho_cmd()
         .args([
             "status",
             "--json",
@@ -1038,7 +1046,7 @@ fn test_status_sections_staleness_needs_and_scrubber() {
     assert!(sec_parsed.get("pipeline").is_none());
 
     // 3. `tacho needs` subcommand alias and human text status
-    let needs_out = Command::new(tacho_bin())
+    let needs_out = tacho_cmd()
         .args(["needs"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1057,7 +1065,7 @@ fn test_status_sections_staleness_needs_and_scrubber() {
     );
     assert!(needs_txt.contains("worker-no-pr"), "stdout: {needs_txt}");
 
-    let status_txt_out = Command::new(tacho_bin())
+    let status_txt_out = tacho_cmd()
         .args(["status"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1078,7 +1086,7 @@ fn test_status_sections_staleness_needs_and_scrubber() {
     assert!(status_txt.to_ascii_lowercase().contains("machine:"));
 
     // 4. Unknown `--section` exits with code 2
-    let bad_sec = Command::new(tacho_bin())
+    let bad_sec = tacho_cmd()
         .args(["status", "--section", "nonexistent_section"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1096,7 +1104,7 @@ fn test_status_sections_staleness_needs_and_scrubber() {
         serde_json::to_string(&stale_snap).unwrap(),
     )
     .unwrap();
-    let stale_out = Command::new(tacho_bin())
+    let stale_out = tacho_cmd()
         .args(["status"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1117,7 +1125,7 @@ fn test_hook_guard_subcommand_and_cpu_burners() {
     let tacho_home = tmp.path().join("tacho-home");
 
     let run_guard = |payload: serde_json::Value| -> (Option<i32>, String) {
-        let mut child = Command::new(tacho_bin())
+        let mut child = tacho_cmd()
             .args(["hook", "guard"])
             .env("TACHO_HOME", &tacho_home)
             .stdin(Stdio::piped())
@@ -1188,7 +1196,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     let main_sha = init_git_repo(&repo_dir);
 
     // 1. `tacho version` and `tacho version --json`
-    let ver_out = Command::new(tacho_bin())
+    let ver_out = tacho_cmd()
         .args(["version", "--json"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1205,7 +1213,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     assert!(ver_json["rule"].as_str().unwrap().contains("Auto-updates"));
 
     // 2. `tacho setup --dry-run` and `tacho setup`
-    let setup_dry = Command::new(tacho_bin())
+    let setup_dry = tacho_cmd()
         .args(["setup", "--dry-run"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1219,7 +1227,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     );
     assert!(!tacho_home.join("fleet.env").exists());
 
-    let setup_real = Command::new(tacho_bin())
+    let setup_real = tacho_cmd()
         .args(["setup"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1234,7 +1242,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     assert!(tacho_home.join("fleet.env").is_file());
 
     // 3. `tacho db <name> [checkout]` and `tacho db <name> --rm`
-    let db_up = Command::new(tacho_bin())
+    let db_up = tacho_cmd()
         .args(["db", "feat-db", repo_dir.to_str().unwrap()])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1249,7 +1257,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     let env_txt = fs::read_to_string(repo_dir.join(".tachoenv")).unwrap();
     assert!(env_txt.contains("DATABASE_URL=postgres://"));
 
-    let db_rm = Command::new(tacho_bin())
+    let db_rm = tacho_cmd()
         .args(["db", "feat-db", repo_dir.to_str().unwrap(), "--rm"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1265,7 +1273,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     assert!(!env_after_rm.contains("DATABASE_URL="));
 
     // 4. `tacho session` fleet-wide default configuration and `--clear`
-    let sess_set = Command::new(tacho_bin())
+    let sess_set = tacho_cmd()
         .args([
             "session",
             "--provider",
@@ -1294,7 +1302,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     );
     assert_eq!(st_sess.default_effort.as_deref(), Some("high"));
 
-    let sess_clear = Command::new(tacho_bin())
+    let sess_clear = tacho_cmd()
         .args(["session", "--clear"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1311,7 +1319,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     assert!(st_cleared.default_model.is_none());
 
     // 5. `tacho todo`, `tacho hold --why`, `tacho retire --why`, and `tacho todo --retired`
-    let todo_add = Command::new(tacho_bin())
+    let todo_add = tacho_cmd()
         .args(["todo", "task-retire", "Refactor metrics"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1324,7 +1332,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         String::from_utf8_lossy(&todo_add.stderr)
     );
 
-    let hold_why = Command::new(tacho_bin())
+    let hold_why = tacho_cmd()
         .args(["hold", "task-retire", "--why", "waiting on upstream API"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1341,7 +1349,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         "waiting on upstream API"
     );
 
-    let retire_why = Command::new(tacho_bin())
+    let retire_why = tacho_cmd()
         .args(["retire", "task-retire", "--why", "obsolete"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1354,7 +1362,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         String::from_utf8_lossy(&retire_why.stderr)
     );
 
-    let todo_retired = Command::new(tacho_bin())
+    let todo_retired = tacho_cmd()
         .args(["todo", "--retired", "--json"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1370,7 +1378,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     assert!(retired_list.contains(&"task-retire".to_string()));
 
     // 6. `tacho events --since 1h -n 5` and invalid `--since` exit code 2
-    let ev_ok = Command::new(tacho_bin())
+    let ev_ok = tacho_cmd()
         .args(["events", "--since", "1h", "-n", "5", "--json"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1385,7 +1393,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     let ev_arr: Vec<serde_json::Value> = serde_json::from_slice(&ev_ok.stdout).unwrap();
     assert!(!ev_arr.is_empty() && ev_arr.len() <= 5);
 
-    let ev_bad = Command::new(tacho_bin())
+    let ev_bad = tacho_cmd()
         .args(["events", "--since", "not-a-duration"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1394,7 +1402,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     assert_eq!(ev_bad.status.code(), Some(2));
 
     // 7. `tacho tidy --stale-runs` validation (`0` -> exit 2) and retiring old abandoned runs
-    let tidy_bad = Command::new(tacho_bin())
+    let tidy_bad = tacho_cmd()
         .args(["tidy", "--stale-runs", "0"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1465,7 +1473,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         })
         .unwrap();
 
-    let tidy_stale = Command::new(tacho_bin())
+    let tidy_stale = tacho_cmd()
         .args(["tidy", "--stale-runs", "7"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1480,7 +1488,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     assert!(store.load().unwrap().retired.contains("ancient-run"));
 
     // 8. `tacho train [prs]... --max`, `tacho land [train] --dry-run`, `tacho release-train [pr] --approve`, and `tacho decide-replay`
-    let train_pos = Command::new(tacho_bin())
+    let train_pos = tacho_cmd()
         .args(["train", "88", "--max", "1"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1492,7 +1500,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         String::from_utf8_lossy(&train_pos.stderr)
     );
 
-    let land_pos = Command::new(tacho_bin())
+    let land_pos = tacho_cmd()
         .args(["land", "t001", "--dry-run"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1504,7 +1512,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
         String::from_utf8_lossy(&land_pos.stderr)
     );
 
-    let rel_train = Command::new(tacho_bin())
+    let rel_train = tacho_cmd()
         .args(["release-train", "88", "--approve"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)
@@ -1518,7 +1526,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
     );
     assert_eq!(store.load().unwrap().train_pr.unwrap().number, Some(88));
 
-    let decide_replay = Command::new(tacho_bin())
+    let decide_replay = tacho_cmd()
         .args(["decide-replay", "b088", "--cmd", "true", "--dry-run"])
         .current_dir(&repo_dir)
         .env("TACHO_HOME", &tacho_home)

@@ -32,7 +32,10 @@ impl TestSandbox {
         let mut c = Command::new(&self.tacho_bin);
         c.env("TACHO_HOME", &self.home)
             .env("TACHO_RUNTIME", &self.runtime)
-            .env("TACHO_BIN", &self.tacho_bin);
+            .env("TACHO_BIN", &self.tacho_bin)
+            .env("TACHO_TEST_MODE", "1")
+            .env_remove("TACHO_NOTIFY")
+            .env_remove("TACHO_ROOT_PRUNE");
         c
     }
 }

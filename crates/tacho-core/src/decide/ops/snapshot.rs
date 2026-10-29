@@ -26,6 +26,49 @@ pub const SECTIONS: &[&str] = &[
     "updated_at",
 ];
 
+/// Extracts literal secret values (`>= 4` chars) from configured environment/config variables
+/// whose names contain `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `KEY`, `WEBHOOK`, `AUTH`,
+/// `CREDENTIAL`, or `PRIVATE` (excluding path/port/issue metadata keys unless `WEBHOOK` is present).
+pub fn configured_secrets(env_map: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in env_map {
+        let trimmed = v.trim();
+        if trimmed.chars().count() < 4 {
+            continue;
+        }
+        let up = k.to_ascii_uppercase();
+        let has_secret_word = [
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "KEY",
+            "WEBHOOK",
+            "AUTH",
+            "CREDENTIAL",
+            "PRIVATE",
+        ]
+        .iter()
+        .any(|w| up.contains(w));
+        if !has_secret_word {
+            continue;
+        }
+        let is_non_secret_suffix = [
+            "_FILE", "_PATH", "_DIR", "_ISSUE", "_PORT", "_MODE", "_CMD", "_BIN",
+        ]
+        .iter()
+        .any(|suf| up.ends_with(suf))
+            || (up.ends_with("_URL") && !up.contains("WEBHOOK"));
+        if is_non_secret_suffix {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    out.dedup();
+    out
+}
+
 /// Scrubs secret patterns (`crate::scrub::Scrubber`) and replaces any literal of length >= 4
 /// with `[REDACTED]` (R52).
 pub fn redact_text(value: &str, literals: &[String]) -> String {

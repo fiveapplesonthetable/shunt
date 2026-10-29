@@ -26,6 +26,7 @@ struct ScrubberPatterns {
     gitlab_token: Regex,
     netrc_password: Regex,
     url_userinfo: Regex,
+    query_param: Regex,
     header_dquoted: Regex,
     header_squoted: Regex,
     header_unquoted: Regex,
@@ -104,6 +105,10 @@ static PATTERNS: LazyLock<ScrubberPatterns> = LazyLock::new(|| {
     .unwrap(),
     url_userinfo: Regex::new(r"([a-zA-Z][a-zA-Z0-9+.-]*://)(?:[^:@\s/]+(?::[^@\s/]*)?@)")
         .unwrap(),
+    query_param: Regex::new(
+        r#"(?i)([?&](?:token|key|api_key|apikey|secret|password|passwd|auth|access_token|refresh_token|client_secret|sig|signature)=)[^&\s"'<>]+"#,
+    )
+    .unwrap(),
     header_dquoted: Regex::new(
         r#"(?i)(-H\s+|--header\s+|--header=)"(Authorization|Proxy-Authorization|Cookie|Set-Cookie|X-[a-zA-Z0-9_-]*(?:Key|Token)|[a-zA-Z0-9_-]*(?:Token|Secret|Key|Auth))\s*:\s*([^"]+)""#,
     )
@@ -347,11 +352,12 @@ impl Scrubber {
             })
             .into_owned();
 
-        // 3. URL userinfo (https://user:pass@host -> https://<redacted>@host)
+        // 3. URL userinfo (https://user:pass@host -> https://<redacted>@host) and query params
         s = p
             .url_userinfo
             .replace_all(&s, "${1}<redacted>@")
             .into_owned();
+        s = p.query_param.replace_all(&s, "${1}<redacted>").into_owned();
 
         // 4. Auth & Bearer headers
         s = p

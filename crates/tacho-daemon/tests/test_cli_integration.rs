@@ -90,7 +90,10 @@ fn test_real_cli_binary_end_to_end() {
         let mut cmd = Command::new(&tacho_bin);
         cmd.args(args)
             .env("TACHO_HOME", &home)
-            .env("TACHO_RUNTIME", &runtime);
+            .env("TACHO_RUNTIME", &runtime)
+            .env("TACHO_TEST_MODE", "1")
+            .env_remove("TACHO_NOTIFY")
+            .env_remove("TACHO_ROOT_PRUNE");
 
         if let Some(data) = stdin_data {
             cmd.stdin(Stdio::piped());

@@ -453,6 +453,12 @@ fn test_torture_concurrent_agents() {
                 }
             } else {
                 let mut cmd = Command::new(&tacho_bin);
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
                 cmd.args(["hook", "claude"])
                     .env("TACHO_HOME", &env_home)
                     .env("TACHO_RUNTIME", &env_run)
@@ -527,6 +533,12 @@ fn test_torture_concurrent_agents() {
                         "tool_response": { "exit_code": 0, "content": "premature post" }
                     });
                     let mut cmd = Command::new(&tacho_bin);
+                    cmd.env("TACHO_TEST_MODE", "1")
+                        .env_remove("TACHO_NOTIFY")
+                        .env_remove("TACHO_ROOT_PRUNE");
+                    cmd.env("TACHO_TEST_MODE", "1")
+                        .env_remove("TACHO_NOTIFY")
+                        .env_remove("TACHO_ROOT_PRUNE");
                     cmd.args(["hook", "claude"])
                         .env("TACHO_HOME", &env_home)
                         .env("TACHO_RUNTIME", &env_run)
@@ -551,6 +563,12 @@ fn test_torture_concurrent_agents() {
                     "tool_input": tool_input,
                 });
                 let mut cmd = Command::new(&tacho_bin);
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
                 cmd.args(["hook", "claude"])
                     .env("TACHO_HOME", &env_home)
                     .env("TACHO_RUNTIME", &env_run)
@@ -579,6 +597,12 @@ fn test_torture_concurrent_agents() {
                     "tool_response": { "exit_code": 0, "content": "success" }
                 });
                 let mut cmd = Command::new(&tacho_bin);
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
                 cmd.args(["hook", "claude"])
                     .env("TACHO_HOME", &env_home)
                     .env("TACHO_RUNTIME", &env_run)
@@ -597,6 +621,12 @@ fn test_torture_concurrent_agents() {
                 if chaos_variant == 2 {
                     // Duplicated PostToolUse: send post again
                     let mut cmd = Command::new(&tacho_bin);
+                    cmd.env("TACHO_TEST_MODE", "1")
+                        .env_remove("TACHO_NOTIFY")
+                        .env_remove("TACHO_ROOT_PRUNE");
+                    cmd.env("TACHO_TEST_MODE", "1")
+                        .env_remove("TACHO_NOTIFY")
+                        .env_remove("TACHO_ROOT_PRUNE");
                     cmd.args(["hook", "claude"])
                         .env("TACHO_HOME", &env_home)
                         .env("TACHO_RUNTIME", &env_run)
@@ -620,6 +650,9 @@ fn test_torture_concurrent_agents() {
                 "reason": "completed"
             });
             let mut cmd = Command::new(&tacho_bin);
+            cmd.env("TACHO_TEST_MODE", "1")
+                .env_remove("TACHO_NOTIFY")
+                .env_remove("TACHO_ROOT_PRUNE");
             cmd.args(["hook", "claude"])
                 .env("TACHO_HOME", &env_home)
                 .env("TACHO_RUNTIME", &env_run)
@@ -656,6 +689,12 @@ fn test_torture_concurrent_agents() {
                 b"not json at all\n".to_vec(),
             ] {
                 let mut cmd = Command::new(&tacho_bin);
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
+                cmd.env("TACHO_TEST_MODE", "1")
+                    .env_remove("TACHO_NOTIFY")
+                    .env_remove("TACHO_ROOT_PRUNE");
                 cmd.args(["hook", "claude"])
                     .env("TACHO_HOME", &env_home)
                     .env("TACHO_RUNTIME", &env_run)
@@ -674,6 +713,9 @@ fn test_torture_concurrent_agents() {
             // B. Invalid UTF-8 to hook CLI & socket
             let invalid_utf8 = b"\xff\xfe\xfd\x80\x81\x82\x83\x84\n";
             let mut cmd = Command::new(&tacho_bin);
+            cmd.env("TACHO_TEST_MODE", "1")
+                .env_remove("TACHO_NOTIFY")
+                .env_remove("TACHO_ROOT_PRUNE");
             cmd.args(["hook", "claude"])
                 .env("TACHO_HOME", &env_home)
                 .env("TACHO_RUNTIME", &env_run)
@@ -704,6 +746,9 @@ fn test_torture_concurrent_agents() {
                 "X".repeat(huge_size)
             );
             let mut cmd = Command::new(&tacho_bin);
+            cmd.env("TACHO_TEST_MODE", "1")
+                .env_remove("TACHO_NOTIFY")
+                .env_remove("TACHO_ROOT_PRUNE");
             cmd.args(["hook", "claude"])
                 .env("TACHO_HOME", &env_home)
                 .env("TACHO_RUNTIME", &env_run)
@@ -722,6 +767,9 @@ fn test_torture_concurrent_agents() {
             let end_huge =
                 r#"{"hook_event_name":"SessionEnd","session_id":"sess-huge","reason":"completed"}"#;
             let mut cmd = Command::new(&tacho_bin);
+            cmd.env("TACHO_TEST_MODE", "1")
+                .env_remove("TACHO_NOTIFY")
+                .env_remove("TACHO_ROOT_PRUNE");
             cmd.args(["hook", "claude"])
                 .env("TACHO_HOME", &env_home)
                 .env("TACHO_RUNTIME", &env_run)

@@ -76,13 +76,19 @@ pub trait Hands {
     }
 
     /// Delivers an owner notification (`subject`, `body`).
-    fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
-        tacho_core::decide::plugin::notify_owner_command(subject, body)
+    ///
+    /// The default implementation is inert (`Ok(false)`); only production `Hands`
+    /// implementations (`DaemonHands`, `CliHands`) invoke the external notification hook.
+    fn notify_owner(&mut self, _subject: &str, _body: &str) -> Result<bool, String> {
+        Ok(false)
     }
 
     /// Prunes unused runner Docker volumes when `/` is low on free space (`< 40 GiB`).
+    ///
+    /// The default implementation is inert (`Ok(String::new())`); only production `Hands`
+    /// implementations (`DaemonHands`, `CliHands`) invoke the root-disk prune helper.
     fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
-        prune_runner_volumes_command(None)
+        Ok(String::new())
     }
 }
 
@@ -92,12 +98,19 @@ pub const DEFAULT_ROOT_PRUNE_HELPER: &str = "/usr/local/sbin/tacho-runner-prune"
 /// Runs the root-disk runner-volume prune helper (`cmd_override`, `$TACHO_ROOT_PRUNE`, or
 /// [`DEFAULT_ROOT_PRUNE_HELPER`]) with argument `"check"`.
 pub fn prune_runner_volumes_command(cmd_override: Option<&Path>) -> Result<String, String> {
+    let in_test = tacho_core::decide::plugin::running_in_test_harness();
     let resolved = match cmd_override {
         Some(p) => Some(p.to_path_buf()),
+        None if in_test => std::env::var_os("TACHO_TEST_ROOT_PRUNE")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
         None => std::env::var_os("TACHO_ROOT_PRUNE")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from),
     };
+    if resolved.is_none() && in_test {
+        return Ok(String::new());
+    }
     let (program, args): (String, Vec<String>) = if let Some(custom) = resolved {
         if !custom.is_file() {
             return Err(format!(
@@ -687,8 +700,18 @@ fn execute_actions(
             starttime: b.starttime,
             cgroup: None,
         };
+        let burner_cwd = std::fs::read_link(format!("/proc/{}/cwd", b.pid)).ok();
         match identity::signal_verified(&id, &b.comm, libc::SIGKILL) {
             Ok(Signalled::Delivered) => {
+                if let Some(ref cwd) = burner_cwd.filter(|p| p.is_dir()) {
+                    let run_dir = cwd.join(".tachorun");
+                    let _ = std::fs::create_dir_all(&run_dir);
+                    let notice = tacho_core::decide::watch::burner_notice(
+                        1,
+                        &tacho_core::decide::watch::WatchConfig::default(),
+                    );
+                    let _ = std::fs::write(run_dir.join("TACHO-NOTICE.txt"), notice);
+                }
                 let because = format!(
                     "killed runaway burner pid={} ({}) elapsed={}s",
                     b.pid, b.comm, b.elapsed_secs

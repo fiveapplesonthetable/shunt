@@ -1161,21 +1161,7 @@ pub fn parse_gh_actions_artifacts(
     Ok(out)
 }
 
-/// Returns `true` when executing inside a test harness (`cargo test`, `nextest`, or a child
-/// process spawned by a test suite with `RUST_TEST_THREADS` / `TACHO_TEST_MODE`), so tests
-/// never invoke an ambient production `TACHO_NOTIFY` hook unless `TACHO_TEST_NOTIFY_CMD` is set.
-pub fn running_in_test_harness() -> bool {
-    if cfg!(test)
-        || std::env::var_os("TACHO_TEST_MODE").is_some()
-        || std::env::var_os("RUST_TEST_THREADS").is_some()
-        || std::env::var_os("NEXTEST").is_some()
-        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
-    {
-        return true;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
+fn is_test_binary_path(exe: &std::path::Path) -> bool {
     let in_deps = exe
         .parent()
         .and_then(|p| p.file_name())
@@ -1188,9 +1174,55 @@ pub fn running_in_test_harness() -> bool {
     in_deps && has_hash_suffix
 }
 
-/// Scrubs `subject` and `body` via [`Scrubber::enabled`] and runs `cmd_override` (or `$TACHO_NOTIFY`,
-/// or `$TACHO_TEST_NOTIFY_CMD` when [`running_in_test_harness`] is true) with `TACHO_NOTIFY_SUBJECT`
-/// and `TACHO_NOTIFY_BODY` environment variables and stdin populated with the scrubbed body.
+/// Returns `true` when executing inside a test harness (`cargo test`, `nextest`, or a child
+/// process spawned by a test suite with `RUST_TEST_THREADS` / `TACHO_TEST_MODE`), so tests
+/// never invoke an ambient production `TACHO_NOTIFY` hook unless `TACHO_TEST_NOTIFY_CMD` is set.
+pub fn running_in_test_harness() -> bool {
+    if cfg!(test)
+        || std::env::var_os("TACHO_TEST_MODE").is_some()
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
+        || std::env::var_os("CARGO_BIN_EXE_tacho").is_some()
+        || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
+    {
+        return true;
+    }
+    if std::env::current_exe().is_ok_and(|exe| is_test_binary_path(&exe)) {
+        return true;
+    }
+    let mut cur_pid = std::process::id();
+    for _ in 0..4 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur_pid}/stat")) else {
+            break;
+        };
+        let Some(rparen) = stat.rfind(')') else {
+            break;
+        };
+        let Some(ppid) = stat[rparen + 1..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            break;
+        };
+        if ppid <= 1 || ppid == cur_pid {
+            break;
+        }
+        if std::fs::read_link(format!("/proc/{ppid}/exe"))
+            .is_ok_and(|exe| is_test_binary_path(&exe))
+        {
+            return true;
+        }
+        cur_pid = ppid;
+    }
+    false
+}
+
+/// Scrubs `subject` and `body` via [`Scrubber::enabled`] (plus configured secret environment
+/// variable values) and runs `cmd_override` (or `$TACHO_NOTIFY`, or `$TACHO_TEST_NOTIFY_CMD`
+/// when [`running_in_test_harness`] is true) with `TACHO_NOTIFY_SUBJECT` and `TACHO_NOTIFY_BODY`
+/// environment variables and stdin populated with the scrubbed body.
 pub fn notify_owner_command_with(
     cmd_override: Option<&str>,
     subject: &str,
@@ -1199,12 +1231,21 @@ pub fn notify_owner_command_with(
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    let env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let extra_secrets = crate::decide::ops::snapshot::configured_secrets(&env_map);
     let scrubber = Scrubber::enabled();
-    let clean_subject = scrubber.scrub(subject);
-    let clean_body = scrubber.scrub(body);
+    let mut clean_subject = scrubber.scrub(subject);
+    let mut clean_body = scrubber.scrub(body);
+    for secret in &extra_secrets {
+        if !secret.is_empty() {
+            clean_subject = clean_subject.replace(secret, "<redacted>");
+            clean_body = clean_body.replace(secret, "<redacted>");
+        }
+    }
+    let in_test = running_in_test_harness();
     let resolved_cmd = match cmd_override {
         Some(cmd) => Some(cmd.trim().to_string()),
-        None if running_in_test_harness() => std::env::var("TACHO_TEST_NOTIFY_CMD")
+        None if in_test => std::env::var("TACHO_TEST_NOTIFY_CMD")
             .ok()
             .map(|s| s.trim().to_string()),
         None => std::env::var("TACHO_NOTIFY")
@@ -1212,6 +1253,9 @@ pub fn notify_owner_command_with(
             .map(|s| s.trim().to_string()),
     };
     let Some(cmd_str) = resolved_cmd.filter(|s| !s.is_empty()) else {
+        if !in_test {
+            eprintln!("warning: no notifier is configured (set TACHO_NOTIFY)");
+        }
         return Ok(false);
     };
 

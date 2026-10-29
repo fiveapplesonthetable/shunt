@@ -30,8 +30,8 @@ use super::start::{
     resolve_pinned_base_sha, run_provisioner_bounded, PORT_BASE, PORT_BLOCK_SIZE,
 };
 use super::starve::{
-    parse_cpu_list_str, plan_starve_slice, spawn_burner_with_lifeline, stop_registered_burner,
-    RegisteredBurner, BURNERS_PER_CPU, STARVE_MAX_SECS,
+    parse_cpu_list_str, plan_starve_slice, spawn_burner_with_lifeline, spawn_target_with_lifeline,
+    stop_registered_burner, RegisteredBurner, BURNERS_PER_CPU, STARVE_MAX_SECS,
 };
 use super::tree_of_worktree;
 
@@ -716,9 +716,15 @@ fn test_starve_registered_burner_verification_and_preemption() {
             .expect("piped stdout")
             .read_exact(&mut one_byte)
             .expect("yes must write to stdout after execve");
+        let (target, target_lifeline) =
+            spawn_target_with_lifeline(&[], &["sleep".to_string(), "30".to_string()], 30)
+                .expect("spawn target with lifeline");
+        let target_guard = BurnerReapGuard(target, Some(target_lifeline));
         let pid = guard.0.id();
         let st = proc_pid_starttime(pid).unwrap_or(0);
-        println!("BURNER_READY {pid} {st}");
+        let t_pid = target_guard.0.id();
+        let t_st = proc_pid_starttime(t_pid).unwrap_or(0);
+        println!("BURNER_READY {pid} {st} {t_pid} {t_st}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
         let mut hold = [0u8; 1];
         let _ = std::io::stdin().read(&mut hold);
@@ -777,6 +783,8 @@ fn test_starve_registered_burner_verification_and_preemption() {
     let reader = std::io::BufReader::new(stdout);
     let mut grandchild_pid: Option<u32> = None;
     let mut grandchild_st: Option<u64> = None;
+    let mut target_pid: Option<u32> = None;
+    let mut target_st: Option<u64> = None;
     for line in std::io::BufRead::lines(reader) {
         let line = line.expect("read line from runner");
         if let Some(rest) = line.strip_prefix("BURNER_READY ") {
@@ -786,29 +794,47 @@ fn test_starve_registered_burner_verification_and_preemption() {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .filter(|&st| st > 0);
+            target_pid = parts.next().and_then(|s| s.parse().ok());
+            target_st = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .filter(|&st| st > 0);
             break;
         }
     }
     let g_pid = grandchild_pid.expect("runner must report BURNER_READY pid");
+    let t_pid = target_pid.expect("runner must report target pid");
     assert!(
         pid_alive_with_starttime(g_pid, grandchild_st),
         "grandchild burner must be alive before parent SIGKILL"
     );
+    assert!(
+        pid_alive_with_starttime(t_pid, target_st),
+        "grandchild target must be alive before parent SIGKILL"
+    );
 
     let mut watcher = super::FdEventWatcher::new().unwrap();
     let _ = watcher.register_pid(g_pid);
+    let _ = watcher.register_pid(t_pid);
 
-    // SIGKILL the runner parent directly so only PR_SET_PDEATHSIG can terminate g_pid
+    // SIGKILL the runner parent directly so only the stdin lifeline can terminate g_pid and t_pid
     let _ = runner.kill();
     let _ = runner.wait();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while pid_alive_with_starttime(g_pid, grandchild_st) && std::time::Instant::now() < deadline {
+    while (pid_alive_with_starttime(g_pid, grandchild_st)
+        || pid_alive_with_starttime(t_pid, target_st))
+        && std::time::Instant::now() < deadline
+    {
         watcher.wait_ms(50);
     }
     if pid_alive_with_starttime(g_pid, grandchild_st) {
         let _ = super::procs::signal_group_and_leader(g_pid, libc::SIGKILL);
-        panic!("grandchild burner pid {g_pid} survived parent SIGKILL despite PR_SET_PDEATHSIG");
+        panic!("grandchild burner pid {g_pid} survived parent SIGKILL despite lifeline");
+    }
+    if pid_alive_with_starttime(t_pid, target_st) {
+        let _ = super::procs::signal_group_and_leader(t_pid, libc::SIGKILL);
+        panic!("grandchild target pid {t_pid} survived parent SIGKILL despite lifeline");
     }
 
     let leaked: Vec<u32> = tacho_daemon::exec::observe::scan_procs()

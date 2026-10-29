@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use tacho_core::decide::dispatch::{PullFacts, TodoItem};
@@ -411,39 +411,13 @@ pub fn assemble_train(
     }
 
     let tree_sha = crate::kit::tree_of_worktree(cwd).unwrap_or_else(|_| base_sha.clone());
-    let ci_sha = detect_last_ci_change_sha(cwd, &base_sha);
-    let main_ci_state = tacho_core::decide::land::MainCi {
-        sha: state
-            .main_ci
-            .as_ref()
-            .map(|m| m.sha.clone())
-            .unwrap_or_default(),
-        ok: state
-            .main_ci
-            .as_ref()
-            .is_some_and(|m| m.conclusion.eq_ignore_ascii_case("success")),
-    };
-    let all_areas_set: BTreeSet<String> = state.area_rules.iter().map(|r| r.area.clone()).collect();
-    let extra_proof_areas = tacho_core::decide::land::ci_proof_areas(
-        ci_sha.as_deref(),
-        &main_ci_state,
-        |anc, desc| {
-            Command::new("git")
-                .args(["merge-base", "--is-ancestor", anc, desc])
-                .current_dir(cwd)
-                .status()
-                .is_ok_and(|s| s.success())
-        },
-        &all_areas_set,
-        "gate",
-    );
     let synth_batch = BatchRun {
         id: format!("b{:03}", state.batches.len() + 1),
         group: "train".to_string(),
         prs: accepted_prs.clone(),
         shas,
         main_sha: base_sha.clone(),
-        areas: extra_proof_areas.iter().cloned().collect(),
+        areas: Vec::new(),
         checks: Vec::new(),
         mode: BatchMode::Presubmit,
         status: "passed".to_string(),
@@ -473,7 +447,7 @@ pub fn assemble_train(
     if opts.run_batch {
         execute_batch_with(BatchOptions {
             prs: train.prs.clone(),
-            areas: (!extra_proof_areas.is_empty()).then(|| extra_proof_areas.into_iter().collect()),
+            areas: None,
             origin: BatchOrigin::Train,
             foreground: true,
             ..Default::default()
@@ -1072,8 +1046,7 @@ pub fn detect_last_ci_change_sha(cwd: &Path, main_ref: &str) -> Option<String> {
 }
 
 /// Loads project [`ShotRules`] from `$TACHO_SHOT_RULES_FILE`, `.tachoproof/shot-rules.json`,
-/// or `tacho-shots.json` in `cwd`, auto-discovering screenshot directories from the worktree
-/// layout when no explicit file is present.
+/// or `tacho-shots.json` in `cwd`, returning [`ShotRules::default`] when no rules file is present.
 pub fn load_shot_rules(cwd: &Path) -> ShotRules {
     if let Ok(env_path) = std::env::var("TACHO_SHOT_RULES_FILE") {
         if let Ok(raw) = std::fs::read_to_string(env_path.trim()) {
@@ -1089,58 +1062,7 @@ pub fn load_shot_rules(cwd: &Path) -> ShotRules {
             }
         }
     }
-
-    let mut rules = ShotRules::default();
-    for parent_rel in ["frontend", "apps"] {
-        let parent_dir = cwd.join(parent_rel);
-        let Ok(entries) = std::fs::read_dir(&parent_dir) else {
-            continue;
-        };
-        let mut dir_paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        dir_paths.sort();
-        for path in dir_paths {
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let area = if dir_name == "admin" {
-                "console".to_string()
-            } else {
-                dir_name.to_string()
-            };
-            let area_root = format!("{parent_rel}/{dir_name}/");
-            let has_shots = path.join("screenshots").is_dir()
-                || path.join("screenshots.golden").is_file()
-                || path.join("docs/screenshots").is_dir()
-                || path.join("docs/screenshots.golden").is_file();
-            if !has_shots {
-                continue;
-            }
-            rules.area_roots.push((area.clone(), area_root.clone()));
-            if path.join("docs/screenshots").is_dir()
-                || path.join("docs/screenshots.golden").is_file()
-            {
-                let shot_dir = format!("{area_root}docs/screenshots/");
-                rules.shot_dirs.push((area.clone(), shot_dir));
-                rules.generated_prefixes.push(format!("{area_root}docs/"));
-            } else {
-                let shot_dir = format!("{area_root}screenshots/");
-                rules.shot_dirs.push((area.clone(), shot_dir.clone()));
-                rules.generated_prefixes.push(shot_dir);
-                if path.join("docs").is_dir() {
-                    rules.generated_prefixes.push(format!("{area_root}docs/"));
-                }
-            }
-            if path.join("src/screens").is_dir() {
-                rules
-                    .screen_dirs
-                    .insert(area.clone(), format!("{area_root}src/screens"));
-            }
-        }
-    }
-    rules
+    ShotRules::default()
 }
 
 /// Loads the set of golden screenshot paths from `.golden` manifests in `cwd`.

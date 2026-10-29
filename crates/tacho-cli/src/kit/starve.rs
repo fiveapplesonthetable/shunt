@@ -296,6 +296,56 @@ pub fn spawn_burner_with_lifeline(
     Ok((child, lifeline_tx))
 }
 
+fn target_binary_exists(prog: &str) -> bool {
+    if prog.is_empty() {
+        return false;
+    }
+    if prog.contains('/') {
+        Path::new(prog).is_file()
+    } else {
+        command_on_path(prog)
+    }
+}
+
+/// Spawns the starved target command (`target_argv`) wrapped in `wrap` inside its own process
+/// group (`pgid == pid`) with the same parent-lifeline and hard timeout monitor (`cap_secs`)
+/// as [`spawn_burner_with_lifeline`]:
+/// - If `tacho` exits or receives `SIGKILL`, the kernel immediately closes `lifeline_tx`,
+///   delivering EOF on fd 3 so `kill -KILL 0` terminates the entire target process group.
+/// - If the target runs past `cap_secs`, `read -r -t <cap_secs>` expires and `kill -KILL 0`
+///   enforces the hard cap even if the parent is frozen or gone.
+pub fn spawn_target_with_lifeline(
+    wrap: &[String],
+    target_argv: &[String],
+    timeout_secs: u64,
+) -> io::Result<(Child, std::process::ChildStdin)> {
+    let prog = target_argv.first().map(String::as_str).unwrap_or("");
+    if !target_binary_exists(prog) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("executable '{prog}' not found"),
+        ));
+    }
+    let cap_secs = timeout_secs.clamp(1, STARVE_MAX_SECS);
+    let mut cmd = Command::new("bash");
+    use_private_tmp(&mut cmd, "starve")?;
+    cmd.arg("-c")
+        .arg(format!(
+            "exec 3<&0; (read -r -t {cap_secs} _ <&3 || kill -KILL 0) >/dev/null 2>&1 & exec 3<&- \"$@\" </dev/null"
+        ))
+        .arg("tacho-starve-target")
+        .args(wrap)
+        .args(target_argv)
+        .stdin(Stdio::piped());
+    configure_burner_process(&mut cmd, timeout_secs);
+    let mut child = cmd.spawn()?;
+    let lifeline_tx = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing target piped stdin"))?;
+    Ok((child, lifeline_tx))
+}
+
 /// Executes `tacho starve [--cpus 4] [--cpu-set 0-3] [--timeout 300] -- <cmd...>`.
 pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
     if args.cmd.is_empty() {
@@ -363,25 +413,21 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
         guard.children.iter().map(|(_, r, _)| r.clone()).collect();
     save_registered_burners(&home, &reg_list)?;
 
-    // 3. Spawn the target command pinned to the same CPU slice in its own process group
-    let mut target_cmd = Command::new(&wrap[0]);
-    use_private_tmp(&mut target_cmd, "starve")?;
-    target_cmd.args(&wrap[1..]).args(&args.cmd);
-    configure_burner_process(&mut target_cmd, timeout_secs);
-
-    let mut child = match target_cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            guard.stop_all();
-            let name = args.cmd.first().map(String::as_str).unwrap_or("");
-            eprintln!("could not run {name}: {e}");
-            return Ok(127);
-        }
-        Err(e) => {
-            guard.stop_all();
-            return Err(e);
-        }
-    };
+    // 3. Spawn the target command pinned to the same CPU slice in its own process group with a lifeline cap
+    let (mut child, target_lifeline_tx) =
+        match spawn_target_with_lifeline(wrap, &args.cmd, timeout_secs) {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                guard.stop_all();
+                let name = args.cmd.first().map(String::as_str).unwrap_or("");
+                eprintln!("could not run {name}: {e}");
+                return Ok(127);
+            }
+            Err(e) => {
+                guard.stop_all();
+                return Err(e);
+            }
+        };
 
     let target_pid = child.id();
     let target_st = proc_pid_starttime(target_pid);
@@ -422,6 +468,8 @@ pub fn execute_starve(args: StarveArgs) -> io::Result<i32> {
         watcher.wait_ms(rem_ms.max(1));
     };
 
+    drop(target_lifeline_tx);
+    let _ = signal_group_and_leader(target_pid, libc::SIGKILL);
     guard.stop_all();
 
     if preempted_by_batch {

@@ -65,8 +65,6 @@ pub fn scan_procs() -> Vec<ProcEntry> {
         else {
             continue;
         };
-        let cutime = parse(13).unwrap_or(0);
-        let cstime = parse(14).unwrap_or(0);
         if pid == 2 || ppid == 2 {
             continue;
         }
@@ -95,10 +93,7 @@ pub fn scan_procs() -> Vec<ProcEntry> {
             ppid: ppid as u32,
             pgid: pgid as u32,
             state: fields[0].to_string(),
-            cpu_ticks: utime
-                .saturating_add(stime)
-                .saturating_add(cutime)
-                .saturating_add(cstime),
+            cpu_ticks: utime.saturating_add(stime),
             elapsed_secs,
             comm,
             args,

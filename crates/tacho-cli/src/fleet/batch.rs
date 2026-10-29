@@ -436,20 +436,61 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             areas.insert("workspace".to_string());
         }
     }
-    let (selected_areas, checks) = select_batch_checks_for_origin(
+    let (selected_areas, mut checks) = select_batch_checks_for_origin(
         &all_files,
         &state.area_rules,
         opts.areas.as_deref(),
         batch_mode == BatchMode::Presubmit,
         opts.origin == BatchOrigin::Train,
     );
-    let area_list: Vec<String> = if let Some(req) = opts.areas.as_ref().filter(|a| !a.is_empty()) {
-        req.to_vec()
-    } else if !selected_areas.is_empty() {
-        selected_areas
-    } else {
-        areas.into_iter().collect()
-    };
+    let mut area_list: Vec<String> =
+        if let Some(req) = opts.areas.as_ref().filter(|a| !a.is_empty()) {
+            req.to_vec()
+        } else if !selected_areas.is_empty() {
+            selected_areas
+        } else {
+            areas.into_iter().collect()
+        };
+    if opts.origin == BatchOrigin::Train {
+        let ci_sha = super::train::detect_last_ci_change_sha(&cwd, &main_sha);
+        let main_ci_state = tacho_core::decide::land::MainCi {
+            sha: state
+                .main_ci
+                .as_ref()
+                .map(|m| m.sha.clone())
+                .unwrap_or_default(),
+            ok: state
+                .main_ci
+                .as_ref()
+                .is_some_and(|m| m.conclusion.eq_ignore_ascii_case("success")),
+        };
+        let all_areas_set: BTreeSet<String> =
+            state.area_rules.iter().map(|r| r.area.clone()).collect();
+        let extra_proof_areas = tacho_core::decide::land::ci_proof_areas(
+            ci_sha.as_deref(),
+            &main_ci_state,
+            |anc, desc| {
+                Command::new("git")
+                    .args(["merge-base", "--is-ancestor", anc, desc])
+                    .current_dir(&cwd)
+                    .status()
+                    .is_ok_and(|s| s.success())
+            },
+            &all_areas_set,
+            "gate",
+        );
+        for extra in extra_proof_areas {
+            if !area_list.contains(&extra) {
+                area_list.push(extra.clone());
+            }
+            if !checks.iter().any(|c| c.area == extra) {
+                checks.push(AreaCheck {
+                    area: extra,
+                    units: Vec::new(),
+                });
+            }
+        }
+    }
 
     if let Some(reused) = reusable_batch(&state.batches, &pr_nums, &shas, &main_sha, &area_list) {
         println!(

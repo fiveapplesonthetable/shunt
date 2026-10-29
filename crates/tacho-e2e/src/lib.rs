@@ -182,7 +182,10 @@ impl TestEnv {
         cmd.env("TACHO_HOME", &self.home_dir)
             .env("TACHO_RUNTIME", &self.runtime_dir)
             .env("TACHO_BIN", &self.tacho_bin)
-            .env("TACHO_TRACE_PROCESSOR", &self.tp_bin);
+            .env("TACHO_TRACE_PROCESSOR", &self.tp_bin)
+            .env("TACHO_TEST_MODE", "1")
+            .env_remove("TACHO_NOTIFY")
+            .env_remove("TACHO_ROOT_PRUNE");
 
         // Prepend binary directory to PATH
         if let Some(parent) = self.tp_bin.parent() {

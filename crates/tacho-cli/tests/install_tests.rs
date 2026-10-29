@@ -176,7 +176,11 @@ fn test_concurrent_installs_processes() {
     let mut procs = Vec::new();
     for _ in 0..10 {
         let mut cmd = std::process::Command::new(&tacho_bin);
-        cmd.args(["install", "claude"]).current_dir(temp_dir.path());
+        cmd.args(["install", "claude"])
+            .env("TACHO_TEST_MODE", "1")
+            .env_remove("TACHO_NOTIFY")
+            .env_remove("TACHO_ROOT_PRUNE")
+            .current_dir(temp_dir.path());
         procs.push(cmd.spawn().expect("failed to spawn tacho install"));
     }
 
