@@ -451,6 +451,34 @@ fn test_pr_preflight_refuses_all_violations_and_allows_clean_proof() {
     shots_override.shots_anyway = true;
     assert!(validate_pr_preflight(&shots_override).is_empty());
 
+    // 3. Post-proof commit that only drops/updates non-golden redrawn screenshots is permitted
+    let mut non_golden_post_proof = clean_input.clone();
+    non_golden_post_proof.head_tree = "tree_after_dropping_shot".to_string();
+    let dropped_shot =
+        vec!["frontend/admin/screenshots/05-transfer-detail-waiting.png".to_string()];
+    assert!(
+        super::pr::validate_pr_preflight_with_changes(
+            &non_golden_post_proof,
+            "",
+            Some(&dropped_shot),
+            &BTreeSet::new(),
+        )
+        .is_empty(),
+        "post-proof commit touching only non-golden redrawn screenshots should be accepted"
+    );
+    // If that screenshot is in the golden set, the proof is stale:
+    let golden_set: BTreeSet<String> = dropped_shot.iter().cloned().collect();
+    let golden_errs = super::pr::validate_pr_preflight_with_changes(
+        &non_golden_post_proof,
+        "",
+        Some(&dropped_shot),
+        &golden_set,
+    );
+    assert!(
+        golden_errs.iter().any(|e| e.contains("proof is stale")),
+        "post-proof commit touching a golden screenshot must invalidate the proof: {golden_errs:?}"
+    );
+
     // 3. Robot emoji is refused
     let mut emoji_err = Vec::new();
     check_forbidden_attribution("PR body", "Done \u{1F916}", &mut emoji_err);

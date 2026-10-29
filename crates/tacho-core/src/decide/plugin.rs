@@ -729,11 +729,23 @@ impl CliForgePlugin {
     }
 
     fn run_cli(&self, args: &[String]) -> Result<String, String> {
-        let out = std::process::Command::new(&self.cli_bin)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("failed to spawn {}: {e}", self.cli_bin))?;
+        let mut attempts = 0usize;
+        let out = loop {
+            match std::process::Command::new(&self.cli_bin)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                Ok(out) => break out,
+                // On Linux, concurrent test threads calling fork+exec while a freshly created
+                // executable script's write fd is being closed can briefly yield ETXTBSY (26).
+                Err(e) if e.raw_os_error() == Some(26) && attempts < 200 => {
+                    attempts += 1;
+                    std::thread::yield_now();
+                }
+                Err(e) => return Err(format!("failed to spawn {}: {e}", self.cli_bin)),
+            }
+        };
         if !out.status.success() {
             return Err(format!(
                 "{} {:?} failed: {}",

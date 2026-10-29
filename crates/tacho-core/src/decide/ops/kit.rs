@@ -268,12 +268,37 @@ pub struct ProofRecord {
     pub checks: Vec<ProofCheckResult>,
 }
 
+/// True when a check may regenerate `path` (a screenshot PNG or comparison gallery HTML).
+pub fn is_redrawn_shot_path(path: &str) -> bool {
+    (path.ends_with(".png") && (path.contains("/screenshots/") || path.starts_with("screenshots/")))
+        || path.ends_with("/docs/comparison.html")
+        || path == "docs/comparison.html"
+}
+
+/// True when `path` is a redrawn screenshot artifact that is not in the `golden` set.
+pub fn is_droppable_shot(path: &str, golden: &BTreeSet<String>) -> bool {
+    is_redrawn_shot_path(path) && !golden.contains(path)
+}
+
 /// Why `proof` does not cover the current worktree (KP1–KP5).
 pub fn proof_problems(
     proof: Option<&ProofRecord>,
     tree: &str,
     dirty: bool,
     tool: &str,
+) -> Vec<String> {
+    proof_problems_with_changes(proof, tree, dirty, tool, None, &BTreeSet::new())
+}
+
+/// Why `proof` does not cover the current worktree, allowing post-proof commits that only
+/// touch non-golden redrawn screenshots (`tree_changes` outside `golden`).
+pub fn proof_problems_with_changes(
+    proof: Option<&ProofRecord>,
+    tree: &str,
+    dirty: bool,
+    tool: &str,
+    tree_changes: Option<&[String]>,
+    golden: &BTreeSet<String>,
 ) -> Vec<String> {
     let Some(proof) = proof else {
         return vec![format!("there is no proof. Run: {tool} prove")];
@@ -295,7 +320,10 @@ pub fn proof_problems(
             "there are uncommitted changes. Commit them, then run: {tool} prove"
         ));
     }
-    if proof.tree != tree {
+    let changed_only_in_dropped_shots = tree_changes.is_some_and(|changes| {
+        !changes.is_empty() && changes.iter().all(|p| is_droppable_shot(p, golden))
+    });
+    if proof.tree != tree && !changed_only_in_dropped_shots {
         out.push(format!(
             "the proof is older than the last commit: the files differ from the ones `{tool} prove` ran on. Run: {tool} prove"
         ));
@@ -324,6 +352,35 @@ pub fn check_environment(
     if check.name == "conservative checks" && !gradle_slot.is_empty() {
         env.insert(gradle_slot_var.to_string(), gradle_slot.to_string());
     }
+    env
+}
+
+/// Like [`check_environment`], also isolating Gradle daemons in `<run_dir>/gradle-daemons` via `GRADLE_OPTS`.
+pub fn check_environment_in_dir(
+    check: &ProofCheck,
+    inherited: &BTreeMap<String, String>,
+    rust_cache: &BTreeMap<String, String>,
+    gradle_slot: &str,
+    gradle_slot_var: &str,
+    base: &str,
+    run_dir: &str,
+) -> BTreeMap<String, String> {
+    let mut env = check_environment(
+        check,
+        inherited,
+        rust_cache,
+        gradle_slot,
+        gradle_slot_var,
+        base,
+    );
+    let gradle_opts = super::config::with_gradle_registry(
+        inherited
+            .get("GRADLE_OPTS")
+            .map(String::as_str)
+            .unwrap_or(""),
+        &format!("{run_dir}/gradle-daemons"),
+    );
+    env.insert("GRADLE_OPTS".to_string(), gradle_opts);
     env
 }
 
@@ -360,6 +417,36 @@ pub fn pr_refusals(
     dirty: bool,
     tool: &str,
 ) -> Vec<String> {
+    pr_refusals_with_changes(
+        files,
+        commits,
+        title,
+        description,
+        merges,
+        proof,
+        tree,
+        dirty,
+        tool,
+        None,
+        &BTreeSet::new(),
+    )
+}
+
+/// Like [`pr_refusals`], allowing post-proof commits that only touch non-golden redrawn screenshots.
+#[allow(clippy::too_many_arguments)]
+pub fn pr_refusals_with_changes(
+    files: &[String],
+    commits: &[(String, String)],
+    title: &str,
+    description: &str,
+    merges: &[String],
+    proof: Option<&ProofRecord>,
+    tree: &str,
+    dirty: bool,
+    tool: &str,
+    tree_changes: Option<&[String]>,
+    golden: &BTreeSet<String>,
+) -> Vec<String> {
     let mut out = Vec::new();
     if title.trim().is_empty() || description.trim().is_empty() {
         out.push(format!(
@@ -389,7 +476,14 @@ pub fn pr_refusals(
             "the title or description carries {what}. Remove it"
         ));
     }
-    out.extend(proof_problems(proof, tree, dirty, tool));
+    out.extend(proof_problems_with_changes(
+        proof,
+        tree,
+        dirty,
+        tool,
+        tree_changes,
+        golden,
+    ));
     out
 }
 

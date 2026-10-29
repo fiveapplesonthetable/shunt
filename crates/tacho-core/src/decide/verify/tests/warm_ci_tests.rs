@@ -330,6 +330,51 @@ jobs:
         plan.env.get("RUSTC_WRAPPER").map(String::as_str),
         Some("sccache")
     );
+    assert_eq!(
+        plan.env.get("GRADLE_OPTS").map(String::as_str),
+        Some("-Dorg.gradle.daemon.registry.base=/var/cache/ci/gradle-daemons/warm-android-1")
+    );
+
+    // Two android runs with distinct scope units never share a Gradle daemon registry:
+    let plan2 = host_job_plan(
+        &job,
+        "android",
+        "warm-android-2",
+        "/tmp/wt",
+        "/var/cache/ci",
+        &[2, 3],
+        2,
+        true,
+        true,
+        &cfg,
+    );
+    assert_ne!(plan.env.get("GRADLE_OPTS"), plan2.env.get("GRADLE_OPTS"));
+
+    // Console host job names TACHO_CAPTURE_CONTAINER and removes it on cleanup:
+    let console_plan = host_job_plan(
+        &job,
+        "console",
+        "warm-console-1",
+        "/tmp/wt",
+        "/var/cache/ci",
+        &[2, 3],
+        2,
+        true,
+        true,
+        &cfg,
+    );
+    assert_eq!(
+        console_plan
+            .env
+            .get("TACHO_CAPTURE_CONTAINER")
+            .map(String::as_str),
+        Some("warm-console-1-shots")
+    );
+    assert!(console_plan
+        .argv
+        .last()
+        .unwrap()
+        .contains("docker rm -f \"$TACHO_CAPTURE_CONTAINER\""));
 }
 
 // --- Cases 163–178: test_kit.py & test_jobs.py (202–213) & test_waits_end_on_facts.py (195–201) ---

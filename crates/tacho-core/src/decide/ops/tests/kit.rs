@@ -61,6 +61,45 @@ fn kp1_to_kp7_proof_problems_and_check_environment() {
     // KP5: proof of exact tree stands
     assert!(proof_problems(Some(&ok), "T", false, "tacho").is_empty());
 
+    // Proof covers a commit that only drops redrawn non-golden screenshots
+    let non_golden_shot = vec!["frontend/admin/screenshots/05-transfer-detail-waiting.png".into()];
+    assert!(proof_problems_with_changes(
+        Some(&ok),
+        "OTHER",
+        false,
+        "tacho",
+        Some(&non_golden_shot),
+        &BTreeSet::new()
+    )
+    .is_empty());
+
+    // Proof does NOT cover a commit that changes source files
+    let source_change = vec!["crates/tacho-core/src/lib.rs".into()];
+    assert!(proof_problems_with_changes(
+        Some(&ok),
+        "OTHER",
+        false,
+        "tacho",
+        Some(&source_change),
+        &BTreeSet::new()
+    )[0]
+    .contains("older than the last commit"));
+
+    // Proof does NOT cover a commit that drops a moved golden screenshot
+    let golden_shot: BTreeSet<String> = ["frontend/admin/screenshots/01-signin.png".into()]
+        .into_iter()
+        .collect();
+    let golden_vec: Vec<String> = golden_shot.iter().cloned().collect();
+    assert!(proof_problems_with_changes(
+        Some(&ok),
+        "OTHER",
+        false,
+        "tacho",
+        Some(&golden_vec),
+        &golden_shot
+    )[0]
+    .contains("older than the last commit"));
+
     // KP6 & KP7: check_environment adds rust_cache to cargo/conservative and gradle_slot to conservative only
     let mut inherited = BTreeMap::new();
     inherited.insert("PATH".into(), "/bin".into());
@@ -111,16 +150,21 @@ fn kp1_to_kp7_proof_problems_and_check_environment() {
         Some("gradle-slot")
     );
 
-    // KP8: every check is told the base the change is proved against
-    let env3 = check_environment(
+    // KP8: every check is told the base the change is proved against, and keeps Gradle daemons in its own directory
+    let env3 = check_environment_in_dir(
         &cons_check,
         &inherited,
         &BTreeMap::new(),
         "",
         "TACHO_GRADLE_SLOT",
         "abc123",
+        "/wt/.tachoproof",
     );
     assert_eq!(env3.get("TACHO_BASE").map(String::as_str), Some("abc123"));
+    assert_eq!(
+        env3.get("GRADLE_OPTS").map(String::as_str),
+        Some("-Dorg.gradle.daemon.registry.base=/wt/.tachoproof/gradle-daemons")
+    );
 }
 
 #[test]

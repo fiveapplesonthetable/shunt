@@ -521,6 +521,19 @@ pub fn run_prove_step(
     for (k, v) in env_vars {
         cmd.env(k, v);
     }
+    let inherited_gradle = env_vars
+        .get("GRADLE_OPTS")
+        .cloned()
+        .or_else(|| std::env::var("GRADLE_OPTS").ok())
+        .unwrap_or_default();
+    let proof_gradle_dir = root.join(".tachoproof/gradle-daemons");
+    cmd.env(
+        "GRADLE_OPTS",
+        tacho_core::decide::ops::config::with_gradle_registry(
+            &inherited_gradle,
+            &proof_gradle_dir.to_string_lossy(),
+        ),
+    );
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

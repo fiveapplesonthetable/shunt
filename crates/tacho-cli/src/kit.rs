@@ -209,17 +209,23 @@ pub(crate) fn private_tmp_dir(name: &str) -> io::Result<PathBuf> {
 }
 
 /// Points every temp-dir convention of a spawned agent or runner at `dir`: `TMPDIR`, `TMP`,
-/// `TEMP`, and the JVM's `java.io.tmpdir` (through `JAVA_TOOL_OPTIONS`, preserving any existing
-/// flags).
+/// `TEMP`, the JVM's `java.io.tmpdir` (through `JAVA_TOOL_OPTIONS`, preserving any existing
+/// flags), and Gradle's daemon registry (`GRADLE_OPTS`, unless one is already set).
 pub(crate) fn apply_private_tmp_env(cmd: &mut Command, dir: &Path) {
     let existing_java = std::env::var("JAVA_TOOL_OPTIONS").ok();
+    let existing_gradle = std::env::var("GRADLE_OPTS").ok();
     let dir_str = dir.to_string_lossy();
     let merged_java =
         tacho_core::decide::ops::config::merge_java_tmp_options(existing_java.as_deref(), &dir_str);
+    let merged_gradle = tacho_core::decide::ops::config::with_gradle_registry(
+        existing_gradle.as_deref().unwrap_or(""),
+        &format!("{dir_str}/gradle-daemons"),
+    );
     cmd.env("TMPDIR", dir)
         .env("TMP", dir)
         .env("TEMP", dir)
-        .env("JAVA_TOOL_OPTIONS", merged_java);
+        .env("JAVA_TOOL_OPTIONS", merged_java)
+        .env("GRADLE_OPTS", merged_gradle);
 }
 
 /// [`private_tmp_dir`] followed by [`apply_private_tmp_env`].

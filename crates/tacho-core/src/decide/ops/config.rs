@@ -451,6 +451,48 @@ pub fn merge_java_tmp_options(existing: Option<&str>, tmp_dir: &str) -> String {
     tokens.join(" ")
 }
 
+/// Property prefix used to isolate Gradle daemon registries per run or scope.
+pub const GRADLE_DAEMON_REGISTRY_PROP: &str = "-Dorg.gradle.daemon.registry.base=";
+
+/// `GRADLE_OPTS` naming `directory` as where this process's Gradle daemons register, unless it
+/// already names one.
+///
+/// Daemons share a registry by default, so a build connects to an idle daemon that another
+/// scope started, and systemd kills it when that scope stops.
+pub fn with_gradle_registry(opts: &str, directory: &str) -> String {
+    if opts.contains(GRADLE_DAEMON_REGISTRY_PROP) {
+        opts.to_string()
+    } else {
+        format!("{opts} {GRADLE_DAEMON_REGISTRY_PROP}{directory}")
+            .trim()
+            .to_string()
+    }
+}
+
+/// Returns `env` with `TMPDIR`, `TMP`, `TEMP`, `JAVA_TOOL_OPTIONS` (`-Djava.io.tmpdir=<directory>`),
+/// and `GRADLE_OPTS` (`-Dorg.gradle.daemon.registry.base=<directory>/gradle-daemons`).
+pub fn tmpdir_environment(
+    directory: &str,
+    env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = env.clone();
+    out.insert("TMPDIR".to_string(), directory.to_string());
+    out.insert("TMP".to_string(), directory.to_string());
+    out.insert("TEMP".to_string(), directory.to_string());
+    out.insert(
+        "JAVA_TOOL_OPTIONS".to_string(),
+        merge_java_tmp_options(env.get("JAVA_TOOL_OPTIONS").map(String::as_str), directory),
+    );
+    out.insert(
+        "GRADLE_OPTS".to_string(),
+        with_gradle_registry(
+            env.get("GRADLE_OPTS").map(String::as_str).unwrap_or(""),
+            &format!("{directory}/gradle-daemons"),
+        ),
+    );
+    out
+}
+
 /// Renders the systemd `50-tmp.conf` drop-in redirecting a runner service's `TMPDIR`, `TMP`,
 /// `TEMP`, and `JAVA_TOOL_OPTIONS` into `tmp_dir` off the root disk.
 pub fn runner_tmp_dropin(tmp_dir: &str) -> String {
@@ -517,6 +559,32 @@ mod tmp_and_rootdisk_tests {
         let dropin = runner_tmp_dropin("/srv/fleet/tmp/runner");
         assert!(dropin.contains("TMPDIR=/srv/fleet/tmp/runner"));
         assert!(dropin.contains("-Djava.io.tmpdir=/srv/fleet/tmp/runner"));
+
+        let env = tmpdir_environment(
+            "/t/a",
+            &BTreeMap::from([(
+                "GRADLE_OPTS".to_string(),
+                "-Dorg.gradle.workers.max=2".to_string(),
+            )]),
+        );
+        assert_eq!(
+            env.get("GRADLE_OPTS").map(String::as_str),
+            Some(
+                "-Dorg.gradle.workers.max=2 -Dorg.gradle.daemon.registry.base=/t/a/gradle-daemons"
+            )
+        );
+
+        let env_kept = tmpdir_environment(
+            "/t/b",
+            &BTreeMap::from([(
+                "GRADLE_OPTS".to_string(),
+                "-Dorg.gradle.daemon.registry.base=/t/a/gradle-daemons".to_string(),
+            )]),
+        );
+        assert_eq!(
+            env_kept.get("GRADLE_OPTS").map(String::as_str),
+            Some("-Dorg.gradle.daemon.registry.base=/t/a/gradle-daemons")
+        );
     }
 
     #[test]

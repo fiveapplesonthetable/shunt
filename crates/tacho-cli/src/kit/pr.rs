@@ -123,6 +123,17 @@ pub fn validate_pr_preflight(input: &PrPreflightInput) -> Vec<String> {
 /// Validate all PR preflight invariants plus unified diff guardrails (loosened limits,
 /// vague waits, and time-based test assertions).
 pub fn validate_pr_preflight_with_diff(input: &PrPreflightInput, diff_text: &str) -> Vec<String> {
+    validate_pr_preflight_with_changes(input, diff_text, None, &std::collections::BTreeSet::new())
+}
+
+/// Validate all PR preflight invariants, unified diff guardrails, and optional post-proof
+/// `tree_changes` (allowing commits since `prove` that only drop/update non-golden redrawn shots).
+pub fn validate_pr_preflight_with_changes(
+    input: &PrPreflightInput,
+    diff_text: &str,
+    tree_changes: Option<&[String]>,
+    golden: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     let mut errors = Vec::new();
     if !diff_text.is_empty() {
         if let Err(diff_violations) = crate::hook::check_diff_text_guardrails(diff_text) {
@@ -181,7 +192,13 @@ pub fn validate_pr_preflight_with_diff(input: &PrPreflightInput, diff_text: &str
                     "proof did not pass (failed checks: {failed:?}); fix failures and re-run 'tacho prove'"
                 ));
             }
-            if p.tree != input.head_tree {
+            let changed_only_in_dropped_shots = tree_changes.is_some_and(|changes| {
+                !changes.is_empty()
+                    && changes
+                        .iter()
+                        .all(|path| tacho_core::decide::ops::kit::is_droppable_shot(path, golden))
+            });
+            if p.tree != input.head_tree && !changed_only_in_dropped_shots {
                 errors.push(format!(
                     "proof is stale: proof tree {} does not match current worktree tree {}; run 'tacho prove' again",
                     &p.tree[..p.tree.len().min(12)],
@@ -432,6 +449,61 @@ pub fn execute_pr(args: PrArgs) -> io::Result<()> {
     let full_diff_text = String::from_utf8_lossy(&full_diff_out.stdout).to_string();
 
     let body_desc = args.message;
+    let tree_changes: Option<Vec<String>> = proof.as_ref().and_then(|p| {
+        if p.tree.trim().is_empty() {
+            return None;
+        }
+        let out = Command::new("git")
+            .args(["diff", "--no-renames", "--name-only", &p.tree, &head_tree])
+            .current_dir(&root)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !is_internal_tacho_path(s))
+                .map(String::from)
+                .collect(),
+        )
+    });
+    let shot_rules = crate::fleet::train::load_shot_rules(&root);
+    let mut golden_set = crate::fleet::train::load_worktree_golden_set(&root, &shot_rules);
+    if let Some(ref p) = proof {
+        if !p.tree.trim().is_empty() {
+            let mut golden_files = Vec::new();
+            for (_, d) in &shot_rules.shot_dirs {
+                let base = d.trim_end_matches('/');
+                golden_files.push(format!("{base}.golden"));
+                golden_files.push(format!("{base}/.golden"));
+            }
+            for extra in [
+                "screenshots.golden",
+                "screenshots/.golden",
+                "shots.golden",
+                "shots/.golden",
+            ] {
+                if !golden_files.contains(&extra.to_string()) {
+                    golden_files.push(extra.to_string());
+                }
+            }
+            let proof_goldens = tacho_core::decide::land::golden_names(&golden_files, |rel| {
+                Command::new("git")
+                    .args(["show", &format!("{}:{rel}", p.tree)])
+                    .current_dir(&root)
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default()
+            });
+            golden_set.extend(proof_goldens);
+        }
+    }
+
     let preflight_input = PrPreflightInput {
         title: args.title.clone(),
         description: body_desc.clone(),
@@ -448,7 +520,12 @@ pub fn execute_pr(args: PrArgs) -> io::Result<()> {
         shots_anyway,
     };
 
-    let errors = validate_pr_preflight_with_diff(&preflight_input, &full_diff_text);
+    let errors = validate_pr_preflight_with_changes(
+        &preflight_input,
+        &full_diff_text,
+        tree_changes.as_deref(),
+        &golden_set,
+    );
     if !errors.is_empty() {
         let joined = errors.join("\n  - ");
         let because = format!("pr preflight refused: {}", errors.join("; "));

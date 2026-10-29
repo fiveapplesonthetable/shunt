@@ -66,6 +66,12 @@ pub fn compile_job_script(
         "status=$?".to_string(),
         "rm -rf \"$runner_files\"".to_string(),
     ];
+    if area == "console" && host_uid_gid.is_none() {
+        cleanup_parts.push(
+            "[ -n \"${TACHO_CAPTURE_CONTAINER:-}\" ] && docker rm -f \"$TACHO_CAPTURE_CONTAINER\" >/dev/null 2>&1 || true"
+                .to_string(),
+        );
+    }
     if let Some((uid, gid)) = host_uid_gid {
         let mut chown_paths = vec!["/w".to_string()];
         for m in writable_mounts {
@@ -265,6 +271,22 @@ pub fn host_job_plan(
     env.insert("CMAKE_BUILD_PARALLEL_LEVEL".to_string(), jobs.to_string());
     env.insert("MAKEFLAGS".to_string(), format!("-j{jobs}"));
     env.insert("VITEST_MAX_THREADS".to_string(), jobs.to_string());
+    if area == "android" {
+        let existing = env.get("GRADLE_OPTS").map(String::as_str).unwrap_or("");
+        env.insert(
+            "GRADLE_OPTS".to_string(),
+            crate::decide::ops::config::with_gradle_registry(
+                existing,
+                &format!("{cache_root}/gradle-daemons/{scope_unit}"),
+            ),
+        );
+    }
+    if area == "console" {
+        env.insert(
+            "TACHO_CAPTURE_CONTAINER".to_string(),
+            format!("{scope_unit}-shots"),
+        );
+    }
 
     HostJobPlan {
         argv,
