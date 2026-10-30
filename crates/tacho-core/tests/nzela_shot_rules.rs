@@ -15,7 +15,7 @@ fn the_project_example_preserves_screen_and_shared_code_ownership(
         (
             "frontend/admin/src/screens/Settings.tsx",
             "frontend/admin/screenshots/15-preferences.png",
-            false,
+            true,
         ),
         (
             "frontend/admin/src/screens/Providers.tsx",

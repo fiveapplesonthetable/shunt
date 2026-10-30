@@ -1695,6 +1695,7 @@ fn test_multi_tick_adversarial_simulation_across_all_concerns() {
     let mut b3 = running_batch("b-3", vec![101]);
     b3.main_sha = "main-001".to_string();
     b3.shas = BTreeMap::from([(101, "sha-101".to_string())]);
+    b3.areas = vec!["core".to_string()];
     state5.batches.push(b3);
 
     let obs5 = WorldObservation {
