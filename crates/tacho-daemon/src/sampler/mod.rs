@@ -608,6 +608,10 @@ impl ProcSampler {
                         Ok(_) => {
                             self.record_decide_success(effective_seq, now_ns);
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            self.record_decide_success(effective_seq, now_ns);
+                            self.decide_requested.store(true, Ordering::Release);
+                        }
                         Err(e) => {
                             self.record_decide_failure(effective_seq, now_ns);
                             eprintln!("[tacho-daemon] autonomous decide tick failed: {e}");

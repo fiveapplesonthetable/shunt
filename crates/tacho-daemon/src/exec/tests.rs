@@ -6,6 +6,65 @@ use tacho_core::decide::plugin::MockForge;
 use tacho_core::decide::verify::{BatchMode, BatchRun};
 use tacho_core::decide::watch::{HUNG_SECS, STALLED_SECS};
 
+#[test]
+fn a_tick_cannot_overwrite_a_batch_that_finished_during_observation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = FleetStore::open(&directory.path().join("events.sqlite")).unwrap();
+    let observed = store.load().unwrap();
+    assert!(observed.batches.is_empty());
+    let decision_state = observe::decision_state_of(&observed, 10);
+    let world = WorldObservation::default();
+    let plan = tacho_core::decide::decide(&decision_state, &world);
+    store
+        .mutate(None, |state| {
+            state.batches.push(BatchRun {
+                id: "completed-during-observation".to_string(),
+                status: "passed".to_string(),
+                tree: Some("verified-tree".to_string()),
+                ..Default::default()
+            });
+        })
+        .unwrap();
+    let result = persist_plan_state(&mut store, &observed, &decision_state, &world, &plan, 10);
+    assert!(
+        result.is_err(),
+        "a superseded tick must refuse its state update"
+    );
+    let after = store.load().unwrap();
+    assert!(after
+        .batches
+        .iter()
+        .any(|batch| batch.id == "completed-during-observation" && batch.status == "passed"));
+}
+
+#[test]
+fn a_rejected_tick_journal_write_preserves_the_observed_fleet_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("events.sqlite");
+    let mut store = FleetStore::open(&database).unwrap();
+    let before = store.load().unwrap();
+    rusqlite::Connection::open(&database).unwrap().execute_batch(
+        "CREATE TRIGGER reject_tick BEFORE INSERT ON decision_ticks BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END;"
+    ).unwrap();
+    let live = tacho_core::LiveState::default();
+    let mut hands = DaemonHands {
+        home: directory.path().to_path_buf(),
+        live_state: live.clone(),
+        appender: None,
+        launcher: None,
+    };
+    let mut options = TickOptions::new(&live);
+    options.now_override = Some(10);
+    options.explicit_main_sha = Some("main".to_string());
+    options.procs = Some(Vec::new());
+    assert!(run_tick(directory.path(), &mut store, &mut hands, options).is_err());
+    assert_eq!(
+        store.load().unwrap(),
+        before,
+        "a tick without a journal must not commit its state"
+    );
+}
+
 /// RAII guard that kills a test child process (and its process group) and reaps it on drop.
 struct ChildGuard {
     child: std::process::Child,

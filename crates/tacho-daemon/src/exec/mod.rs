@@ -447,9 +447,7 @@ pub fn run_tick(
             plan,
         });
     }
-    let tick_id = store.record_decision_tick(now, &decision_state, &world_obs, &plan)?;
-
-    persist_plan_state(store, &plan, now)?;
+    let tick_id = persist_plan_state(store, &state, &decision_state, &world_obs, &plan, now)?;
 
     let mut f = Failures {
         hands,
@@ -589,7 +587,14 @@ fn handoff_tasks(plan: &DecisionPlan, mut todo: Vec<TodoItem>, now: i64) -> Vec<
 
 /// Persists `decide`'s next state. Runs before any action so actions that mutate the store
 /// (spawns, resumes, aborts, worktree removal) are never overwritten by it.
-fn persist_plan_state(store: &mut FleetStore, plan: &DecisionPlan, now: i64) -> io::Result<()> {
+fn persist_plan_state(
+    store: &mut FleetStore,
+    observed: &FleetState,
+    decision_state: &DecisionState,
+    observation: &WorldObservation,
+    plan: &DecisionPlan,
+    now: i64,
+) -> io::Result<i64> {
     let next = &plan.next_state;
     let mut todo = plan.dispatched_tasks.clone();
     for item in handoff_tasks(plan, next.todo.clone(), now) {
@@ -598,7 +603,7 @@ fn persist_plan_state(store: &mut FleetStore, plan: &DecisionPlan, now: i64) -> 
         }
     }
     let reaped = !plan.reaped_agents.is_empty();
-    store.mutate(None, |st| {
+    store.commit_tick(observed, now, (decision_state, observation, plan), |st| {
         st.todo = todo;
         st.agents = next.agents.clone();
         if reaped {
