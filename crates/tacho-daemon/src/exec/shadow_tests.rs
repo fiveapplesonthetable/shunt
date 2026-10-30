@@ -29,6 +29,33 @@ impl Hands for RecordingHands {
 }
 
 #[test]
+fn forge_observation_uses_the_configured_workflow_file() -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let mut store = FleetStore::open(&home.path().join("events.sqlite"))?;
+    store.save(&FleetState {
+        max_workers: 0,
+        workflow_path: Some(".github/workflows/ci.yaml".into()),
+        ..Default::default()
+    })?;
+    let forge = MockForge::default();
+    let live = tacho_core::LiveState::default();
+    let mut hands = RecordingHands::default();
+    let mut options = TickOptions::new(&live);
+    options.dry_run = true;
+    options.explicit_main_sha = Some("main".into());
+    options.procs = Some(Vec::new());
+    options.forge = Some(&forge);
+    run_tick(home.path(), &mut store, &mut hands, options)?;
+    let requests = forge
+        .ci_requests
+        .lock()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    assert_eq!(*requests, vec![("main".into(), "ci.yaml".into())]);
+    assert_eq!(hands.effects, 0);
+    Ok(())
+}
+
+#[test]
 fn dry_run_uses_fresh_forge_heads_without_persisting_or_executing(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let home = tempfile::tempdir()?;

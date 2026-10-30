@@ -31,6 +31,8 @@ mode and every required project hook is configured.
 | Root prune respects running work | `supervise_tick.py:watch_root_disk` | `exec/mod.rs`, configured prune helper | `test_root_disk_check_in_tick_warns_and_prunes_volumes_and_clears_on_recovery`; install and verify the project helper |
 | Screenshot owners and golden lists | `shots.py` | `examples/nzela-shots.json`, `decide/land/shots.rs` | `the_project_example_preserves_screen_and_shared_code_ownership`; external comparison over 1,461 tracked PNGs in 40 source/golden scenarios |
 | Fresh observation without execution | world adapters and pure plan | `exec/mod.rs`, `exec/observe.rs` | `dry_run_uses_fresh_forge_heads_without_persisting_or_executing`, `a_dry_run_refuses_failed_observations_without_recording_them` |
+| Main CI uses the configured workflow | workflow configuration | `exec/observe.rs` | `forge_observation_uses_the_configured_workflow_file`; set `workflow_path` to the project's workflow file |
+| Fresh pull observations preserve check selection | PR files from the forge | `decide/plugin.rs` | `an_open_pull_observation_preserves_the_files_that_select_its_checks`, `a_partial_forge_file_list_cannot_select_an_incomplete_proof` |
 
 The screenshot example is project configuration. Copy it to `tacho-shots.json`
 in the project worktree. The no-pixel filename pattern is currently built into

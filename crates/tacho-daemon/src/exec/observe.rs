@@ -1080,10 +1080,16 @@ pub fn refresh_world(
             },
         };
 
+    let workflow = state
+        .workflow_path
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("CI");
     let new_ci =
         match env_json::<tacho_core::decide::ops::snapshot::MainCiRun>("TACHO_MAIN_CI_JSON") {
             Some(ci) => Some(Some(ci)),
-            None => match forge.main_ci_run("main", "CI", &mut runner) {
+            None => match forge.main_ci_run("main", workflow, &mut runner) {
                 Ok(ci) => Some(ci),
                 Err(e) => {
                     let msg = format!("forge {} main_ci refresh failed: {e}", forge.forge_name());

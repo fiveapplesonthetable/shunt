@@ -56,7 +56,8 @@ fn next_recommends_only_a_current_complete_batch_proof() {
         compute_next_instruction(&valid, &BTreeSet::new(), 100),
         "ask the owner to land PR #20"
     );
-    let mutations: &[(&str, fn(&mut FleetState))] = &[
+    type Mutation = (&'static str, fn(&mut FleetState));
+    let mutations: &[Mutation] = &[
         ("head moved", |s| {
             for p in &mut s.open_prs_cache {
                 p.head = "new".into();
