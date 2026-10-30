@@ -105,6 +105,16 @@ pub struct CliHands {
 }
 
 impl tacho_daemon::exec::Hands for CliHands {
+    fn spawn_batch(
+        &mut self,
+        store: &mut FleetStore,
+        plan: &tacho_core::decide::verify::BatchPlan,
+        main_sha: &str,
+        repo: &std::path::Path,
+    ) -> io::Result<Option<u32>> {
+        super::batch::spawn_planned_batch(store, plan, main_sha, repo)
+    }
+
     fn spawn_worker(&mut self, store: &mut FleetStore, item: &TodoItem) -> io::Result<Option<u32>> {
         spawn_worker_for_item(store, item).map(Some)
     }

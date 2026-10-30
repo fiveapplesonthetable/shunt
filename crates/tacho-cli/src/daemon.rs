@@ -9,6 +9,16 @@ use crate::paths::{ensure_dir_0700, resolve_home, resolve_runtime};
 struct ProcessLauncher;
 
 impl tacho_daemon::exec::Launcher for ProcessLauncher {
+    fn spawn_batch(
+        &self,
+        store: &mut tacho_daemon::FleetStore,
+        plan: &tacho_core::decide::verify::BatchPlan,
+        main_sha: &str,
+        repo: &std::path::Path,
+    ) -> std::io::Result<Option<u32>> {
+        crate::fleet::batch::spawn_planned_batch(store, plan, main_sha, repo)
+    }
+
     fn spawn_worker(
         &self,
         store: &mut tacho_daemon::FleetStore,
