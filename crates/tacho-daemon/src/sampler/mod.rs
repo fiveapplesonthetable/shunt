@@ -106,6 +106,7 @@ pub struct ProcSampler {
     worktree_states: HashMap<String, WorktreeSnapshot>,
     cgroup_enabled: bool,
     dry_run: bool,
+    launcher: Option<std::sync::Arc<dyn crate::exec::Launcher>>,
     worktree_scan_secs: u64,
     home_dir: Option<std::path::PathBuf>,
     fleet_store: Option<crate::fleet::FleetStore>,
@@ -153,6 +154,7 @@ impl ProcSampler {
             worktree_states: HashMap::new(),
             cgroup_enabled: true,
             dry_run: false,
+            launcher: None,
             worktree_scan_secs: 30,
             home_dir: None,
             fleet_store: None,
@@ -164,6 +166,11 @@ impl ProcSampler {
             decide_forge: None,
             decide_requested: std::sync::Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sets the process launcher used by autonomous ticks.
+    pub fn set_launcher(&mut self, launcher: Option<std::sync::Arc<dyn crate::exec::Launcher>>) {
+        self.launcher = launcher;
     }
 
     /// Sets whether cgroup accounting is enabled.
@@ -570,10 +577,12 @@ impl ProcSampler {
                     }
                 }
                 if let Some(ref mut store) = self.fleet_store {
+                    store.attach_appender(appender.clone());
                     let mut hands = crate::fleet::DaemonHands {
                         home: home_dir.clone(),
                         live_state: (*latest_live).clone(),
                         appender: Some(appender.clone()),
+                        launcher: self.launcher.clone(),
                     };
                     let gh_forge = if self.decide_forge.is_none() {
                         std::env::var("TACHO_GH_REPO")
