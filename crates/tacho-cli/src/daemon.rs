@@ -15,13 +15,8 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
     ensure_dir_0700(&runtime).map_err(|e| e.to_string())?;
 
     let paths = DaemonPaths::custom(&home, &runtime).map_err(|e| e.to_string())?;
-    let mut config = Config::load_or_default(&paths.config_file()).unwrap_or_else(|e| {
-        eprintln!(
-            "[tacho-daemon] ignoring invalid config {}: {e}; using defaults",
-            paths.config_file().display()
-        );
-        Config::default()
-    });
+    let mut config = Config::load_or_default(&paths.config_file()).map_err(|e| e.to_string())?;
+    config.sampler.dry_run |= args.dry_run;
 
     if let Some(otlp) = args.otlp {
         config.otlp_addr = Some(otlp);

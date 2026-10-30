@@ -166,6 +166,18 @@ fn sql_err(e: rusqlite::Error) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+fn state_error(error: serde_json::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "invalid fleet state ({:?}, line {}, column {})",
+            error.classify(),
+            error.line(),
+            error.column()
+        ),
+    )
+}
+
 /// Alias for [`FleetStore`] sharing `$TACHO_HOME/events.sqlite`.
 pub type FleetDb = FleetStore;
 
@@ -307,7 +319,7 @@ impl FleetStore {
             .optional()
             .map_err(sql_err)?;
         match raw {
-            Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            Some(json) => serde_json::from_str(&json).map_err(state_error),
             None => Ok(FleetState::default()),
         }
     }
@@ -315,7 +327,7 @@ impl FleetStore {
     /// Saves the updated [`FleetState`] atomically to SQLite.
     pub fn save(&self, state: &FleetState) -> io::Result<()> {
         let now = now_secs();
-        let json = serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string(state).map_err(io::Error::other)?;
         self.conn.execute(
             "INSERT INTO fleet_state (id, updated_at, state_json)
              VALUES (1, ?1, ?2)
@@ -347,12 +359,13 @@ impl FleetStore {
             )
             .optional()
             .map_err(sql_err)?;
-        let mut state: FleetState = raw
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let mut state: FleetState = match raw {
+            Some(json) => serde_json::from_str(&json).map_err(state_error)?,
+            None => FleetState::default(),
+        };
         let result = f(&mut state);
         let now = now_secs();
-        let json = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string(&state).map_err(io::Error::other)?;
         tx.execute(
             "INSERT INTO fleet_state (id, updated_at, state_json)
              VALUES (1, ?1, ?2)
@@ -1101,6 +1114,10 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "fleet_state_tests.rs"]
+mod state_integrity_tests;
 
 #[cfg(test)]
 mod tests {

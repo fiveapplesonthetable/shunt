@@ -73,7 +73,11 @@ impl Daemon {
             failing_repeats: config.detectors.failing_count,
         });
 
-        let on_stall = config.detectors.on_stall.clone();
+        let on_stall = if config.sampler.dry_run {
+            None
+        } else {
+            config.detectors.on_stall.clone()
+        };
         let on_stall_timeout = Duration::from_secs(config.detectors.on_stall_timeout_secs);
 
         // Fallible setup that needs no threads happens first, so an error here cannot leak
@@ -117,6 +121,7 @@ impl Daemon {
             lock,
             appender.clone(),
             shutdown_flag.clone(),
+            config.sampler.dry_run,
         ) {
             Ok(server) => server,
             Err(e) => {
@@ -139,12 +144,16 @@ impl Daemon {
 
         // 6. Spawn retention maintenance thread (hourly small-batch prune)
         let (retention_wake_tx, retention_wake_rx) = crossbeam_channel::bounded::<()>(1);
-        let retention_thread = spawn_retention_thread(
-            config.retention_days,
-            paths.clone(),
-            shutdown_flag.clone(),
-            retention_wake_rx,
-        );
+        let retention_thread = if config.sampler.dry_run {
+            None
+        } else {
+            Some(spawn_retention_thread(
+                config.retention_days,
+                paths.clone(),
+                shutdown_flag.clone(),
+                retention_wake_rx,
+            ))
+        };
 
         // 7. Register SIGINT / SIGTERM signal handler
         let (signal_handle, signal_thread) =
@@ -203,7 +212,7 @@ impl Daemon {
             otlp_shutdown_fds,
             sampler_thread: Some(sampler_thread),
             sampler_waker,
-            retention_thread: Some(retention_thread),
+            retention_thread,
             appender_thread: Some(appender_thread),
             signal_thread,
         })
@@ -275,6 +284,10 @@ impl Drop for Daemon {
         self.stop();
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_shadow_tests.rs"]
+mod shadow_tests;
 
 /// Joins a daemon thread, reporting a panic instead of discarding it.
 fn join_logged(name: &str, handle: JoinHandle<()>) {
