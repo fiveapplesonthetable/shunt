@@ -17,6 +17,7 @@ mode and every required project hook is configured.
 | Only owned runaway burners are stopped | `supervise.py:burners` | `exec/observe.rs`, `exec/identity.rs` | `case_41_unrelated_host_burner_outside_agent_trees_work_root_and_cgroups_is_ignored`; executor attribution is also required |
 | Worker slots can explicitly be zero | `dispatch.py`, `plan.py` | `decide/mod.rs` | `zero_worker_slots_never_dispatch_queued_work` |
 | Invalid persisted state preserves limits and holds | state reader | `fleet.rs` | `corrupt_state_is_refused_without_reopening_worker_slots`, `a_mutation_never_replaces_corrupt_state_or_runs_its_action` |
+| A tick preserves concurrent results and journals its state atomically | state transaction | `fleet.rs:commit_tick`, `exec/mod.rs` | `a_tick_cannot_overwrite_a_batch_that_finished_during_observation`, `a_rejected_tick_journal_write_preserves_the_observed_fleet_state` |
 | Current proof identity gates readiness | `plan.py:still_ready` | `decide/land/legacy.rs`, `fleet/dispatch.rs` | `next_recommends_only_a_current_complete_batch_proof` |
 | Batch checks use the proposed tree | `premerge.py`, `trainrun.py` | `fleet/batch/checkout.rs` | `a_batch_checks_the_proposed_tree_and_preserves_the_main_checkout`, `a_green_main_checkout_cannot_certify_a_broken_proposed_tree`, `a_check_cannot_certify_a_tree_it_replaces_after_running` |
 | Conflicting drafts need rebasing | next-step planner | `fleet/dispatch.rs` | `next_rebases_a_conflicting_draft_before_verification` |

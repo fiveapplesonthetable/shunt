@@ -84,6 +84,80 @@ fn init_git_repo(dir: &Path) -> String {
 }
 
 #[test]
+fn a_cancelled_job_stops_a_descendant_that_started_a_new_session() {
+    cancelled_session_case(false, false);
+}
+
+#[test]
+fn cancellation_escalates_a_detached_child_after_its_parent_exits() {
+    cancelled_session_case(true, false);
+}
+
+#[test]
+fn immediate_cancellation_stops_a_detached_child() {
+    cancelled_session_case(true, true);
+}
+
+fn cancelled_session_case(ignore_term: bool, now: bool) {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let repo = temporary.path().join("repo");
+    let home = temporary.path().join("home");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo);
+    let socket = temporary.path().join("child.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let script = repo.join("check.py");
+    fs::write(&script, format!("import os,signal,socket,subprocess,sys\nif len(sys.argv)>2:\n if {ignore_term}: signal.signal(signal.SIGTERM,signal.SIG_IGN)\n s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall((str(os.getpid())+'\\n').encode());s.recv(1)\nelse:\n subprocess.run([sys.executable,__file__,sys.argv[1],'child'],start_new_session=True,check=True)\n", ignore_term=if ignore_term { "True" } else { "False" })).unwrap();
+    let started = tacho_cmd()
+        .args(["job", "detached-check", "--", "python3"])
+        .arg(&script)
+        .arg(&socket)
+        .current_dir(&repo)
+        .env("TACHO_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let (stream, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let child: u32 = line.trim().parse().unwrap();
+    let mut command = tacho_cmd();
+    command.args(["kill", "detached-check"]);
+    if now {
+        command.arg("--now");
+    }
+    let stopped = command
+        .current_dir(&repo)
+        .env("TACHO_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        !Path::new(&format!("/proc/{child}")).exists()
+            || tacho_daemon::sampler::is_process_zombie(child),
+        "the cancelled check still owns a live process in another session"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join(".tachorun/detached-check.exit"))
+            .unwrap()
+            .trim(),
+        if now || ignore_term { "137" } else { "143" }
+    );
+}
+
+#[test]
 fn the_daemon_starts_a_queued_worker_in_its_allocated_worktree() {
     daemon_worker_case(false);
 }

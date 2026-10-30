@@ -5,6 +5,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -129,6 +130,159 @@ pub fn signal_group_and_leader(pid: u32, sig: libc::c_int) -> io::Result<()> {
     send_signal(-(pid as i32), sig)?;
     send_signal(pid as i32, sig)?;
     Ok(())
+}
+
+struct JobProcess {
+    pid: u32,
+    starttime: u64,
+    fd: OwnedFd,
+}
+
+impl JobProcess {
+    fn open(pid: u32, starttime: u64) -> io::Result<Option<Self>> {
+        // Pin the identity before rechecking /proc so PID reuse cannot redirect a signal.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw < 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        Ok(pid_alive_with_starttime(pid, Some(starttime)).then_some(Self { pid, starttime, fd }))
+    }
+
+    fn alive(&self) -> bool {
+        pid_alive_with_starttime(self.pid, Some(self.starttime))
+    }
+
+    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+struct StoppedJobTree(Vec<JobProcess>);
+
+impl Drop for StoppedJobTree {
+    fn drop(&mut self) {
+        for process in self.0.iter().rev() {
+            let _ = process.signal(libc::SIGCONT);
+        }
+    }
+}
+
+fn stop_job_tree(pid: u32, starttime: u64) -> io::Result<StoppedJobTree> {
+    let mut tree = StoppedJobTree(Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let watcher = FdEventWatcher::new()?;
+    let mut pending = vec![pid];
+    while let Some(child) = pending.pop() {
+        if tree.0.iter().any(|process| process.pid == child) {
+            continue;
+        }
+        let Some(identity) = (if child == pid {
+            Some(starttime)
+        } else {
+            proc_pid_starttime(child)
+        }) else {
+            continue;
+        };
+        let Some(process) = JobProcess::open(child, identity)? else {
+            continue;
+        };
+        // Parents remain stopped while descendants are discovered, including new sessions.
+        // A disappearing/reused child must still have a stopped parent in this tree.
+        if child != pid {
+            let parent = tacho_daemon::sampler::read_process_ppid(child);
+            if !tree
+                .0
+                .iter()
+                .any(|process| Some(process.pid) == parent && process.alive())
+            {
+                continue;
+            }
+        }
+        tree.0.push(process);
+        let process = tree.0.last().unwrap();
+        process.signal(libc::SIGSTOP)?;
+        while process.alive() {
+            let stopped = fs::read_to_string(format!("/proc/{child}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rfind(')')
+                        .map(|end| stat[end + 1..].trim_start().starts_with(['T', 't']))
+                })
+                .unwrap_or(false);
+            if stopped {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "job tree did not stop for cancellation",
+                ));
+            }
+            watcher.wait_ms(1);
+        }
+        // Every thread can have children; the /proc scan includes their process-wide PPIDs.
+        pending.extend(
+            tacho_daemon::sampler::find_process_tree(child)
+                .into_iter()
+                .filter(|descendant| {
+                    tacho_daemon::sampler::read_process_ppid(*descendant) == Some(child)
+                }),
+        );
+    }
+    Ok(tree)
+}
+
+fn wait_for_job_tree(tree: &StoppedJobTree, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let mut pending: Vec<libc::pollfd> = tree
+            .0
+            .iter()
+            .filter(|process| process.alive())
+            .map(|process| libc::pollfd {
+                fd: process.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let result = unsafe {
+            libc::poll(
+                pending.as_mut_ptr(),
+                pending.len() as libc::nfds_t,
+                remaining.as_millis().min(200) as i32,
+            )
+        };
+        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::last_os_error());
+        }
+    }
 }
 
 /// Check whether `pid` is alive, `/proc/<pid>/stat` is readable, and not a zombie (`state != 'Z'`).
@@ -553,24 +707,27 @@ pub fn execute_kill(args: KillArgs) -> io::Result<()> {
     } else {
         libc::SIGTERM
     };
-    signal_group_and_leader(pid, sig)?;
+    let tree = stop_job_tree(pid, actual_st.unwrap())?;
+    for process in tree.0.iter().rev() {
+        process.signal(sig)?;
+        process.signal(libc::SIGCONT)?;
+    }
 
     let mut escalated = args.now;
     if !args.now {
-        let mut watcher = FdEventWatcher::new()?;
-        let _ = watcher.register_pid(pid);
         let grace_deadline = Instant::now() + Duration::from_secs(5);
-        while pid_alive_with_starttime(pid, actual_st) && Instant::now() < grace_deadline {
-            let rem_ms = grace_deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .min(200) as i32;
-            watcher.wait_ms(rem_ms.max(1));
-        }
-        if pid_alive_with_starttime(pid, actual_st) {
+        if !wait_for_job_tree(&tree, grace_deadline)? {
             escalated = true;
-            signal_group_and_leader(pid, libc::SIGKILL)?;
+            for process in tree.0.iter().rev() {
+                process.signal(libc::SIGKILL)?;
+            }
         }
+    }
+    if !wait_for_job_tree(&tree, Instant::now() + Duration::from_secs(1))? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "cancelled job still has a live descendant",
+        ));
     }
 
     let exit_code = if escalated { 137 } else { 143 };

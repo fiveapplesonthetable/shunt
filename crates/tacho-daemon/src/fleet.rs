@@ -684,6 +684,40 @@ impl FleetStore {
         res
     }
 
+    /// Commits a tick's journal and state only while its observed fleet state is still current.
+    pub fn commit_tick<F>(
+        &mut self,
+        observed: &FleetState,
+        ts: i64,
+        record: (&DecisionState, &WorldObservation, &DecisionPlan),
+        update: F,
+    ) -> io::Result<i64>
+    where
+        F: FnOnce(&mut FleetState),
+    {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(sql_err)?;
+        let result = (|| {
+            let mut current = self.load()?;
+            if &current != observed {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "fleet state changed during observation; no actions executed",
+                ));
+            }
+            update(&mut current);
+            self.save(&current)?;
+            let id = self.record_decision_tick(ts, record.0, record.1, record.2)?;
+            self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+            Ok(id)
+        })();
+        if result.is_err() && !self.conn.is_autocommit() {
+            self.conn.execute_batch("ROLLBACK").map_err(sql_err)?;
+        }
+        result
+    }
+
     /// Records a complete orchestrator decision tick with both its input state and its output plan
     /// into `decision_ticks` so the tick can be deterministically replayed offline.
     pub fn record_decision_tick(
