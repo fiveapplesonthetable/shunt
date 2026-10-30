@@ -160,6 +160,7 @@ impl Default for FleetState {
 pub struct FleetStore {
     conn: Connection,
     home: std::path::PathBuf,
+    appender: Option<crate::appender::AppenderHandle>,
 }
 
 fn sql_err(e: rusqlite::Error) -> io::Error {
@@ -299,7 +300,16 @@ impl FleetStore {
         }
 
         let home = db_path.parent().map(Path::to_path_buf).unwrap_or_default();
-        Ok(Self { conn, home })
+        Ok(Self {
+            conn,
+            home,
+            appender: None,
+        })
+    }
+
+    /// Routes trace inputs through the daemon's sequence allocator.
+    pub fn attach_appender(&mut self, appender: crate::appender::AppenderHandle) {
+        self.appender = Some(appender);
     }
 
     /// Directory containing this store's database (`$TACHO_HOME`).
@@ -458,6 +468,34 @@ impl FleetStore {
         because: &str,
         ts_ns: u64,
     ) -> io::Result<()> {
+        if let Some(appender) = &self.appender {
+            let input = if let Some(slug) = track_key
+                .strip_prefix("task:")
+                .and_then(|s| s.strip_suffix("/state"))
+            {
+                tacho_core::Input::TaskState {
+                    source_ts_ns: Some(ts_ns),
+                    slug: slug.to_string(),
+                    state: status,
+                    because: Some(because.to_string()),
+                }
+            } else {
+                tacho_core::Input::Custom {
+                    source_ts_ns: Some(ts_ns),
+                    track: track_key.to_string(),
+                    op: tacho_core::CustomOp::State,
+                    name: Some(label.to_string()),
+                    id: None,
+                    args: BTreeMap::from([("because".to_string(), because.to_string())]),
+                    value: None,
+                    flow_out: None,
+                    flow_in: None,
+                }
+            };
+            return appender
+                .send_input(input, ts_ns)
+                .map_err(|error| io::Error::other(error.to_string()));
+        }
         let proto_state: tacho::TaskStatus = status.into();
         let ev_body = tacho::Event {
             body: Some(tacho::event::Body::TaskState(tacho::TaskState {
@@ -529,6 +567,34 @@ impl FleetStore {
         end_ts_ns: u64,
         because: &str,
     ) -> io::Result<()> {
+        if let Some(appender) = &self.appender {
+            let end = end_ts_ns.max(start_ts_ns.saturating_add(1_000_000));
+            let inputs = [
+                (tacho_core::CustomOp::Begin, start_ts_ns),
+                (tacho_core::CustomOp::End, end),
+            ]
+            .into_iter()
+            .map(|(op, ts)| {
+                (
+                    tacho_core::Input::Custom {
+                        source_ts_ns: Some(ts),
+                        track: track_key.to_string(),
+                        op,
+                        name: Some(name.to_string()),
+                        id: None,
+                        args: BTreeMap::from([("because".to_string(), because.to_string())]),
+                        value: None,
+                        flow_out: None,
+                        flow_in: None,
+                    },
+                    ts,
+                )
+            })
+            .collect();
+            return appender
+                .send_input_batch(inputs)
+                .map_err(|error| io::Error::other(error.to_string()));
+        }
         let begin_body = tacho::Event {
             body: Some(tacho::event::Body::Custom(tacho::Custom {
                 name: Some(name.chars().take(128).collect()),
@@ -952,22 +1018,20 @@ pub fn deliver_tell_message(
     store.record_decision("dispatch", "tell", agent_key, msg)
 }
 
-/// The daemon's [`Hands`](crate::exec::Hands): it cannot start provider sessions (dispatched
-/// items stay queued for `tacho tick`), delivers tells through the inbox, and emits trace
-/// events through the appender when one is attached.
+/// Executes daemon actions through its launcher, inbox and attached trace appender.
 pub struct DaemonHands {
     pub home: std::path::PathBuf,
     pub live_state: tacho_core::LiveState,
     pub appender: Option<crate::appender::AppenderHandle>,
+    pub launcher: Option<std::sync::Arc<dyn crate::exec::Launcher>>,
 }
 
 impl crate::exec::Hands for DaemonHands {
-    fn spawn_worker(
-        &mut self,
-        _store: &mut FleetStore,
-        _item: &TodoItem,
-    ) -> io::Result<Option<u32>> {
-        Ok(None)
+    fn spawn_worker(&mut self, store: &mut FleetStore, item: &TodoItem) -> io::Result<Option<u32>> {
+        self.launcher
+            .as_ref()
+            .map(|launcher| launcher.spawn_worker(store, item))
+            .transpose()
     }
 
     fn deliver_tell(
@@ -1059,11 +1123,27 @@ pub fn execute_decide_tick(
     explicit_main_sha: Option<String>,
     dry_run: bool,
 ) -> io::Result<(Option<i64>, DecisionState, WorldObservation, DecisionPlan)> {
+    execute_decide_tick_with_launcher(home_dir, live_state, explicit_main_sha, dry_run, None, None)
+}
+
+/// Executes a tick with the same process launcher and appender as the sampler.
+pub fn execute_decide_tick_with_launcher(
+    home_dir: &Path,
+    live_state: &tacho_core::LiveState,
+    explicit_main_sha: Option<String>,
+    dry_run: bool,
+    launcher: Option<std::sync::Arc<dyn crate::exec::Launcher>>,
+    appender: Option<crate::appender::AppenderHandle>,
+) -> io::Result<(Option<i64>, DecisionState, WorldObservation, DecisionPlan)> {
     let mut store = FleetStore::open(&home_dir.join("events.sqlite"))?;
+    if let Some(ref appender) = appender {
+        store.attach_appender(appender.clone());
+    }
     let mut hands = DaemonHands {
         home: home_dir.to_path_buf(),
         live_state: live_state.clone(),
-        appender: None,
+        appender,
+        launcher,
     };
     let gh_forge = std::env::var("TACHO_GH_REPO")
         .ok()

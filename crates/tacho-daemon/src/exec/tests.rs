@@ -72,6 +72,7 @@ fn test_run_tick_persists_real_progress_samples_and_replays_identically() {
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
 
     // Tick 1 at t = 1000: first sample is recorded; agent is Moving (0 supervision actions).
@@ -233,6 +234,7 @@ fn test_run_tick_with_mock_forge_refreshes_world_and_clears_main_broken() {
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.repo = Some(repo);
@@ -297,6 +299,7 @@ fn test_run_tick_forwards_owner_notifications_and_watchdog_alerts_to_forge_issue
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.explicit_main_sha = Some("b".repeat(40));
@@ -383,6 +386,7 @@ fn test_run_tick_retries_failed_owner_notifications_and_watchdog_alerts_on_next_
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts1 = TickOptions::new(&live);
     opts1.explicit_main_sha = Some("b".repeat(40));
@@ -619,6 +623,7 @@ fn test_retired_main_checkout_survives_tidy_with_index_and_untracked_files_intac
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.explicit_main_sha = Some("a".repeat(40));
@@ -750,6 +755,7 @@ fn test_worker_running_in_main_checkout_is_stopped_with_page() {
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.explicit_main_sha = Some("a".repeat(40));
@@ -862,6 +868,7 @@ fn test_holder_directory_worker_is_not_mistaken_for_main_checkout() {
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.repo = Some(fleet_main);
@@ -958,6 +965,7 @@ fn test_ordinary_stall_escalation_notifies_owner_without_killing_worker() {
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let t_escalate = 1_000 + STALLED_SECS + 120;
     let mut opts = TickOptions::new(&live);
@@ -1060,6 +1068,7 @@ fn test_root_disk_check_in_tick_warns_and_prunes_volumes_and_clears_on_recovery(
             home: home.clone(),
             live_state: live.clone(),
             appender: None,
+            launcher: None,
         },
         prune_script: fake_prune,
     };

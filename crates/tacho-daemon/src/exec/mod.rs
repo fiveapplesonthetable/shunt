@@ -10,9 +10,8 @@
 //!   the error is collected. After the plan's state is persisted the tick returns `Err` listing
 //!   every failed action, so callers still learn about it. Only store (SQLite) errors abort.
 //!
-//! What differs between callers is only what the process can physically do, behind [`Hands`]:
-//! starting provider sessions and delivering tells through a provider (CLI) versus queueing
-//! for a spawning executor and writing the inbox (daemon).
+//! Callers provide [`Hands`] for physical actions; the daemon uses a [`Launcher`] adapter
+//! to start workers and its appender to record trace events without reentering the API.
 //!
 //! Ticks are serialized in-process ([`TICK_LOCK`]) and across processes (an `flock` on
 //! `$TACHO_HOME/decide.lock`), so a CLI tick and a daemon tick never execute two plans
@@ -39,6 +38,12 @@ use identity::{AgentProcess, Identity, Signalled};
 /// Error kind a [`Hands::deliver_tell`] returns when delivering would resume a session whose
 /// old process may still own the worktree. Recorded as `tell_refused`, not as a failure.
 pub const RESUME_REFUSED: io::ErrorKind = io::ErrorKind::ResourceBusy;
+
+/// Starts project processes from either an API tick or the autonomous sampler.
+pub trait Launcher: Send + Sync {
+    /// Starts and records a worker in its allocated worktree.
+    fn spawn_worker(&self, store: &mut FleetStore, item: &TodoItem) -> io::Result<u32>;
+}
 
 /// What a caller of [`run_tick`] can physically do.
 pub trait Hands {
