@@ -718,8 +718,17 @@ pub struct StartArgs {
     pub dir: Option<PathBuf>,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug)]
 pub struct ProveArgs {
+    /// Read an explicit project/plugin check plan as JSON.
+    #[arg(long)]
+    pub plan_file: Option<PathBuf>,
+    /// Maximum independent verification lanes running at once.
+    #[arg(long, default_value = "1")]
+    pub jobs: std::num::NonZeroUsize,
+    /// Assign an area to an exclusive resource lane: AREA=RESOURCE.
+    #[arg(long = "lane")]
+    pub lanes: Vec<String>,
     /// Optional worktree directory (defaults to current working directory).
     #[arg(long)]
     pub dir: Option<PathBuf>,
@@ -735,6 +744,21 @@ pub struct ProveArgs {
     /// Screenshot file paths to record in the proof summary.
     #[arg(long = "screenshot")]
     pub screenshots: Vec<String>,
+}
+
+impl Default for ProveArgs {
+    fn default() -> Self {
+        Self {
+            plan_file: None,
+            jobs: std::num::NonZeroUsize::MIN,
+            lanes: Vec::new(),
+            dir: None,
+            base: None,
+            dry_run: false,
+            keep_going: false,
+            screenshots: Vec::new(),
+        }
+    }
 }
 
 #[derive(Args, Debug)]
