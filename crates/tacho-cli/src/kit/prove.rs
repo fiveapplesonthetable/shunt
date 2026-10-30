@@ -745,7 +745,13 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         .output()?;
     let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
     let tree = tree_of_worktree(&root)?;
-    let changes = source_changes(&root, &input_tree, &tree, &args.screenshots)?;
+    let outputs: Vec<_> = args
+        .outputs
+        .iter()
+        .chain(&args.screenshots)
+        .cloned()
+        .collect();
+    let changes = source_changes(&root, &input_tree, &tree, &outputs)?;
     if !changes.is_empty() {
         all_ok = false;
         eprintln!(

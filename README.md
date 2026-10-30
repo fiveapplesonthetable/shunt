@@ -359,6 +359,6 @@ same lane. Without `--jobs`, execution stays sequential.
 Full scrubbed command output is kept under `.tachoproof/logs`. A failure stops
 unscheduled work unless `--keep-going` is set, and running checks finish before
 the result is recorded. Inputs changed during execution invalidate the proof;
-only generated paths explicitly declared with `--screenshot` may change. A
+only generated paths explicitly declared with `--output` or `--screenshot` may change. A
 running proof replaces any earlier success with an incomplete result, so it
 cannot be published as a completed check.
