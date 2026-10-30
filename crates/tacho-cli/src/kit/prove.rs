@@ -528,7 +528,7 @@ fn run_prove_step_logged(
     let t0 = Instant::now();
     let out_tmp = tempfile::NamedTempFile::new()?;
     let out_file = out_tmp.reopen()?;
-    let err_file = out_tmp.reopen()?;
+    let err_file = out_file.try_clone()?;
 
     let mut cmd = Command::new("bash");
     use_private_tmp(&mut cmd, "prove")?;
@@ -824,4 +824,29 @@ pub(super) fn source_changes(
         .filter(|path| !path.is_empty() && !outputs.iter().any(|output| output == path))
         .map(str::to_owned)
         .collect())
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn stdout_and_stderr_keep_every_write_in_the_shared_proof_log() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("output.log");
+        let check = PlannedCheck {
+            name: "interleaved output".into(),
+            cmd: "printf 'stdout-first\\n'; printf 'stderr-middle\\n' >&2; printf 'stdout-last\\n'"
+                .into(),
+            area: "unit".into(),
+            units: vec![],
+        };
+        let (code, _, _) =
+            run_prove_step_logged(root.path(), &check, &BTreeMap::new(), 5, Some(&log)).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "stdout-first\nstderr-middle\nstdout-last\n"
+        );
+    }
 }
