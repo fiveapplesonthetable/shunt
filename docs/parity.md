@@ -18,6 +18,7 @@ mode and every required project hook is configured.
 | Worker slots can explicitly be zero | `dispatch.py`, `plan.py` | `decide/mod.rs` | `zero_worker_slots_never_dispatch_queued_work` |
 | Invalid persisted state preserves limits and holds | state reader | `fleet.rs` | `corrupt_state_is_refused_without_reopening_worker_slots`, `a_mutation_never_replaces_corrupt_state_or_runs_its_action` |
 | Current proof identity gates readiness | `plan.py:still_ready` | `decide/land/legacy.rs`, `fleet/dispatch.rs` | `next_recommends_only_a_current_complete_batch_proof` |
+| Batch checks use the proposed tree | `premerge.py`, `trainrun.py` | `fleet/batch/checkout.rs` | `a_batch_checks_the_proposed_tree_and_preserves_the_main_checkout`, `a_green_main_checkout_cannot_certify_a_broken_proposed_tree`, `a_check_cannot_certify_a_tree_it_replaces_after_running` |
 | Conflicting drafts need rebasing | next-step planner | `fleet/dispatch.rs` | `next_rebases_a_conflicting_draft_before_verification` |
 | Train notifications require member proofs | `trainrun.py:mail_released_trains` | `decide/mod.rs` | `an_observed_train_never_mails_without_current_member_proofs` |
 | Failed notification channels remain pending | `mail.py`, `owner_tick.py` | `exec/mod.rs` | `undelivered_notifications_remain_pending_until_a_channel_succeeds` |
