@@ -23,7 +23,8 @@ use super::procs::{
 };
 use super::prove::{
     changed_files_since, extract_screen_from_screenshot_path, filter_files_for_area_mapping,
-    plan_prove_checks, plan_rust_unit_checks, run_prove_step, stray_screenshots_for_files,
+    plan_prove_checks, plan_rust_unit_checks, run_prove_step, source_changes,
+    stray_screenshots_for_files,
 };
 use super::start::{
     allocate_port_block, format_tachoenv_content, is_full_hex_sha, merge_path,
@@ -62,6 +63,24 @@ fn init_test_repo(dir: &Path) -> String {
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn proof_refuses_a_source_change_while_allowing_only_declared_generated_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_test_repo(tmp.path());
+    let before = tree_of_worktree(tmp.path()).unwrap();
+    fs::write(tmp.path().join("capture.png"), "generated").unwrap();
+    fs::write(tmp.path().join("README.md"), "edited while checking").unwrap();
+    let after = tree_of_worktree(tmp.path()).unwrap();
+    assert_eq!(
+        source_changes(tmp.path(), &before, &after, &["capture.png".into()]).unwrap(),
+        vec!["README.md"]
+    );
+    assert_eq!(
+        source_changes(tmp.path(), &before, &after, &[]).unwrap(),
+        vec!["README.md", "capture.png"]
+    );
 }
 
 #[test]

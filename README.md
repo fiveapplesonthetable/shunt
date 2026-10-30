@@ -333,3 +333,32 @@ exits 124.
 ## Documentation
 
 For the comprehensive system architecture guide, design specifications, and query guides, open [docs/index.html](docs/index.html).
+
+## Parallel project checks
+
+`tacho prove` accepts a check plan emitted by a project plugin:
+
+```json
+[
+  {"name":"build","cmd":"cargo build","area":"build","units":[]},
+  {"name":"unit","cmd":"cargo test","area":"unit","units":[]},
+  {"name":"browser","cmd":"npm --prefix web test","area":"browser","units":[]}
+]
+```
+
+```sh
+tacho prove --plan-file checks.json --jobs 2 \
+  --lane build=cargo-target --lane unit=cargo-target --lane browser=web
+```
+
+Checks sharing a resource lane run in plan order. Independent lanes overlap,
+up to `--jobs`. Parallel execution requires an explicit lane for every area;
+areas sharing a build directory, database or mutable artifact belong to the
+same lane. Without `--jobs`, execution stays sequential.
+
+Full scrubbed command output is kept under `.tachoproof/logs`. A failure stops
+unscheduled work unless `--keep-going` is set, and running checks finish before
+the result is recorded. Inputs changed during execution invalidate the proof;
+only generated paths explicitly declared with `--screenshot` may change. A
+running proof replaces any earlier success with an incomplete result, so it
+cannot be published as a completed check.

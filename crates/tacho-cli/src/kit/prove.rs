@@ -22,10 +22,13 @@ use super::{
 };
 use crate::cli::ProveArgs;
 
+mod execution;
+
 pub const PROVE_STEP_TIMEOUT_SECS: u64 = 3600;
 
 /// A planned verification check derived from changed files.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlannedCheck {
     pub name: String,
     pub cmd: String,
@@ -503,6 +506,25 @@ pub fn run_prove_step(
     units: &[String],
     timeout_secs: u64,
 ) -> io::Result<(i32, u64, String)> {
+    let check = PlannedCheck {
+        name: String::new(),
+        cmd: cmd_str.to_owned(),
+        area: area.to_owned(),
+        units: units.to_vec(),
+    };
+    run_prove_step_logged(root, &check, env_vars, timeout_secs, None)
+}
+
+fn run_prove_step_logged(
+    root: &Path,
+    check: &PlannedCheck,
+    env_vars: &BTreeMap<String, String>,
+    timeout_secs: u64,
+    log: Option<&Path>,
+) -> io::Result<(i32, u64, String)> {
+    let cmd_str = &check.cmd;
+    let area = &check.area;
+    let units = &check.units;
     let t0 = Instant::now();
     let out_tmp = tempfile::NamedTempFile::new()?;
     let out_file = out_tmp.reopen()?;
@@ -566,6 +588,9 @@ pub fn run_prove_step(
     let mut raw_output = String::new();
     let _ = File::open(out_tmp.path()).and_then(|mut f| f.read_to_string(&mut raw_output));
     let scrubbed = Scrubber::new().scrub(&raw_output);
+    if let Some(log) = log {
+        write_atomic(log, scrubbed.as_bytes())?;
+    }
     let tail_lines: Vec<&str> = scrubbed.lines().rev().take(40).collect();
     let mut tail: String = tail_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
     if exit_code == 124 {
@@ -597,7 +622,6 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
             format!("no changed files relative to base {base_sha}"),
         ));
     }
-    let _ = super::verify_and_plan_worktree_migrations(&root)?;
 
     let stray_shots = stray_screenshots_for_files(&root, &changed);
     if !stray_shots.is_empty() {
@@ -607,7 +631,10 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         );
     }
 
-    let planned = plan_prove_checks(&root, &changed, &state.area_rules);
+    let planned: Vec<PlannedCheck> = match &args.plan_file {
+        Some(path) => serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?,
+        None => plan_prove_checks(&root, &changed, &state.area_rules),
+    };
     if planned.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -618,26 +645,75 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         ));
     }
 
+    let planned_count = planned.len();
+    let lanes = execution::resource_lanes(planned.clone(), &args.lanes, args.jobs.get())?;
+    if args.dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&planned).map_err(io::Error::other)?
+        );
+        return Ok(());
+    }
+    let _ = super::verify_and_plan_worktree_migrations(&root)?;
+    let input_tree = tree_of_worktree(&root)?;
+    let proof_dir = root.join(".tachoproof");
+    fs::create_dir_all(proof_dir.join("logs"))?;
+    write_atomic(
+        &proof_dir.join("summary.json"),
+        &serde_json::to_vec(&ProofSummary {
+            ok: false,
+            tree: input_tree.clone(),
+            base: base_sha.clone(),
+            timestamp: now_secs(),
+            ..Default::default()
+        })
+        .map_err(io::Error::other)?,
+    )?;
+
     let timeout_secs = std::env::var("TACHO_PROVE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(PROVE_STEP_TIMEOUT_SECS);
 
-    let mut executed_checks = Vec::new();
-    let mut all_ok = true;
-
-    for item in planned {
+    let completed = execution::execute(lanes, args.jobs.get(), args.keep_going, |index, item| {
         println!("==> [{}] {} (units: {:?})", item.area, item.cmd, item.units);
         let start_ns = now_ns();
-        let (exit_code, duration_ms, output_tail) = run_prove_step(
+        let (exit_code, duration_ms, output_tail) = run_prove_step_logged(
             &root,
-            &item.cmd,
+            item,
             &env_map,
-            &item.area,
-            &item.units,
             timeout_secs,
+            Some(&proof_dir.join("logs").join(format!("{index:03}.log"))),
         )?;
         let end_ns = now_ns();
+        let ok = exit_code == 0;
+        println!(
+            "<== [{}] {} {} ({duration_ms} ms)",
+            item.area,
+            item.name,
+            if ok { "passed" } else { "FAILED" }
+        );
+        if !ok {
+            eprintln!(
+                "Check '{}' FAILED (exit {exit_code}):\n{output_tail}",
+                item.name
+            );
+        }
+        Ok((
+            ok,
+            (
+                item.clone(),
+                exit_code,
+                duration_ms,
+                output_tail,
+                start_ns,
+                end_ns,
+            ),
+        ))
+    })?;
+    let mut all_ok = completed.len() == planned_count;
+    let mut executed_checks = Vec::new();
+    for (_, (item, exit_code, duration_ms, output_tail, start_ns, end_ns)) in completed {
         let ok = exit_code == 0;
         store.emit_duration_slice(
             &format!("prove:{}", item.area),
@@ -659,13 +735,6 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
 
         if !ok {
             all_ok = false;
-            eprintln!(
-                "Check '{}' FAILED (exit {exit_code}):\n{output_tail}",
-                item.name
-            );
-            if !args.keep_going {
-                break;
-            }
         }
     }
 
@@ -676,6 +745,14 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         .output()?;
     let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
     let tree = tree_of_worktree(&root)?;
+    let changes = source_changes(&root, &input_tree, &tree, &args.screenshots)?;
+    if !changes.is_empty() {
+        all_ok = false;
+        eprintln!(
+            "proof inputs changed while checks ran: {}",
+            changes.join(", ")
+        );
+    }
 
     let mut screenshots: Vec<String> = changed
         .iter()
@@ -721,4 +798,24 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         &tree[..tree.len().min(12)]
     );
     Ok(())
+}
+
+pub(super) fn source_changes(
+    root: &Path,
+    before: &str,
+    after: &str,
+    outputs: &[String],
+) -> io::Result<Vec<String>> {
+    let diff = Command::new("git")
+        .args(["diff", "--name-only", "-z", before, after])
+        .current_dir(root)
+        .output()?;
+    if !diff.status.success() {
+        return Err(io::Error::other("cannot compare proof input trees"));
+    }
+    Ok(String::from_utf8_lossy(&diff.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty() && !outputs.iter().any(|output| output == path))
+        .map(str::to_owned)
+        .collect())
 }
