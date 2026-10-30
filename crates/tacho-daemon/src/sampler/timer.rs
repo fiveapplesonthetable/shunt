@@ -181,7 +181,8 @@ fn run_sampler_loop(
 ) {
     let interval = Duration::from_millis(config.interval_ms.max(100));
     let mut proc_sampler = ProcSampler::new(&config.mounts);
-    proc_sampler.set_cgroup_enabled(config.cgroup);
+    proc_sampler.set_cgroup_enabled(config.cgroup && !config.dry_run);
+    proc_sampler.set_dry_run(config.dry_run);
     proc_sampler.set_worktree_scan_secs(config.worktree_scan_secs);
     proc_sampler.set_decide_refresh_secs(config.decide_refresh_secs);
     proc_sampler.set_decide_request_flag(control.decide_requested.clone());

@@ -2019,9 +2019,6 @@ impl ProjectPolicy {
 
     /// Apply this `ProjectPolicy` onto a [`DecisionState`](crate::decide::DecisionState).
     pub fn apply_to_state(&self, state: &mut crate::decide::DecisionState) {
-        if state.max_parallel == 0 && self.dispatch.slots > 0 {
-            state.max_parallel = self.dispatch.slots as usize;
-        }
         if state.area_rules.is_empty() {
             state.area_rules = self.area_rules.clone();
         }

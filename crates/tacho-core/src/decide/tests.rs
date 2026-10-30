@@ -1069,6 +1069,7 @@ fn test_unified_replayable_decide_function() {
         prs: vec![50],
         shas: BTreeMap::from([(50, "sha50".to_string())]),
         main_sha: "main-sha-1".to_string(),
+        areas: vec!["tacho-core".to_string()],
         status: "running".to_string(),
         started_at: 900,
         ..Default::default()
@@ -1937,7 +1938,8 @@ mod torture_proptests {
                     std::slice::from_ref(&batch),
                     &holds,
                     "main-1",
-                    &HashMap::new()
+                    &HashMap::new(),
+                    &[]
                 )
                 .is_empty()
             );

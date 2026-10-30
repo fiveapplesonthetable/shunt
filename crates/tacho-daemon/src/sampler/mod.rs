@@ -105,6 +105,7 @@ pub struct ProcSampler {
     session_run_tracks: HashMap<SessionKey, String>,
     worktree_states: HashMap<String, WorktreeSnapshot>,
     cgroup_enabled: bool,
+    dry_run: bool,
     worktree_scan_secs: u64,
     home_dir: Option<std::path::PathBuf>,
     fleet_store: Option<crate::fleet::FleetStore>,
@@ -151,6 +152,7 @@ impl ProcSampler {
             session_run_tracks: HashMap::new(),
             worktree_states: HashMap::new(),
             cgroup_enabled: true,
+            dry_run: false,
             worktree_scan_secs: 30,
             home_dir: None,
             fleet_store: None,
@@ -167,6 +169,11 @@ impl ProcSampler {
     /// Sets whether cgroup accounting is enabled.
     pub fn set_cgroup_enabled(&mut self, enabled: bool) {
         self.cgroup_enabled = enabled;
+    }
+
+    /// Keeps autonomous ticks read-only when observing another fleet.
+    pub fn set_dry_run(&mut self, enabled: bool) {
+        self.dry_run = enabled;
     }
 
     /// Sets the minimum interval between worktree file-change scans in seconds.
@@ -577,6 +584,7 @@ impl ProcSampler {
                         None
                     };
                     let mut opts = crate::exec::TickOptions::new(&latest_live);
+                    opts.dry_run = self.dry_run;
                     if let Some(ref f) = self.decide_forge {
                         opts.forge = Some(f.as_ref());
                     } else if let Some(ref f) = gh_forge {
