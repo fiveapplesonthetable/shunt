@@ -744,6 +744,9 @@ pub struct ProveArgs {
     /// Screenshot file paths to record in the proof summary.
     #[arg(long = "screenshot")]
     pub screenshots: Vec<String>,
+    /// Generated file paths that checks may change without invalidating source proof.
+    #[arg(long = "output")]
+    pub outputs: Vec<String>,
 }
 
 impl Default for ProveArgs {
@@ -757,6 +760,7 @@ impl Default for ProveArgs {
             dry_run: false,
             keep_going: false,
             screenshots: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 }
