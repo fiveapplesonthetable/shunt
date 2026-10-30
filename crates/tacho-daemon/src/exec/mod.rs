@@ -43,6 +43,17 @@ pub const RESUME_REFUSED: io::ErrorKind = io::ErrorKind::ResourceBusy;
 pub trait Launcher: Send + Sync {
     /// Starts and records a worker in its allocated worktree.
     fn spawn_worker(&self, store: &mut FleetStore, item: &TodoItem) -> io::Result<u32>;
+
+    /// Claims and starts verification of the supplied heads against the observed main.
+    fn spawn_batch(
+        &self,
+        _store: &mut FleetStore,
+        _plan: &tacho_core::decide::verify::BatchPlan,
+        _main_sha: &str,
+        _repo: &Path,
+    ) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
 }
 
 /// What a caller of [`run_tick`] can physically do.
@@ -50,6 +61,17 @@ pub trait Hands {
     /// Starts a worker for a dispatched item and records it (`dispatch/start`).
     /// `Ok(None)`: this process cannot start workers; the item stays queued.
     fn spawn_worker(&mut self, store: &mut FleetStore, item: &TodoItem) -> io::Result<Option<u32>>;
+
+    /// Claims and starts a verification batch, or leaves it queued when unsupported.
+    fn spawn_batch(
+        &mut self,
+        _store: &mut FleetStore,
+        _plan: &tacho_core::decide::verify::BatchPlan,
+        _main_sha: &str,
+        _repo: &Path,
+    ) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
 
     /// Delivers a decided message to an agent and records the delivery.
     fn deliver_tell(
@@ -366,6 +388,9 @@ pub fn run_tick(
 
     let tick_start_ns = now_ns();
     let mut refresh_errors = Vec::new();
+    if !opts.dry_run {
+        recover_lost_batches(home, store)?;
+    }
     let mut state = store.load()?;
     if let Some(forge) = opts.forge {
         let outcome = observe::refresh_world(
@@ -675,6 +700,29 @@ fn batch_identities(home: &Path) -> BTreeMap<String, RecordedIdentity> {
         .and_then(|raw| serde_json::from_str::<BatchIdentities>(&raw).ok())
         .unwrap_or_default()
         .batch_identities
+}
+
+fn recover_lost_batches(home: &Path, store: &mut FleetStore) -> io::Result<()> {
+    let identities = batch_identities(home);
+    store.mutate(None, |state| {
+        for batch in &mut state.batches {
+            if !matches!(batch.status.as_str(), "running" | "bisecting") {
+                continue;
+            }
+            let Some(recorded) = identities
+                .get(&batch.id)
+                .filter(|recorded| batch.pid == Some(recorded.pid) && recorded.starttime.is_some())
+            else {
+                continue;
+            };
+            if !identity::pid_alive_matching(recorded.pid, recorded.starttime) {
+                batch.status = "lost".to_string();
+                batch.finished_at = Some(now_secs());
+                batch.pid = None;
+                batch.log = "batch runner exited without recording a verdict".to_string();
+            }
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -990,6 +1038,32 @@ fn execute_actions(
                     true,
                 )?;
             }
+        }
+    }
+
+    for batch in &plan.batch_plans {
+        let result = match state.repo_root.as_deref() {
+            Some(repo) => f
+                .hands
+                .spawn_batch(store, batch, &obs.main_sha, Path::new(repo)),
+            None => Ok(None),
+        };
+        match result {
+            Ok(Some(pid)) => println!("Started batch {} (pid {pid})", batch.id),
+            Ok(None) => store.record_decision(
+                "verify",
+                "batch_queued",
+                &batch.id,
+                "verification awaits an available batch executor",
+            )?,
+            Err(error) => f.record(
+                store,
+                "verify",
+                "batch_start_failed",
+                &batch.id,
+                &format!("failed to start batch {}: {error}", batch.id),
+                true,
+            )?,
         }
     }
 

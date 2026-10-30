@@ -3,6 +3,9 @@
 //! with env-file precedence, and area hang timeout reporting.
 
 mod checkout;
+mod launch;
+
+pub use launch::spawn_planned_batch;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -362,6 +365,30 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 
 /// Executes batch verification with full [`BatchOptions`] (`--areas`, `--foreground`/detached, [`BatchOrigin`]).
 pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
+    let claimed = launch::receive_claim()?;
+    let result = execute_batch_inner(opts, claimed.as_deref());
+    if let (Err(error), Some(id)) = (&result, claimed) {
+        let mut store = open_fleet_store()?;
+        store.mutate(
+            Some(("verify", "batch_runner_failed", &id, &error.to_string())),
+            |state| {
+                if let Some(batch) = state
+                    .batches
+                    .iter_mut()
+                    .find(|batch| batch.id == id && batch.status == "running")
+                {
+                    batch.status = "infrastructure".to_string();
+                    batch.finished_at = Some(now_secs());
+                    batch.pid = None;
+                    batch.log = error.to_string();
+                }
+            },
+        )?;
+    }
+    result
+}
+
+fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<()> {
     if !opts.foreground && !opts.dry_run {
         let _ = launch_detached_batch(&opts)?;
         return Ok(());
@@ -495,7 +522,9 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         }
     }
 
-    if let Some(reused) = reusable_batch(&state.batches, &pr_nums, &shas, &main_sha, &area_list) {
+    if let Some(reused) = reusable_batch(&state.batches, &pr_nums, &shas, &main_sha, &area_list)
+        .filter(|_| claimed.is_none())
+    {
         println!(
             "Reusing green batch {} for PRs {:?} on main {}",
             reused.id,
@@ -505,7 +534,34 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         return Ok(());
     }
 
-    let batch_id = new_batch_id(&state.batches);
+    let claim = claimed
+        .map(|id| {
+            let claim = state
+                .batches
+                .iter()
+                .find(|batch| {
+                    batch.id == id
+                        && batch.status == "running"
+                        && batch.pid == Some(std::process::id())
+                })
+                .ok_or_else(|| io::Error::other("batch runner does not own its claim"))?;
+            if claim.prs != pr_nums
+                || claim.shas != shas
+                || claim.main_sha != main_sha
+                || claim.mode != batch_mode
+            {
+                return Err(io::Error::other("batch inputs moved after its claim"));
+            }
+            Ok(claim)
+        })
+        .transpose()?;
+    if let Some(claim) = claim {
+        area_list = claim.areas.clone();
+        checks = claim.checks.clone();
+    }
+    let batch_id = claim
+        .map(|batch| batch.id.clone())
+        .unwrap_or_else(|| new_batch_id(&state.batches));
     if opts.dry_run {
         println!("Batch ID: {batch_id}");
         println!("Origin:   {}", opts.origin.as_str());
@@ -757,6 +813,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         store.mutate(
             Some(("verify", "batch_hang", &batch_id, &hang.summary)),
             |st| {
+                st.batches.retain(|batch| batch.id != b_run.id);
                 st.batches.push(b_run);
             },
         )?;
@@ -801,6 +858,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         store.mutate(
             Some(("verify", "batch_red_once", &batch_id, &because)),
             |st| {
+                st.batches.retain(|batch| batch.id != b_run.id);
                 st.batches.push(b_run);
             },
         )?;
@@ -869,6 +927,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         store.mutate(
             Some(("verify", "batch_head_moved", &batch_id, &moved_reason)),
             |st| {
+                st.batches.retain(|batch| batch.id != b_run.id);
                 st.batches.push(b_run);
             },
         )?;
@@ -917,6 +976,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 flake_tasks(&updated, &st.todo, &st.agents, &st.retired, finished);
             st.flakes = with_tasks;
             st.todo.extend(new_items);
+            st.batches.retain(|batch| batch.id != b_run.id);
             st.batches.push(b_run);
         })?;
         emit_decision_event(&format!("batch:{batch_id}"), "verify:flake", &because);
@@ -968,6 +1028,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                     },
                 );
             }
+            st.batches.retain(|batch| batch.id != b_run.id);
             st.batches.push(b_run);
         })?;
         for &pr in &pr_nums {
@@ -1047,6 +1108,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             };
             let because = format!("batch {batch_id} aborted: base main is red ({sum})");
             store.mutate(Some(("verify", "main_broken", &batch_id, &because)), |st| {
+                st.batches.retain(|batch| batch.id != b_run.id);
                 st.batches.push(b_run);
             })?;
             store.emit_duration_slice(
@@ -1108,6 +1170,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                     );
                 }
             }
+            st.batches.retain(|batch| batch.id != b_run.id);
             st.batches.push(b_run);
         })?;
         emit_decision_event(&format!("batch:{batch_id}"), "verify:fail", &because);
@@ -1128,7 +1191,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 let mut rerun_opts = opts.clone();
                 rerun_opts.prs = reruns;
                 rerun_opts.dry_run = false;
-                if let Err(rerun_err) = execute_batch_with(rerun_opts) {
+                if let Err(rerun_err) = execute_batch_inner(rerun_opts, None) {
                     eprintln!("Rerun batch failed: {rerun_err}");
                 }
             }

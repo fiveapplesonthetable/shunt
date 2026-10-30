@@ -1061,6 +1061,19 @@ pub struct DaemonHands {
 }
 
 impl crate::exec::Hands for DaemonHands {
+    fn spawn_batch(
+        &mut self,
+        store: &mut FleetStore,
+        plan: &tacho_core::decide::verify::BatchPlan,
+        main_sha: &str,
+        repo: &Path,
+    ) -> io::Result<Option<u32>> {
+        match &self.launcher {
+            Some(launcher) => launcher.spawn_batch(store, plan, main_sha, repo),
+            None => Ok(None),
+        }
+    }
+
     fn spawn_worker(&mut self, store: &mut FleetStore, item: &TodoItem) -> io::Result<Option<u32>> {
         self.launcher
             .as_ref()
