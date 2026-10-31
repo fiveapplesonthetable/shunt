@@ -359,6 +359,10 @@ fn batch_origin_and_proptest_counterexample_detection() {
 fn select_batch_checks_filters_by_requested_areas() {
     let rules = vec![
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "core".to_string(),
             prefixes: vec!["crates/tacho-core/".to_string()],
             unit_prefixes: BTreeMap::new(),
@@ -367,6 +371,10 @@ fn select_batch_checks_filters_by_requested_areas() {
             needs_screenshot: false,
         },
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "cli".to_string(),
             prefixes: vec!["crates/tacho-cli/".to_string()],
             unit_prefixes: BTreeMap::new(),
@@ -1754,6 +1762,10 @@ fn waiting_for_with_ci_proof_requires_all_and_costly_areas_until_main_ci_passes(
 
     let rules = vec![
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "rust".into(),
             prefixes: vec!["crates/".into()],
             checks: Vec::new(),
@@ -1762,6 +1774,10 @@ fn waiting_for_with_ci_proof_requires_all_and_costly_areas_until_main_ci_passes(
             unit_prefixes: std::collections::BTreeMap::new(),
         },
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "console".into(),
             prefixes: vec!["frontend/admin/".into()],
             checks: Vec::new(),

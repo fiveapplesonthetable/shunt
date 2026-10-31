@@ -11,6 +11,36 @@ use super::store::{git_stdout, open_fleet_store};
 
 /// Executes project configuration validation, application or inspection.
 pub fn execute(args: ProjectArgs) -> io::Result<()> {
+    if let ProjectOperation::Select {
+        path,
+        files_file,
+        each,
+    } = &args.command
+    {
+        let project: ProjectConfig =
+            serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
+        project.validate().map_err(io::Error::other)?;
+        let files: Vec<String> =
+            serde_json::from_slice(&fs::read(files_file)?).map_err(io::Error::other)?;
+        let router = tacho_core::decide::verify::AreaRouter::new(&project.area_rules)
+            .map_err(io::Error::other)?;
+        let value = if *each {
+            serde_json::to_value(
+                files
+                    .iter()
+                    .map(|file| (file, router.select(std::slice::from_ref(file))))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+        } else {
+            serde_json::to_value(router.select(&files))
+        }
+        .map_err(io::Error::other)?;
+        println!(
+            "{}",
+            serde_json::to_string(&value).map_err(io::Error::other)?
+        );
+        return Ok(());
+    }
     if let ProjectOperation::ImportState { path, dry_run } = &args.command {
         let bytes = fs::read(path)?;
         let (_, _, preview) = tacho_daemon::fleet::state_import::validate(&bytes)?;
@@ -51,7 +81,9 @@ pub fn execute(args: ProjectArgs) -> io::Result<()> {
         ProjectOperation::Validate { path } => (path, false),
         ProjectOperation::Apply { path } => (path, true),
         ProjectOperation::Show => return Ok(()),
-        ProjectOperation::ImportState { .. } | ProjectOperation::Resolve { .. } => return Ok(()),
+        ProjectOperation::ImportState { .. }
+        | ProjectOperation::Resolve { .. }
+        | ProjectOperation::Select { .. } => return Ok(()),
     };
     let project: ProjectConfig =
         serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;

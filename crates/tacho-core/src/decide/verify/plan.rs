@@ -101,43 +101,112 @@ pub fn cap(prs: &[u64], parent_map: &BTreeMap<u64, u64>, limit: usize) -> Vec<u6
     out
 }
 
-/// Map a list of changed file paths to affected area names.
-/// Uses `rules` when configured; otherwise infers top-level workspace crates (`crates/<name>`)
-/// or falls back to `"ci"` for `.github/`/`scripts/` and `"workspace"` for other files.
-pub fn areas_for_files(files: &[String], rules: &[AreaRule]) -> Vec<String> {
-    let mut out = BTreeSet::new();
-    if !rules.is_empty() {
-        for f in files {
+/// Compiled project routing shared by batch planning and worker proof selection.
+pub struct AreaRouter<'a> {
+    rules: &'a [AreaRule],
+    compiled: Vec<(
+        &'a AreaRule,
+        regex::RegexSet,
+        regex::RegexSet,
+        regex::RegexSet,
+    )>,
+}
+
+impl<'a> AreaRouter<'a> {
+    /// Compiles every expression before selecting any input paths.
+    pub fn new(rules: &'a [AreaRule]) -> Result<Self, regex::Error> {
+        let compiled = rules
+            .iter()
+            .map(|rule| {
+                Ok((
+                    rule,
+                    regex::RegexSet::new(&rule.patterns)?,
+                    regex::RegexSet::new(&rule.fallback_patterns)?,
+                    regex::RegexSet::new(&rule.required_patterns)?,
+                ))
+            })
+            .collect::<Result<_, regex::Error>>()?;
+        Ok(Self { rules, compiled })
+    }
+
+    /// Selects mandatory areas and all matching ordinary or unmatched-path rules.
+    pub fn select(&self, files: &[String]) -> Vec<String> {
+        if self.rules.is_empty() {
+            return areas_for_files(files, self.rules);
+        }
+        let mut out = BTreeSet::new();
+        if !files.is_empty() {
+            out.extend(
+                self.rules
+                    .iter()
+                    .filter(|rule| rule.always)
+                    .map(|rule| rule.area.clone()),
+            );
+        }
+        for file in files {
             let mut matched = false;
-            for r in rules {
-                if r.prefixes.iter().any(|p| f.starts_with(p)) {
-                    out.insert(r.area.clone());
+            for (rule, patterns, _, required) in &self.compiled {
+                if required.is_match(file) {
+                    out.insert(rule.area.clone());
+                }
+                if rule.prefixes.iter().any(|prefix| file.starts_with(prefix))
+                    || patterns.is_match(file)
+                {
+                    out.insert(rule.area.clone());
                     matched = true;
                 }
             }
             if !matched {
-                if f.starts_with(".github/") || f.starts_with("scripts/ci") {
-                    out.insert("ci".to_string());
-                } else {
-                    out.insert("workspace".to_string());
+                for (rule, _, fallback, _) in &self.compiled {
+                    if fallback.is_match(file) {
+                        out.insert(rule.area.clone());
+                        matched = true;
+                    }
                 }
             }
+            if !matched {
+                out.insert(
+                    if file.starts_with(".github/") || file.starts_with("scripts/ci") {
+                        "ci"
+                    } else {
+                        "workspace"
+                    }
+                    .to_string(),
+                );
+            }
         }
-    } else {
-        for f in files {
-            if f.starts_with(".github/") || f.starts_with("ci/") {
-                out.insert("ci".to_string());
-            } else if let Some(rest) = f.strip_prefix("crates/") {
-                if let Some(krate) = rest.split('/').next() {
-                    out.insert(krate.to_string());
-                } else {
-                    out.insert("workspace".to_string());
-                }
-            } else if f.ends_with(".md") || f.starts_with("docs/") {
-                out.insert("docs".to_string());
+        out.into_iter().collect()
+    }
+}
+
+/// Maps changed paths to configured areas, or infers workspace areas without project rules.
+pub fn areas_for_files(files: &[String], rules: &[AreaRule]) -> Vec<String> {
+    if !rules.is_empty() {
+        return AreaRouter::new(rules)
+            .map(|router| router.select(files))
+            .unwrap_or_else(|_| {
+                rules
+                    .iter()
+                    .map(|rule| rule.area.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            });
+    }
+    let mut out = BTreeSet::new();
+    for f in files {
+        if f.starts_with(".github/") || f.starts_with("ci/") {
+            out.insert("ci".to_string());
+        } else if let Some(rest) = f.strip_prefix("crates/") {
+            if let Some(krate) = rest.split('/').next() {
+                out.insert(krate.to_string());
             } else {
                 out.insert("workspace".to_string());
             }
+        } else if f.ends_with(".md") || f.starts_with("docs/") {
+            out.insert("docs".to_string());
+        } else {
+            out.insert("workspace".to_string());
         }
     }
     out.into_iter().collect()

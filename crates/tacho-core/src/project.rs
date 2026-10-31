@@ -215,6 +215,9 @@ impl ProjectConfig {
             return Err("a project must define its verification areas".into());
         }
         for rule in &self.area_rules {
+            generated_output_matcher(&rule.patterns)?;
+            generated_output_matcher(&rule.fallback_patterns)?;
+            generated_output_matcher(&rule.required_patterns)?;
             if rule.area.trim().is_empty() || !areas.insert(&rule.area) {
                 return Err("verification areas must have distinct nonempty names".into());
             }

@@ -20,11 +20,9 @@ pub fn proof_plan(changed_files: &[String], rules: &[AreaRule]) -> Vec<(String, 
         add("whitespace".to_string(), "git diff --check".to_string());
     }
 
+    let selected = areas_for_files(changed_files, rules);
     for r in rules {
-        if changed_files
-            .iter()
-            .any(|f| r.prefixes.iter().any(|p| f.starts_with(p)))
-        {
+        if selected.contains(&r.area) {
             for (name, cmd) in &r.checks {
                 add(name.clone(), cmd.clone());
             }
@@ -242,12 +240,10 @@ pub fn proof_problems(
             crate::char_prefix(head_sha, 12)
         ));
     }
-    let needs_shot = rules.iter().any(|r| {
-        r.needs_screenshot
-            && changed_files
-                .iter()
-                .any(|f| r.prefixes.iter().any(|pref| f.starts_with(pref)))
-    });
+    let selected = areas_for_files(changed_files, rules);
+    let needs_shot = rules
+        .iter()
+        .any(|rule| rule.needs_screenshot && selected.contains(&rule.area));
     if needs_shot && p.screenshots.is_empty() {
         problems.push("UI files changed but proof has no screenshots".to_string());
     }

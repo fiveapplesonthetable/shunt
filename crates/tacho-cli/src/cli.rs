@@ -283,6 +283,14 @@ pub struct ProjectArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ProjectOperation {
+    /// Select affected areas from a JSON file of changed paths without changing controller state.
+    Select {
+        path: PathBuf,
+        #[arg(long)]
+        files_file: PathBuf,
+        #[arg(long)]
+        each: bool,
+    },
     /// Import a repository adapter's state snapshot into an empty controller.
     ImportState {
         path: PathBuf,

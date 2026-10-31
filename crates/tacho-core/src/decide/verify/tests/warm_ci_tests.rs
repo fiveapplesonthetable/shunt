@@ -430,6 +430,10 @@ fn test_waits_end_on_facts_and_kill_group_escalates_term_to_kill() {
 #[test]
 fn test_prove_plan_attribution_and_pr_refusals() {
     let rules = vec![AreaRule {
+        patterns: Vec::new(),
+        fallback_patterns: Vec::new(),
+        required_patterns: Vec::new(),
+        always: false,
         area: "console".to_string(),
         prefixes: vec!["apps/console/".to_string()],
         checks: vec![("console-typecheck".to_string(), "pnpm check".to_string())],

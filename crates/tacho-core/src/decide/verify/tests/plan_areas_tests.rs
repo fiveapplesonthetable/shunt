@@ -857,6 +857,10 @@ fn test_a_changed_config_selects_everything() {
 fn test_batch_planner_integrates_costly_area_selection_end_to_end() {
     let rules = vec![
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "console".to_string(),
             prefixes: vec!["frontend/admin/".to_string()],
             unit_prefixes: BTreeMap::new(),
@@ -865,6 +869,10 @@ fn test_batch_planner_integrates_costly_area_selection_end_to_end() {
             needs_screenshot: false,
         },
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "android".to_string(),
             prefixes: vec!["frontend/android/".to_string()],
             unit_prefixes: BTreeMap::new(),
@@ -873,6 +881,10 @@ fn test_batch_planner_integrates_costly_area_selection_end_to_end() {
             needs_screenshot: false,
         },
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "image".to_string(),
             prefixes: vec!["deploy/Dockerfile".to_string(), "crates/".to_string()],
             unit_prefixes: BTreeMap::new(),
