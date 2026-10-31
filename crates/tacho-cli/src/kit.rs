@@ -14,6 +14,7 @@
 //! - [`starve`]: `<= 5 min` (300s) CPU starvation runner (`4` burners per CPU on `<= 1/8` fleet CPUs,
 //!   default highest 4 CPUs, refuses during merge-check batch, stops burners when batch starts).
 
+pub mod artifacts;
 pub mod pr;
 pub mod procs;
 pub mod prove;

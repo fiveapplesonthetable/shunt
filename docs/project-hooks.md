@@ -27,6 +27,21 @@ base, tree, selected areas and units. A successful command cannot certify a
 tree that it changes. Native workflow execution remains available when a
 repository does not install a verification hook.
 
+`generated_outputs` lists regexes of derived files. Changed matching files
+are archived with their before and after Git object IDs, then restored to
+their input bytes. New derived files are collected and removed from the
+checkout. Worker artifacts live in `.tachoproof/artifacts`; batch artifacts
+live under the fleet home's `runs/<batch>/artifacts/<probe>` directory.
+Collection never changes a branch head. Changes to any other tracked or
+untracked source file invalidate verification. A generated output must be
+a regular file.
+
+`input_lists` contains objects with a repository-relative `file` and `root`.
+Each list names required reference files, one per line, relative to that
+root. Blank lines and `#` comments are ignored. Listed files remain inputs
+even inside a generated-output directory. The list is read from the input
+Git tree, so a check cannot weaken it while it runs.
+
 `notify` receives a scrubbed subject and body from both CLI and daemon owner
 notifications. An unsuccessful delivery remains pending. Credentials come
 from the process environment, independently of the checked-in contract.

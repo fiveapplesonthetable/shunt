@@ -789,6 +789,22 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
         );
         let txt = Scrubber::new().scrub(&raw_txt);
         let timed_out = out.status.code() == Some(124) || out.status.code() == Some(137);
+        if let Some(project) = &state.project {
+            let outputs = crate::kit::tree_of_worktree(check_cwd)?;
+            let destination = store
+                .home()
+                .join("runs")
+                .join(&batch_id)
+                .join("artifacts")
+                .join(label);
+            crate::kit::artifacts::collect(
+                check_cwd,
+                &expected_tree,
+                &outputs,
+                project,
+                &destination,
+            )?;
+        }
         if out.status.success() {
             checkout.verify_unchanged(&expected_tree)?;
         }
@@ -815,27 +831,29 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
                 &batch_id,
                 &recorded_head,
             );
-            let fix_shots = opts.origin == BatchOrigin::Train
-                || std::env::var("TACHO_FIX_SHOTS").ok().as_deref() == Some("1");
-            let shot_rules = super::train::load_shot_rules(check_cwd);
-            match super::train::stage_and_commit_merged_screenshots(
-                check_cwd,
-                &report_dir,
-                &batch_id,
-                &all_files,
-                fix_shots,
-                &shot_rules,
-            ) {
-                Ok(Some(_new_commit)) => {
-                    return Err(io::Error::other("generated screenshots need collecting into the PR heads before verification"));
-                }
-                Ok(None) => {}
-                Err(shot_err) => {
-                    ok = false;
-                    if !log_text.is_empty() {
-                        log_text.push('\n');
+            if state.project.is_none() {
+                let fix_shots = opts.origin == BatchOrigin::Train
+                    || std::env::var("TACHO_FIX_SHOTS").ok().as_deref() == Some("1");
+                let shot_rules = super::train::load_shot_rules(check_cwd);
+                match super::train::stage_and_commit_merged_screenshots(
+                    check_cwd,
+                    &report_dir,
+                    &batch_id,
+                    &all_files,
+                    fix_shots,
+                    &shot_rules,
+                ) {
+                    Ok(Some(_new_commit)) => {
+                        return Err(io::Error::other("generated screenshots need collecting into the PR heads before verification"));
                     }
-                    log_text.push_str(&shot_err.to_string());
+                    Ok(None) => {}
+                    Err(shot_err) => {
+                        ok = false;
+                        if !log_text.is_empty() {
+                            log_text.push('\n');
+                        }
+                        log_text.push_str(&shot_err.to_string());
+                    }
                 }
             }
         }

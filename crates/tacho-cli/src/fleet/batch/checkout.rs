@@ -55,9 +55,10 @@ impl BatchCheckout {
                 "checks changed the merged tree; a passing proof requires the recorded PR heads",
             ));
         }
-        git(&self.path, &["diff", "--quiet", "HEAD"])
-            .map(|_| ())
-            .map_err(|_| io::Error::other("checks changed tracked files; collect generated artifacts into the PR heads before verification"))
+        if crate::kit::tree_of_worktree(&self.path)? != expected_tree {
+            return Err(io::Error::other("checks changed source files; declared generated outputs must be collected before verification"));
+        }
+        Ok(())
     }
 }
 
