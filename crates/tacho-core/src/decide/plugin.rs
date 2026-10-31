@@ -263,6 +263,21 @@ pub enum PullDisposition {
     Closed,
 }
 
+/// Fresh identities needed to merge or resume an ordered train.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePullFacts {
+    /// Complete current pull-request head commit.
+    pub head: String,
+    /// Target branch on the configured repository.
+    pub base: String,
+    /// Current lifecycle state on the forge.
+    pub disposition: PullDisposition,
+    /// Whether the pull request must be marked ready before merging.
+    pub draft: bool,
+    /// Actual merge commit for a merged pull request.
+    pub merge_commit: Option<String>,
+}
+
 /// Pluggable code-host / forge interface (PR facts, mergeable state, CI checks, and
 /// issue/PR body & comment updates).
 ///
@@ -373,6 +388,29 @@ pub trait ForgePlugin: Send + Sync {
     fn merge_pr(&self, pr: u64) -> Result<(), String> {
         let _ = pr;
         Ok(())
+    }
+
+    /// Merges only the exact pull-request head admitted by a proof.
+    fn merge_pr_at_head(&self, _pr: u64, _head: &str) -> Result<(), String> {
+        Err("forge does not support merging an exact head".into())
+    }
+
+    /// Reads current pull identities independently of cached queue observations.
+    fn merge_pull_facts(
+        &self,
+        _pr: u64,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<MergePullFacts, String> {
+        Err("forge does not support merge identity observation".into())
+    }
+
+    /// Reads an immutable commit's tree from the configured repository.
+    fn commit_tree(
+        &self,
+        _commit: &str,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<String, String> {
+        Err("forge does not support commit tree observation".into())
     }
 
     /// Lists GitHub Actions caches for `plan_actions_tidy`.
@@ -863,6 +901,80 @@ impl CliForgePlugin {
 }
 
 impl ForgePlugin for CliForgePlugin {
+    fn merge_pull_facts(
+        &self,
+        pr: u64,
+        run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<MergePullFacts, String> {
+        let mut argv = vec![
+            self.cli_bin.clone(),
+            "pr".into(),
+            "view".into(),
+            pr.to_string(),
+        ];
+        argv.extend(self.repo_args());
+        argv.extend([
+            "--json".into(),
+            "headRefOid,baseRefName,state,isDraft,mergeCommit".into(),
+        ]);
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Observed {
+            head_ref_oid: String,
+            base_ref_name: String,
+            state: PullDisposition,
+            #[serde(default)]
+            is_draft: bool,
+            merge_commit: Option<Commit>,
+        }
+        #[derive(Deserialize)]
+        struct Commit {
+            oid: String,
+        }
+        let observed: Observed = serde_json::from_str(&run(&argv)?)
+            .map_err(|error| format!("unexpected merge identity observation: {error}"))?;
+        let complete =
+            |sha: &str| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if !complete(&observed.head_ref_oid)
+            || observed
+                .merge_commit
+                .as_ref()
+                .is_some_and(|commit| !complete(&commit.oid))
+            || (observed.state == PullDisposition::Merged && observed.merge_commit.is_none())
+        {
+            return Err("pull observation lacks a complete commit identity".into());
+        }
+        Ok(MergePullFacts {
+            head: observed.head_ref_oid,
+            base: observed.base_ref_name,
+            disposition: observed.state,
+            draft: observed.is_draft,
+            merge_commit: observed.merge_commit.map(|commit| commit.oid),
+        })
+    }
+
+    fn commit_tree(
+        &self,
+        commit: &str,
+        run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<String, String> {
+        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("commit tree requires a complete commit identity".into());
+        }
+        let repository = self.repo.as_deref().unwrap_or("{owner}/{repo}");
+        let value: serde_json::Value = serde_json::from_str(&run(&[
+            self.cli_bin.clone(),
+            "api".into(),
+            format!("repos/{repository}/git/commits/{commit}"),
+        ])?)
+        .map_err(|error| format!("unexpected commit tree observation: {error}"))?;
+        value["tree"]["sha"]
+            .as_str()
+            .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(String::from)
+            .ok_or("forge did not observe the commit tree".into())
+    }
+
     fn branch_head(
         &self,
         branch: &str,
@@ -1164,6 +1276,19 @@ impl ForgePlugin for CliForgePlugin {
         args.extend(self.repo_args());
         args.push("--merge".to_string());
         self.run_cli(&args).map(|_| ())
+    }
+
+    fn merge_pr_at_head(&self, pr: u64, head: &str) -> Result<(), String> {
+        if !self.allow_merge {
+            return Err("merging is disabled by configuration".into());
+        }
+        if head.len() != 40 || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("merging requires a complete verified head".into());
+        }
+        let mut argv = vec!["pr".into(), "merge".into(), pr.to_string()];
+        argv.extend(self.repo_args());
+        argv.extend(["--merge".into(), "--match-head-commit".into(), head.into()]);
+        self.run_cli(&argv).map(|_| ())
     }
 
     fn list_actions_caches(&self) -> Result<Vec<crate::decide::ops::tidy::ActionsCache>, String> {

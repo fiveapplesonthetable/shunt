@@ -3,14 +3,68 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::process::Command;
 
-use tacho_core::decide::land::{finished, mismatch, open_for, queue, train_refusal, TrainRecord};
+use tacho_core::decide::land::{finished, mismatch, open_for, queue, TrainRecord};
+use tacho_core::decide::plugin::{ForgePlugin, PullDisposition};
 use tacho_core::TaskStatus;
 
 use crate::cli::LandArgs;
 
-use super::store::{emit_decision_event, now_ns, open_fleet_store};
+use super::store::{emit_decision_event, now_ns, open_fleet_store, resolve_verification_main_sha};
+
+fn complete_train_proof(state: &tacho_daemon::FleetState, train: &TrainRecord) -> io::Result<()> {
+    let batch = state
+        .batches
+        .iter()
+        .find(|batch| batch.id == train.batch_id)
+        .ok_or_else(|| io::Error::other("train has no verification batch"))?;
+    if batch.status != "passed"
+        || !batch.flakes.is_empty()
+        || !batch.skipped.is_empty()
+        || batch.mode != tacho_core::decide::verify::BatchMode::Presubmit
+        || batch.prs != train.prs
+        || batch.shas != train.shas
+        || batch.main_sha != train.base
+        || batch.tree.as_deref() != Some(train.tree.as_str())
+        || train.prs.is_empty()
+    {
+        return Err(io::Error::other(
+            "train does not match a complete passed batch",
+        ));
+    }
+    for number in &train.prs {
+        let proof = state
+            .passed
+            .get(number)
+            .ok_or_else(|| io::Error::other("train member has no passed proof"))?;
+        if proof.batch_id != batch.id
+            || train.shas.get(number) != Some(&proof.sha)
+            || proof.main_sha != train.base
+            || proof.tree != train.tree
+        {
+            return Err(io::Error::other("train member proof identity changed"));
+        }
+        if let Some(pull) = state
+            .open_prs_cache
+            .iter()
+            .find(|pull| pull.number == *number)
+        {
+            let required =
+                tacho_core::decide::verify::areas_for_files(&pull.files, &state.area_rules);
+            if pull.files.is_empty()
+                || required.is_empty()
+                || required
+                    .iter()
+                    .any(|area| !proof.areas.contains(area) || !batch.areas.contains(area))
+            {
+                return Err(io::Error::other(
+                    "train member proof does not cover its required areas",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Options for `tacho land`.
 #[derive(Debug, Clone, Default)]
@@ -62,20 +116,7 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
     let mut store = open_fleet_store()?;
     let state = store.load()?;
     let cwd = std::env::current_dir()?;
-    let current_main = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&cwd)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    let current_tree = Command::new("git")
-        .args(["rev-parse", "HEAD^{tree}"])
-        .current_dir(&cwd)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let current_main = resolve_verification_main_sha(&cwd, &state)?;
 
     let target_open = if let Some(ref tid) = args.train {
         let found = state
@@ -95,44 +136,117 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
     };
 
     if let Some(open) = target_open {
-        if let Some(refusal_reason) =
-            train_refusal(&open, &current_main, &state.open_prs_cache, &state.holds)
-        {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, refusal_reason));
-        }
-        if args.dry_run {
-            println!("Would land train {}: PRs {:?}", open.id, open.prs);
-            return Ok(());
-        }
         let merge_enabled = match std::env::var("TACHO_LAND_MERGE") {
             Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
             Err(_) => state.merge_prs,
         };
+        if !merge_enabled {
+            println!("Merging is disabled; train {} remains open.", open.id);
+            return Ok(());
+        }
+        complete_train_proof(&state, &open)?;
         let gh_forge = tacho_daemon::project::forge_repository(&state).map(|r| {
             tacho_core::decide::plugin::GitHubForge::new(r).with_allow_merge(merge_enabled)
         });
-        let post_merge_tree = if let (Some(ref forge), true) = (&gh_forge, merge_enabled) {
-            use tacho_core::decide::plugin::ForgePlugin;
-            for &pr in &open.prs {
-                let _ = forge.mark_pr_ready(pr);
-                forge.merge_pr(pr).map_err(io::Error::other)?;
-            }
-            let _ = Command::new("git")
-                .args(["fetch", "-q", "origin", "main"])
-                .current_dir(&cwd)
-                .status();
-            Command::new("git")
-                .args(["rev-parse", "origin/main^{tree}"])
-                .current_dir(&cwd)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| current_tree.clone())
-        } else {
-            current_tree.clone()
+        let forge = gh_forge
+            .as_ref()
+            .ok_or_else(|| io::Error::other("merging requires a configured forge repository"))?;
+        let mut runner = |argv: &[String]| {
+            tacho_daemon::exec::observe::run_argv(
+                Some(&cwd),
+                argv,
+                std::time::Duration::from_secs(30),
+            )
         };
+        let mut expected_main = open.base.clone();
+        let mut progress = open.clone();
+        progress.landed_prs.clear();
+        let mut remaining = Vec::new();
+        for &number in &open.prs {
+            if state.holds.contains_key(&format!("pr:{number}")) {
+                return Err(io::Error::other(format!("PR #{number} is held")));
+            }
+            let pull = forge
+                .merge_pull_facts(number, &mut runner)
+                .map_err(io::Error::other)?;
+            if open.shas.get(&number) != Some(&pull.head) || pull.base != "main" {
+                return Err(io::Error::other(format!(
+                    "PR #{number} no longer has its verified head and base"
+                )));
+            }
+            match pull.disposition {
+                PullDisposition::Merged if remaining.is_empty() => {
+                    expected_main = pull
+                        .merge_commit
+                        .ok_or_else(|| io::Error::other("merged member lacks its merge commit"))?;
+                    progress.landed_prs.push(number);
+                }
+                PullDisposition::Open => remaining.push((number, pull)),
+                _ => {
+                    return Err(io::Error::other(
+                        "train members are closed or merged outside their verified order",
+                    ))
+                }
+            }
+        }
+        if current_main != expected_main {
+            return Err(io::Error::other(
+                "canonical main moved outside the verified train prefix",
+            ));
+        }
+        if args.dry_run {
+            println!(
+                "Would land train {}: PRs {:?}",
+                open.id,
+                remaining
+                    .iter()
+                    .map(|(number, _)| number)
+                    .collect::<Vec<_>>()
+            );
+            return Ok(());
+        }
+        for (number, pull) in remaining {
+            if resolve_verification_main_sha(&cwd, &state)? != expected_main {
+                return Err(io::Error::other(
+                    "canonical main moved before the next train member",
+                ));
+            }
+            if pull.draft {
+                forge.mark_pr_ready(number).map_err(io::Error::other)?;
+            }
+            forge
+                .merge_pr_at_head(number, &pull.head)
+                .map_err(io::Error::other)?;
+            let merged = forge
+                .merge_pull_facts(number, &mut runner)
+                .map_err(io::Error::other)?;
+            if merged.disposition != PullDisposition::Merged
+                || merged.head != pull.head
+                || merged.base != "main"
+            {
+                return Err(io::Error::other(
+                    "the forge has not confirmed the expected member merge",
+                ));
+            }
+            expected_main = merged
+                .merge_commit
+                .ok_or_else(|| io::Error::other("confirmed merge lacks a commit identity"))?;
+            progress.landed_prs.push(number);
+            store.mutate(None, |state| {
+                state.merged_prs.insert(number);
+                if let Some(train) = state.trains.iter_mut().find(|train| train.id == open.id) {
+                    *train = progress.clone();
+                }
+            })?;
+        }
+        if resolve_verification_main_sha(&cwd, &state)? != expected_main {
+            return Err(io::Error::other(
+                "canonical main moved after the train merge",
+            ));
+        }
+        let post_merge_tree = forge
+            .commit_tree(&expected_main, &mut runner)
+            .map_err(io::Error::other)?;
         let mut landed = finished(&open);
         if let Some(err) = mismatch(&landed, &post_merge_tree) {
             landed.status = "mismatch".to_string();

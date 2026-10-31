@@ -5,6 +5,13 @@ its hooks. `shunt project apply shunt.json` installs it in the fleet store. Appl
 configuration preserves worker limits, holds, queued work and proof records.
 The CLI and daemon read the same installed contract.
 
+Owner merge execution requires the configured merge permission or
+`TACHO_LAND_MERGE`. A disabled merge leaves its train open. Landing queries
+the configured forge for every member's complete head and target branch,
+merges with an atomic head condition, and confirms each resulting merge.
+Only an ordered merged prefix can be resumed. The final canonical commit's
+tree must equal the verified tree before the train is recorded as landed.
+
 The contract has version `1`, a repository's `area_rules`, an optional forge
 `repository` in `owner/name` form, optional workflow settings, and `hooks`.
 Unknown fields and unsupported versions are errors. A hook is an explicit
