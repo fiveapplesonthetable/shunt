@@ -38,6 +38,10 @@ base, tree, selected areas and units. A successful command cannot certify a
 tree that it changes. Native workflow execution remains available when a
 repository does not install a verification hook.
 
+Before assembling a batch checkout, Shunt confirms the observed pull-request heads
+and fetches any missing pinned commits from the configured canonical repository.
+The source checkout's branch and remote-tracking refs remain unchanged.
+
 Batch probes stream combined stdout and stderr to private files under
 `runs/<batch>/logs`. Each probe prints its log path before starting, and the
 files remain after success or failure. Successful records retain the log
