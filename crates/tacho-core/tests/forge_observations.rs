@@ -2,6 +2,50 @@ use serde_json::json;
 use tacho_core::decide::plugin::{parse_gh_pr_list, CliForgePlugin, ForgePlugin};
 
 #[test]
+fn branch_heads_come_from_the_configured_forge_repository() {
+    let forge = CliForgePlugin::new("owner/canonical");
+    let sha = "a".repeat(40);
+    let head = forge
+        .branch_head("main", &mut |argv| {
+            assert!(argv
+                .iter()
+                .any(|arg| arg == "repos/owner/canonical/git/ref/heads/main"));
+            Ok(json!({"object":{"sha":sha}}).to_string())
+        })
+        .unwrap();
+    assert_eq!(head, Some(sha));
+    assert!(forge
+        .branch_head("main", &mut |_| Ok(
+            json!({"object":{"sha":"abbreviated"}}).to_string()
+        ))
+        .is_err());
+}
+
+#[test]
+fn a_disappeared_pull_requires_an_explicit_terminal_state() {
+    use tacho_core::decide::plugin::PullDisposition;
+    let forge = CliForgePlugin::new("owner/canonical");
+    for (state, expected) in [
+        ("OPEN", PullDisposition::Open),
+        ("MERGED", PullDisposition::Merged),
+        ("CLOSED", PullDisposition::Closed),
+    ] {
+        assert_eq!(
+            forge
+                .pull_disposition(7, &mut |argv| {
+                    assert!(argv
+                        .windows(2)
+                        .any(|pair| pair == ["--repo", "owner/canonical"]));
+                    Ok(json!({"state":state}).to_string())
+                })
+                .unwrap(),
+            expected
+        );
+    }
+    assert!(forge.pull_disposition(7, &mut |_| Ok("{}".into())).is_err());
+}
+
+#[test]
 fn an_open_pull_observation_preserves_the_files_that_select_its_checks() {
     let forge = CliForgePlugin::new("owner/project");
     let argv = forge.plan_open_prs_cmd();

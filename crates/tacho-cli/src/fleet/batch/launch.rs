@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use tacho_core::decide::verify::{new_batch_id, BatchMode, BatchPlan, BatchRun};
 use tacho_daemon::FleetStore;
 
-use super::super::store::{now_secs, record_batch_pid_identity, resolve_live_main_sha};
+use super::super::store::{now_secs, record_batch_pid_identity, resolve_verification_main_sha};
 
 struct PendingChild(Option<Child>);
 
@@ -30,7 +30,7 @@ pub fn spawn_planned_batch(
     if plan.prs.is_empty() || plan.areas.is_empty() || main_sha.is_empty() {
         return Err(io::Error::other("batch plan lacks verification inputs"));
     }
-    if resolve_live_main_sha(repo) != main_sha {
+    if resolve_verification_main_sha(repo, &store.load()?)? != main_sha {
         return Err(io::Error::other("main moved after batch planning"));
     }
     let logs = store.home().join("logs");

@@ -30,7 +30,7 @@ use crate::cli::{BatchArgs, FlakesArgs};
 
 use super::store::{
     emit_decision_event, load_fleet_env, now_ns, now_secs, open_fleet_store,
-    record_batch_pid_identity, resolve_live_main_sha, resolve_live_pr_heads,
+    record_batch_pid_identity, resolve_live_pr_heads, resolve_verification_main_sha,
 };
 use crate::kit::{apply_private_tmp_env, private_tmp_dir, use_private_tmp};
 
@@ -415,7 +415,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
         .unwrap_or(600)
         .max(1);
 
-    let main_sha = resolve_live_main_sha(&cwd);
+    let main_sha = resolve_verification_main_sha(&cwd, &state)?;
 
     let pr_nums: Vec<u64> = if !opts.prs.is_empty() {
         opts.prs.clone()
@@ -980,7 +980,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
 
     // Ref-movement refusal: re-read live `main` and open PR heads from the remote before recording results!
     let latest_state = store.load()?;
-    let current_main = resolve_live_main_sha(&cwd);
+    let current_main = resolve_verification_main_sha(&cwd, &state)?;
     let current_shas = resolve_live_pr_heads(&cwd, &pr_nums, &shas, &latest_state);
     if let Some(moved_reason) = batch_refs_moved(&main_sha, &current_main, &shas, &current_shas) {
         let b_run = BatchRun {

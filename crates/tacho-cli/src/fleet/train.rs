@@ -23,7 +23,7 @@ use crate::cli::{QueueArgs, ReleaseTrainArgs, ShotsArgs, ShotsSubcommands, Train
 use super::batch::{execute_batch_with, BatchOptions, BatchOrigin};
 use super::store::{
     emit_decision_event, load_fleet_meta, mutate_fleet_meta, now_ns, now_secs, open_fleet_store,
-    resolve_live_main_sha, resolve_live_pr_heads, NoticeState,
+    resolve_live_pr_heads, resolve_verification_main_sha, NoticeState,
 };
 use crate::kit::use_private_tmp;
 
@@ -227,7 +227,7 @@ pub fn assemble_train(
 ) -> io::Result<TrainRecord> {
     let state = store.load()?;
     let now = now_secs();
-    let base_sha = resolve_live_main_sha(cwd);
+    let base_sha = resolve_verification_main_sha(cwd, &state)?;
 
     let candidates: Vec<PullFacts> = if !opts.prs.is_empty() {
         let mut list = Vec::new();
@@ -380,7 +380,7 @@ pub fn assemble_train(
         }
     }
 
-    let live_main_after = resolve_live_main_sha(cwd);
+    let live_main_after = resolve_verification_main_sha(cwd, &state)?;
     let live_pr_shas_after = resolve_live_pr_heads(cwd, &accepted_prs, &shas, &state);
     if let Some(moved_reason) =
         batch_refs_moved(&base_sha, &live_main_after, &shas, &live_pr_shas_after)
@@ -791,7 +791,7 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
     let ordered_nums = order_train_prs(&elig, &state.open_prs_cache);
     let parent_map = parents(&state.open_prs_cache);
     let cwd = std::env::current_dir()?;
-    let initial_main = resolve_live_main_sha(&cwd);
+    let initial_main = resolve_verification_main_sha(&cwd, &state)?;
     let compile_cmd = std::env::var("TACHO_COMPILE_CMD")
         .ok()
         .or_else(|| state.train_compile_cmd.clone())
@@ -829,7 +829,7 @@ pub fn execute_release_train_with(args: ReleaseTrainOptions) -> io::Result<()> {
     }
 
     // Verify that neither main nor any surviving member head moved during compilation
-    let live_main_after = resolve_live_main_sha(&cwd);
+    let live_main_after = resolve_verification_main_sha(&cwd, &state)?;
     let live_pr_shas_after = resolve_live_pr_heads(&cwd, &surviving, &member_shas, &state);
     if let Some(moved_reason) = batch_refs_moved(
         &initial_main,

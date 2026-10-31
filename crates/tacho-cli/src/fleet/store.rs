@@ -389,13 +389,56 @@ pub fn resolve_live_main_sha(cwd: &Path) -> String {
         .unwrap_or_else(|| "HEAD".to_string())
 }
 
-/// Resolves live PR head SHAs from `origin` or local branches to detect ref movement during batch/train runs.
+/// Resolves the configured base repository before a verification result can be admitted.
+pub fn resolve_verification_main_sha(cwd: &Path, state: &FleetState) -> io::Result<String> {
+    use tacho_core::decide::plugin::{CliForgePlugin, ForgePlugin};
+    let Some(repository) = state
+        .project
+        .as_ref()
+        .and_then(|project| project.repository.as_deref())
+    else {
+        return Ok(resolve_live_main_sha(cwd));
+    };
+    CliForgePlugin::new(repository)
+        .branch_head("main", &mut |argv| {
+            tacho_daemon::exec::observe::run_argv(Some(cwd), argv, Duration::from_secs(30))
+        })
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("forge did not observe canonical main"))
+}
+
+/// Resolves live PR heads; project verification refuses cached or checkout-local identities.
 pub fn resolve_live_pr_heads(
     cwd: &Path,
     pr_nums: &[u64],
     expected_shas: &BTreeMap<u64, String>,
     latest_state: &FleetState,
 ) -> BTreeMap<u64, String> {
+    if let Some(repository) = latest_state
+        .project
+        .as_ref()
+        .and_then(|project| project.repository.as_deref())
+    {
+        use tacho_core::decide::plugin::{CliForgePlugin, ForgePlugin};
+        let forge = CliForgePlugin::new(repository);
+        let mut current = BTreeMap::new();
+        for &number in pr_nums {
+            let observed = tacho_daemon::exec::observe::run_argv(
+                Some(cwd),
+                &forge.plan_pr_facts_cmd(number),
+                Duration::from_secs(30),
+            )
+            .ok()
+            .and_then(|output| serde_json::from_str::<serde_json::Value>(&output).ok())
+            .and_then(|value| value["headRefOid"].as_str().map(String::from))
+            .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let Some(head) = observed else {
+                return BTreeMap::new();
+            };
+            current.insert(number, head);
+        }
+        return current;
+    }
     let mut current_shas = expected_shas.clone();
     let mut remote_refs: BTreeMap<String, String> = BTreeMap::new();
     if let Ok(out) = Command::new("git")
