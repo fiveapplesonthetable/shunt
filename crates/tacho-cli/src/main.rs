@@ -720,6 +720,11 @@ fn main() {
                 exit_io_err(e);
             }
         }
+        Commands::Project(args) => {
+            if let Err(e) = fleet::project::execute(args) {
+                exit_io_err(e);
+            }
+        }
         Commands::Tick(args) => {
             if let Err(e) = fleet::execute_tick(args) {
                 exit_io_err(e);

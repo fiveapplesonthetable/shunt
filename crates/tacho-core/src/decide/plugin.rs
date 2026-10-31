@@ -1254,16 +1254,7 @@ pub fn notify_owner_command_with(
     use std::process::{Command, Stdio};
 
     let env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
-    let extra_secrets = crate::decide::ops::snapshot::configured_secrets(&env_map);
-    let scrubber = Scrubber::enabled();
-    let mut clean_subject = scrubber.scrub(subject);
-    let mut clean_body = scrubber.scrub(body);
-    for secret in &extra_secrets {
-        if !secret.is_empty() {
-            clean_subject = clean_subject.replace(secret, "<redacted>");
-            clean_body = clean_body.replace(secret, "<redacted>");
-        }
-    }
+    let (clean_subject, clean_body) = crate::project::scrub_notification(subject, body, &env_map);
     let in_test = running_in_test_harness();
     let resolved_cmd = match cmd_override {
         Some(cmd) => Some(cmd.trim().to_string()),

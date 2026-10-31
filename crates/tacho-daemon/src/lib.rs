@@ -8,6 +8,7 @@ pub mod exec;
 pub mod fleet;
 pub mod log;
 pub mod paths;
+pub mod project;
 pub mod recorder;
 pub mod sampler;
 pub mod server;

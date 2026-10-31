@@ -1,0 +1,51 @@
+//! Repository configuration applied independently of live queue state.
+
+use std::fs;
+use std::io;
+
+use tacho_core::project::ProjectConfig;
+
+use crate::cli::{ProjectArgs, ProjectOperation};
+
+use super::store::{git_stdout, open_fleet_store};
+
+/// Executes project configuration validation, application or inspection.
+pub fn execute(args: ProjectArgs) -> io::Result<()> {
+    if matches!(args.command, ProjectOperation::Show) {
+        let project = open_fleet_store()?.load()?.project;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&project).map_err(io::Error::other)?
+        );
+        return Ok(());
+    }
+    let (path, apply) = match args.command {
+        ProjectOperation::Validate { path } => (path, false),
+        ProjectOperation::Apply { path } => (path, true),
+        ProjectOperation::Show => return Ok(()),
+    };
+    let project: ProjectConfig =
+        serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;
+    project.validate().map_err(io::Error::other)?;
+    if apply {
+        let cwd = crate::kit::find_worktree_root(&std::env::current_dir()?);
+        let root = git_stdout(&cwd, &["rev-parse", "--show-toplevel"])?;
+        let root = std::path::Path::new(root.trim());
+        open_fleet_store()?.mutate(
+            Some((
+                "project",
+                "apply",
+                "configuration",
+                "validated project contract replaces project-owned settings",
+            )),
+            |state| {
+                tacho_daemon::project::apply(state, project, root);
+            },
+        )?;
+    }
+    println!(
+        "Project configuration {}",
+        if apply { "applied" } else { "valid" }
+    );
+    Ok(())
+}

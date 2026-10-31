@@ -15,6 +15,7 @@ pub mod input;
 pub mod kind;
 pub mod lane;
 pub mod live;
+pub mod project;
 pub mod recorder;
 pub mod scrub;
 pub mod track;

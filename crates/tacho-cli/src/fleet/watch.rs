@@ -142,7 +142,7 @@ impl tacho_daemon::exec::Hands for CliHands {
         if cfg!(test) {
             return Ok(false);
         }
-        tacho_core::decide::plugin::notify_owner_command(subject, body)
+        tacho_daemon::project::notify_owner(&self.home, subject, body)
     }
 
     fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
@@ -162,9 +162,7 @@ pub fn execute_tick_with(store: &mut FleetStore, args: TickArgs) -> io::Result<(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let live = tacho_core::LiveState::default();
     let mut hands = CliHands { home: home.clone() };
-    let gh_forge = std::env::var("TACHO_GH_REPO")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    let gh_forge = tacho_daemon::project::forge_repository(&store.load()?)
         .map(tacho_core::decide::plugin::GitHubForge::new);
     let mut opts = tacho_daemon::exec::TickOptions::new(&live);
     opts.dry_run = args.dry_run;

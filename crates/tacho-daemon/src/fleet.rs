@@ -50,6 +50,8 @@ pub struct DecisionRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FleetState {
+    /// Validated project contract shared by CLI and daemon execution.
+    pub project: Option<tacho_core::project::ProjectConfig>,
     pub max_workers: usize,
     pub default_provider: String,
     pub default_model: Option<String>,
@@ -107,6 +109,7 @@ pub struct FleetState {
 impl Default for FleetState {
     fn default() -> Self {
         Self {
+            project: None,
             max_workers: 4,
             default_provider: "claude".to_string(),
             default_model: None,
@@ -1154,7 +1157,7 @@ impl crate::exec::Hands for DaemonHands {
     }
 
     fn notify_owner(&mut self, subject: &str, body: &str) -> Result<bool, String> {
-        tacho_core::decide::plugin::notify_owner_command(subject, body)
+        crate::project::notify_owner(&self.home, subject, body)
     }
 
     fn prune_root_disk_volumes(&mut self) -> Result<String, String> {
@@ -1192,9 +1195,7 @@ pub fn execute_decide_tick_with_launcher(
         appender,
         launcher,
     };
-    let gh_forge = std::env::var("TACHO_GH_REPO")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    let gh_forge = crate::project::forge_repository(&store.load()?)
         .map(tacho_core::decide::plugin::GitHubForge::new);
     let mut opts = crate::exec::TickOptions::new(live_state);
     opts.dry_run = dry_run;

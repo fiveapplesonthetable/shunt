@@ -568,6 +568,10 @@ pub fn provision_worktree_in_store(
     if !wt_path.exists() {
         let out = Command::new("git")
             .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
                 "worktree",
                 "add",
                 "-B",
@@ -653,6 +657,35 @@ pub fn provision_worktree_in_store(
         &extra_kv,
     );
     let env_map = parse_env(&initial_env_content);
+
+    if let Some(project) = &state.project {
+        let mut request = tacho_core::project::HookRequest {
+            version: 1,
+            kind: tacho_core::project::HookKind::RunnerTrust,
+            repository_root: state
+                .repo_root
+                .clone()
+                .unwrap_or_else(|| cwd.to_string_lossy().into_owned()),
+            worktree: wt_path.to_string_lossy().into_owned(),
+            base: base_sha.clone(),
+            head: base_sha.clone(),
+            tree: crate::fleet::store::git_stdout(&wt_path, &["rev-parse", "HEAD^{tree}"])?,
+            files: Vec::new(),
+            areas: Vec::new(),
+            payload: serde_json::json!({"operation":"worker", "slug":args.slug, "port":base_port, "port_last":port_last, "target_dir":cargo_target_dir}),
+        };
+        if let Some(command) = project
+            .hooks
+            .get(&tacho_core::project::HookKind::RunnerTrust)
+        {
+            tacho_daemon::project::invoke(command, Path::new(&request.repository_root), &request)?;
+        }
+        if let Some(command) = project.hooks.get(&tacho_core::project::HookKind::Prepare) {
+            request.kind = tacho_core::project::HookKind::Prepare;
+            let output = tacho_daemon::project::invoke(command, &wt_path, &request)?;
+            extra_kv.extend(tacho_daemon::project::prepared_environment(&output)?);
+        }
+    }
 
     let install_timeout = std::env::var("TACHO_START_TIMEOUT_SECS")
         .ok()
