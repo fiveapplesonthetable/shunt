@@ -109,6 +109,7 @@ pub struct AreaRouter<'a> {
         regex::RegexSet,
         regex::RegexSet,
         regex::RegexSet,
+        regex::RegexSet,
     )>,
 }
 
@@ -123,6 +124,7 @@ impl<'a> AreaRouter<'a> {
                     regex::RegexSet::new(&rule.patterns)?,
                     regex::RegexSet::new(&rule.fallback_patterns)?,
                     regex::RegexSet::new(&rule.required_patterns)?,
+                    regex::RegexSet::new(&rule.input_patterns)?,
                 ))
             })
             .collect::<Result<_, regex::Error>>()?;
@@ -145,7 +147,7 @@ impl<'a> AreaRouter<'a> {
         }
         for file in files {
             let mut matched = false;
-            for (rule, patterns, _, required) in &self.compiled {
+            for (rule, patterns, _, required, _) in &self.compiled {
                 if required.is_match(file) {
                     out.insert(rule.area.clone());
                 }
@@ -157,7 +159,7 @@ impl<'a> AreaRouter<'a> {
                 }
             }
             if !matched {
-                for (rule, _, fallback, _) in &self.compiled {
+                for (rule, _, fallback, _, _) in &self.compiled {
                     if fallback.is_match(file) {
                         out.insert(rule.area.clone());
                         matched = true;
@@ -175,6 +177,14 @@ impl<'a> AreaRouter<'a> {
                 );
             }
         }
+        out.retain(|area| {
+            self.compiled
+                .iter()
+                .find(|(rule, _, _, _, _)| &rule.area == area)
+                .is_none_or(|(rule, _, _, _, inputs)| {
+                    rule.input_patterns.is_empty() || files.iter().any(|file| inputs.is_match(file))
+                })
+        });
         out.into_iter().collect()
     }
 }

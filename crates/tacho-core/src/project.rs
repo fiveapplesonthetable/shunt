@@ -218,6 +218,7 @@ impl ProjectConfig {
             generated_output_matcher(&rule.patterns)?;
             generated_output_matcher(&rule.fallback_patterns)?;
             generated_output_matcher(&rule.required_patterns)?;
+            generated_output_matcher(&rule.input_patterns)?;
             if rule.area.trim().is_empty() || !areas.insert(&rule.area) {
                 return Err("verification areas must have distinct nonempty names".into());
             }

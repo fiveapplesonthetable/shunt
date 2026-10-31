@@ -343,6 +343,7 @@ fn test_kit_start_prove_and_pr_preflight() {
                 patterns: Vec::new(),
                 fallback_patterns: Vec::new(),
                 required_patterns: Vec::new(),
+                input_patterns: Vec::new(),
                 always: false,
                 area: "docs".to_string(),
                 prefixes: vec!["docs/".to_string(), "README.md".to_string()],

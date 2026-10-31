@@ -371,6 +371,7 @@ fn test_prove_step_execution_and_area_rule_substitution() {
         patterns: Vec::new(),
         fallback_patterns: Vec::new(),
         required_patterns: Vec::new(),
+        input_patterns: Vec::new(),
         always: false,
         area: "backend".to_string(),
         prefixes: vec!["crates/".to_string()],
