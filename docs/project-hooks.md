@@ -22,6 +22,16 @@ Unknown fields and unsupported versions are errors. A hook is an explicit
 `program`, an array of literal `args`, and an optional `timeout_secs` between
 one and 3,600, defaulting to 60. Request values pass through JSON stdin.
 
+Area rules combine literal `prefixes` and regular-expression `patterns`. An area
+with `always: true` runs for every nonempty change; it does not make an unknown
+path known. Only paths unmatched by ordinary rules use `fallback_patterns`.
+Malformed expressions prevent configuration installation. Proof commands,
+screenshot requirements and batch planning consume the same selection.
+
+`shunt project select shunt.json --files-file paths.json` selects areas from a
+JSON array of changed paths without opening controller state. `--each` returns
+the selection for every path, compiling the rules once for the complete input.
+
 `proof_plan` receives the changed paths, base, head and input tree. It returns
 the JSON check array accepted by `shunt prove --plan-file`. Editing source
 during planning invalidates the plan, including during a proof dry run.
@@ -111,3 +121,5 @@ an array of area names. Grouping uses the union of a stack's areas. Pipeline
 changes run alone. Planning and claiming consume the same grouping rules,
 including `group:<name>` holds. A retained queue row never restarts a recorded
 attempt; an explicit retry uses a new attempt key.
+
+`required_patterns` adds an area for matching inputs without classifying those paths as known. Its matches keep unmatched-path fallback checks, including when a screenshot or generated output has no owning source rule.

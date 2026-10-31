@@ -2177,6 +2177,10 @@ pub struct ProjectPolicy {
 fn default_area_rules() -> Vec<AreaRule> {
     vec![
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "core".to_string(),
             prefixes: vec!["crates/".to_string(), "src/".to_string()],
             unit_prefixes: BTreeMap::new(),
@@ -2185,6 +2189,10 @@ fn default_area_rules() -> Vec<AreaRule> {
             needs_screenshot: false,
         },
         AreaRule {
+            patterns: Vec::new(),
+            fallback_patterns: Vec::new(),
+            required_patterns: Vec::new(),
+            always: false,
             area: "ci".to_string(),
             prefixes: vec![".github/".to_string(), "scripts/".to_string()],
             unit_prefixes: BTreeMap::new(),

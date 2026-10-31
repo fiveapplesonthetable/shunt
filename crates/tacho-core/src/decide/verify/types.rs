@@ -208,6 +208,18 @@ pub struct AreaRule {
     pub area: String,
     #[serde(default)]
     pub prefixes: Vec<String>,
+    /// Additional path expressions selected alongside literal prefixes.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Selects this area without claiming that the matching input path is known.
+    #[serde(default)]
+    pub required_patterns: Vec<String>,
+    /// Expressions considered only for paths no ordinary rule recognizes.
+    #[serde(default)]
+    pub fallback_patterns: Vec<String>,
+    /// Requires this area for every nonempty change without claiming its paths.
+    #[serde(default)]
+    pub always: bool,
     #[serde(default)]
     pub unit_prefixes: BTreeMap<String, Vec<String>>,
     #[serde(default)]

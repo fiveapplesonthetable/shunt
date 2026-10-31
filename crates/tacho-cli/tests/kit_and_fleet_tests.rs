@@ -340,6 +340,10 @@ fn test_kit_start_prove_and_pr_preflight() {
     store
         .mutate(None, |st| {
             st.area_rules.push(AreaRule {
+                patterns: Vec::new(),
+                fallback_patterns: Vec::new(),
+                required_patterns: Vec::new(),
+                always: false,
                 area: "docs".to_string(),
                 prefixes: vec!["docs/".to_string(), "README.md".to_string()],
                 unit_prefixes: std::collections::BTreeMap::new(),

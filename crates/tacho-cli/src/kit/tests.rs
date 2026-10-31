@@ -368,6 +368,10 @@ fn test_prove_step_execution_and_area_rule_substitution() {
     assert!(out_ok.contains("area=core units=u1,u2"));
 
     let rules = vec![AreaRule {
+        patterns: Vec::new(),
+        fallback_patterns: Vec::new(),
+        required_patterns: Vec::new(),
+        always: false,
         area: "backend".to_string(),
         prefixes: vec!["crates/".to_string()],
         unit_prefixes: BTreeMap::from([("api".to_string(), vec!["crates/api/".to_string()])]),
