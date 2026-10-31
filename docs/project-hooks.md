@@ -27,6 +27,11 @@ base, tree, selected areas and units. A successful command cannot certify a
 tree that it changes. Native workflow execution remains available when a
 repository does not install a verification hook.
 
+Batch probes stream combined stdout and stderr to private files under
+`runs/<batch>/logs`. Each probe prints its log path before starting, and the
+files remain after success or failure. Successful records retain the log
+directory; failure classification still reads the complete failed output.
+
 `generated_outputs` lists regexes of derived files. Changed matching files
 are archived with their before and after Git object IDs, then restored to
 their input bytes. New derived files are collected and removed from the

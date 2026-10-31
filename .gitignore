@@ -1,6 +1,8 @@
 target/
 *.perfetto-trace
 /scratch/
+/.tachorun/
+/.tachoproof/
 
 # Fuzzing & proptest artifacts
 fuzz/corpus/
