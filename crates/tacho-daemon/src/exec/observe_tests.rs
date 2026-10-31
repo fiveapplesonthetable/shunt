@@ -494,3 +494,64 @@ fn test_git_commands_refuse_plain_subdir_inside_enclosing_repo() {
         "observe_worktree must never leave .git/index.lock in parent repo"
     );
 }
+
+#[test]
+fn a_project_without_a_ci_workflow_still_refreshes_its_forge() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut store = FleetStore::open(&temporary.path().join("events.sqlite")).unwrap();
+    let project = serde_json::from_value(serde_json::json!({
+        "version":1,"repository":"owner/repository",
+        "area_rules":[{"area":"runtime","prefixes":["src/"]}]
+    }))
+    .unwrap();
+    store
+        .mutate(None, |state| {
+            crate::project::apply(state, project, temporary.path());
+        })
+        .unwrap();
+    let forge = MockForge {
+        branch_head: Ok(Some("a".repeat(40))),
+        main_ci: Err("this project has no hosted CI workflow".into()),
+        open_prs: Ok(vec![PullFacts {
+            number: 12,
+            head: "b".repeat(40),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let mut hands = TestHands {
+        attention: Vec::new(),
+    };
+    let observed = refresh_world(
+        &mut store,
+        &forge,
+        None,
+        &mut hands,
+        Duration::from_secs(2),
+        true,
+    )
+    .unwrap();
+    assert!(observed.errors.is_empty(), "{:?}", observed.errors);
+    assert!(forge.ci_requests.lock().unwrap().is_empty());
+    assert_eq!(
+        store.load().unwrap().open_prs_cache.first().unwrap().number,
+        12
+    );
+    store
+        .mutate(None, |state| state.workflow_path = Some("ci.yaml".into()))
+        .unwrap();
+    let configured = refresh_world(
+        &mut store,
+        &forge,
+        None,
+        &mut hands,
+        Duration::from_secs(2),
+        true,
+    )
+    .unwrap();
+    assert_eq!(configured.errors.len(), 1);
+    assert_eq!(
+        *forge.ci_requests.lock().unwrap(),
+        vec![("main".into(), "ci.yaml".into())]
+    );
+}

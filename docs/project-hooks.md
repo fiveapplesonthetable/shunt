@@ -5,7 +5,9 @@ its hooks. `shunt project apply shunt.json` installs it in the fleet store. Appl
 configuration preserves worker limits, holds, queued work and proof history.
 Changing the repository, verification hooks, area selection or verification inputs
 invalidates active passes. Transport and publication changes preserve those passes.
-The CLI and daemon read the same installed contract.
+The CLI and daemon read the same installed contract. A project that omits
+`workflow_path` still observes its pull requests and canonical main, without
+querying a hosted CI workflow. An explicitly configured workflow must be observable.
 
 Owner merge execution requires the configured merge permission or
 `TACHO_LAND_MERGE`. A disabled merge leaves its train open. Landing queries
