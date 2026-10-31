@@ -105,4 +105,5 @@ if ((${#leaked_burners[@]})); then
 fi
 
 PYTHONPATH="$root/plugins/ci" python3 -m unittest discover -s "$root/plugins/ci/tests"
+PYTHONPATH="$root/plugins/notify" python3 -m unittest discover -s "$root/plugins/notify/tests"
 
