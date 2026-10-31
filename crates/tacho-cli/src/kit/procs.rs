@@ -180,6 +180,30 @@ impl JobProcess {
 
 struct StoppedJobTree(Vec<JobProcess>);
 
+fn direct_process_children(pid: u32) -> io::Result<Vec<u32>> {
+    let mut children = std::collections::BTreeSet::new();
+    let threads = match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(threads) => threads,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    for thread in threads {
+        let raw = match fs::read_to_string(thread?.path().join("children")) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for child in raw.split_whitespace() {
+            children.insert(
+                child
+                    .parse()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            );
+        }
+    }
+    Ok(children.into_iter().collect())
+}
+
 impl Drop for StoppedJobTree {
     fn drop(&mut self) {
         for process in self.0.iter().rev() {
@@ -241,14 +265,8 @@ fn stop_job_tree(pid: u32, starttime: u64) -> io::Result<StoppedJobTree> {
             }
             watcher.wait_ms(1);
         }
-        // Every thread can have children; the /proc scan includes their process-wide PPIDs.
-        pending.extend(
-            tacho_daemon::sampler::find_process_tree(child)
-                .into_iter()
-                .filter(|descendant| {
-                    tacho_daemon::sampler::read_process_ppid(*descendant) == Some(child)
-                }),
-        );
+        // A stopped parent cannot fork again; every thread's children are collected before it resumes.
+        pending.extend(direct_process_children(child)?);
     }
     Ok(tree)
 }
@@ -781,4 +799,28 @@ pub fn execute_note(args: NoteArgs) -> io::Result<()> {
         note.phase, note.text
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod child_index_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn the_child_index_includes_a_process_forked_by_another_thread() {
+        let (ready, child_pid) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+            ready.send(child.id()).unwrap();
+            let _ = released.recv();
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+        let pid = child_pid.recv().unwrap();
+        let found = direct_process_children(std::process::id());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(found.unwrap().contains(&pid));
+    }
 }
