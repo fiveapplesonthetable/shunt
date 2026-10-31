@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from shunt_ci.runner import allocations, execute
 from shunt_ci.spec import Plan
@@ -38,6 +39,16 @@ class JobExecution(unittest.TestCase):
     def run_plan(self, value, **arguments):
         with redirect_stdout(io.StringIO()):
             return execute(value, self.root, self.output, available_cpus=self.cpus, **arguments)
+
+    def test_jobs_inherit_only_explicit_controller_settings(self):
+        command = shlex.join([sys.executable, "-c", "import json,os,pathlib; pathlib.Path('environment.json').write_text(json.dumps({key:os.environ.get(key) for key in ('TACHO_HOME','TACHO_BATCH_CLAIMED','TACHO_GH_REPO','TACHO_TEST_MODE','PROJECT_VALUE')}))"])
+        with patch.dict(os.environ, {"TACHO_HOME":"controller-home", "TACHO_BATCH_CLAIMED":"1", "TACHO_GH_REPO":"owner/controller", "PROJECT_VALUE":"retained"}):
+            receipt = self.run_plan(plan([job("isolated", command, environment={"TACHO_TEST_MODE":"1"})]))
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(json.loads((self.root / "environment.json").read_text()), {
+            "TACHO_HOME":None,"TACHO_BATCH_CLAIMED":None,"TACHO_GH_REPO":None,
+            "TACHO_TEST_MODE":"1","PROJECT_VALUE":"retained",
+        })
 
     def test_environment_channels_preserve_literal_values_without_executing_them(self):
         marker = self.root / "must-not-exist"

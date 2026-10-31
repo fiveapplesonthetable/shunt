@@ -19,6 +19,9 @@ a CPU budget and a timeout. A step has `run`, an optional workspace-relative
 execution resources. Cycles, unknown fields, invalid environment
 names and directories that escape the workspace are errors before execution.
 
+Host jobs inherit ordinary environment values. Controller settings with the
+`TACHO_` prefix reach a job only when its plan explicitly declares them.
+
 An `image` selects a container job. `mounts` declare host and container paths and
 whether they are read-only. Writable mounts and the workspace return to the
 caller's ownership. A `service` declares an image, network alias, environment,

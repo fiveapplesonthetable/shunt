@@ -151,6 +151,7 @@ def _wait_service(name, seconds, cancellation, run):
 def execute(job, root, name, cpus, parent, log, cancellation, run=subprocess.run):
     resources = {"cpus":len(cpus),"name":name,"worktree":str(root),"service":f"{name}-service","network":name}
     environment = {**job.environment, **{key: value.format(**resources) for key, value in job.resource_environment.items()}}
+    process_env = {key: value for key, value in os.environ.items() if not key.startswith("TACHO_")}
     scope = f"{name}.scope" if job.host_scope and not job.image else None
     service = f"{name}-service"
     additional = [template.format(**resources) for template in job.owned_containers]
@@ -194,13 +195,12 @@ def execute(job, root, name, cpus, parent, log, cancellation, run=subprocess.run
                     log.write(f"service {spec.alias} did not become ready\n{started.stderr}".encode()); log.flush()
                     return NOT_STARTED
             argv = container_argv(job, root, name, cpus, parent, environment)
-            process_env = os.environ.copy()
         else:
             argv = ["taskset", "-c", ",".join(map(str, cpus)), "bash", "-c", driver(str(root), [], None), "shunt-ci", *commands]
             if scope:
                 argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit", name,
                         "--property", f"AllowedCPUs={','.join(map(str, cpus))}", *argv]
-            process_env = {**os.environ, **environment}
+            process_env.update(environment)
         with process_lock:
             if cancellation.tripped:
                 return STOPPED
