@@ -21,6 +21,8 @@ use tacho_core::decide::{DecisionPlan, DecisionState, WorldObservation};
 use tacho_core::{Kind, Scrubber, TaskStatus};
 use tacho_proto::tacho;
 
+pub mod state_import;
+
 /// A recorded worktree allocation in fleet state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorktreeEntry {
@@ -50,6 +52,8 @@ pub struct DecisionRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FleetState {
+    /// Project-owned decisions that remain pending after a controller handoff.
+    pub external_attention: BTreeMap<String, String>,
     /// Validated project contract shared by CLI and daemon execution.
     pub project: Option<tacho_core::project::ProjectConfig>,
     pub max_workers: usize,
@@ -109,6 +113,7 @@ pub struct FleetState {
 impl Default for FleetState {
     fn default() -> Self {
         Self {
+            external_attention: BTreeMap::new(),
             project: None,
             max_workers: 4,
             default_provider: "claude".to_string(),

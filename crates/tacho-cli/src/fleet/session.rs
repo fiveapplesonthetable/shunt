@@ -282,6 +282,7 @@ fn spawn_worker_with_trace(
     let cgroup = proc_pid_cgroup(pid);
 
     let run = AgentRun {
+        outcome: Default::default(),
         key: item.key.clone(),
         pid: Some(pid),
         area: item.area.clone(),
@@ -515,6 +516,7 @@ pub fn execute_attach(args: AttachArgs) -> io::Result<()> {
             a.pr = pr_num;
             a.pr_none = is_none;
             a.pr_source = Some("attached".to_string());
+            a.outcome = tacho_core::decide::dispatch::RunOutcome::Completed;
             if a.finished_at.is_none() {
                 a.finished_at = Some(now_secs());
             }

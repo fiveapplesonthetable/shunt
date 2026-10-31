@@ -49,6 +49,12 @@ use watch::{
 /// Complete pure fleet state input to [`decide`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DecisionState {
+    /// Project-owned decisions retained across controller handoffs.
+    #[serde(default)]
+    pub external_attention: BTreeMap<String, String>,
+    /// Requires explicit confirmation of a worker's no-PR report.
+    #[serde(default)]
+    pub review_no_pr: bool,
     pub max_parallel: usize,
     pub todo: Vec<TodoItem>,
     pub agents: BTreeMap<String, AgentRun>,
@@ -243,6 +249,9 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
                 } else if is_none {
                     a.pr_none = true;
                     a.pr_source = Some("none".to_string());
+                    if state.review_no_pr {
+                        a.outcome = dispatch::RunOutcome::AwaitingPrReview;
+                    }
                 }
             }
             reaped_agents.push((k, found_pr, is_none));
@@ -625,6 +634,16 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         &next.passed,
         &next.failed,
         obs.now,
+    );
+    attention_items.extend(
+        next.external_attention
+            .iter()
+            .map(|(key, summary)| AttentionItem {
+                kind: "project".into(),
+                target: key.clone(),
+                summary: summary.clone(),
+                command_hint: format!("tacho project resolve {key}"),
+            }),
     );
     for (pr_num, reason) in &barred_rebases {
         attention_items.push(AttentionItem {

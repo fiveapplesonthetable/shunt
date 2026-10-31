@@ -276,3 +276,37 @@ fn an_invalid_project_version_preserves_the_live_configuration_and_pause() {
     );
     assert_eq!(store.load().unwrap(), before);
 }
+
+#[test]
+fn project_commits_are_not_treated_as_updates_to_the_controller_binary() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let home = temp.path().join("home");
+    fixture(&repo, false);
+    let first = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let first = String::from_utf8(first.stdout).unwrap().trim().to_owned();
+    git(
+        &repo,
+        &["commit", "-am", "The application advances independently"],
+    );
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&repo, &["checkout", "--detach", &first]);
+    let applied = cli(&repo, &home, &["project", "apply"]);
+    assert!(applied.status.success());
+    let preview = cli(&repo, &home, &["tick", "--dry-run"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert!(value["plan"]["self_update"]["target_sha"].is_null());
+    assert_eq!(
+        value["observation"]["behind_commits"],
+        serde_json::json!([])
+    );
+}

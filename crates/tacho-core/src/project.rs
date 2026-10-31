@@ -79,6 +79,9 @@ pub struct ProjectConfig {
     /// Reference-file lists that take precedence over generated-output patterns.
     #[serde(default)]
     pub input_lists: Vec<InputList>,
+    /// Whether a worker's `PR: none` report requires explicit confirmation.
+    #[serde(default)]
+    pub review_no_pr: bool,
     /// Workflow used for main CI observation.
     #[serde(default)]
     pub workflow_path: Option<String>,
@@ -158,6 +161,11 @@ impl ProjectConfig {
 pub fn generated_output_matcher(patterns: &[String]) -> Result<regex::RegexSet, String> {
     regex::RegexSet::new(patterns)
         .map_err(|error| format!("invalid generated output pattern: {error}"))
+}
+
+/// Identifies an immutable migration snapshot by its complete bytes.
+pub fn content_id(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 /// Scrubs notifications using the same configured secrets in every runtime path.

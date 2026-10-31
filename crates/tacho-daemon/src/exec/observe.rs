@@ -717,6 +717,11 @@ pub fn decision_state_of(state: &FleetState, now: i64) -> DecisionState {
         }
     }
     DecisionState {
+        external_attention: state.external_attention.clone(),
+        review_no_pr: state
+            .project
+            .as_ref()
+            .is_some_and(|project| project.review_no_pr),
         max_parallel: state.max_workers,
         todo,
         agents: state.agents.clone(),
@@ -819,7 +824,12 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
         }
     }
     let agent_samples = agent_samples(state, host, &live_keys);
-    let repo_obs = host.repo.map(observe_repo).unwrap_or_default();
+    // Project source and the installed controller binary have independent update lifecycles.
+    let repo_obs = if state.project.is_some() {
+        RepoObs::default()
+    } else {
+        host.repo.map(observe_repo).unwrap_or_default()
+    };
 
     let mut ready_trains = Vec::new();
     if let Some(open) = tacho_core::decide::land::open_for(&state.trains) {
