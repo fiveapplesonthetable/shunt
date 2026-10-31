@@ -404,7 +404,13 @@ pub fn run_tick(
             !opts.dry_run,
         )?;
         refresh_errors = outcome.errors;
-        if opts.dry_run && !refresh_errors.is_empty() {
+        if !refresh_errors.is_empty()
+            && (opts.dry_run
+                || state
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project.repository.is_some()))
+        {
             return Err(io::Error::other(refresh_errors.join("; ")));
         }
         state = if opts.dry_run {

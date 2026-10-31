@@ -67,8 +67,9 @@ pub use store::{
     emit_decision_event, fleet_meta_path, git_stdout, live_agent_keys, load_fleet_env,
     load_fleet_meta, mutate_fleet_meta, now_ns, now_secs, open_fleet_store, parse_systemd_env_file,
     pid_alive, pid_alive_matching, proc_pid_cgroup, proc_pid_starttime, record_batch_pid_identity,
-    resolve_live_main_sha, resolve_live_pr_heads, save_fleet_meta, wait_for_pid_exit, write_atomic,
-    BatchPidIdentity, CodeMoveRecord, FleetMeta, NoticeState, RetiredMeta, WatchdogIssueState,
+    resolve_live_main_sha, resolve_live_pr_heads, resolve_verification_main_sha, save_fleet_meta,
+    wait_for_pid_exit, write_atomic, BatchPidIdentity, CodeMoveRecord, FleetMeta, NoticeState,
+    RetiredMeta, WatchdogIssueState,
 };
 pub use tidy::{
     apply_tidy_decisions, build_tidy_snapshot, execute_tidy, execute_tidy_with, rescue_worktree,

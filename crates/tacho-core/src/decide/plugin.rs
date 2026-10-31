@@ -251,6 +251,18 @@ pub struct ForgeChecksVerdict {
     pub missing_required: Vec<String>,
 }
 
+/// Confirmed lifecycle state of a pull request on its forge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PullDisposition {
+    /// The pull request can still receive commits.
+    Open,
+    /// Its changes were merged into the base repository.
+    Merged,
+    /// It was closed without merging.
+    Closed,
+}
+
 /// Pluggable code-host / forge interface (PR facts, mergeable state, CI checks, and
 /// issue/PR body & comment updates).
 ///
@@ -313,6 +325,24 @@ pub trait ForgePlugin: Send + Sync {
     ) -> Result<Vec<PullFacts>, String> {
         let out = run(&self.plan_open_prs_cmd())?;
         self.parse_open_prs(&out)
+    }
+
+    /// Fresh head of the configured repository's branch, independent of checkout remotes.
+    fn branch_head(
+        &self,
+        _branch: &str,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// A disappeared pull request is retired only after its terminal state is confirmed.
+    fn pull_disposition(
+        &self,
+        _number: u64,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<PullDisposition, String> {
+        Err("forge does not support pull state observation".into())
     }
 
     /// Creates or updates an open issue with `title` and `body` (scrubbed via [`Scrubber`]).
@@ -543,6 +573,10 @@ pub fn parse_gh_pr_list(stdout: &str) -> Result<Vec<PullFacts>, String> {
 /// Offline / test forge: returns configured values and never runs a command.
 #[derive(Debug, Clone)]
 pub struct MockForge {
+    /// Fresh branch observation, or an injected observation failure.
+    pub branch_head: Result<Option<String>, String>,
+    /// Confirmed states of pulls that disappeared from the open list.
+    pub pull_dispositions: BTreeMap<u64, PullDisposition>,
     /// Value returned by [`ForgePlugin::main_ci_run`]; `Err` simulates a forge failure.
     pub main_ci: Result<Option<MainCiRun>, String>,
     /// Recorded `main_ci_run(branch, workflow)` calls.
@@ -572,6 +606,8 @@ pub struct MockForge {
 impl Default for MockForge {
     fn default() -> Self {
         Self {
+            branch_head: Ok(None),
+            pull_dispositions: BTreeMap::new(),
             main_ci: Ok(None),
             ci_requests: std::sync::Arc::default(),
             open_prs: Ok(Vec::new()),
@@ -589,6 +625,24 @@ impl Default for MockForge {
 }
 
 impl ForgePlugin for MockForge {
+    fn branch_head(
+        &self,
+        _branch: &str,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Option<String>, String> {
+        self.branch_head.clone()
+    }
+
+    fn pull_disposition(
+        &self,
+        number: u64,
+        _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<PullDisposition, String> {
+        self.pull_dispositions
+            .get(&number)
+            .copied()
+            .ok_or("pull state is unknown".into())
+    }
     fn forge_name(&self) -> &str {
         "mock"
     }
@@ -809,6 +863,55 @@ impl CliForgePlugin {
 }
 
 impl ForgePlugin for CliForgePlugin {
+    fn branch_head(
+        &self,
+        branch: &str,
+        run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Option<String>, String> {
+        if branch.is_empty()
+            || branch
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && !b"._-/".contains(&byte))
+        {
+            return Err("invalid branch reference".into());
+        }
+        let repository = self.repo.as_deref().unwrap_or("{owner}/{repo}");
+        let output = run(&[
+            self.cli_bin.clone(),
+            "api".into(),
+            format!("repos/{repository}/git/ref/heads/{branch}"),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&output)
+            .map_err(|error| format!("unexpected branch observation: {error}"))?;
+        let sha = value["object"]["sha"]
+            .as_str()
+            .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or("forge branch observation lacks a complete commit identity")?;
+        Ok(Some(sha.to_string()))
+    }
+
+    fn pull_disposition(
+        &self,
+        number: u64,
+        run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<PullDisposition, String> {
+        let mut argv = vec![
+            self.cli_bin.clone(),
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+        ];
+        argv.extend(self.repo_args());
+        argv.extend(["--json".into(), "state".into()]);
+        #[derive(Deserialize)]
+        struct Observation {
+            state: PullDisposition,
+        }
+        serde_json::from_str::<Observation>(&run(&argv)?)
+            .map(|observation| observation.state)
+            .map_err(|error| format!("unexpected pull state observation: {error}"))
+    }
+
     fn open_prs(
         &self,
         run: &mut dyn FnMut(&[String]) -> Result<String, String>,

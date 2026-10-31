@@ -236,6 +236,110 @@ fn test_refresh_world_updates_state_and_retains_last_known_on_forge_failure() {
 }
 
 #[test]
+fn disappeared_pulls_remain_pending_until_their_terminal_state_is_confirmed() {
+    use tacho_core::decide::plugin::PullDisposition;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = FleetStore::open(&dir.path().join("events.sqlite")).unwrap();
+    store
+        .mutate(None, |state| {
+            state.open_prs_cache = [12, 13, 14]
+                .into_iter()
+                .map(|number| PullFacts {
+                    number,
+                    ..Default::default()
+                })
+                .collect();
+        })
+        .unwrap();
+    let forge = MockForge {
+        branch_head: Ok(Some("a".repeat(40))),
+        pull_dispositions: BTreeMap::from([
+            (12, PullDisposition::Merged),
+            (13, PullDisposition::Closed),
+        ]),
+        ..Default::default()
+    };
+    let mut hands = TestHands {
+        attention: Vec::new(),
+    };
+    let outcome = refresh_world(
+        &mut store,
+        &forge,
+        None,
+        &mut hands,
+        Duration::from_secs(2),
+        true,
+    )
+    .unwrap();
+    assert_eq!(outcome.errors.len(), 1);
+    let state = store.load().unwrap();
+    assert!(state.merged_prs.contains(&12));
+    assert!(state.closed_prs.contains(&13));
+    assert_eq!(
+        state
+            .open_prs_cache
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        vec![14]
+    );
+    assert_eq!(state.main_sha, Some("a".repeat(40)));
+    let forge = MockForge {
+        pull_dispositions: BTreeMap::from([(14, PullDisposition::Closed)]),
+        ..forge
+    };
+    let outcome = refresh_world(
+        &mut store,
+        &forge,
+        None,
+        &mut hands,
+        Duration::from_secs(2),
+        true,
+    )
+    .unwrap();
+    assert!(outcome.errors.is_empty());
+    assert!(store.load().unwrap().open_prs_cache.is_empty());
+    assert!(store.load().unwrap().closed_prs.contains(&14));
+}
+
+#[test]
+fn a_project_cannot_refresh_main_from_an_unrelated_local_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = FleetStore::open(&dir.path().join("events.sqlite")).unwrap();
+    store
+        .mutate(None, |state| {
+            state.project = Some(
+                serde_json::from_value(serde_json::json!({
+                    "version":1,"repository":"owner/canonical","area_rules":[{"area":"all"}]
+                }))
+                .unwrap(),
+            );
+        })
+        .unwrap();
+    let mut hands = TestHands {
+        attention: Vec::new(),
+    };
+    let outcome = refresh_world(
+        &mut store,
+        &MockForge::default(),
+        Some(dir.path()),
+        &mut hands,
+        Duration::from_secs(2),
+        true,
+    )
+    .unwrap();
+    assert!(outcome
+        .errors
+        .iter()
+        .any(|error| error.contains("canonical main")));
+    assert!(!store
+        .load()
+        .unwrap()
+        .world_refreshed_at
+        .contains_key("main"));
+}
+
+#[test]
 fn test_build_tidy_snapshot_uses_actual_idle_mtime_and_detects_untracked_dirty_files() {
     let dir = tempfile::tempdir().unwrap();
     let main_repo = dir.path().join("main-repo");

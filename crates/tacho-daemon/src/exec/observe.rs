@@ -1096,7 +1096,7 @@ pub fn refresh_world(
     let mut outcome = RefreshOutcome::default();
     let mut runner = |argv: &[String]| run_argv(repo, argv, timeout);
 
-    let new_prs =
+    let mut new_prs =
         match env_json::<Vec<tacho_core::decide::dispatch::PullFacts>>("TACHO_OPEN_PRS_JSON") {
             Some(prs) => Some(prs),
             None => match forge.open_prs(&mut runner) {
@@ -1117,6 +1117,30 @@ pub fn refresh_world(
                 }
             },
         };
+
+    let mut dispositions = BTreeMap::new();
+    if let Some(prs) = &mut new_prs {
+        let observed: BTreeSet<_> = prs.iter().map(|pr| pr.number).collect();
+        for previous in &state.open_prs_cache {
+            if observed.contains(&previous.number) {
+                continue;
+            }
+            match forge.pull_disposition(previous.number, &mut runner) {
+                Ok(tacho_core::decide::plugin::PullDisposition::Open) => prs.push(previous.clone()),
+                Ok(disposition) => {
+                    dispositions.insert(previous.number, disposition);
+                }
+                Err(error) => {
+                    prs.push(previous.clone());
+                    outcome.errors.push(format!(
+                        "pull {} state refresh failed: {error}",
+                        previous.number
+                    ));
+                }
+            }
+        }
+        prs.sort_by_key(|pr| pr.number);
+    }
 
     let workflow = state
         .workflow_path
@@ -1146,18 +1170,36 @@ pub fn refresh_world(
             },
         };
 
-    let new_sha = repo.filter(|r| inside_git_checkout(r)).and_then(|r| {
-        crate::sampler::run_git(r, &["ls-remote", "origin", "refs/heads/main"], timeout)
-            .ok()
-            .and_then(|out| {
-                out.lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().next())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-            })
-            .or_else(|| local_main_sha(r))
-    });
+    let forge_sha = forge.branch_head("main", &mut runner);
+    let configured_repository = state
+        .project
+        .as_ref()
+        .and_then(|project| project.repository.as_ref())
+        .is_some();
+    let new_sha = match forge_sha {
+        Ok(Some(sha)) => Some(sha),
+        result if configured_repository => {
+            outcome.errors.push(format!(
+                "canonical main refresh failed: {}",
+                result
+                    .err()
+                    .unwrap_or_else(|| "forge did not observe a branch head".into())
+            ));
+            None
+        }
+        _ => repo.filter(|r| inside_git_checkout(r)).and_then(|r| {
+            crate::sampler::run_git(r, &["ls-remote", "origin", "refs/heads/main"], timeout)
+                .ok()
+                .and_then(|out| {
+                    out.lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().next())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                })
+                .or_else(|| local_main_sha(r))
+        }),
+    };
 
     let prs_changed = new_prs
         .as_ref()
@@ -1166,9 +1208,32 @@ pub fn refresh_world(
     let sha_changed = new_sha
         .as_ref()
         .is_some_and(|sha| state.main_sha.as_ref() != Some(sha));
-    outcome.changed = prs_changed || ci_changed || sha_changed;
+    let dispositions_changed = dispositions
+        .iter()
+        .any(|(number, disposition)| match disposition {
+            tacho_core::decide::plugin::PullDisposition::Merged => {
+                !state.merged_prs.contains(number)
+            }
+            tacho_core::decide::plugin::PullDisposition::Closed => {
+                !state.closed_prs.contains(number)
+            }
+            tacho_core::decide::plugin::PullDisposition::Open => false,
+        });
+    outcome.changed = prs_changed || ci_changed || sha_changed || dispositions_changed;
 
     let update = |st: &mut FleetState| {
+        for (number, disposition) in &dispositions {
+            match disposition {
+                tacho_core::decide::plugin::PullDisposition::Merged => {
+                    st.merged_prs.insert(*number);
+                    st.closed_prs.remove(number);
+                }
+                tacho_core::decide::plugin::PullDisposition::Closed => {
+                    st.closed_prs.insert(*number);
+                }
+                tacho_core::decide::plugin::PullDisposition::Open => {}
+            }
+        }
         if let Some(prs) = &new_prs {
             st.open_prs_cache = prs.clone();
             st.world_refreshed_at.insert("prs".to_string(), now);
