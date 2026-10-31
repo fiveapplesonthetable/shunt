@@ -35,7 +35,7 @@ use dispatch::{
 };
 use land::{queue, ReadyItem};
 use verify::{
-    batch_refs_moved, batches, classify, counterexample, decide_fixes, failed_tests, flake_tasks,
+    batch_refs_moved, classify, counterexample, decide_fixes, failed_tests, flake_tasks,
     record_flakes, summary_line, AreaRule, BatchPlan, BatchRun, FailedRecord, FixDecisions,
     FlakeEntry, PassedRecord, MAX_BATCH_SIZE,
 };
@@ -55,6 +55,9 @@ pub struct DecisionState {
     /// Requires explicit confirmation of a worker's no-PR report.
     #[serde(default)]
     pub review_no_pr: bool,
+    /// Project-owned stack grouping and pipeline isolation rules.
+    #[serde(default)]
+    pub batch_grouping: Option<crate::project::BatchGrouping>,
     pub max_parallel: usize,
     pub todo: Vec<TodoItem>,
     pub agents: BTreeMap<String, AgentRun>,
@@ -225,10 +228,11 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     let mut reaped_agents = Vec::new();
     let agent_keys: Vec<String> = next.agents.keys().cloned().collect();
     for k in agent_keys {
-        let should_reap = next
-            .agents
-            .get(&k)
-            .is_some_and(|a| a.finished_at.is_none() && !obs.live_keys.contains(&k));
+        let should_reap = next.agents.get(&k).is_some_and(|a| {
+            a.outcome == dispatch::RunOutcome::Unspecified
+                && a.finished_at.is_none()
+                && !obs.live_keys.contains(&k)
+        });
         if should_reap {
             let started_at = next.agents[&k].started_at;
             let tail = obs
@@ -552,7 +556,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     }
 
     // 7. Speculative verification batches (`batches`), ready queue (`queue`), and janitor (`decide_tidy`).
-    let batch_plans = batches(
+    let batch_plans = verify::batches_with_grouping(
         &obs.open_prs,
         &next.holds,
         &next.passed,
@@ -560,6 +564,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         &next.batches,
         &next.area_rules,
         MAX_BATCH_SIZE,
+        next.batch_grouping.as_ref(),
     );
     let ready_prs = queue(
         &obs.open_prs,

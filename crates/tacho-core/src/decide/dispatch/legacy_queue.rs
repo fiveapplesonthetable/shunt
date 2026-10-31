@@ -230,6 +230,9 @@ pub fn next_work(
             break;
         }
         let root = base_key(&item.key);
+        if agents.contains_key(&item.key) {
+            continue;
+        }
         if retired.contains(&item.key) || retired.contains(root) {
             chosen_indices.insert(idx);
             continue;
@@ -291,6 +294,12 @@ pub fn may_start(
     closed_prs: &BTreeSet<u64>,
 ) -> (bool, String) {
     let root = base_key(&item.key);
+    if agents.contains_key(&item.key) {
+        return (
+            false,
+            format!("{} already has a recorded attempt", item.key),
+        );
+    }
     if retired.contains(&item.key) || retired.contains(root) {
         return (false, format!("{} is retired", item.key));
     }

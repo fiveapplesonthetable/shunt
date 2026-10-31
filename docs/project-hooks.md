@@ -64,3 +64,12 @@ queue progress. Imported history remains visible without replaying old
 notifications. `external_attention` retains project decisions until
 `shunt project resolve <key>` explicitly clears them. Project application
 commits are observed independently of controller binary updates.
+
+`batch_grouping` defines the pipeline group (`ci_group`), pipeline path
+regexes (`ci_files`), ignored areas (`group_ignore`), an ordered `groups`
+table, and a `fallback_group`. Each table entry has a `name` and a `when`
+condition: `superset_of`, `subset_of` or `non_empty_subset_of`, each holding
+an array of area names. Grouping uses the union of a stack's areas. Pipeline
+changes run alone. Planning and claiming consume the same grouping rules,
+including `group:<name>` holds. A retained queue row never restarts a recorded
+attempt; an explicit retry uses a new attempt key.

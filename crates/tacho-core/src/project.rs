@@ -4,7 +4,68 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::decide::verify::AreaRule;
+use crate::decide::verify::{AreaRule, GroupMatch, GroupRule};
+
+/// Ordered project rules for assigning a stack to an independently held batch group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchGrouping {
+    /// Group for changes to the verification pipeline; each runs alone.
+    pub ci_group: String,
+    /// Regexes that identify pipeline changes.
+    pub ci_files: Vec<String>,
+    /// Areas that do not affect a stack's group.
+    pub group_ignore: BTreeSet<String>,
+    /// First matching area rule determines the group.
+    pub groups: Vec<GroupRule>,
+    /// Group used when no rule matches.
+    pub fallback_group: String,
+}
+
+impl BatchGrouping {
+    /// Determines the group from the union of a stack's changed areas.
+    pub fn group(&self, areas: &BTreeSet<String>) -> String {
+        let rest: BTreeSet<_> = areas.difference(&self.group_ignore).cloned().collect();
+        self.groups
+            .iter()
+            .find(|rule| match &rule.when {
+                GroupMatch::SupersetOf(want) => want.is_subset(&rest),
+                GroupMatch::SubsetOf(allowed) => rest.is_subset(allowed),
+                GroupMatch::NonEmptySubsetOf(allowed) => {
+                    !rest.is_empty() && rest.is_subset(allowed)
+                }
+            })
+            .map(|rule| rule.name.clone())
+            .unwrap_or_else(|| self.fallback_group.clone())
+    }
+
+    /// Identifies a pipeline change using validated project patterns.
+    pub fn pipeline(&self, files: &[String]) -> bool {
+        self.ci_files.iter().any(|pattern| {
+            regex::Regex::new(pattern)
+                .map(|pattern| files.iter().any(|file| pattern.is_match(file)))
+                .unwrap_or(true)
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut names = BTreeSet::new();
+        if self.ci_group.trim().is_empty()
+            || self.fallback_group.trim().is_empty()
+            || self
+                .groups
+                .iter()
+                .any(|rule| rule.name.trim().is_empty() || !names.insert(&rule.name))
+        {
+            return Err(
+                "batch groups need distinct nonempty rule names and named pipeline/fallback groups"
+                    .into(),
+            );
+        }
+        generated_output_matcher(&self.ci_files)?;
+        Ok(())
+    }
+}
 
 /// The operation a repository implements at an orchestration boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -82,6 +143,9 @@ pub struct ProjectConfig {
     /// Whether a worker's `PR: none` report requires explicit confirmation.
     #[serde(default)]
     pub review_no_pr: bool,
+    /// Project grouping policy consumed by both planning and batch claims.
+    #[serde(default)]
+    pub batch_grouping: Option<BatchGrouping>,
     /// Workflow used for main CI observation.
     #[serde(default)]
     pub workflow_path: Option<String>,
@@ -134,6 +198,9 @@ impl ProjectConfig {
             }
         }
         generated_output_matcher(&self.generated_outputs)?;
+        if let Some(grouping) = &self.batch_grouping {
+            grouping.validate()?;
+        }
         for list in &self.input_lists {
             for path in [&list.file, &list.root] {
                 if path.contains('\0')

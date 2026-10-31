@@ -300,6 +300,30 @@ pub fn batches(
     rules: &[AreaRule],
     limit: usize,
 ) -> Vec<BatchPlan> {
+    batches_with_grouping(
+        open_prs,
+        holds,
+        passed,
+        failed,
+        existing_batches,
+        rules,
+        limit,
+        None,
+    )
+}
+
+/// Plans batches using an explicit project grouping policy when one is installed.
+#[allow(clippy::too_many_arguments)]
+pub fn batches_with_grouping(
+    open_prs: &[PullFacts],
+    holds: &BTreeMap<String, Hold>,
+    passed: &BTreeMap<u64, PassedRecord>,
+    failed: &BTreeMap<u64, FailedRecord>,
+    existing_batches: &[BatchRun],
+    rules: &[AreaRule],
+    limit: usize,
+    grouping: Option<&crate::project::BatchGrouping>,
+) -> Vec<BatchPlan> {
     let running_prs: BTreeSet<u64> = existing_batches
         .iter()
         .filter(|b| b.status == "running" || b.status == "bisecting")
@@ -314,6 +338,15 @@ pub fn batches(
 
     let parent_map = parents(open_prs);
     let by_num: BTreeMap<u64, &PullFacts> = open_prs.iter().map(|p| (p.number, p)).collect();
+    let mut stack_areas: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    if grouping.is_some() {
+        for pr in open_prs {
+            stack_areas
+                .entry(root(pr.number, &parent_map))
+                .or_default()
+                .extend(areas_for_files(&pr.files, rules));
+        }
+    }
 
     // Candidates that need verification (plus any unpassed ancestor in their stack).
     let mut candidates: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -321,7 +354,13 @@ pub fn batches(
         if !needs_check(pr, holds, passed, failed, &running_prs) {
             continue;
         }
-        let group = if is_isolated_ci(&pr.files, rules) {
+        let group = if let Some(grouping) = grouping {
+            if grouping.pipeline(&pr.files) {
+                grouping.ci_group.clone()
+            } else {
+                grouping.group(&stack_areas[&root(pr.number, &parent_map)])
+            }
+        } else if is_isolated_ci(&pr.files, rules) {
             format!("ci-pr{}", pr.number)
         } else {
             let r = root(pr.number, &parent_map);
@@ -373,7 +412,10 @@ pub fn batches(
 
     let mut plans = Vec::new();
     for (group, pr_list) in candidates {
-        let capped = cap(&pr_list, &parent_map, limit.max(1));
+        let mut capped = cap(&pr_list, &parent_map, limit.max(1));
+        if grouping.is_some_and(|config| group == config.ci_group) {
+            capped.truncate(1);
+        }
         if capped.is_empty() {
             continue;
         }
@@ -392,7 +434,11 @@ pub fn batches(
         next_num += 1;
         let id = format!("b{next_num:03}");
         let raw_areas: Vec<String> = area_set.into_iter().collect();
-        let areas = select_costly_areas(&raw_areas, &all_files, true, false);
+        let areas = if grouping.is_some() {
+            raw_areas
+        } else {
+            select_costly_areas(&raw_areas, &all_files, true, false)
+        };
         let raw_checks = checks_for_files(&all_files, rules);
         let area_lookup: BTreeSet<&str> = areas.iter().map(String::as_str).collect();
         let mut checks: Vec<AreaCheck> = raw_checks
