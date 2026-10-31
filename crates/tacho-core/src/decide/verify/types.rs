@@ -217,6 +217,9 @@ pub struct AreaRule {
     /// Expressions considered only for paths no ordinary rule recognizes.
     #[serde(default)]
     pub fallback_patterns: Vec<String>,
+    /// Keeps a selected area only when the change also contains one of these inputs.
+    #[serde(default)]
+    pub input_patterns: Vec<String>,
     /// Requires this area for every nonempty change without claiming its paths.
     #[serde(default)]
     pub always: bool,

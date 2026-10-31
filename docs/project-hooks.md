@@ -123,3 +123,5 @@ including `group:<name>` holds. A retained queue row never restarts a recorded
 attempt; an explicit retry uses a new attempt key.
 
 `required_patterns` adds an area for matching inputs without classifying those paths as known. Its matches keep unmatched-path fallback checks, including when a screenshot or generated output has no owning source rule.
+
+`input_patterns` restricts an otherwise selected area to changes containing at least one matching input. The input may be a different file from the one selecting the area. Known paths remain known when their area has no required input.

@@ -62,7 +62,12 @@ fn proof_commands_and_structured_checks_use_the_same_routing() {
 
 #[test]
 fn malformed_path_or_fallback_patterns_are_refused_before_installation() {
-    for field in ["patterns", "fallback_patterns", "required_patterns"] {
+    for field in [
+        "patterns",
+        "fallback_patterns",
+        "required_patterns",
+        "input_patterns",
+    ] {
         let mut rule = json!({"area":"console","prefixes":["web/"]});
         rule[field] = json!(["["]);
         let project: ProjectConfig =
@@ -86,5 +91,35 @@ fn required_path_checks_keep_unknown_input_fallbacks() {
     assert_eq!(
         areas_for_files(&["web/screenshots/home.png".into()], &configured),
         vec!["screens", "source"]
+    );
+}
+
+#[test]
+fn selected_areas_require_a_matching_input_across_the_whole_change() {
+    let rules: Vec<AreaRule> = serde_json::from_value(json!([
+        {"area":"client","patterns":["^shared/"],"input_patterns":["^client/"]},
+        {"area":"known","patterns":["^client/"]},
+        {"area":"inventory","fallback_patterns":[".*"]}
+    ]))
+    .unwrap();
+    assert_eq!(
+        areas_for_files(&["shared/config".into()], &rules),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        areas_for_files(&["shared/config".into(), "client/home".into()], &rules),
+        vec!["client", "known"]
+    );
+}
+
+#[test]
+fn input_guards_do_not_remove_the_legacy_unknown_path_fallback() {
+    let rules: Vec<AreaRule> = serde_json::from_value(json!([
+        {"area":"known","prefixes":["known/"]}
+    ]))
+    .unwrap();
+    assert_eq!(
+        areas_for_files(&["unknown".into()], &rules),
+        vec!["workspace"]
     );
 }

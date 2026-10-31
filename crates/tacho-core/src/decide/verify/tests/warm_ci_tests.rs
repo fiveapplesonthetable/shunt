@@ -433,6 +433,7 @@ fn test_prove_plan_attribution_and_pr_refusals() {
         patterns: Vec::new(),
         fallback_patterns: Vec::new(),
         required_patterns: Vec::new(),
+        input_patterns: Vec::new(),
         always: false,
         area: "console".to_string(),
         prefixes: vec!["apps/console/".to_string()],
