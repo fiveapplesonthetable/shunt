@@ -90,7 +90,7 @@ pub fn spawn_planned_batch(
         }) {
             return Ok(None);
         }
-        let fresh = tacho_core::decide::verify::batches(
+        let fresh = tacho_core::decide::verify::batches_with_grouping(
             &state.open_prs_cache,
             &state.holds,
             &state.passed,
@@ -98,6 +98,10 @@ pub fn spawn_planned_batch(
             &state.batches,
             &state.area_rules,
             tacho_core::decide::verify::MAX_BATCH_SIZE,
+            state
+                .project
+                .as_ref()
+                .and_then(|project| project.batch_grouping.as_ref()),
         );
         if !fresh.iter().any(|batch| {
             batch.group == plan.group

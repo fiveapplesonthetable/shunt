@@ -718,6 +718,10 @@ pub fn decision_state_of(state: &FleetState, now: i64) -> DecisionState {
     }
     DecisionState {
         external_attention: state.external_attention.clone(),
+        batch_grouping: state
+            .project
+            .as_ref()
+            .and_then(|project| project.batch_grouping.clone()),
         review_no_pr: state
             .project
             .as_ref()

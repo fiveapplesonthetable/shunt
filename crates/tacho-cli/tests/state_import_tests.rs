@@ -122,6 +122,41 @@ fn an_import_dry_run_creates_no_controller_database() {
 }
 
 #[test]
+fn an_operator_stop_records_a_terminal_outcome_and_a_hold() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+    store
+        .mutate(None, |state| {
+            state.agents.insert(
+                "worker".into(),
+                tacho_core::decide::dispatch::AgentRun {
+                    key: "worker".into(),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_tacho"))
+        .args(["stop", "worker"])
+        .env("TACHO_HOME", &home)
+        .env("TACHO_TEST_MODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let state = store.load().unwrap();
+    assert_eq!(
+        state.agents["worker"].outcome,
+        tacho_core::decide::dispatch::RunOutcome::Stopped
+    );
+    assert!(state.holds.contains_key("worker"));
+}
+
+#[test]
 fn incomplete_proofs_and_unmapped_live_work_cannot_be_imported() {
     for unmapped in [true, false] {
         let temp = tempfile::tempdir().unwrap();

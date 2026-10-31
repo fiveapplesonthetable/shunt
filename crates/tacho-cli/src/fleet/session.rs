@@ -587,6 +587,7 @@ pub fn execute_stop(args: StopArgs) -> io::Result<()> {
                 a.finished_at = Some(now);
                 a.exit_code = Some(143);
                 a.status_note = "stopped".to_string();
+                a.outcome = tacho_core::decide::dispatch::RunOutcome::Stopped;
             }
             st.holds = with_hold(&st.holds, base_key(&args.key), "stopped by user", now);
         },
@@ -814,6 +815,7 @@ pub fn deliver_tell_action(
                     a.cgroup = resumed_cgroup;
                     a.finished_at = None;
                     a.exit_code = None;
+                    a.outcome = Default::default();
                     a.status_note = format!("nudged: {message}");
                     a.brief = format!("{}\n\nGuidance from operator:\n{message}", a.brief);
                 }
