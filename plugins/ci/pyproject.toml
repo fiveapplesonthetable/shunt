@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shunt-ci"
-version = "0.1.0"
+version = "0.1.1"
 description = "Isolated execution of explicit project CI job plans"
 requires-python = ">=3.11"
 

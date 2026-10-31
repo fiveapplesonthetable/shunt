@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,6 +18,7 @@ from unittest.mock import patch
 from shunt_ci.runner import allocations, execute
 from shunt_ci.spec import Plan
 from shunt_ci.resources import cache_slot
+from shunt_ci.process import driver
 
 
 def plan(jobs):
@@ -39,6 +41,30 @@ class JobExecution(unittest.TestCase):
     def run_plan(self, value, **arguments):
         with redirect_stdout(io.StringIO()):
             return execute(value, self.root, self.output, available_cpus=self.cpus, **arguments)
+
+    def test_container_steps_trust_only_their_mounted_checkout(self):
+        other = self.root.parent / "unrelated repository"
+        other.mkdir()
+        for root in (self.root, other):
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+        config = self.root.parent / "container.gitconfig"
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": str(config),
+                       "GIT_CONFIG_NOSYSTEM": "1", "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+        command = (f"git -C {shlex.quote(str(self.root))} rev-parse --is-inside-work-tree && "
+                   f"! git -C {shlex.quote(str(other))} rev-parse --is-inside-work-tree")
+        result = subprocess.run(["bash", "-c", driver(str(self.root), [], f"{os.getuid()}:{os.getgid()}"),
+                                 "shunt-ci", command], env=environment, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        trusted = subprocess.check_output(["git", "config", "--file", str(config), "--get-all", "safe.directory"], text=True)
+        self.assertEqual(trusted.splitlines(), [str(self.root)])
+
+    def test_host_steps_do_not_change_the_users_git_trust_configuration(self):
+        config = self.root.parent / "host.gitconfig"
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1"}
+        result = subprocess.run(["bash", "-c", driver(str(self.root), [], None), "shunt-ci", "true"],
+                                env=environment, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(config.exists())
 
     def test_jobs_inherit_only_explicit_controller_settings(self):
         command = shlex.join([sys.executable, "-c", "import json,os,pathlib; pathlib.Path('environment.json').write_text(json.dumps({key:os.environ.get(key) for key in ('TACHO_HOME','TACHO_BATCH_CLAIMED','TACHO_GH_REPO','TACHO_TEST_MODE','PROJECT_VALUE')}))"])

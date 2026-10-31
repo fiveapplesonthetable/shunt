@@ -52,7 +52,12 @@ class Cancellation:
 def driver(root: str, writable: list[str], owner: str | None) -> str:
     """Runs shell steps while parsing runner environment files strictly as data."""
     handback = ""
+    checkout_trust = ""
     if owner:
+        checkout_trust = (
+            'if command -v git >/dev/null 2>&1; then '
+            f'git config --global --add safe.directory {shlex.quote(root)} || exit $?; fi; '
+        )
         destinations = shlex.join([root, *writable])
         handback = (
             f'refused=$(LC_ALL=C chown -R {owner} {destinations} 2>&1 >/dev/null) || handback=$?; '
@@ -68,6 +73,7 @@ def driver(root: str, writable: list[str], owner: str | None) -> str:
         'interrupt() { status=$1; trap - TERM INT; if [ -n "$child" ]; then '
         + interrupt_child + ' 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi; exit "$status"; }; '
         "trap finish EXIT; trap 'interrupt 143' TERM; trap 'interrupt 130' INT; "
+        + checkout_trust +
         'runner_files=$(mktemp -d -t shunt-runner.XXXXXX) || exit 1; '
         'export GITHUB_PATH="$runner_files/path" GITHUB_ENV="$runner_files/env" '
         'GITHUB_OUTPUT="$runner_files/output" GITHUB_STEP_SUMMARY="$runner_files/summary"; '
