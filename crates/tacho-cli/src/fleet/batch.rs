@@ -602,6 +602,21 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
                 .ok_or_else(|| io::Error::other("batch head is missing"))
         })
         .collect::<io::Result<_>>()?;
+    if let Some(repository) = tacho_daemon::project::forge_repository(&state) {
+        let current = resolve_live_pr_heads(&cwd, &pr_nums, &shas, &state);
+        if current != shas {
+            return Err(io::Error::other(
+                "PR heads moved before batch checkout; refresh the observation",
+            ));
+        }
+        let mut commits = heads.clone();
+        commits.push(&main_sha);
+        checkout::fetch_missing(
+            &cwd,
+            &format!("https://github.com/{repository}.git"),
+            &commits,
+        )?;
+    }
     let checkout = checkout::BatchCheckout::new(&cwd, &main_sha)?;
     let tree_sha = checkout.prepare(&main_sha, &heads)?;
     let check_cwd = checkout.path();

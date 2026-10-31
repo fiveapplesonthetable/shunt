@@ -20,6 +20,32 @@ fn git(repo: &Path, args: &[&str]) -> io::Result<String> {
         .map(|output| output.trim().to_string())
 }
 
+pub(super) fn fetch_missing(repo: &Path, remote: &str, commits: &[&str]) -> io::Result<()> {
+    let missing: Vec<_> = commits
+        .iter()
+        .copied()
+        .filter(|commit| git(repo, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_err())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["fetch", "--no-tags", "--no-write-fetch-head", remote];
+    args.extend(missing.iter().copied());
+    git(repo, &args).map_err(|error| {
+        io::Error::other(format!(
+            "fetching pinned verification commits from {remote} failed: {error}"
+        ))
+    })?;
+    for commit in missing {
+        git(repo, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).map_err(|error| {
+            io::Error::other(format!(
+                "verification commit {commit} is unavailable after fetch: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 impl BatchCheckout {
     pub(super) fn new(repo: &Path, main: &str) -> io::Result<Self> {
         let root = crate::kit::private_tmp_dir("batch-checkout")?;

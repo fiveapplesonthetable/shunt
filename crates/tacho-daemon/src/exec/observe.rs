@@ -1149,6 +1149,7 @@ pub fn refresh_world(
     let new_ci =
         match env_json::<tacho_core::decide::ops::snapshot::MainCiRun>("TACHO_MAIN_CI_JSON") {
             Some(ci) => Some(Some(ci)),
+            None if state.project.is_some() && state.workflow_path.is_none() => Some(None),
             None => match forge.main_ci_run("main", workflow, &mut runner) {
                 Ok(ci) => Some(ci),
                 Err(e) => {
