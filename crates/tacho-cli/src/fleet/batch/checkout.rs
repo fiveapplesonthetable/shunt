@@ -9,7 +9,14 @@ pub(super) struct BatchCheckout {
 }
 
 fn git(repo: &Path, args: &[&str]) -> io::Result<String> {
-    tacho_daemon::sampler::run_git_in_worktree(repo, args, Duration::from_secs(30))
+    let mut argv = vec![
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ];
+    argv.extend_from_slice(args);
+    tacho_daemon::sampler::run_git_in_worktree(repo, &argv, Duration::from_secs(30))
         .map(|output| output.trim().to_string())
 }
 

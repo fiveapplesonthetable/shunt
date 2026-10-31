@@ -64,6 +64,11 @@ pub enum Commands {
     /// Example: tacho setup --dry-run
     Setup(SetupArgs),
 
+    /// Validate or apply a repository's versioned project configuration.
+    ///
+    /// Example: tacho project apply shunt.json
+    Project(ProjectArgs),
+
     /// Start or tear down an isolated per-worktree database.
     ///
     /// Example: tacho db fix-auth --rm
@@ -268,6 +273,28 @@ pub enum Commands {
     ///
     /// Example: tacho shots accept batch-123
     Shots(ShotsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ProjectArgs {
+    #[command(subcommand)]
+    pub command: ProjectOperation,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProjectOperation {
+    /// Validate the configuration without changing fleet state.
+    Validate {
+        #[arg(default_value = "shunt.json")]
+        path: PathBuf,
+    },
+    /// Apply project configuration while preserving live queue state and limits.
+    Apply {
+        #[arg(default_value = "shunt.json")]
+        path: PathBuf,
+    },
+    /// Show the currently applied project contract.
+    Show,
 }
 
 #[derive(Args, Debug)]

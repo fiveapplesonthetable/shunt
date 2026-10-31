@@ -631,10 +631,55 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         );
     }
 
-    let planned: Vec<PlannedCheck> = match &args.plan_file {
-        Some(path) => serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?,
-        None => plan_prove_checks(&root, &changed, &state.area_rules),
-    };
+    let planned: Vec<PlannedCheck> =
+        match &args.plan_file {
+            Some(path) => serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?,
+            None => {
+                if let Some(hook) = state.project.as_ref().and_then(|project| {
+                    project.hooks.get(&tacho_core::project::HookKind::ProofPlan)
+                }) {
+                    let tree = tree_of_worktree(&root)?;
+                    let request = tacho_core::project::HookRequest {
+                        version: 1,
+                        kind: tacho_core::project::HookKind::ProofPlan,
+                        repository_root: state
+                            .repo_root
+                            .clone()
+                            .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+                        worktree: root.to_string_lossy().into_owned(),
+                        base: base_sha.clone(),
+                        head: crate::fleet::store::git_stdout(&root, &["rev-parse", "HEAD"])?,
+                        tree: tree.clone(),
+                        files: changed.clone(),
+                        areas: Vec::new(),
+                        payload: serde_json::Value::Null,
+                    };
+                    if let Some(trust_hook) = state.project.as_ref().and_then(|project| {
+                        project
+                            .hooks
+                            .get(&tacho_core::project::HookKind::RunnerTrust)
+                    }) {
+                        let mut trust = request.clone();
+                        trust.kind = tacho_core::project::HookKind::RunnerTrust;
+                        trust.payload = serde_json::json!({"operation":"proof"});
+                        tacho_daemon::project::invoke(
+                            trust_hook,
+                            Path::new(&request.repository_root),
+                            &trust,
+                        )?;
+                    }
+                    let output = tacho_daemon::project::invoke(hook, &root, &request)?;
+                    if tree_of_worktree(&root)? != tree {
+                        return Err(io::Error::other(
+                            "project planner changed the inputs it claims to check",
+                        ));
+                    }
+                    serde_json::from_str(&output).map_err(io::Error::other)?
+                } else {
+                    plan_prove_checks(&root, &changed, &state.area_rules)
+                }
+            }
+        };
     if planned.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

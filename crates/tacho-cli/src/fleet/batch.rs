@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -466,10 +467,15 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             )));
         }
     }
+    let project_areas: Vec<_> = areas.iter().cloned().collect();
+    let requested_areas = opts
+        .areas
+        .as_deref()
+        .or_else(|| state.project.as_ref().map(|_| project_areas.as_slice()));
     let (selected_areas, mut checks) = select_batch_checks_for_origin(
         &all_files,
         &state.area_rules,
-        opts.areas.as_deref(),
+        requested_areas,
         batch_mode == BatchMode::Presubmit,
         opts.origin == BatchOrigin::Train,
     );
@@ -586,7 +592,22 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
     let checkout = checkout::BatchCheckout::new(&cwd, &main_sha)?;
     let tree_sha = checkout.prepare(&main_sha, &heads)?;
     let check_cwd = checkout.path();
-    let check_cmd = if let Some(ref custom_cmd) = opts.cmd {
+    let verify_hook = if opts.cmd.is_none() {
+        state
+            .project
+            .as_ref()
+            .and_then(|project| project.hooks.get(&tacho_core::project::HookKind::Verify))
+            .cloned()
+    } else {
+        None
+    };
+    let check_cmd = if let Some(hook) = &verify_hook {
+        hook.argv()
+            .iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else if let Some(ref custom_cmd) = opts.cmd {
         custom_cmd.clone()
     } else {
         let candidate_wf = state.workflow_path.clone().or_else(|| {
@@ -694,19 +715,59 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             .iter()
             .flat_map(|c| c.units.iter().cloned())
             .collect();
+        let request = tacho_core::project::HookRequest {
+            version: 1,
+            kind: tacho_core::project::HookKind::Verify,
+            repository_root: state
+                .repo_root
+                .clone()
+                .unwrap_or_else(|| cwd.to_string_lossy().into_owned()),
+            worktree: check_cwd.to_string_lossy().into_owned(),
+            base: main_sha.clone(),
+            head: super::store::git_stdout(check_cwd, &["rev-parse", "HEAD"])?,
+            tree: expected_tree.clone(),
+            files: all_files.clone(),
+            areas: area_list.clone(),
+            payload: serde_json::json!({"operation":"batch", "batch_id":batch_id, "mode":format!("{batch_mode:?}").to_ascii_lowercase(), "members":prefix_prs, "heads":shas, "units":units_csv, "label":label}),
+        };
+        let mut prepared_environment = BTreeMap::new();
+        if let Some(project) = &state.project {
+            if let Some(command) = project
+                .hooks
+                .get(&tacho_core::project::HookKind::RunnerTrust)
+            {
+                let mut trust = request.clone();
+                trust.kind = tacho_core::project::HookKind::RunnerTrust;
+                tacho_daemon::project::invoke(
+                    command,
+                    std::path::Path::new(&request.repository_root),
+                    &trust,
+                )?;
+            }
+            if let Some(command) = project.hooks.get(&tacho_core::project::HookKind::Prepare) {
+                let mut prepare = request.clone();
+                prepare.kind = tacho_core::project::HookKind::Prepare;
+                let output = tacho_daemon::project::invoke(command, check_cwd, &prepare)?;
+                prepared_environment = tacho_daemon::project::prepared_environment(&output)?;
+            }
+        }
         let mut cmd = Command::new("timeout");
-        cmd.args([
-            "--signal=KILL",
-            &format!("{timeout_secs}s"),
-            "bash",
-            "-c",
-            &check_cmd,
-        ])
-        .current_dir(check_cwd);
+        cmd.args(["--signal=KILL", &format!("{timeout_secs}s")]);
+        if let Some(hook) = &verify_hook {
+            cmd.args(hook.argv());
+            let mut input = tempfile::tempfile()?;
+            input.write_all(&serde_json::to_vec(&request).map_err(io::Error::other)?)?;
+            std::io::Seek::rewind(&mut input)?;
+            cmd.stdin(Stdio::from(input));
+        } else {
+            cmd.args(["bash", "-c", &check_cmd]);
+        }
+        cmd.current_dir(check_cwd);
         apply_private_tmp_env(&mut cmd, &fleet_tmp);
         for (ek, ev) in &merged_env {
             cmd.env(ek, ev);
         }
+        cmd.envs(&prepared_environment);
         let out = cmd
             .env("TACHO_BATCH_ID", &batch_id)
             .env(

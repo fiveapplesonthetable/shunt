@@ -27,6 +27,7 @@ pub mod batch;
 pub mod dispatch;
 pub mod land;
 pub mod ops;
+pub mod project;
 pub mod session;
 pub mod shape;
 pub mod store;

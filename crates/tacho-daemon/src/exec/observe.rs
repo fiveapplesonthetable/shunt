@@ -960,7 +960,17 @@ pub fn env_json<T: serde::de::DeserializeOwned>(var: &str) -> Option<T> {
 /// Executes an explicit `argv` slice (no shell) in its own process group with a strict timeout,
 /// waiting on its pidfd and killing the process group on expiration.
 pub fn run_argv(cwd: Option<&Path>, argv: &[String], timeout: Duration) -> Result<String, String> {
-    use std::io::Read;
+    run_argv_with_input(cwd, argv, timeout, None)
+}
+
+/// Executes argv with optional stdin under the same timeout and process-group ownership.
+pub fn run_argv_with_input(
+    cwd: Option<&Path>,
+    argv: &[String],
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -969,7 +979,11 @@ pub fn run_argv(cwd: Option<&Path>, argv: &[String], timeout: Duration) -> Resul
     };
     let mut cmd = Command::new(prog);
     cmd.args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -979,6 +993,10 @@ pub fn run_argv(cwd: Option<&Path>, argv: &[String], timeout: Duration) -> Resul
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {prog}: {e}"))?;
+    let input_writer = match (input, child.stdin.take()) {
+        (Some(bytes), Some(mut stdin)) => Some(std::thread::spawn(move || stdin.write_all(&bytes))),
+        _ => None,
+    };
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let out_reader = std::thread::Builder::new()
@@ -1020,6 +1038,12 @@ pub fn run_argv(cwd: Option<&Path>, argv: &[String], timeout: Duration) -> Resul
         .map_err(|e| format!("{prog} stderr read failed: {e}"))?;
     if !exited {
         return Err(format!("{prog} timed out after {}s", timeout.as_secs()));
+    }
+    if let Some(writer) = input_writer {
+        writer
+            .join()
+            .map_err(|_| format!("{prog} stdin writer panicked"))?
+            .map_err(|e| format!("{prog} stdin write failed: {e}"))?;
     }
     if !status.success() {
         let stderr_str = String::from_utf8_lossy(&err_bytes).trim().to_string();

@@ -108,12 +108,9 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
             Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
             Err(_) => state.merge_prs,
         };
-        let gh_forge = std::env::var("TACHO_GH_REPO")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|r| {
-                tacho_core::decide::plugin::GitHubForge::new(r).with_allow_merge(merge_enabled)
-            });
+        let gh_forge = tacho_daemon::project::forge_repository(&state).map(|r| {
+            tacho_core::decide::plugin::GitHubForge::new(r).with_allow_merge(merge_enabled)
+        });
         let post_merge_tree = if let (Some(ref forge), true) = (&gh_forge, merge_enabled) {
             use tacho_core::decide::plugin::ForgePlugin;
             for &pr in &open.prs {
