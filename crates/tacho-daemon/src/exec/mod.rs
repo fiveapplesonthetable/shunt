@@ -235,7 +235,7 @@ impl<'a> TickOptions<'a> {
 pub struct TickOutcome {
     /// Recorded tick id; the previous id when this tick duplicated it; `None` on dry run.
     pub tick_id: Option<i64>,
-    /// `true` when inputs and plan equalled the last recorded tick and nothing was executed.
+    /// `true` when inputs and plan equal the previous tick; pending owner delivery may retry.
     pub deduped: bool,
     pub state: DecisionState,
     pub obs: WorldObservation,
@@ -459,9 +459,8 @@ pub fn run_tick(
         });
     }
 
-    // Same inputs and same decision as the last recorded tick: nothing new to record or
-    // execute. Point at the tick this one would duplicate (unless forge refresh failed, which
-    // must surface as an error so the sampler backs off).
+    // Pending owner I/O still needs acknowledgement when the decision is unchanged.
+    // Forge refresh failures must surface so the sampler backs off.
     if let Some(prev) = store.unchanged_since_latest_tick(&decision_state, &world_obs, &plan)? {
         if !refresh_errors.is_empty() {
             return Err(io::Error::other(format!(
@@ -469,6 +468,14 @@ pub fn run_tick(
                 refresh_errors.len(),
                 refresh_errors.join("; ")
             )));
+        }
+        let mut failures = Failures {
+            hands,
+            errors: Vec::new(),
+        };
+        execute_owner_io(home, store, &mut failures, &world_obs, &plan, opts.forge)?;
+        if !failures.errors.is_empty() {
+            return Err(io::Error::other(failures.errors.join("; ")));
         }
         return Ok(TickOutcome {
             tick_id: Some(prev),
@@ -671,7 +678,30 @@ fn persist_plan_state(
         st.nudged = next.nudged.clone();
         st.rebase_attempts = next.rebase_attempts.clone();
         st.fix_notified = next.fix_notified.clone();
-        st.notified_failures = next.notified_keys.clone();
+        for ready in &plan.ready_trains {
+            if !st.trains.iter().any(|train| train.id == ready.train_id) {
+                for older in &mut st.trains {
+                    if older.status == "open"
+                        && older.prs.iter().any(|number| ready.order.contains(number))
+                    {
+                        older.status = "superseded".into();
+                        older.reason = Some(format!("superseded by {}", ready.train_id));
+                    }
+                }
+                st.trains.push(tacho_core::decide::land::TrainRecord {
+                    id: ready.train_id.clone(),
+                    prs: ready.order.clone(),
+                    shas: ready.heads.clone(),
+                    base: ready.base.clone(),
+                    tree: ready.tree.clone(),
+                    status: "open".into(),
+                    created_at: now,
+                    batch_id: ready.batch_id.clone(),
+                    landed_prs: Vec::new(),
+                    reason: None,
+                });
+            }
+        }
         st.inbox = next.inbox.clone();
         st.last_tick_ts = next.last_tick_ts;
         st.last_watchdog_alert_ts = next.last_watchdog_alert_ts;
@@ -729,6 +759,116 @@ fn recover_lost_batches(home: &Path, store: &mut FleetStore) -> io::Result<()> {
             }
         }
     })
+}
+
+fn execute_owner_io(
+    home: &Path,
+    store: &mut FleetStore,
+    f: &mut Failures<'_>,
+    obs: &WorldObservation,
+    plan: &DecisionPlan,
+    forge: Option<&dyn tacho_core::decide::plugin::ForgePlugin>,
+) -> io::Result<()> {
+    let state = store.load()?;
+    let publication = crate::project::publish_queue(store, plan, &obs.main_sha);
+    let publication_ok = publication.is_ok();
+    if let Err(error) = publication {
+        f.record(
+            store,
+            "watch",
+            "queue_publication_failed",
+            "owner-queue",
+            &error.to_string(),
+            true,
+        )?;
+    }
+    for n in &plan.owner_notifications {
+        if state.project.is_some() {
+            use tacho_core::project::DeliveryOutcome;
+            if n.ready.is_some() && !publication_ok {
+                continue;
+            }
+            match crate::project::notify_notice(home, n) {
+                Ok(DeliveryOutcome::Sent) => {
+                    store.mutate(None, |state| {
+                        state.notified_failures.insert(n.key.clone());
+                        if let Some(ready) = &n.ready {
+                            state.notified_failures.insert(ready.delivery_key.clone());
+                        }
+                        state
+                            .external_attention
+                            .remove(&format!("notification-delivery:{}", n.key));
+                    })?;
+                    store.record_decision("watch", "notify_owner", &n.key, &n.because)?;
+                }
+                Ok(DeliveryOutcome::Uncertain) => {
+                    let key = format!("notification-delivery:{}", n.key);
+                    let message = format!("Delivery of {} is uncertain. Resolve its transport receipt before another attempt.", n.subject);
+                    if state.external_attention.get(&key) != Some(&message) {
+                        store.mutate(None, |state| {
+                            state.external_attention.insert(key, message);
+                        })?;
+                    }
+                }
+                Ok(DeliveryOutcome::Pending) => {}
+                Err(error) => {
+                    f.record(store, "watch", "notify_owner_failed", &n.key, &error, true)?;
+                }
+            }
+            continue;
+        }
+        let mut notify_failed = false;
+        let mut delivered = false;
+        match if n.ready.as_ref().is_some_and(|ready| !ready.announce) {
+            Ok(true)
+        } else {
+            f.hands.notify_owner(&n.subject, &n.body)
+        } {
+            Ok(sent) => delivered = sent,
+            Err(e) => {
+                notify_failed = true;
+                f.record(
+                    store,
+                    "watch",
+                    "notify_owner_failed",
+                    &n.key,
+                    &format!("failed to notify owner for {}: {e}", n.key),
+                    true,
+                )?;
+            }
+        }
+        if let Some(forge) = forge {
+            let issue_title = if n.kind == "main_red" || n.kind == "main-red" {
+                "main is red".to_string()
+            } else {
+                format!("tacho alert: {}", n.key)
+            };
+            match forge.set_issue(&issue_title, &n.body) {
+                Ok(issue) => delivered |= issue.is_some(),
+                Err(e) => {
+                    notify_failed = true;
+                    f.record(
+                        store,
+                        "watch",
+                        "set_issue_failed",
+                        &n.key,
+                        &format!("failed to set issue '{issue_title}' for {}: {e}", n.key),
+                        true,
+                    )?;
+                }
+            }
+        }
+        if !notify_failed && delivered {
+            store.mutate(None, |state| {
+                state.notified_failures.insert(n.key.clone());
+                if let Some(ready) = &n.ready {
+                    state.notified_failures.insert(ready.delivery_key.clone());
+                }
+            })?;
+            store.record_decision("watch", "notify_owner", &n.key, &n.because)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1140,52 +1280,7 @@ fn execute_actions(
         println!("Self-update: {}", plan.self_update.because);
         store.record_decision("watch", "self_update", target, &plan.self_update.because)?;
     }
-    for n in &plan.owner_notifications {
-        let mut notify_failed = false;
-        let mut delivered = false;
-        match f.hands.notify_owner(&n.subject, &n.body) {
-            Ok(sent) => delivered = sent,
-            Err(e) => {
-                notify_failed = true;
-                f.record(
-                    store,
-                    "watch",
-                    "notify_owner_failed",
-                    &n.key,
-                    &format!("failed to notify owner for {}: {e}", n.key),
-                    true,
-                )?;
-            }
-        }
-        if let Some(forge) = forge {
-            let issue_title = if n.kind == "main_red" || n.kind == "main-red" {
-                "main is red".to_string()
-            } else {
-                format!("tacho alert: {}", n.key)
-            };
-            match forge.set_issue(&issue_title, &n.body) {
-                Ok(issue) => delivered |= issue.is_some(),
-                Err(e) => {
-                    notify_failed = true;
-                    f.record(
-                        store,
-                        "watch",
-                        "set_issue_failed",
-                        &n.key,
-                        &format!("failed to set issue '{issue_title}' for {}: {e}", n.key),
-                        true,
-                    )?;
-                }
-            }
-        }
-        if notify_failed || !delivered {
-            store.mutate(None, |st| {
-                st.notified_failures.remove(&n.key);
-            })?;
-        } else {
-            store.record_decision("watch", "notify_owner", &n.key, &n.because)?;
-        }
-    }
+    execute_owner_io(home, store, f, obs, plan, forge)?;
     if let Some(alert) = &plan.watchdog_alert {
         let mut alert_failed = false;
         let mut delivered = false;
@@ -1309,6 +1404,9 @@ fn supervise_resume(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod owner_notice_tests;
 
 #[cfg(test)]
 mod shadow_tests;

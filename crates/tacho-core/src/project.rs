@@ -81,6 +81,20 @@ pub enum HookKind {
     RunnerTrust,
     /// Delivers an owner notification.
     Notify,
+    /// Publishes current verified queue state independently of announcements.
+    Publish,
+}
+
+/// A project transport's explicit acknowledgment of a notification attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOutcome {
+    /// The owner announcement was accepted or already acknowledged.
+    Sent,
+    /// No delivery was acknowledged; the same key remains pending.
+    Pending,
+    /// Acceptance cannot be established and requires an operator finding.
+    Uncertain,
 }
 
 /// An explicit program and argv; request values are supplied through JSON stdin.
@@ -158,6 +172,24 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
+    /// Identifies the installed policy that selects and executes verification.
+    pub fn verification_identity(&self) -> String {
+        let hooks: BTreeMap<_, _> = self
+            .hooks
+            .iter()
+            .filter(|(kind, _)| {
+                matches!(
+                    kind,
+                    HookKind::Prepare
+                        | HookKind::ProofPlan
+                        | HookKind::Verify
+                        | HookKind::RunnerTrust
+                )
+            })
+            .collect();
+        content_id(serde_json::json!({"repository":self.repository,"areas":self.area_rules,"hooks":hooks,"generated_outputs":self.generated_outputs,"input_lists":self.input_lists,"workflow_path":self.workflow_path,"workflow_jobs":self.workflow_jobs,"workflow_expressions":self.workflow_expressions}).to_string().as_bytes())
+    }
+
     /// Refuses incomplete or ambiguous configuration before any runtime state changes.
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 {

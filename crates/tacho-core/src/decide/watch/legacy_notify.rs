@@ -127,6 +127,124 @@ pub struct OwnerNotification {
     pub body: String,
     pub command_hint: String,
     pub because: String,
+    /// Structured verified inputs for queue publication and delivery policy.
+    #[serde(default)]
+    pub ready: Option<ReadyTrainNotice>,
+}
+
+/// Exact verified inputs passed to project-owned publication and transport hooks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyTrainNotice {
+    /// Owner-invoked train identifier.
+    pub train_id: String,
+    /// Batch that supplied the complete proof.
+    pub batch_id: String,
+    /// Verified merge order.
+    pub order: Vec<u64>,
+    /// Complete member commit identities.
+    pub heads: BTreeMap<u64, String>,
+    /// Canonical base checked by the batch.
+    pub base: String,
+    /// Complete verified source tree.
+    pub tree: String,
+    /// Transport identity independent of the publication identifier.
+    pub delivery_key: String,
+    /// Whether these ordered heads need a new owner announcement.
+    pub announce: bool,
+}
+
+/// Stable attention identity independent of elapsed-time display text.
+pub fn attention_notification_key(item: &AttentionItem, holds: &BTreeMap<String, Hold>) -> String {
+    if item.kind == "stale-hold" {
+        if let Some(hold) = holds.get(&item.target) {
+            return format!(
+                "attention:stale-hold:{}:{}:{}",
+                item.target,
+                hold.since,
+                crate::project::content_id(hold.reason.as_bytes())
+            );
+        }
+    }
+    format!("attention:{}:{}:{}", item.kind, item.target, item.summary)
+}
+
+/// Identifies an ordered set using every byte of each member head.
+pub fn ready_delivery_key(order: &[u64], heads: &BTreeMap<u64, String>) -> Option<String> {
+    let entries: Vec<_> = order
+        .iter()
+        .map(|number| {
+            heads
+                .get(number)
+                .filter(|head| !head.is_empty())
+                .map(|head| (*number, head))
+        })
+        .collect::<Option<_>>()?;
+    if entries.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&entries)
+        .ok()
+        .map(|value| format!("ready:v2:{value}"))
+}
+
+fn announcement_covered(
+    order: &[u64],
+    heads: &BTreeMap<u64, String>,
+    notified: &BTreeSet<String>,
+) -> bool {
+    let wanted: Vec<_> = order
+        .iter()
+        .filter_map(|number| heads.get(number).map(|head| (*number, head.clone())))
+        .collect();
+    notified.iter().any(|key| {
+        let Some(encoded) = key.strip_prefix("ready:v2:") else {
+            return false;
+        };
+        let Ok(previous) = serde_json::from_str::<Vec<(u64, String)>>(encoded) else {
+            return false;
+        };
+        let mut remaining = wanted.iter();
+        let mut next = remaining.next();
+        for entry in &previous {
+            if next == Some(entry) {
+                next = remaining.next();
+            }
+        }
+        next.is_none()
+    })
+}
+
+/// Builds an owner publication only from complete passed train inputs.
+pub fn ready_train_notice(
+    train_id: &str,
+    order: &[u64],
+    heads: &BTreeMap<u64, String>,
+    batches: &[BatchRun],
+    notified: &BTreeSet<String>,
+) -> Option<ReadyTrainNotice> {
+    if train_id.is_empty() {
+        return None;
+    }
+    let delivery_key = ready_delivery_key(order, heads)?;
+    let batch = batches.iter().rev().find(|batch| {
+        batch.status == "passed"
+            && batch.flakes.is_empty()
+            && batch.skipped.is_empty()
+            && batch.mode == crate::decide::verify::BatchMode::Presubmit
+            && batch.prs == order
+            && &batch.shas == heads
+            && batch.tree.as_ref().is_some_and(|tree| !tree.is_empty())
+    })?;
+    Some(ReadyTrainNotice {
+        train_id: train_id.into(),
+        batch_id: batch.id.clone(),
+        order: order.to_vec(),
+        heads: heads.clone(),
+        base: batch.main_sha.clone(),
+        tree: batch.tree.clone()?,
+        delivery_key,
+        announce: !announcement_covered(order, heads, notified),
+    })
 }
 
 /// Decide whether the running orchestrator should advance to a newer `main` commit.
@@ -220,19 +338,24 @@ pub fn decide_self_update(
 pub fn decide_owner_notifications(
     attention_items: &[AttentionItem],
     batches: &[BatchRun],
-    ready_trains: &[(String, Vec<u64>, BTreeMap<u64, String>)],
+    ready_trains: &[ReadyTrainNotice],
     failed_main_jobs: &BTreeMap<String, String>,
     deploy_runs: &[DeployRunObs],
     already_notified: &BTreeSet<String>,
+    holds: &BTreeMap<String, Hold>,
 ) -> Vec<OwnerNotification> {
     let mut out = Vec::new();
 
     for item in attention_items {
-        let key = format!("attention:{}:{}:{}", item.kind, item.target, item.summary);
+        if item.kind == "notification-delivery" {
+            continue;
+        }
+        let key = attention_notification_key(item, holds);
         if already_notified.contains(&key) {
             continue;
         }
         out.push(OwnerNotification {
+            ready: None,
             key,
             kind: item.kind.clone(),
             subject: format!("[tacho] {} needs attention ({})", item.target, item.kind),
@@ -245,16 +368,22 @@ pub fn decide_owner_notifications(
         });
     }
 
-    for (train_id, order, heads) in ready_trains {
-        if train_id.is_empty() || order.is_empty() {
+    for ready in ready_trains {
+        let train_id = &ready.train_id;
+        let order = &ready.order;
+        let Ok(identity) = serde_json::to_vec(&(
+            train_id,
+            &ready.batch_id,
+            &ready.base,
+            &ready.tree,
+            &ready.delivery_key,
+        )) else {
             continue;
-        }
-        let mut head_parts = Vec::new();
-        for pr in order {
-            let sha = heads.get(pr).map(String::as_str).unwrap_or("");
-            head_parts.push(format!("{pr}:{}", crate::char_prefix(sha, 8)));
-        }
-        let key = format!("ready:{train_id}:{}", head_parts.join(","));
+        };
+        let key = format!(
+            "ready-event:{train_id}:{}",
+            crate::project::content_id(&identity)
+        );
         if already_notified.contains(&key) {
             continue;
         }
@@ -265,6 +394,7 @@ pub fn decide_owner_notifications(
             .join(" ");
         let cmd = format!("tacho land --train {train_id}");
         out.push(OwnerNotification {
+            ready: Some(ready.clone()),
             key,
             kind: "ready-train".to_string(),
             subject: format!("[tacho] train {train_id} ready to merge ({pr_list})"),
@@ -288,6 +418,7 @@ pub fn decide_owner_notifications(
             .map(|c| format!(" (blamed PR #{c})"))
             .unwrap_or_default();
         out.push(OwnerNotification {
+            ready: None,
             key,
             kind: "red-batch".to_string(),
             subject: format!("[tacho] batch {} failed{}", b.id, culprit_str),
@@ -307,6 +438,7 @@ pub fn decide_owner_notifications(
         }
         let cmd = "tacho status".to_string();
         out.push(OwnerNotification {
+            ready: None,
             key,
             kind: "main-red".to_string(),
             subject: format!("[tacho] main job failed: {job_key}"),
@@ -333,6 +465,7 @@ pub fn decide_owner_notifications(
         let short = &d.head_sha[..d.head_sha.len().min(8)];
         let cmd = "tacho top".to_string();
         out.push(OwnerNotification {
+            ready: None,
             key,
             kind: "deploy-started".to_string(),
             subject: format!("[tacho] deploy of {short} started (run #{})", d.run_id),

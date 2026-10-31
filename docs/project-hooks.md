@@ -2,7 +2,9 @@
 
 `shunt project validate shunt.json` checks a repository contract without executing
 its hooks. `shunt project apply shunt.json` installs it in the fleet store. Applying
-configuration preserves worker limits, holds, queued work and proof records.
+configuration preserves worker limits, holds, queued work and proof history.
+Changing the repository, verification hooks, area selection or verification inputs
+invalidates active passes. Transport and publication changes preserve those passes.
 The CLI and daemon read the same installed contract.
 
 Owner merge execution requires the configured merge permission or
@@ -54,9 +56,27 @@ root. Blank lines and `#` comments are ignored. Listed files remain inputs
 even inside a generated-output directory. The list is read from the input
 Git tree, so a check cannot weaken it while it runs.
 
-`notify` receives a scrubbed subject and body from both CLI and daemon owner
-notifications. An unsuccessful delivery remains pending. Credentials come
-from the process environment, independently of the checked-in contract.
+A complete passed batch creates an owner train automatically, including for draft
+pull requests. Every member must retain its exact head, batch, base, tree and required
+checks. `publish` receives the current main, typed ready trains and attention items
+before ready work is announced. Identical successfully published snapshots are skipped.
+A failed publication remains pending and blocks that ready announcement.
+
+`notify` receives a scrubbed subject and body. Scheduler notices also include a
+stable `key`, `kind` and optional `ready` object with the train, batch, ordered pull
+requests, complete heads, base and tree. The ready object's `delivery_key` identifies
+the ordered full heads independently of the proof attempt. `announce` is false when
+those heads, or an ordered superset containing them, have already been announced.
+A new proof can therefore update the owner queue without sending another email.
+
+A notify hook acknowledges with `{"delivery":"sent"}`, `pending` or `uncertain`.
+An empty successful response retains compatibility with simple transport hooks.
+Delivery is recorded only after acknowledgment. Pending I/O is retried even when
+the scheduler's decision is unchanged. Uncertain delivery remains visible for
+transport reconciliation and does not recursively announce its own failure.
+The `shunt-notify` plugin provides durable transport claims and explicit uncertain
+receipt resolution. Credentials come from the process environment independently
+of the checked-in contract.
 
 `review_no_pr` keeps a worker's `PR: none` result pending until an operator
 confirms it with `shunt attach <key> none`. Stopped and abandoned imported

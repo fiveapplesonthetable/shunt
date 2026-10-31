@@ -52,6 +52,8 @@ pub struct DecisionRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FleetState {
+    /// Last queue snapshot acknowledged by the project publication hook.
+    pub owner_queue_digest: Option<String>,
     /// Project-owned decisions that remain pending after a controller handoff.
     pub external_attention: BTreeMap<String, String>,
     /// Validated project contract shared by CLI and daemon execution.
@@ -113,6 +115,7 @@ pub struct FleetState {
 impl Default for FleetState {
     fn default() -> Self {
         Self {
+            owner_queue_digest: None,
             external_attention: BTreeMap::new(),
             project: None,
             max_workers: 4,
