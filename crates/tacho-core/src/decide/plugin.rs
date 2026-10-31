@@ -809,6 +809,78 @@ impl CliForgePlugin {
 }
 
 impl ForgePlugin for CliForgePlugin {
+    fn open_prs(
+        &self,
+        run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+    ) -> Result<Vec<PullFacts>, String> {
+        let output = run(&self.plan_open_prs_cmd())?;
+        let mut pulls: Vec<serde_json::Value> = serde_json::from_str(&output)
+            .map_err(|error| format!("unexpected PR list output: {error}"))?;
+        if pulls.len() >= 200 {
+            return Err("open PR list reached its observation limit".into());
+        }
+        for pull in &mut pulls {
+            let count = pull["changedFiles"]
+                .as_u64()
+                .ok_or("missing PR file count")?;
+            let files = pull["files"].as_array().ok_or("missing PR file list")?;
+            if count == files.len() as u64 {
+                continue;
+            }
+            let number = pull["number"].as_u64().ok_or("missing PR number")?;
+            let head = pull["headRefOid"]
+                .as_str()
+                .filter(|head| !head.is_empty())
+                .ok_or("missing PR head")?
+                .to_string();
+            let repository = self.repo.as_deref().unwrap_or("{owner}/{repo}");
+            let pages = run(&[
+                self.cli_bin.clone(),
+                "api".into(),
+                "--paginate".into(),
+                format!("repos/{repository}/pulls/{number}/files?per_page=100"),
+            ])?;
+            #[derive(Deserialize)]
+            struct File {
+                filename: String,
+            }
+            let pages: Vec<Vec<File>> = serde_json::Deserializer::from_str(&pages)
+                .into_iter::<Vec<File>>()
+                .collect::<Result<_, _>>()
+                .map_err(|error| format!("unexpected paginated PR files: {error}"))?;
+            let files: Vec<_> = pages
+                .into_iter()
+                .flatten()
+                .map(|file| file.filename)
+                .collect();
+            let unique: std::collections::BTreeSet<_> = files.iter().collect();
+            if count != files.len() as u64 || unique.len() != files.len() {
+                return Err("paginated PR file list is incomplete or contains duplicates".into());
+            }
+            let mut argv = vec![self.cli_bin.clone(), "pr".into(), "view".into()];
+            argv.extend(self.repo_args());
+            argv.extend([
+                number.to_string(),
+                "--json".into(),
+                "headRefOid,changedFiles".into(),
+            ]);
+            let current: serde_json::Value = serde_json::from_str(&run(&argv)?)
+                .map_err(|error| format!("unexpected PR head confirmation: {error}"))?;
+            if current["headRefOid"].as_str() != Some(head.as_str())
+                || current["changedFiles"].as_u64() != Some(count)
+            {
+                return Err("PR changed while its file list was paginated".into());
+            }
+            pull["files"] = serde_json::Value::Array(
+                files
+                    .into_iter()
+                    .map(|path| serde_json::json!({"path":path}))
+                    .collect(),
+            );
+        }
+        self.parse_open_prs(&serde_json::to_string(&pulls).map_err(|error| error.to_string())?)
+    }
+
     fn forge_name(&self) -> &str {
         &self.name
     }
