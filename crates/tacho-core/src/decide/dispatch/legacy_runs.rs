@@ -59,6 +59,23 @@ pub struct TodoItem {
     pub compare: Option<String>,
 }
 
+/// An explicit run result whose meaning survives a controller handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    /// Existing records retain their inferred lifecycle.
+    #[default]
+    Unspecified,
+    /// The controller has confirmed the work is complete.
+    Completed,
+    /// An operator stopped the run.
+    Stopped,
+    /// The work was abandoned or retired.
+    Abandoned,
+    /// A pull-request result still requires confirmation.
+    AwaitingPrReview,
+}
+
 /// A recorded agent run in fleet state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentRun {
@@ -75,6 +92,9 @@ pub struct AgentRun {
     pub log: String,
     #[serde(default)]
     pub status_note: String,
+    /// Explicit lifecycle information preserved across controller handoffs.
+    #[serde(default)]
+    pub outcome: RunOutcome,
     #[serde(default)]
     pub started_at: i64,
     #[serde(default)]
@@ -396,6 +416,12 @@ pub fn pr_problem(agent: &AgentRun, commits_ahead: Option<u32>) -> Option<String
             ));
         }
     }
+    if agent.outcome == RunOutcome::AwaitingPrReview {
+        return Some(format!(
+            "{} has a pull-request result awaiting confirmation (run 'tacho attach {} <pr>|none')",
+            agent.key, agent.key
+        ));
+    }
     if agent.pr_none && commits_ahead.unwrap_or(0) > 0 {
         return Some(format!(
             "{} reported 'PR: none' despite {} commit(s) in its worktree",
@@ -442,6 +468,13 @@ pub fn run_state(
     if queued {
         return RunState::Resuming;
     }
+    match last.outcome {
+        RunOutcome::Completed => return RunState::Done,
+        RunOutcome::AwaitingPrReview | RunOutcome::Stopped | RunOutcome::Abandoned => {
+            return RunState::Stuck
+        }
+        RunOutcome::Unspecified => {}
+    }
     if recorded_pr(last).is_some() {
         return RunState::Done;
     }
@@ -472,6 +505,9 @@ pub fn needs_resume(
     let Some(last) = chain.last() else {
         return false;
     };
+    if last.outcome != RunOutcome::Unspecified {
+        return false;
+    }
     if !last.area.is_empty() && holds.contains_key(&format!("area:{}", last.area)) {
         return false;
     }
@@ -562,7 +598,10 @@ pub fn done_keys(
     let mut out = BTreeSet::new();
     for root in base_keys(agents, retired) {
         if let Some(last) = latest(agents, retired, &root) {
-            if recorded_pr(last).is_some() || (last.pr_none && last.exit_code == Some(0)) {
+            if last.outcome == RunOutcome::Completed
+                || (last.outcome == RunOutcome::Unspecified
+                    && (recorded_pr(last).is_some() || (last.pr_none && last.exit_code == Some(0))))
+            {
                 out.insert(root);
             }
         }

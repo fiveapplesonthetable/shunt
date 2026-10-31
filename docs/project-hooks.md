@@ -45,3 +45,22 @@ Git tree, so a check cannot weaken it while it runs.
 `notify` receives a scrubbed subject and body from both CLI and daemon owner
 notifications. An unsuccessful delivery remains pending. Credentials come
 from the process environment, independently of the checked-in contract.
+
+`review_no_pr` keeps a worker's `PR: none` result pending until an operator
+confirms it with `shunt attach <key> none`. Stopped and abandoned imported
+runs retain those outcomes and do not enter automatic retry.
+
+`shunt project import-state snapshot.json --dry-run` validates a versioned
+neutral snapshot without creating a controller database. A repository's
+one-time migration adapter supplies the target state, the original source
+records in `archive`, and any `unmapped_active` features. Unknown or changed
+state fields, live workers, running batches and incomplete proof identities
+prevent import.
+
+Without `--dry-run`, import writes the state and exact source envelope in one
+SQLite transaction, and refuses an already initialized controller. Replaying
+the identical snapshot returns its receipt without replacing subsequent
+queue progress. Imported history remains visible without replaying old
+notifications. `external_attention` retains project decisions until
+`shunt project resolve <key>` explicitly clears them. Project application
+commits are observed independently of controller binary updates.

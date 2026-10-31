@@ -283,6 +283,14 @@ pub struct ProjectArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ProjectOperation {
+    /// Import a repository adapter's state snapshot into an empty controller.
+    ImportState {
+        path: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Resolve a project-owned operator decision.
+    Resolve { key: String },
     /// Validate the configuration without changing fleet state.
     Validate {
         #[arg(default_value = "shunt.json")]

@@ -11,6 +11,34 @@ use super::store::{git_stdout, open_fleet_store};
 
 /// Executes project configuration validation, application or inspection.
 pub fn execute(args: ProjectArgs) -> io::Result<()> {
+    if let ProjectOperation::ImportState { path, dry_run } = &args.command {
+        let bytes = fs::read(path)?;
+        let (_, _, preview) = tacho_daemon::fleet::state_import::validate(&bytes)?;
+        let receipt = if *dry_run {
+            preview
+        } else {
+            open_fleet_store()?.import_snapshot(&bytes)?
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt).map_err(io::Error::other)?
+        );
+        return Ok(());
+    }
+    if let ProjectOperation::Resolve { key } = &args.command {
+        open_fleet_store()?.mutate(
+            Some((
+                "project",
+                "resolve",
+                key,
+                "project decision explicitly resolved",
+            )),
+            |state| {
+                state.external_attention.remove(key);
+            },
+        )?;
+        return Ok(());
+    }
     if matches!(args.command, ProjectOperation::Show) {
         let project = open_fleet_store()?.load()?.project;
         println!(
@@ -23,6 +51,7 @@ pub fn execute(args: ProjectArgs) -> io::Result<()> {
         ProjectOperation::Validate { path } => (path, false),
         ProjectOperation::Apply { path } => (path, true),
         ProjectOperation::Show => return Ok(()),
+        ProjectOperation::ImportState { .. } | ProjectOperation::Resolve { .. } => return Ok(()),
     };
     let project: ProjectConfig =
         serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;
