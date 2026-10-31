@@ -76,11 +76,7 @@ pub fn still_ready(
     current_main: &str,
     merged_prs_since: &[u64],
 ) -> bool {
-    if !pr.state.eq_ignore_ascii_case("OPEN")
-        || pr.draft
-        || pr.head.is_empty()
-        || current_main.is_empty()
-    {
+    if !pr.state.eq_ignore_ascii_case("OPEN") || pr.head.is_empty() || current_main.is_empty() {
         return false;
     }
     if pr.mergeable.eq_ignore_ascii_case("CONFLICTING") {

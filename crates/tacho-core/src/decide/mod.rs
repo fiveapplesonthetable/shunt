@@ -42,8 +42,8 @@ use verify::{
 use watch::{
     decide_owner_notifications, decide_self_update, decide_tidy, down_alert, down_reason,
     needs_you, supervise_step, take_sample, verdict, AttentionItem, BehindCommit, DeployRunObs,
-    OwnerNotification, ProgressSample, SelfUpdateDecision, SuperviseAction, TidyDecision,
-    TidySnapshot, Verdict,
+    OwnerNotification, ProgressSample, ReadyTrainNotice, SelfUpdateDecision, SuperviseAction,
+    TidyDecision, TidySnapshot, Verdict,
 };
 
 /// Complete pure fleet state input to [`decide`].
@@ -179,6 +179,9 @@ pub struct DecisionPlan {
     pub batch_resolutions: Vec<BatchResolution>,
     pub batch_plans: Vec<BatchPlan>,
     pub ready_prs: Vec<ReadyItem>,
+    /// Complete verified train publications, including already announced heads.
+    #[serde(default)]
+    pub ready_trains: Vec<ReadyTrainNotice>,
     pub tidy_decisions: Vec<TidyDecision>,
     pub attention_items: Vec<AttentionItem>,
     pub owner_notifications: Vec<OwnerNotification>,
@@ -644,7 +647,11 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         next.external_attention
             .iter()
             .map(|(key, summary)| AttentionItem {
-                kind: "project".into(),
+                kind: if key.starts_with("notification-delivery:") {
+                    "notification-delivery".into()
+                } else {
+                    "project".into()
+                },
                 target: key.clone(),
                 summary: summary.clone(),
                 command_hint: format!("tacho project resolve {key}"),
@@ -718,7 +725,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         }
     }
 
-    let verified_trains: Vec<_> = obs
+    let mut verified_trains: Vec<_> = obs
         .ready_trains
         .iter()
         .filter(|(_, order, heads)| {
@@ -731,16 +738,72 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         })
         .cloned()
         .collect();
+    for batch in &next.batches {
+        if batch.prs.is_empty()
+            || !batch.prs.iter().all(|number| {
+                ready_prs.iter().any(|item| {
+                    item.pr == *number
+                        && item.batch_id == batch.id
+                        && batch.shas.get(number) == Some(&item.sha)
+                })
+            })
+        {
+            continue;
+        }
+        if !verified_trains
+            .iter()
+            .any(|(_, order, heads)| order == &batch.prs && heads == &batch.shas)
+        {
+            verified_trains.push((
+                format!("batch-{}", batch.id),
+                batch.prs.clone(),
+                batch.shas.clone(),
+            ));
+        }
+    }
+    let ready_trains: Vec<_> = verified_trains
+        .iter()
+        .filter_map(|(id, order, heads)| {
+            let first = order.first()?;
+            let item = ready_prs
+                .iter()
+                .find(|item| item.pr == *first && heads.get(first) == Some(&item.sha))?;
+            if !order.iter().all(|number| {
+                ready_prs.iter().any(|member| {
+                    member.pr == *number
+                        && member.batch_id == item.batch_id
+                        && heads.get(number) == Some(&member.sha)
+                })
+            }) {
+                return None;
+            }
+            let batch = next
+                .batches
+                .iter()
+                .find(|batch| batch.id == item.batch_id)?;
+            watch::ready_train_notice(
+                id,
+                order,
+                heads,
+                std::slice::from_ref(batch),
+                &next.notified_keys,
+            )
+        })
+        .collect();
     let owner_notifications = decide_owner_notifications(
         &attention_items,
         &next.batches,
-        &verified_trains,
+        &ready_trains,
         &failed_main_jobs,
         &obs.deploy_runs,
         &next.notified_keys,
+        &next.holds,
     );
     for n in &owner_notifications {
         next.notified_keys.insert(n.key.clone());
+        if let Some(ready) = &n.ready {
+            next.notified_keys.insert(ready.delivery_key.clone());
+        }
     }
 
     let has_active_work = !obs.live_keys.is_empty() || !next.todo.is_empty();
@@ -793,6 +856,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         batch_resolutions,
         batch_plans,
         ready_prs,
+        ready_trains,
         tidy_decisions,
         attention_items,
         owner_notifications,

@@ -837,18 +837,16 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
 
     let mut ready_trains = Vec::new();
     if let Some(open) = tacho_core::decide::land::open_for(&state.trains) {
-        let heads = open
-            .prs
-            .iter()
-            .filter_map(|&pr| {
-                state
-                    .open_prs_cache
-                    .iter()
-                    .find(|p| p.number == pr)
-                    .map(|p| (pr, p.head.clone()))
+        if open.prs.iter().all(|number| {
+            state.passed.get(number).is_some_and(|record| {
+                record.batch_id == open.batch_id
+                    && open.shas.get(number) == Some(&record.sha)
+                    && record.main_sha == open.base
+                    && record.tree == open.tree
             })
-            .collect();
-        ready_trains.push((open.id.clone(), open.prs.clone(), heads));
+        }) {
+            ready_trains.push((open.id.clone(), open.prs.clone(), open.shas.clone()));
+        }
     }
 
     let agent_roots: BTreeSet<u32> = live_keys

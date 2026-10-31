@@ -180,10 +180,12 @@ impl FleetStore {
             &state.failed,
             snapshot.captured_at,
         ) {
-            state.notified_failures.insert(format!(
-                "attention:{}:{}:{}",
-                item.kind, item.target, item.summary
-            ));
+            state
+                .notified_failures
+                .insert(tacho_core::decide::watch::attention_notification_key(
+                    &item,
+                    &state.holds,
+                ));
         }
         for (key, summary) in &state.external_attention {
             state
