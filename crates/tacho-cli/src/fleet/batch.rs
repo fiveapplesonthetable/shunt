@@ -878,6 +878,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
             checks: checks.clone(),
+            area_sources: BTreeMap::new(),
             mode: batch_mode,
             status: "hang".to_string(),
             started_at: now,
@@ -915,6 +916,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
             checks: checks.clone(),
+            area_sources: BTreeMap::new(),
             mode: batch_mode,
             status: "red-once".to_string(),
             started_at: now,
@@ -992,6 +994,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
             checks: checks.clone(),
+            area_sources: BTreeMap::new(),
             mode: batch_mode,
             status: "head-moved".to_string(),
             started_at: now,
@@ -1026,6 +1029,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
             checks: checks.clone(),
+            area_sources: BTreeMap::new(),
             mode: batch_mode,
             status: "flake".to_string(),
             started_at: now,
@@ -1067,6 +1071,27 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
     }
 
     if ok {
+        let mut area_sources = tacho_core::decide::verify::reusable_area_sources(
+            &state.batches,
+            &pr_nums,
+            &shas,
+            &main_sha,
+            &tree_sha,
+            batch_mode,
+        );
+        for area in &area_list {
+            area_sources.insert(area.clone(), batch_id.clone());
+        }
+        let proved_areas: Vec<_> = area_sources.keys().cloned().collect();
+        let mut proved_checks = checks.clone();
+        for area in &proved_areas {
+            if !proved_checks.iter().any(|check| check.area == *area) {
+                proved_checks.push(AreaCheck {
+                    area: area.clone(),
+                    units: vec!["all".into()],
+                });
+            }
+        }
         let b_run = BatchRun {
             id: batch_id.clone(),
             group: area_list
@@ -1076,8 +1101,9 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             prs: pr_nums.clone(),
             shas: shas.clone(),
             main_sha: main_sha.clone(),
-            areas: area_list.clone(),
-            checks: checks.clone(),
+            areas: proved_areas.clone(),
+            checks: proved_checks.clone(),
+            area_sources: area_sources.clone(),
             mode: batch_mode,
             status: "passed".to_string(),
             started_at: now,
@@ -1103,7 +1129,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
                         batch_id: batch_id.clone(),
                         passed_at: finished,
                         tree: tree_sha.clone(),
-                        areas: area_list.clone(),
+                        areas: proved_areas.clone(),
                     },
                 );
             }
@@ -1174,6 +1200,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
                 main_sha: main_sha.clone(),
                 areas: area_list.clone(),
                 checks: checks.clone(),
+                area_sources: BTreeMap::new(),
                 mode: batch_mode,
                 status: "main-broken".to_string(),
                 started_at: now,
@@ -1217,6 +1244,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             main_sha: main_sha.clone(),
             areas: area_list.clone(),
             checks: checks.clone(),
+            area_sources: BTreeMap::new(),
             mode: batch_mode,
             status: "failed".to_string(),
             started_at: now,

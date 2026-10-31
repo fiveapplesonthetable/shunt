@@ -18,6 +18,7 @@ fn a_tick_cannot_overwrite_a_batch_that_finished_during_observation() {
     store
         .mutate(None, |state| {
             state.batches.push(BatchRun {
+                area_sources: Default::default(),
                 id: "completed-during-observation".to_string(),
                 status: "passed".to_string(),
                 tree: Some("verified-tree".to_string()),
@@ -244,6 +245,7 @@ fn test_run_tick_with_mock_forge_refreshes_world_and_clears_main_broken() {
     store
         .mutate(None, |st| {
             st.batches.push(BatchRun {
+                area_sources: Default::default(),
                 id: "b-main-broken".to_string(),
                 group: "core".to_string(),
                 prs: vec![55],
@@ -317,6 +319,7 @@ fn test_run_tick_forwards_owner_notifications_and_watchdog_alerts_to_forge_issue
     store
         .mutate(None, |st| {
             st.batches.push(BatchRun {
+                area_sources: Default::default(),
                 id: "b-red".to_string(),
                 group: "core".to_string(),
                 prs: vec![7],
@@ -393,6 +396,7 @@ fn test_run_tick_retries_failed_owner_notifications_and_watchdog_alerts_on_next_
     store
         .mutate(None, |st| {
             st.batches.push(BatchRun {
+                area_sources: Default::default(),
                 id: "b-red".to_string(),
                 group: "core".to_string(),
                 prs: vec![7],

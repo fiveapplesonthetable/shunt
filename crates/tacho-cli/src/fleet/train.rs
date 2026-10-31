@@ -412,6 +412,7 @@ pub fn assemble_train(
 
     let tree_sha = crate::kit::tree_of_worktree(cwd).unwrap_or_else(|_| base_sha.clone());
     let synth_batch = BatchRun {
+        area_sources: BTreeMap::new(),
         id: format!("b{:03}", state.batches.len() + 1),
         group: "train".to_string(),
         prs: accepted_prs.clone(),
