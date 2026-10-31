@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -33,6 +35,17 @@ use super::store::{
     record_batch_pid_identity, resolve_live_pr_heads, resolve_verification_main_sha,
 };
 use crate::kit::{apply_private_tmp_env, private_tmp_dir, use_private_tmp};
+
+fn probe_tail(path: &std::path::Path) -> io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const LIMIT: u64 = 256 * 1024;
+    let mut file = fs::File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(LIMIT);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
 
 /// Origin of a batch verification run:
 /// - `Daemon`: reruns the same tree once on red (recording flakes to the flake ledger,
@@ -706,6 +719,8 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
     let merged_env = load_fleet_env(opts.env_file.as_deref());
     record_batch_pid_identity(&batch_id, std::process::id())?;
     let fleet_tmp = private_tmp_dir(&format!("batch-{batch_id}"))?;
+    let log_directory = store.home().join("runs").join(&batch_id).join("logs");
+    fs::create_dir_all(&log_directory)?;
     let run_probe = |k: usize, label: &str| -> io::Result<(bool, bool, String, u64, u64)> {
         let prefix_heads: Vec<&str> = heads.iter().copied().take(k).collect();
         let expected_tree = checkout.prepare(&main_sha, &prefix_heads)?;
@@ -768,8 +783,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             cmd.env(ek, ev);
         }
         cmd.envs(&prepared_environment);
-        let out = cmd
-            .env("TACHO_BATCH_ID", &batch_id)
+        cmd.env("TACHO_BATCH_ID", &batch_id)
             .env(
                 "TACHO_BATCH_MODE",
                 format!("{batch_mode:?}").to_ascii_lowercase(),
@@ -779,16 +793,37 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             .env("TACHO_BATCH_PROBE_K", k.to_string())
             .env("TACHO_BATCH_PROBE_PRS", prefix_prs.join(","))
             .env("TACHO_BATCH_LABEL", label)
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .output()?;
+            .env("PYTHONDONTWRITEBYTECODE", "1");
+        let (mut log, log_path) = tempfile::Builder::new()
+            .prefix(&format!("{label}-"))
+            .suffix(".log")
+            .tempfile_in(&log_directory)?
+            .keep()
+            .map_err(|error| error.error)?;
+        let (mut reader, writer) = UnixStream::pair()?;
+        let writer: OwnedFd = writer.into();
+        cmd.stdout(Stdio::from(writer.try_clone()?))
+            .stderr(Stdio::from(writer));
+        println!("Probe {label} log: {}", log_path.display());
+        let spool = std::thread::spawn(move || io::copy(&mut reader, &mut log).map(|_| ()));
+        let status = cmd.status();
+        drop(cmd);
+        spool
+            .join()
+            .map_err(|_| io::Error::other("probe log writer failed"))??;
+        let status = status?;
         let p_end = now_ns();
-        let raw_txt = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+        let text = if status.success() {
+            probe_tail(&log_path)?
+        } else {
+            String::from_utf8_lossy(&fs::read(&log_path)?).into_owned()
+        };
+        let txt = format!(
+            "Full probe log: {}\n{}",
+            log_path.display(),
+            Scrubber::new().scrub(&text)
         );
-        let txt = Scrubber::new().scrub(&raw_txt);
-        let timed_out = out.status.code() == Some(124) || out.status.code() == Some(137);
+        let timed_out = status.code() == Some(124) || status.code() == Some(137);
         if let Some(project) = &state.project {
             let outputs = crate::kit::tree_of_worktree(check_cwd)?;
             let destination = store
@@ -805,10 +840,10 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
                 &destination,
             )?;
         }
-        if out.status.success() {
+        if status.success() {
             checkout.verify_unchanged(&expected_tree)?;
         }
-        Ok((out.status.success(), timed_out, txt, p_start, p_end))
+        Ok((status.success(), timed_out, txt, p_start, p_end))
     };
 
     let (mut ok, timed_out, mut log_text, p0_start, p0_end) = run_probe(pr_nums.len(), "r0")?;
@@ -1110,7 +1145,7 @@ fn execute_batch_inner(opts: BatchOptions, claimed: Option<&str>) -> io::Result<
             finished_at: Some(finished),
             tree: Some(tree_sha.clone()),
             pid: None,
-            log: String::new(),
+            log: format!("Probe logs: {}", log_directory.display()),
             culprit: None,
             skipped: Vec::new(),
             flakes: Vec::new(),
