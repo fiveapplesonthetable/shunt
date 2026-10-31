@@ -52,10 +52,16 @@ pub(super) fn verified_state() -> FleetState {
 #[test]
 fn next_recommends_only_a_current_complete_batch_proof() {
     let valid = verified_state();
-    assert_eq!(
-        compute_next_instruction(&valid, &BTreeSet::new(), 100),
-        "ask the owner to land PR #20"
-    );
+    for draft in [false, true] {
+        let mut state = valid.clone();
+        for pull in &mut state.open_prs_cache {
+            pull.draft = draft;
+        }
+        assert_eq!(
+            compute_next_instruction(&state, &BTreeSet::new(), 100),
+            "ask the owner to land PR #20"
+        );
+    }
     type Mutation = (&'static str, fn(&mut FleetState));
     let mutations: &[Mutation] = &[
         ("head moved", |s| {
@@ -65,11 +71,6 @@ fn next_recommends_only_a_current_complete_batch_proof() {
         }),
         ("main moved", |s| s.main_sha = Some("unrelated-main".into())),
         ("main unknown", |s| s.main_sha = None),
-        ("draft", |s| {
-            for p in &mut s.open_prs_cache {
-                p.draft = true;
-            }
-        }),
         ("conflict", |s| {
             for p in &mut s.open_prs_cache {
                 p.mergeable = "CONFLICTING".into();
