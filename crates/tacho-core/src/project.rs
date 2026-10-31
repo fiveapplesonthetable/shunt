@@ -40,6 +40,16 @@ fn default_timeout() -> u64 {
     60
 }
 
+/// A project-owned list of reference files that remain immutable check inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputList {
+    /// Repository-relative UTF-8 list file, with one path per line and `#` comments.
+    pub file: String,
+    /// Repository-relative directory against which listed paths are resolved.
+    pub root: String,
+}
+
 impl HookCommand {
     /// The complete command passed directly to the operating system.
     pub fn argv(&self) -> Vec<String> {
@@ -63,6 +73,12 @@ pub struct ProjectConfig {
     /// Project implementations of runtime operations.
     #[serde(default)]
     pub hooks: BTreeMap<HookKind, HookCommand>,
+    /// Regexes of derived files collected as artifacts and restored after checks.
+    #[serde(default)]
+    pub generated_outputs: Vec<String>,
+    /// Reference-file lists that take precedence over generated-output patterns.
+    #[serde(default)]
+    pub input_lists: Vec<InputList>,
     /// Workflow used for main CI observation.
     #[serde(default)]
     pub workflow_path: Option<String>,
@@ -114,6 +130,21 @@ impl ProjectConfig {
                 return Err("hook timeout_secs must be between 1 and 3600".into());
             }
         }
+        generated_output_matcher(&self.generated_outputs)?;
+        for list in &self.input_lists {
+            for path in [&list.file, &list.root] {
+                if path.contains('\0')
+                    || std::path::Path::new(path)
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                {
+                    return Err("input list paths must stay inside the repository".into());
+                }
+            }
+            if list.file.is_empty() {
+                return Err("an input list requires its file path".into());
+            }
+        }
         if self.hooks.contains_key(&HookKind::Verify)
             && !self.hooks.contains_key(&HookKind::RunnerTrust)
         {
@@ -121,6 +152,12 @@ impl ProjectConfig {
         }
         Ok(())
     }
+}
+
+/// Compiles the project's declared derived-file patterns once for a collection run.
+pub fn generated_output_matcher(patterns: &[String]) -> Result<regex::RegexSet, String> {
+    regex::RegexSet::new(patterns)
+        .map_err(|error| format!("invalid generated output pattern: {error}"))
 }
 
 /// Scrubs notifications using the same configured secrets in every runtime path.

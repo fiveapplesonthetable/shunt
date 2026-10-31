@@ -490,6 +490,12 @@ pub fn tree_of_worktree(root: &Path) -> io::Result<String> {
     let run_temp_git = |args: &[&str]| -> io::Result<std::process::Output> {
         use std::os::unix::process::CommandExt;
         let child = Command::new("git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+            ])
             .args(args)
             .current_dir(&canon)
             .env("GIT_INDEX_FILE", &tmp_index)

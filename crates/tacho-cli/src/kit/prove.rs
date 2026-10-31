@@ -789,7 +789,17 @@ pub fn execute_prove(args: ProveArgs) -> io::Result<()> {
         .current_dir(&root)
         .output()?;
     let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
-    let tree = tree_of_worktree(&root)?;
+    let mut tree = tree_of_worktree(&root)?;
+    if let Some(project) = &state.project {
+        super::artifacts::collect(
+            &root,
+            &input_tree,
+            &tree,
+            project,
+            &proof_dir.join("artifacts"),
+        )?;
+        tree = tree_of_worktree(&root)?;
+    }
     let outputs: Vec<_> = args
         .outputs
         .iter()
