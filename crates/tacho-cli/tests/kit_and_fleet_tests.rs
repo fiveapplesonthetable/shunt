@@ -784,7 +784,8 @@ fn test_fleet_batch_bisect_flake_train_land_and_trace() {
         String::from_utf8_lossy(&land_out.stderr)
     );
     let st_after_land = store.load().unwrap();
-    assert!(st_after_land.merged_prs.contains(&10));
+    assert!(!st_after_land.merged_prs.contains(&10));
+    assert_eq!(st_after_land.trains.last().unwrap().status, "open");
 
     // 6. Export a Perfetto trace (`tacho trace`) and verify non-empty valid snapshot
     let trace_path = tmp.path().join("fleet.perfetto-trace");
