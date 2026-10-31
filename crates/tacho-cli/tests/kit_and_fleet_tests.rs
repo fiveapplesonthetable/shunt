@@ -1684,6 +1684,7 @@ fn test_cli_surface_version_setup_db_session_todo_hold_retire_events_tidy_replay
                 },
             );
             st.batches.push(tacho_core::decide::verify::BatchRun {
+                area_sources: Default::default(),
                 id: "b088".to_string(),
                 group: "core".to_string(),
                 prs: vec![88],

@@ -1791,6 +1791,7 @@ fn waiting_for_with_ci_proof_requires_all_and_costly_areas_until_main_ci_passes(
         proved_tree: Some("train-tree".into()),
     };
     let partial_batch = BatchRun {
+        area_sources: Default::default(),
         id: "b001".into(),
         group: "train".into(),
         prs: vec![1],

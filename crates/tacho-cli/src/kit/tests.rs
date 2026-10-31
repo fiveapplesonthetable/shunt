@@ -875,6 +875,7 @@ fn test_starve_refuses_when_merge_batch_is_running() {
     store
         .mutate(None, |st| {
             st.batches.push(BatchRun {
+                area_sources: Default::default(),
                 id: "b001".to_string(),
                 group: "core".to_string(),
                 prs: vec![10],

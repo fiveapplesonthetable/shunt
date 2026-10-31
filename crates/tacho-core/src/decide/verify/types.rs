@@ -55,6 +55,9 @@ pub struct BatchRun {
     pub areas: Vec<String>,
     #[serde(default)]
     pub checks: Vec<AreaCheck>,
+    /// Original successful batch for each complete area proof.
+    #[serde(default)]
+    pub area_sources: BTreeMap<String, String>,
     #[serde(default)]
     pub mode: BatchMode,
     /// `"running"`, `"passed"`, `"failed"`, `"flake"`, `"bisecting"`, `"head-moved"`, `"main-broken"`, `"hang"`

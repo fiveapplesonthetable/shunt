@@ -387,6 +387,7 @@ fn handle_train(mut args: TrainArgs) -> io::Result<()> {
                 }
                 let now = fleet::now_secs();
                 Some(BatchRun {
+                    area_sources: Default::default(),
                     id: format!("b{:03}", state.batches.len() + 1),
                     group: "manual".to_string(),
                     prs: target_prs.clone(),

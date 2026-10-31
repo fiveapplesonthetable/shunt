@@ -249,6 +249,58 @@ pub fn reusable_batch<'a>(
     None
 }
 
+/// Complete area proofs for the identical ordered members, base, tree and verification mode.
+pub fn reusable_area_sources(
+    history: &[BatchRun],
+    prs: &[u64],
+    shas: &BTreeMap<u64, String>,
+    main_sha: &str,
+    tree: &str,
+    mode: BatchMode,
+) -> BTreeMap<String, String> {
+    let mut seen = BTreeSet::new();
+    let mut sources = BTreeMap::new();
+    if main_sha.is_empty() || tree.is_empty() || prs.is_empty() {
+        return sources;
+    }
+    for batch in history.iter().rev().filter(|batch| {
+        batch.main_sha == main_sha
+            && batch.tree.as_deref() == Some(tree)
+            && batch.prs == prs
+            && &batch.shas == shas
+            && batch.mode == mode
+    }) {
+        for area in &batch.areas {
+            if !seen.insert(area.clone()) {
+                continue;
+            }
+            if batch.status != "passed"
+                || batch.finished_at.is_none()
+                || !batch.flakes.is_empty()
+                || !batch.skipped.is_empty()
+            {
+                continue;
+            }
+            if !batch
+                .checks
+                .iter()
+                .any(|check| check.area == *area && check.units.iter().any(|unit| unit == "all"))
+            {
+                continue;
+            }
+            sources.insert(
+                area.clone(),
+                batch
+                    .area_sources
+                    .get(area)
+                    .cloned()
+                    .unwrap_or_else(|| batch.id.clone()),
+            );
+        }
+    }
+    sources
+}
+
 /// Generate the next sequential batch identifier (`b001`, `b002`, ...).
 pub fn new_batch_id(existing: &[BatchRun]) -> String {
     let mut max_n = 0u64;
