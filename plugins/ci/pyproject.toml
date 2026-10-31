@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shunt-ci"
+version = "0.1.0"
+description = "Isolated execution of explicit project CI job plans"
+requires-python = ">=3.11"
+
+[project.scripts]
+shunt-ci = "shunt_ci.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["shunt_ci*"]
